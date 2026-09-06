@@ -55,6 +55,22 @@ pub struct AgentArgs {
     // agent's own flags.
     #[arg(allow_hyphen_values = true, last = true)]
     pub flags: Vec<String>,
+    /// R1-4 (2026-09-06 review): seat instructions to inject as the worker's
+    /// own system prompt, in whichever form the target adapter actually
+    /// supports (`AgentAdapter::system_prompt_args` -- claude's
+    /// `--append-system-prompt`, codex's `developer_instructions`), rather
+    /// than as a harness-specific flag the caller has to spell itself.
+    ///
+    /// This exists because BOTH forks of a delegation have to carry it: an
+    /// inline supervised run renders it into the child's own launch flags
+    /// ([`flags_with_system_prompt`]), and a dashboard pane carries it as
+    /// `SpawnRequest::system_prompt` -- which survives the file-drop
+    /// sanitiser, unlike the trailing `-- <flags>` a caller used to spell it
+    /// in. `workflow::review::reviewer_argv` is the first caller: its
+    /// reviewer-seat instructions used to be dropped outright the moment a
+    /// live dashboard fulfilled the review as a pane.
+    #[arg(long)]
+    pub system_prompt: Option<String>,
     /// Restart budget before giving up.
     #[arg(long)]
     pub max_restarts: Option<u32>,
@@ -1368,6 +1384,31 @@ pub(crate) fn translated_route_flags(
 /// explicit `--sandbox`/`--ask-for-approval`/`--permission-mode`/
 /// `--disallowedTools` demonstrably wins rather than merely surviving
 /// because a CLI takes the last occurrence of a repeated flag.
+/// R1-4: the trailing flags one delegation actually launches an INLINE
+/// supervised child with -- `--system-prompt`'s text rendered through the
+/// target adapter's own injection form (`AgentAdapter::system_prompt_args`),
+/// then whatever the operator typed after `--`.
+///
+/// Order matters and is deliberately this way round: the seat instructions
+/// come first, so an explicit passthrough (a `--model` pin, a policy flag)
+/// still wins under CLI last-occurrence semantics, and so the argv is
+/// byte-identical to what a caller spelling the adapter flag itself used to
+/// produce. Pure, so both forks' parity is testable without launching
+/// anything.
+fn flags_with_system_prompt(args: &AgentArgs, adapter: &dyn AgentAdapter) -> Vec<String> {
+    let Some(text) = args
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return args.flags.clone();
+    };
+    let mut out = adapter.system_prompt_args(text);
+    out.extend_from_slice(&args.flags);
+    out
+}
+
 fn worker_launch_flags(
     cfg: &CtxConfig,
     name: &str,
@@ -2116,7 +2157,18 @@ fn try_join_dashboard<W: Write>(
     // by `pane_ceiling_notices` below rather than refused: an operator who
     // asked for a pane gets one, and finds out on stderr what the pane could
     // not carry.
-    let pinned_model = super::adapters::model_only_flags(&args.flags);
+    //
+    // R1-4 (2026-09-06 review): read with `last_model_flag`, not `model_only_
+    // flags`. The latter gives up on ANY non-model token, so a caller that
+    // pinned a model alongside anything else (`workflow::review::
+    // reviewer_argv`, whose read-only floor rides in the same list) silently
+    // lost the pin and the pane ran on the generic worker default. The value
+    // is still re-checked at the fulfilment side (`dash::mod::pane_model_
+    // args`: `argv_unsafe_prompt` plus `validate_model_str`); the leading-dash
+    // filter here just keeps an obviously bogus pin off the request.
+    let pinned_model = super::adapters::last_model_flag(&args.flags)
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.starts_with('-'));
     for notice in pane_ceiling_notices(args) {
         eprintln!("zirv ctx agent: {notice}");
     }
@@ -2204,6 +2256,16 @@ fn try_join_dashboard<W: Write>(
         // on the pane's real harness child. `pane_ceiling_notices` above
         // already told the operator so.
         flags: args.flags.clone(),
+        // R1-4: the seat instructions this delegation asked for, as DATA --
+        // the fulfilling pane renders them through its own adapter's
+        // injection form, so they survive the sanitiser that clears `flags`
+        // and a pane-fulfilled reviewer keeps the seat it was launched for.
+        system_prompt: args
+            .system_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
     };
     let path = match spawnreq::write_request(&dir, &req) {
         Ok(path) => path,
@@ -2295,13 +2357,32 @@ fn try_join_dashboard<W: Write>(
 /// `--max-restarts` and `--timeout-secs` are absent on purpose: a pane's
 /// child is never restarted by zirv at all (so any restart budget is already
 /// satisfied) and its wall-clock ceiling IS enforced, by `dash::mod::
-/// enforce_pane_deadlines`. Only the two genuinely unhonoured asks appear.
+/// enforce_pane_deadlines`. Only the genuinely unhonoured asks appear.
+///
+/// R1-7 (2026-09-06 review): `--force` is one of them. A request reaches the
+/// dashboard through the file-backed drop directory, and that channel proves
+/// nothing about who wrote it -- `dash::mod::intake_channels`' own shared
+/// `requests` leaf is writable by any process that discovered this dashboard
+/// (issue #179, accepted), so an operator's terminal and a pane's own harness
+/// child are indistinguishable there. `sanitize_file_dropped_request`
+/// therefore clears `force` for every drop, which means an operator who typed
+/// it gets a pane whose spend gate and cross-harness routing were re-decided
+/// without it. That is a demotion, so it is announced here rather than
+/// silently applied.
 fn pane_ceiling_notices(args: &AgentArgs) -> Vec<String> {
     let mut notices = Vec::new();
     if args.max_tool_calls.is_some() {
         notices.push(
             "--max-tool-calls is not enforced on a dashboard pane (no verified tool-call \
              counter); the token budget still is"
+                .to_string(),
+        );
+    }
+    if args.force {
+        notices.push(
+            "--force is not carried to a dashboard pane: a spawn request arrives on a channel \
+             that cannot prove an operator wrote it, so the dashboard clears the override and \
+             applies its own spend gate and cross-harness routing"
                 .to_string(),
         );
     }
@@ -2708,17 +2789,17 @@ pub fn run_with<W: Write>(
         warn_about_paths_outside_launch_repo(&prompt, repo, home.as_deref());
     }
     // Issue #328: printed on stdout ahead of either fork (pane ack or
-    // headless result) so the delegating session reads it whichever path
-    // runs the task.
+    // inline supervised result) so the delegating session reads it whichever
+    // path runs the task.
     if let Some(hint) = same_harness_hint(args, env) {
         writeln!(w, "{hint}")?;
     }
 
     // Loaded here rather than after the dashboard-join attempt below (its
     // former position): the spawn gate needs `cfg.pace` before either fork
-    // of this delegation -- a pane spawn and a headless run -- is chosen,
-    // and `try_join_dashboard` is the fork point between them. `exec::
-    // run_with` still loads its own copy internally on the headless path
+    // of this delegation -- a pane spawn and an inline supervised run -- is
+    // chosen, and `try_join_dashboard` is the fork point between them.
+    // `exec::run_with` still loads its own copy internally on the inline path
     // (the same pattern `chat.rs` already uses ahead of `wrap::run_with`),
     // so this remains one extra read of the same layered config rather than
     // a new code path.
@@ -2820,8 +2901,15 @@ pub fn run_with<W: Write>(
         },
         &mut refresh_flags,
     );
-    let requested_command =
-        worker_launch_flags(&cfg, &args.name, requested_adapter.as_ref(), &args.flags);
+    let requested_command = worker_launch_flags(
+        &cfg,
+        &args.name,
+        requested_adapter.as_ref(),
+        // R1-4: the seat instructions are part of what this delegation
+        // launches with, so the routing read sees the same argv the launch
+        // below will build.
+        &flags_with_system_prompt(args, requested_adapter.as_ref()),
+    );
     let requested_model = adapters::last_model_flag(&requested_command);
     let source_model_explicit = flags_pin_model(&args.flags);
     let bounds = super::fallback::TaskBounds {
@@ -3098,7 +3186,15 @@ pub fn run_with<W: Write>(
     // both reads are the same pure function over the same inputs.
     let launch_repo = effective_launch_repo(args.workdir.as_deref(), repo);
     let command = with_headless_extra_writable_roots(
-        worker_launch_flags(&cfg, &args.name, adapter.as_ref(), &args.flags),
+        worker_launch_flags(
+            &cfg,
+            &args.name,
+            adapter.as_ref(),
+            // R1-4: `--system-prompt` reaches an inline supervised child
+            // through the adapter's own injection form here; the pane fork
+            // carries the same text on `SpawnRequest::system_prompt`.
+            &flags_with_system_prompt(args, adapter.as_ref()),
+        ),
         adapter.as_ref(),
         &launch_repo,
         &state.mail(),
@@ -5698,6 +5794,7 @@ mod tests {
             name: name.to_string(),
             prompt: prompt.to_string(),
             flags: Vec::new(),
+            system_prompt: None,
             max_restarts: Some(0),
             timeout_secs: Some(30),
             quiet: false,
@@ -8240,6 +8337,96 @@ mod tests {
         );
     }
 
+    /// R1-4: a reviewer-shaped delegation -- seat instructions plus a model
+    /// pin plus the adapter's own read-only floor -- used to reach a pane
+    /// with NEITHER. `model_only_flags` gives up on any non-model token, so
+    /// `SpawnRequest::model` was `None` and the pane ran the generic worker
+    /// default; the seat instructions rode `flags`, which the fulfilment side
+    /// clears outright. Both now travel as request data.
+    #[test]
+    fn a_reviewer_shaped_delegation_carries_its_model_and_seat_prompt_to_the_pane() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let (requests_dir, env) = live_dashboard_dir(tmp.path());
+
+        let responder = std::thread::spawn({
+            let dir = requests_dir.clone();
+            move || respond_to_next_request(dir, r#"{"ok":true,"short":"abcd1234","reason":null}"#)
+        });
+
+        let mut args = joinable_args("claude", "review this package");
+        args.system_prompt =
+            Some("zirv workflow agent seat: reviewer@1\nrole: reviewer".to_string());
+        // Exactly what `workflow::review::reviewer_argv` puts after `--`:
+        // the model pin never travels alone.
+        args.flags = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--disallowedTools=Write,Edit,Bash,NotebookEdit".to_string(),
+        ];
+        assert!(
+            super::adapters::model_only_flags(&args.flags).is_none(),
+            "sanity: the old extraction gives up on this exact shape"
+        );
+
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("dashboard join runs");
+        let request_body = responder.join().expect("responder thread");
+
+        assert_eq!(code, 0);
+        let req: spawnreq::SpawnRequest =
+            serde_json::from_str(&request_body).expect("the request parses");
+        assert_eq!(
+            req.model.as_deref(),
+            Some("opus"),
+            "the pinned review model must reach the pane: {request_body}"
+        );
+        assert!(
+            req.system_prompt
+                .as_deref()
+                .is_some_and(|text| text.contains("workflow agent seat: reviewer@1")),
+            "and so must the seat instructions: {request_body}"
+        );
+    }
+
+    /// The other fork of the same delegation: an inline supervised child must
+    /// hear the identical seat instructions, through the adapter's own
+    /// injection form and ahead of the operator's own trailing flags (so a
+    /// model pin still wins under CLI last-occurrence semantics).
+    #[test]
+    fn a_seat_prompt_reaches_an_inline_child_through_the_adapters_own_injection_form() {
+        let adapter = super::super::adapters::claude::ClaudeAdapter::new(None);
+        let mut args = args_for("claude", "review this package");
+        args.flags = vec!["--model".to_string(), "opus".to_string()];
+
+        assert_eq!(
+            flags_with_system_prompt(&args, &adapter),
+            args.flags,
+            "no seat instructions changes nothing at all"
+        );
+
+        args.system_prompt = Some("zirv workflow agent seat: reviewer@1".to_string());
+        assert_eq!(
+            flags_with_system_prompt(&args, &adapter),
+            vec![
+                "--append-system-prompt".to_string(),
+                "zirv workflow agent seat: reviewer@1".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ],
+            "the seat text is rendered by the adapter and lands before the operator's own flags"
+        );
+
+        args.system_prompt = Some("   ".to_string());
+        assert_eq!(
+            flags_with_system_prompt(&args, &adapter),
+            args.flags,
+            "a blank seat prompt is nothing to inject"
+        );
+    }
+
     /// Issue #155, Phase 5(c): `--role`/`--group` travel on the request for
     /// the fulfilment side's depth cap and budget resolution.
     #[test]
@@ -8865,6 +9052,32 @@ mod tests {
         assert!(
             notices[1].contains("--verbose"),
             "the dropped flags must be named: {notices:?}"
+        );
+    }
+
+    /// R1-7: the drop channel cannot tell an operator's terminal from a
+    /// pane's own harness child (`dash::mod::intake_channels`: the shared
+    /// `requests` leaf proves nothing, issue #179), so the dashboard clears
+    /// `force` on every file drop -- including one an operator really did
+    /// type. A demotion the operator cannot see is worse than either
+    /// alternative, so it is announced.
+    #[test]
+    fn a_pane_announces_that_it_cannot_carry_an_operators_force() {
+        let mut args = args_for("claude", "go");
+        args.max_tool_calls = None;
+        args.flags = Vec::new();
+        args.force = false;
+        assert!(
+            pane_ceiling_notices(&args).is_empty(),
+            "nothing was overridden, so there is nothing to say"
+        );
+
+        args.force = true;
+        let notices = pane_ceiling_notices(&args);
+        assert_eq!(notices.len(), 1, "got {notices:?}");
+        assert!(
+            notices[0].contains("--force"),
+            "the dropped override must be named: {notices:?}"
         );
     }
 
