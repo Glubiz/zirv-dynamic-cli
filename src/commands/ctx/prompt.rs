@@ -129,8 +129,15 @@ pub const SUB_ORCHESTRATOR_PROMPT_FILE: &str = "system-prompt.sub-orchestrator.m
 /// naming the role layer is needed -- the orchestrator layer stays the sole
 /// voice on who performs a change, and this standard speaks only to
 /// proportionality: how much ceremony a given size needs.
+///
+/// v6 (issue #326, orchestrator-side token trims): a new bullet tells every
+/// session to keep the OUTPUT of the commands and reads it runs small --
+/// quiet/short flags, `--stat`/`-n` limits, reading a file by range, and
+/// never re-printing output already shown -- a distinct concern from the
+/// no-slop bullet above it, which is about the session's own prose, not the
+/// tool calls it makes.
 pub const DEFAULT_PROMPT: &str = "\
-zirv engineering standard (v5)
+zirv engineering standard (v6)
 
 Work the way a top-tier engineer works: judgment first, process in proportion, nothing wasted.
 
@@ -163,6 +170,8 @@ changed it.
 - No slop: no filler or narration, no comments that restate the code, no defensive code for \
 impossible states, no redundant docs or hedging, no recap of what you just did. Delete \
 whatever it orphans -- code, imports, tests, docs -- and rename what no longer fits.
+- Keep tool output small: prefer quiet flags and --stat/-n limits, read files by range, and \
+never re-print output already shown.
 - Think like QA: what could this break, which edge case is uncovered -- empty or null input, \
 a boundary, partial failure, concurrency, the unhappy path? Test behaviour, not \
 implementation -- one focused test per behaviour change, none for a change that cannot alter \
@@ -313,6 +322,12 @@ pass, or a step was skipped, say so and show the output. Never call unverified w
 /// see `compile.rs`'s `an_orchestrator_composition_never_duplicates_the_
 /// skill_discovery_hint`.
 ///
+/// v18 (issue #326): the checkpoint bullet's own `zirv ctx status --brief
+/// --diff` shrinks back to the bare `zirv ctx status` -- `StatusArgs` now
+/// defaults `--brief`/`--diff` to true (a `--full` flag restores the old,
+/// uncollapsed, non-diffed report), so the flags this bullet used to spell
+/// out are already the default a bare invocation gets.
+///
 /// The literal header the derived harness/orchestration roster
 /// (`PromptSource::Harnesses`) starts with -- named, like `CONTEXT_LAYER_
 /// HEADER` and the workflow/memory headers, so `compile.rs`'s `CompiledContext::
@@ -385,7 +400,7 @@ pub fn orchestrator_write_lines(posture: OrchestratorWrites, hook_enforced: bool
 }
 
 pub const HARNESS_PROMPT: &str = "\
-zirv meta-harness (v17)
+zirv meta-harness (v18)
 
 - zirv is the harness supervising this session -- context, usage, and cross-harness \
 communication. It launched the agent in this seat and is not one of the agents.
@@ -399,7 +414,7 @@ your own harness from an orchestrator seat. `zirv ctx agent --role sub-orchestra
 `--workdir <path>` for another repo or worktree (otherwise the worker stays confined to this \
 one and reports BLOCKED), and trust the result exactly as you would a native subagent's. A \
 worker runs unattended and must not delegate further.
-- Checkpoints: `zirv ctx status --brief --diff` and `zirv ctx inbox` at task start, after long \
+- Checkpoints: `zirv ctx status` and `zirv ctx inbox` at task start, after long \
 steps, and before reporting done. A `[zirv \u{25b8} mail]` line means mail is already waiting: \
 run `zirv ctx inbox` (never `--peek`) right away. Steer a live worker with `zirv ctx send \
 --to-session <short>` or `zirv ctx nudge`; `--all` reaches every live session, while an \
@@ -3122,8 +3137,10 @@ mod tests {
 
     #[test]
     fn the_shipped_default_is_short_and_plain() {
+        // Issue #326: bumped from 3500 to fit the new tool-output-hygiene
+        // bullet (v6); still a floor, not a policy engine.
         assert!(
-            DEFAULT_PROMPT.len() < 3500,
+            DEFAULT_PROMPT.len() < 3700,
             "a floor, not a policy engine: {} bytes",
             DEFAULT_PROMPT.len()
         );
@@ -3140,6 +3157,26 @@ mod tests {
             DEFAULT_PROMPT.contains("honest"),
             "failure reporting rule present"
         );
+    }
+
+    /// Issue #326: the standard now also tells a session to keep the OUTPUT
+    /// of its tool calls small, not just its own prose (the no-slop bullet
+    /// above it) -- quiet flags, `--stat`/`-n` limits, ranged file reads, and
+    /// never re-printing output already shown.
+    #[test]
+    fn the_shipped_default_teaches_tool_output_hygiene() {
+        for claim in [
+            "Keep tool output small",
+            "--stat",
+            "-n limits",
+            "read files by range",
+            "never re-print output already shown",
+        ] {
+            assert!(
+                DEFAULT_PROMPT.contains(claim),
+                "the tool-output-hygiene bullet must say '{claim}':\n{DEFAULT_PROMPT}"
+            );
+        }
     }
 
     #[test]
@@ -4711,7 +4748,7 @@ mod tests {
     #[test]
     fn the_harness_layer_only_promises_the_mail_a_worker_is_actually_told_to_send() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v17)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v18)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4771,7 +4808,7 @@ mod tests {
     #[test]
     fn the_harness_layer_teaches_the_fan_out_send_mode_too() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v17)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v18)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4809,7 +4846,7 @@ mod tests {
     #[test]
     fn the_harness_layer_names_workdir_for_cross_repo_delegation() {
         assert!(
-            HARNESS_PROMPT.starts_with("zirv meta-harness (v17)"),
+            HARNESS_PROMPT.starts_with("zirv meta-harness (v18)"),
             "a reworded layer carries its own version: {}",
             HARNESS_PROMPT.lines().next().unwrap_or_default()
         );
@@ -4864,7 +4901,7 @@ mod tests {
             "must say which one wins"
         );
         assert!(
-            HARNESS_PROMPT.contains("(v17)"),
+            HARNESS_PROMPT.contains("(v18)"),
             "a changed instruction layer must bump its own version token"
         );
     }
@@ -7364,7 +7401,7 @@ mod tests {
     #[test]
     fn the_default_prompt_carries_the_v5_marker_and_new_wording() {
         assert!(
-            DEFAULT_PROMPT.contains("zirv engineering standard (v5)"),
+            DEFAULT_PROMPT.contains("zirv engineering standard (v6)"),
             "got {DEFAULT_PROMPT}"
         );
         assert!(
@@ -7393,7 +7430,7 @@ mod tests {
         .expect("composed");
 
         assert!(
-            composed.text.contains("zirv engineering standard (v5)"),
+            composed.text.contains("zirv engineering standard (v6)"),
             "got {}",
             composed.text
         );

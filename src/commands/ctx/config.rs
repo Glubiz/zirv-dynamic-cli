@@ -1032,6 +1032,16 @@ pub struct WorkflowConfig {
     /// doc-verb drift, ...) must never be the one that turns them off.
     /// Empty by default, so every builtin runs.
     pub builtin_checks_exclude: Vec<String>,
+    /// Issue #326: byte cap on the active workflow step's resolved skill
+    /// instructions -- `engine::render_current_context`'s own output, both
+    /// injected into the session prompt (`prompt::with_workflow_layer`) and
+    /// printed directly by `zirv workflow context` -- so a step whose
+    /// selected skills happen to be large does not inject them unbounded on
+    /// every compose. A cut truncation still ends with a note naming the
+    /// omitted byte count, never a silent cut. `REPO_FORBIDDEN`, same
+    /// reasoning as `search.max_output_bytes`: a repo checkout must not be
+    /// able to widen its own step-context output cap.
+    pub max_context_bytes: usize,
 }
 
 impl Default for WorkflowConfig {
@@ -1052,6 +1062,7 @@ impl Default for WorkflowConfig {
             auto_spawn_on_gate: false,
             allow_empty_verify: false,
             builtin_checks_exclude: Vec::new(),
+            max_context_bytes: 8192,
         }
     }
 }
@@ -2366,6 +2377,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["workflow", "allow_empty_verify"],
         EnvKind::Bool,
     ),
+    (
+        "ZIRV_CTX_WORKFLOW_MAX_CONTEXT_BYTES",
+        &["workflow", "max_context_bytes"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_MEMORY", &["memory", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_MEMORY_HARVEST",
@@ -3177,6 +3193,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["workflow", "builtin_checks_exclude"],
         "ZIRV_CTX_WORKFLOW_BUILTIN_CHECKS_EXCLUDE",
+    ),
+    // Issue #326: same reasoning as `search.max_output_bytes` -- a repo
+    // checkout must not be able to widen its own workflow-step-context
+    // output cap.
+    (
+        &["workflow", "max_context_bytes"],
+        "ZIRV_CTX_WORKFLOW_MAX_CONTEXT_BYTES",
     ),
     // A repo checkout must not be able to switch either memory scope's own
     // gate on or off for itself, grow its cap, or turn on automatic
@@ -9021,6 +9044,7 @@ mod tests {
         ("workflow", "auto_spawn_on_gate"),
         ("workflow", "allow_empty_verify"),
         ("workflow", "builtin_checks_exclude"),
+        ("workflow", "max_context_bytes"),
         ("policy", "repo_fs_write"),
         ("policy", "outside_repo_fs_write"),
         ("policy", "shell_exec"),

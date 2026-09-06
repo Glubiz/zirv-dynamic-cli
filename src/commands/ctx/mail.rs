@@ -2236,28 +2236,52 @@ pub fn run_inbox_with<W: Write>(
     // read once, from `env` alone (`agent::parent_identity`, never anything
     // in `messages` itself), and reused for every message in this listing.
     let parent_short = super::agent::parent_identity(env);
-    for (path, msg) in &messages {
-        if args.json {
+    // Issue #326 (audit finding): `mail.max_delivered_bytes` already bounds
+    // a single message's own body everywhere this ledger folds into a
+    // launched session's prompt (`exec.rs`/`run_loop.rs`/`dash/pane.rs`),
+    // but nothing capped what THIS verb delivers in aggregate across one
+    // call -- an inbox with many pending messages handed over every one of
+    // them, unbounded. `messages` is already oldest-first (`list`'s own
+    // ordering), so deliver whole messages, in that order, until the next
+    // one would push the running total over the cap, then stop: never a
+    // partial message, and never skip an oversized one to reach a smaller
+    // one behind it, which would break the oldest-first read-once contract
+    // this verb otherwise promises. The first message is always delivered
+    // regardless of its own size -- part of the queue beats none of it,
+    // the same single-oversized-item fallback `select_memory_within_cap`
+    // uses. Whatever is left is not consumed at all -- still unread,
+    // waiting for the next call -- and this call says so rather than
+    // silently dropping it.
+    let mut delivered_bytes = 0usize;
+    let mut more_unread = 0usize;
+    for (i, (path, msg)) in messages.iter().enumerate() {
+        let rendered = if args.json {
             if let Some((envelope, _)) = envelope_for_mail_path(&state, path) {
                 let view = delivery_view(&state, envelope, now_secs());
                 let mut value = serde_json::to_value(view)?;
                 value["body"] = serde_json::Value::String(msg.body.clone());
-                writeln!(w, "{}", serde_json::to_string(&value)?)?;
+                serde_json::to_string(&value)?
             } else {
-                writeln!(w, "{}", serde_json::to_string(msg)?)?;
+                serde_json::to_string(msg)?
             }
         } else {
-            write!(
-                w,
-                "{}",
-                render_delivery_message(
-                    &state,
-                    path,
-                    msg,
-                    parent_short.as_deref(),
-                    &cfg.screen.thresholds(),
-                )
-            )?;
+            render_delivery_message(
+                &state,
+                path,
+                msg,
+                parent_short.as_deref(),
+                &cfg.screen.thresholds(),
+            )
+        };
+        if delivered_bytes > 0 && delivered_bytes + rendered.len() > cfg.mail.max_delivered_bytes {
+            more_unread = messages.len() - i;
+            break;
+        }
+        delivered_bytes += rendered.len();
+        if args.json {
+            writeln!(w, "{rendered}")?;
+        } else {
+            write!(w, "{rendered}")?;
         }
         if args.peek {
             let _ = mark_delivery(
@@ -2274,6 +2298,17 @@ pub fn run_inbox_with<W: Write>(
             // mailbox from `path`, so a directed cross-slug message moves
             // into the `read/` trail beside the file it came from.
             consume_reading(&state, &slug, path, reader.as_deref())?;
+        }
+    }
+    if more_unread > 0 {
+        if args.json {
+            writeln!(w, "{}", serde_json::json!({ "more_unread": more_unread }))?;
+        } else {
+            writeln!(
+                w,
+                "zirv ctx inbox: {more_unread} more unread (mail.max_delivered_bytes budget \
+                 reached)"
+            )?;
         }
     }
     Ok(0)
@@ -4729,6 +4764,71 @@ This is part of the body too.\n";
             "only the foreign-directed message should survive: {remaining:?}"
         );
         assert_eq!(remaining[0].1.from_session, "other-sender");
+    }
+
+    /// Issue #326 (audit finding): `mail.max_delivered_bytes` used to bound
+    /// only a single message's own body at the prompt-injection call sites
+    /// (`exec.rs`/`run_loop.rs`/`dash/pane.rs`), never the AGGREGATE this
+    /// verb hands back in one call. Five broadcast messages, oldest first,
+    /// under a cap that fits only the first couple: the oldest ones must
+    /// still be delivered and consumed, the newest must be left behind
+    /// unread for a later call, and the call must say how many it left.
+    #[test]
+    fn inbox_stops_at_the_delivered_bytes_cap_and_leaves_the_rest_unread() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(tmp.path());
+
+        for i in 0..5u64 {
+            let mut msg = sample(&format!("sender-{i}"), 1_700_000_000 + i);
+            msg.body = format!("message body number {i}");
+            store(&state, &slug, &msg, &cfg).expect("store");
+        }
+
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            ("ZIRV_CTX_MAIL_MAX_DELIVERED_BYTES", "400"),
+        ]);
+
+        let mut out = Vec::new();
+        let code = run_inbox_with(&inbox_args(false), &mut out, tmp.path(), &|k| {
+            env.get(k).cloned()
+        })
+        .expect("inbox");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("message body number 0"),
+            "the oldest message must still be delivered: {printed}"
+        );
+        assert!(
+            !printed.contains("message body number 4"),
+            "the newest message must not be delivered past the cap: {printed}"
+        );
+        assert!(
+            printed.contains("more unread"),
+            "the call must say how many it left behind: {printed}"
+        );
+
+        let remaining = list(&state, &slug, None, None).expect("list");
+        assert!(
+            !remaining.is_empty(),
+            "mail past the cap must still be sitting unread"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|(_, m)| m.body == "message body number 4"),
+            "the newest message must be among what is left unread: {remaining:?}"
+        );
     }
 
     /// Item 2's "twice-read shows nothing the second time", for the default

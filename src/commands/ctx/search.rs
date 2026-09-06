@@ -491,6 +491,46 @@ pub fn render_window_text(lines: &[WindowLine], center: usize, max_bytes: usize)
     out
 }
 
+/// Issue #326 (audit finding): the JSON counterpart of `render_window_text`'s
+/// own byte budget -- `--json` used to serialize the whole `window` array
+/// with no cap at all, so a wide search window (a long transcript message,
+/// or a generous `--around` radius) could still flood a caller's context
+/// even though the plain-text render right next to it was always capped.
+/// Greedily drops the line farthest from `center` first (by ordinal
+/// distance), so the hit's own immediate context is the last thing to go --
+/// the mirror image of `render_window_text`'s tail-truncation, adapted for
+/// an array that must stay valid JSON rather than a byte string that can be
+/// cut anywhere. `max_bytes` bounds the window array alone, not the whole
+/// envelope: the same "cap the body, not the header" split the text path
+/// already uses (see its own caller, which subtracts the header's length
+/// first) -- the schema/query/top_hit fields around it are small and
+/// roughly constant, unlike the window, which grows with search radius.
+/// Never drops the last line: part of the winning hit beats none of it.
+fn cap_window_for_json(
+    mut window: Vec<WindowLine>,
+    center: usize,
+    max_bytes: usize,
+) -> (Vec<WindowLine>, bool) {
+    let fits = |w: &[WindowLine]| {
+        serde_json::to_string(w)
+            .map(|s| s.len() <= max_bytes)
+            .unwrap_or(false)
+    };
+    if fits(&window) {
+        return (window, false);
+    }
+    while window.len() > 1 && !fits(&window) {
+        let farthest = window
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, line)| line.ordinal.abs_diff(center))
+            .map(|(i, _)| i)
+            .expect("window is non-empty");
+        window.remove(farthest);
+    }
+    (window, true)
+}
+
 // ---------------------------------------------------------------------
 // I/O shell
 // ---------------------------------------------------------------------
@@ -561,11 +601,14 @@ pub fn run_with<W: Write>(
     let window = build_window(file, top.ordinal, DEFAULT_WINDOW_RADIUS);
 
     if args.json {
+        let (window, truncated) =
+            cap_window_for_json(window, top.ordinal, cfg.search.max_output_bytes);
         let payload = serde_json::json!({
             "schema": SEARCH_SCHEMA_VERSION,
             "query": query,
             "top_hit": top,
             "window": window,
+            "truncated": truncated,
         });
         writeln!(w, "{}", serde_json::to_string(&payload)?)?;
     } else {
@@ -612,6 +655,7 @@ fn scroll<W: Write>(
     };
     let window = build_window(file, around, DEFAULT_WINDOW_RADIUS);
     if json {
+        let (window, truncated) = cap_window_for_json(window, around, max_output_bytes);
         let payload = serde_json::json!({
             "schema": SEARCH_SCHEMA_VERSION,
             "session": session,
@@ -619,6 +663,7 @@ fn scroll<W: Write>(
             "source": file.source.label(),
             "path": file.path,
             "window": window,
+            "truncated": truncated,
         });
         writeln!(w, "{}", serde_json::to_string(&payload)?)?;
     } else {
@@ -916,6 +961,52 @@ mod tests {
         let rendered = render_window_text(&lines, 0, 2048);
         assert!(rendered.len() <= 2048 + 32, "got {} bytes", rendered.len());
         assert!(rendered.contains("truncated"));
+    }
+
+    /// Issue #326 (audit finding): `--json` used to serialize the whole
+    /// window with no cap at all, unlike `render_window_text`'s own budget
+    /// right above -- this is that same budget's JSON counterpart. Drops
+    /// the lines FARTHEST from the center first, so the hit's own immediate
+    /// context (ordinal 25 here) survives even though both edges (0 and 49)
+    /// do not.
+    #[test]
+    fn cap_window_for_json_caps_the_window_array_and_drops_the_farthest_line_first() {
+        let lines: Vec<WindowLine> = (0..50)
+            .map(|i| WindowLine {
+                ordinal: i,
+                role: "user".to_string(),
+                text: "x".repeat(200),
+            })
+            .collect();
+        let (capped, truncated) = cap_window_for_json(lines, 25, 2048);
+        assert!(truncated, "an oversized window must be flagged truncated");
+        let bytes = serde_json::to_string(&capped).unwrap().len();
+        assert!(
+            bytes <= 2048,
+            "the capped window must fit: got {bytes} bytes"
+        );
+        assert!(
+            capped.iter().any(|l| l.ordinal == 25),
+            "the center line must survive: {capped:?}"
+        );
+        assert!(
+            !capped.iter().any(|l| l.ordinal == 0 || l.ordinal == 49),
+            "the farthest lines must be dropped first: {capped:?}"
+        );
+    }
+
+    #[test]
+    fn cap_window_for_json_is_a_no_op_under_budget() {
+        let lines: Vec<WindowLine> = (0..3)
+            .map(|i| WindowLine {
+                ordinal: i,
+                role: "user".to_string(),
+                text: "short".to_string(),
+            })
+            .collect();
+        let (capped, truncated) = cap_window_for_json(lines.clone(), 1, 2048);
+        assert!(!truncated, "must not claim truncation when nothing was cut");
+        assert_eq!(capped, lines);
     }
 
     // -- run_with acceptance --------------------------------------------------
