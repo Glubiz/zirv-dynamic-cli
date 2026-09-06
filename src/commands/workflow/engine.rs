@@ -2297,6 +2297,28 @@ fn is_headless_env(raw: Option<&str>) -> bool {
     raw == Some("1")
 }
 
+/// Issue #326: caps `rendered`'s total bytes at `max_bytes`, appending a
+/// visible marker naming how many bytes were cut rather than a silent
+/// truncation -- the same "keep what came first, mark what is missing"
+/// shape `memory::cap_body` already uses for a memory entry's own per-entry
+/// cap. The head is kept, never the tail: `rendered`'s own workflow/profile/
+/// task/step/phase/state header lines come first and matter far more than
+/// whichever selected skill happened to render last.
+fn cap_workflow_context(rendered: String, max_bytes: usize) -> String {
+    if rendered.len() <= max_bytes {
+        return rendered;
+    }
+    let omitted = rendered.len() - max_bytes;
+    let marker = format!(
+        "\n[workflow context truncated -- {omitted} bytes omitted, cap \
+         workflow.max_context_bytes={max_bytes}]\n"
+    );
+    let keep = max_bytes.saturating_sub(marker.len());
+    let mut truncated = crate::utils::truncate_bytes(rendered, Some(keep));
+    truncated.push_str(&marker);
+    truncated
+}
+
 /// Current ephemeral skill context for the context compiler/session prompt.
 /// Completed steps are intentionally absent; the durable state remains in
 /// [`WorkflowState`] and is never accumulated into model context.
@@ -2377,7 +2399,21 @@ pub fn render_current_context(
             ));
         }
     }
-    Ok(Some(rendered))
+    // Issue #326: a step whose selected skills happen to be large must not
+    // inject them unbounded into the session prompt (`prompt::with_workflow_
+    // layer`) or print them unbounded from `zirv workflow context` -- both
+    // consumers funnel through this one function, so capping here catches
+    // both at the single source rather than needing its own cap at each
+    // consumer. A config load failure degrades to the built-in default
+    // rather than skipping the cap entirely: this function must never fail
+    // just because config could not be read.
+    let max_context_bytes =
+        crate::commands::ctx::config::CtxConfig::load(repo, &|key| std::env::var(key).ok())
+            .map_or_else(
+                |_| crate::commands::ctx::config::WorkflowConfig::default().max_context_bytes,
+                |cfg| cfg.workflow.max_context_bytes,
+            );
+    Ok(Some(cap_workflow_context(rendered, max_context_bytes)))
 }
 
 pub fn active_skill_context(repo: &Path) -> CtxResult<Option<String>> {
@@ -6965,6 +7001,54 @@ mod tests {
         assert_eq!(evidence.sidechain_cache_read_input_tokens, Some(12_000));
         assert_eq!(evidence.sidechain_output_tokens, Some(90));
         assert_eq!(evidence.session_id.as_deref(), Some(session_id));
+    }
+
+    /// Issue #326: `workflow.max_context_bytes` caps `render_current_
+    /// context`'s own output -- the single source both `prompt::with_
+    /// workflow_layer` and `zirv workflow context` render from -- rather
+    /// than injecting a large step's resolved skill instructions unbounded.
+    /// A substantial `Feature` classification composes several real skills
+    /// (`worktree`/`implement`/`execute-plan`, per `substantial_
+    /// implementation_composes_execute_plan_and_worktree` above), comfortably
+    /// over the tiny cap this test forces, so the cut is real, not
+    /// coincidental. The cut must still lead with the task/step header
+    /// (`cap_workflow_context` keeps the head) and end with a visible
+    /// marker naming both the omitted byte count and the config key, never
+    /// silence.
+    #[test]
+    fn workflow_context_over_the_configured_cap_is_truncated_with_a_visible_marker() {
+        let repo = tempdir().unwrap();
+        let _vars = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "ZIRV_CTX_WORKFLOW_MAX_CONTEXT_BYTES",
+            Some("300"),
+        )]);
+        let mut classification = low_classification();
+        classification.complexity = Complexity::Substantial;
+        let state = skip_leading_artifact_steps(WorkflowState::start(
+            repo.path().to_path_buf(),
+            "substantial feature".into(),
+            WorkflowKind::Feature,
+            None,
+            true,
+            classification,
+        ));
+        let context = render_current_context(&state, repo.path(), None)
+            .unwrap()
+            .unwrap();
+        assert!(
+            context.len() <= 300,
+            "must not exceed the configured cap: {} bytes:\n{context}",
+            context.len()
+        );
+        assert!(
+            context.contains("workflow context truncated")
+                && context.contains("workflow.max_context_bytes=300"),
+            "a cut must leave a visible marker, not silence: {context}"
+        );
+        assert!(
+            context.starts_with("zirv workflow step"),
+            "the head (task/step header) must be kept, not dropped: {context}"
+        );
     }
 
     #[test]

@@ -827,7 +827,7 @@ fn describe_injection_fallback(cfg: &CtxConfig) -> Option<String> {
     }
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Clone, clap::Args)]
 pub struct StatusArgs {
     /// How many recent supervisor decisions to show.
     #[arg(long, default_value_t = 10)]
@@ -841,16 +841,23 @@ pub struct StatusArgs {
     /// is the cheap version of the same read. `--decisions` is ignored in
     /// this mode: the "recent decisions" section is omitted, with a note
     /// pointing back at the full view.
-    #[arg(long, default_value_t = false)]
+    ///
+    /// Issue #326: defaults to true -- a bare `zirv ctx status` is now
+    /// `--brief --diff` -- so passing `--brief` explicitly is a no-op; use
+    /// `--full` to get the old, uncollapsed report back.
+    #[arg(long, default_value_t = true)]
     pub brief: bool,
     /// Print only the sections whose rendered text changed since this
     /// session's previous `--diff` call, using a small per-session snapshot
     /// kept in the state dir (`StateDir::status_snapshots`, keyed by
     /// `ZIRV_CTX_SESSION`). The diff view is plain text: sections either
     /// changed or did not, so there is nothing color-coded to preserve.
-    /// Without `--diff`, output is unaffected -- no snapshot is read or
+    ///
+    /// Issue #326: defaults to true, the other half of the new `--brief
+    /// --diff` bare default; passing `--diff` explicitly is a no-op. Use
+    /// `--full` to render every section fresh, with no snapshot read or
     /// written.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     pub diff: bool,
     /// Issue #312: print a single window-attribution table for `<session>`
     /// (a registered session id, `sessions::Record::session`) instead of the
@@ -865,6 +872,12 @@ pub struct StatusArgs {
     /// mode, matching `--breakdown`'s own early-return shape.
     #[arg(long, default_value_t = false)]
     pub json: bool,
+    /// Issue #326: restore the report `zirv ctx status` printed before
+    /// `--brief --diff` became the bare default -- the full, non-collapsed
+    /// sections with no snapshot-diffing. Overrides `--brief`/`--diff` back
+    /// to off even if either is also passed explicitly.
+    #[arg(long, default_value_t = false)]
+    pub full: bool,
 }
 
 /// Issue #264: the `spend:` line's own computation, factored out so a test
@@ -2051,6 +2064,23 @@ pub fn run_with<W: Write>(
     if args.json {
         return render_pool_json(w, repo, env);
     }
+    // Issue #326: `--full` overrides `--brief`/`--diff` back to their
+    // pre-#326 off state, regardless of the (now default-true) values those
+    // two carry -- one place to shadow `args`, so every read site below
+    // (already written against `args.brief`/`args.diff`) needs no change of
+    // its own.
+    let full_args;
+    let args = if args.full {
+        full_args = StatusArgs {
+            brief: false,
+            diff: false,
+            full: false,
+            ..args.clone()
+        };
+        &full_args
+    } else {
+        args
+    };
     if !args.diff {
         return render_report(args, w, repo, env, colour);
     }
@@ -2211,6 +2241,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2231,6 +2262,45 @@ mod tests {
         assert!(text.contains("no handoff"), "got {text}");
     }
 
+    /// Issue #326: `--full` wins over `--brief`/`--diff` even when both are
+    /// ALSO passed explicitly as `true` -- the override is unconditional,
+    /// not just "only matters when the caller relied on the new default".
+    /// No session identity is set, so without the override this would take
+    /// the diff path's own "no session identity" branch instead of a plain
+    /// full report; `--full` must short-circuit before that branch is ever
+    /// reached.
+    #[test]
+    fn full_overrides_explicit_brief_and_diff_back_to_the_old_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let env = env_for(&state);
+
+        let mut out = Vec::new();
+        let code = run_with(
+            &StatusArgs {
+                decisions: 10,
+                brief: true,
+                diff: true,
+                full: true,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("status --diff:"),
+            "--full must skip the diff-snapshot path entirely: got {text}"
+        );
+        assert!(text.contains("no supervised sessions"), "got {text}");
+    }
+
     /// Issue #358 (task T6a): the pool section's own header appears in the
     /// full (non-`--brief`) report, right after the fallback block --
     /// `header(colour, "pool")`'s exact `"\npool:"` shape, matching every
@@ -2247,6 +2317,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2277,6 +2348,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: true,
             },
@@ -2375,6 +2447,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2407,6 +2480,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2437,6 +2511,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2471,6 +2546,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2517,6 +2593,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2562,6 +2639,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2624,6 +2702,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2662,6 +2741,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2713,6 +2793,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2769,6 +2850,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2842,6 +2924,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2886,6 +2969,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2928,6 +3012,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -2976,6 +3061,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3034,6 +3120,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3088,6 +3175,7 @@ mod tests {
                 decisions: 2,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3127,6 +3215,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3202,6 +3291,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3261,6 +3351,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3305,6 +3396,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3359,6 +3451,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3396,6 +3489,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3445,6 +3539,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3507,6 +3602,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3624,6 +3720,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3692,6 +3789,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3743,6 +3841,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3806,6 +3905,7 @@ mod tests {
                     decisions: 5,
                     brief,
                     diff: false,
+                    full: false,
                     breakdown: None,
                     json: false,
                 },
@@ -3875,6 +3975,7 @@ mod tests {
                     decisions: 5,
                     brief,
                     diff: false,
+                    full: false,
                     breakdown: None,
                     json: false,
                 },
@@ -3935,6 +4036,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -3975,6 +4077,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4006,6 +4109,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4053,6 +4157,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4105,6 +4210,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4156,6 +4262,7 @@ mod tests {
                 decisions: 5,
                 brief: true,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4224,6 +4331,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4286,6 +4394,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4327,6 +4436,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4364,6 +4474,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4411,6 +4522,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4461,6 +4573,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4524,6 +4637,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4559,6 +4673,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4601,6 +4716,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4637,6 +4753,7 @@ mod tests {
                         decisions: 5,
                         brief: false,
                         diff: false,
+                        full: false,
                         breakdown: None,
                         json: false,
                     },
@@ -4681,6 +4798,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4932,6 +5050,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -4963,6 +5082,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5017,6 +5137,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5085,6 +5206,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5150,6 +5272,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5303,6 +5426,7 @@ mod tests {
                 decisions: 5,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5320,6 +5444,7 @@ mod tests {
                 decisions: 5,
                 brief: true,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5453,6 +5578,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: true,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5499,6 +5625,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            full: false,
             breakdown: None,
             json: false,
         };
@@ -5550,6 +5677,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            full: false,
             breakdown: None,
             json: false,
         };
@@ -5637,6 +5765,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            full: false,
             breakdown: None,
             json: false,
         };
@@ -5664,6 +5793,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: false,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5791,6 +5921,7 @@ mod tests {
             decisions: 10,
             brief: false,
             diff: true,
+            full: false,
             breakdown: None,
             json: false,
         };
@@ -5837,6 +5968,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: true,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5853,6 +5985,7 @@ mod tests {
                 decisions: 10,
                 brief: true,
                 diff: true,
+                full: false,
                 breakdown: None,
                 json: false,
             },
@@ -5884,6 +6017,7 @@ mod tests {
                 decisions: 10,
                 brief: false,
                 diff: true,
+                full: false,
                 breakdown: None,
                 json: false,
             },

@@ -360,6 +360,19 @@ fn find_after(haystack: &str, from: usize, needle: &str) -> Option<usize> {
 /// context-ranked retrieval layer. Core selection remains private-first and
 /// capped by `core_max_bytes`; retrieval uses changed repository paths as its
 /// deterministic launch context and its own byte/entry limits.
+///
+/// Issue #326 (audit finding): the returned core is the ACTUAL selection --
+/// `select_memory_within_cap`'s own output, not the whole unfiltered bank.
+/// Returning the whole bank here used to mean `compile_with_harness_roster`'s
+/// final `with_memory_layer` call re-selected by recency across core+
+/// retrieval combined under their SUMMED cap, so an excess of merely-recent
+/// core entries could crowd out a highly-relevant retrieval pick that would
+/// have fit fine under its own dedicated budget -- retrieval's own rank order
+/// (`retrieval::select`, already correctly precedence- and budget-bounded)
+/// was discarded and replaced with a second, unrelated recency sort. Since
+/// the core returned here is now itself already <= `core_max_bytes`, the
+/// merged core+retrieval set downstream always fits under the summed cap by
+/// construction, so nothing is re-selected out from under either side.
 fn gather_memory(
     state: &StateDir,
     repo: &Path,
@@ -373,18 +386,22 @@ fn gather_memory(
     // which used to mean every file was read twice on every session launch
     // (see `memory::LoadedMemory`'s own doc comment).
     let loaded = memory::load_all_scopes(repo, state, slug, cfg);
-    let core = memory::render_for_prompt_from_loaded(&loaded);
-    let core_keys: std::collections::HashSet<(bool, String)> =
-        prompt::select_memory_within_cap(&core, cfg.memory.core_max_bytes)
+    let full_bank = memory::render_for_prompt_from_loaded(&loaded);
+    let core: Vec<prompt::MemoryLine> =
+        prompt::select_memory_within_cap(&full_bank, cfg.memory.core_max_bytes)
             .0
             .into_iter()
-            .map(|entry| {
-                (
-                    entry.scope == memory::MemoryScope::Shared,
-                    entry.key.to_lowercase(),
-                )
-            })
+            .cloned()
             .collect();
+    let core_keys: std::collections::HashSet<(bool, String)> = core
+        .iter()
+        .map(|entry| {
+            (
+                entry.scope == memory::MemoryScope::Shared,
+                entry.key.to_lowercase(),
+            )
+        })
+        .collect();
 
     let candidates = retrieval::candidates_from_loaded(&loaded, now);
     let retrieval_context = retrieval::RetrievalContext {
@@ -684,6 +701,23 @@ fn native_file_already_carries_canonical(
     native_text == super::context_cli::render_generated(common, harness)
 }
 
+/// Issue #326: whether `adapter_name`'s native file exists and is
+/// zirv-managed at all -- the file's bare name when so, for the "dedupe
+/// should have fired but did not" warning below. Deliberately looser than
+/// `native_file_already_carries_canonical`: that function also demands the
+/// bytes still match a fresh render, which is exactly the condition the
+/// warning fires on the ABSENCE of. A hand-written CLAUDE.md/AGENTS.md the
+/// operator has never run `zirv context sync` on is not `is_managed`, so it
+/// is silently not this warning's business -- only a file zirv itself
+/// generated, and has since drifted from, is.
+fn native_file_is_generated(adapter_name: &str, repo: &Path) -> Option<String> {
+    let native = native_context_path(adapter_name, repo)?;
+    let text = std::fs::read_to_string(&native).ok()?;
+    super::context_cli::is_managed(&text)
+        .then(|| native.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .flatten()
+}
+
 /// Adds the canonical `.zirv/context/{common,claude,codex}.md` layer to a
 /// composed prompt, right after whatever `prompt::compose` itself already
 /// added (its own repo `system-prompt.md` layer, or the user layer before it
@@ -772,6 +806,22 @@ fn with_canonical_context_layer(
             common_text.as_deref(),
             harness_text.as_deref(),
         );
+    // Issue #326: `dedupe_native` is on -- the operator wants the dedupe --
+    // yet it did not fire this compile. Worth a line only when there is a
+    // zirv-generated native file to have gone stale in the first place: a
+    // repo with no generated file at all (never `zirv context sync`ed, or a
+    // hand-written CLAUDE.md/AGENTS.md) gets no warning, since there is
+    // nothing here for the operator to refresh.
+    if cfg.context.dedupe_native
+        && !dedupe
+        && let Some(native_file_name) = native_file_is_generated(adapter_name, repo)
+    {
+        eprintln!(
+            "zirv: {native_file_name} is zirv-generated but no longer matches the canonical \
+             context layer, so dedupe did not fire this compile -- run `zirv context sync` to \
+             refresh it"
+        );
+    }
 
     let mut candidates: Vec<ContextLayerCandidate> = vec![(
         context::PrecedenceTier::CanonicalCommon,
@@ -2570,6 +2620,123 @@ mod tests {
         );
     }
 
+    /// Issue #326 (audit finding): more than `core_max_bytes` worth of
+    /// merely-RECENT private core entries used to be able to crowd a
+    /// genuinely relevant retrieval pick entirely out of the final render.
+    /// `gather_memory` used to return the WHOLE unfiltered bank as "core",
+    /// so `compile_with_harness_roster`'s final `with_memory_layer` call
+    /// re-selected by recency across core+retrieval combined under their
+    /// SUMMED cap -- with enough recent filler, that second selection could
+    /// fill the entire combined budget on recency alone before ever reaching
+    /// the one entry retrieval had already, correctly, picked out by
+    /// relevance. Uses the shipped defaults (`core_max_bytes`/
+    /// `retrieval_max_bytes` = 2048 each, matching the audit's own repro
+    /// numbers): 30 filler entries alone total well over the COMBINED 4096-
+    /// byte cap, all newer than the one relevant entry, which only clears
+    /// the retrieval relevance floor via its changed-path match.
+    #[test]
+    fn a_relevant_retrieval_entry_survives_an_oversized_recent_core_bank() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
+        std::fs::write(repo.path().join("src/lib.rs"), "pub fn changed() {}\n")
+            .expect("write changed path");
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .arg("init")
+            .output()
+            .expect("git init");
+        assert!(init.status.success());
+
+        let state_dir = tempfile::tempdir().expect("state");
+        let state = StateDir::from_root(state_dir.path().to_path_buf());
+        let slug = super::super::state::repo_slug(repo.path());
+        let cfg = CtxConfig::default();
+
+        for i in 0..30u64 {
+            let filler = memory::Entry {
+                key: format!("filler-{i:02}"),
+                body: "recent but unrelated filler memory ".repeat(4),
+                written: 1_000 + i,
+                verified: 1_000 + i,
+                written_by: "test".to_string(),
+                source: "explicit".to_string(),
+                importance: None,
+                confidence: None,
+                tags: Vec::new(),
+                paths: Vec::new(),
+            };
+            memory::upsert_scoped(
+                memory::MemoryScope::Private,
+                repo.path(),
+                &state,
+                &slug,
+                &cfg,
+                &filler,
+            )
+            .expect("store filler");
+        }
+        let relevant = memory::Entry {
+            key: "path-specific-fact".to_string(),
+            // Padded well past one filler entry's own rendered size (150
+            // bytes): a short body here would let it sneak into the CORE
+            // selection anyway, through `rank_and_fill`'s deliberate "skip an
+            // oversized entry rather than starve a smaller one behind it"
+            // leftover-space fill -- which is correct behaviour for
+            // `select_memory_within_cap` in general, but would defeat this
+            // test's whole point (proving retrieval, not core leftover
+            // space, is what delivers this entry).
+            body: "lib changes require the compatibility check. "
+                .repeat(8)
+                .trim()
+                .to_string(),
+            written: 1,
+            verified: 1,
+            written_by: "test".to_string(),
+            source: "explicit".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: vec!["src/lib.rs".to_string()],
+        };
+        memory::upsert_scoped(
+            memory::MemoryScope::Private,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &relevant,
+        )
+        .expect("store relevant");
+
+        let compiled = compile(
+            None,
+            repo.path(),
+            false,
+            &cfg,
+            &ClaudeAdapter::new(None),
+            PromptRole::Worker,
+            &state,
+            now_secs(),
+            LaunchMode::Headless,
+            false,
+        );
+        assert!(
+            compiled.core_memory.injected_bytes <= cfg.memory.core_max_bytes,
+            "core must actually respect its own cap: {} bytes",
+            compiled.core_memory.injected_bytes
+        );
+        assert_eq!(
+            compiled.retrieved_memory.selected_entries, 1,
+            "the path match is the only signal that clears the relevance floor"
+        );
+        let text = compiled.composed.expect("composed").text;
+        assert!(
+            text.contains("lib changes require the compatibility check"),
+            "an oversized recent core bank must not crowd out a relevant retrieval pick: {text}"
+        );
+    }
+
     /// Issue #155, Phase 1(b): this repository's own canonical context must
     /// fit the budget zirv ships. Pinned as a test rather than fixed once,
     /// because the file grows with every session that edits it and a silent
@@ -2898,6 +3065,48 @@ mod tests {
                 composed.text
             );
         }
+    }
+
+    /// Issue #326: the gating logic behind the "dedupe should have fired but
+    /// did not" stderr warning -- deliberately looser than
+    /// `native_file_already_carries_canonical`. No file at all, and a
+    /// hand-written one the operator never `zirv context sync`ed, are both
+    /// "nothing generated to have gone stale", so neither is this warning's
+    /// business; a managed file is, even a stale one -- that is the one case
+    /// the warning exists for.
+    #[test]
+    fn native_file_is_generated_only_when_the_file_is_zirv_managed() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            super::native_file_is_generated("claude", repo.path()),
+            None,
+            "no native file at all"
+        );
+
+        std::fs::write(
+            repo.path().join("CLAUDE.md"),
+            "# My own CLAUDE.md\n\nhand-written, never zirv-generated\n",
+        )
+        .expect("write");
+        assert_eq!(
+            super::native_file_is_generated("claude", repo.path()),
+            None,
+            "a hand-written file is not zirv-managed"
+        );
+
+        std::fs::write(
+            repo.path().join("CLAUDE.md"),
+            crate::commands::ctx::context_cli::render_generated(
+                Some("what common.md used to say\n"),
+                None,
+            ),
+        )
+        .expect("write");
+        assert_eq!(
+            super::native_file_is_generated("claude", repo.path()),
+            Some("CLAUDE.md".to_string()),
+            "a managed file, even a stale one, is this warning's business"
+        );
     }
 
     /// CRITICAL (review finding on 90523d3): the embedded header hash proves

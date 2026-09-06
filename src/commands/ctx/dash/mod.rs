@@ -16771,7 +16771,7 @@ mod tests {
              DEFAULT_PROMPT: {prompt}"
         );
         assert_eq!(
-            prompt.matches("zirv engineering standard (v5)").count(),
+            prompt.matches("zirv engineering standard (v6)").count(),
             1,
             "DEFAULT_PROMPT's header must appear exactly once, carried by the composed text \
              rather than a second time from task_prompt_with_conventions_fallback: {prompt}"
@@ -16868,7 +16868,7 @@ mod tests {
         // report-back instruction, which only makes sense as mail.
         assert!(prompt.starts_with("do the work"), "got {prompt}");
         assert_eq!(
-            prompt.contains("zirv engineering standard (v5)"),
+            prompt.contains("zirv engineering standard (v6)"),
             fallback_is_safe,
             "the composed conventions ride the fallback exactly when it is safe: {prompt}"
         );
