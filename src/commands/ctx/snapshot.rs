@@ -323,8 +323,11 @@ fn recent_rot_verdicts(state: &StateDir, session: Option<&str>, limit: usize) ->
 /// Safety-decision counts by verdict, and by `matched_pattern`, over
 /// `decisions.jsonl`'s own `safety-decisions/` bucket (issue #147's
 /// `log::read_safety_decisions`), optionally filtered to one session.
-fn safety_decision_counts(state: &StateDir, session: Option<&str>) -> String {
-    let mut records = log::read_safety_decisions(state);
+/// Takes already-read `records` rather than reading them: this and
+/// [`latest_attestation`] each used to re-read every day bucket, which on
+/// one real machine was 248 ms of a 446 ms `zirv ctx snapshot`.
+fn safety_decision_counts(records: &[log::SafetyDecisionRecord], session: Option<&str>) -> String {
+    let mut records = records.to_vec();
     if let Some(session) = session {
         records.retain(|r| r.session == session);
     }
@@ -360,15 +363,15 @@ fn safety_decision_counts(state: &StateDir, session: Option<&str>) -> String {
 /// #320), optionally scoped to one session. Empty-string attestations (a
 /// record written before the field was read back at all) are treated as
 /// absent, never as a genuine empty state.
-fn latest_attestation(state: &StateDir, session: Option<&str>) -> Option<String> {
-    let mut records = log::read_safety_decisions(state);
-    if let Some(session) = session {
-        records.retain(|r| r.session == session);
-    }
+fn latest_attestation(
+    records: &[log::SafetyDecisionRecord],
+    session: Option<&str>,
+) -> Option<String> {
     records
-        .into_iter()
+        .iter()
         .rev()
-        .map(|r| r.attestation)
+        .filter(|r| session.is_none_or(|s| r.session == s))
+        .map(|r| r.attestation.clone())
         .find(|a| !a.is_empty())
 }
 
@@ -533,9 +536,11 @@ pub fn build(session: Option<&str>, repo: &Path, env: EnvLookup<'_>) -> CtxResul
         ),
     ));
 
-    let attestation = state
+    let safety_decisions = state
         .as_ref()
-        .and_then(|state| latest_attestation(state, session.as_deref()));
+        .map(log::read_safety_decisions)
+        .unwrap_or_default();
+    let attestation = latest_attestation(&safety_decisions, session.as_deref());
     let policy_fingerprint = safety::policy_fingerprint(&cfg.safety).ok();
     sections.push(Section::new(
         "Safety policy",
@@ -577,7 +582,7 @@ pub fn build(session: Option<&str>, repo: &Path, env: EnvLookup<'_>) -> CtxResul
             ));
             sections.push(Section::new(
                 "Safety decisions",
-                safety_decision_counts(state, session.as_deref()),
+                safety_decision_counts(&safety_decisions, session.as_deref()),
             ));
             sections.push(Section::new(
                 "Work groups and delegations",

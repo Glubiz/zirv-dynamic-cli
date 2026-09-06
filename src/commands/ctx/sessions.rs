@@ -1245,8 +1245,53 @@ pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
     }
     sweep_orphaned_markers(state, &found);
     sweep_orphan_endpoints(state, &found);
+    sweep_orphan_socket_paths(state, &found);
     sweep_orphaned_screening_summaries(state, &found);
     found
+}
+
+/// The same "no live record, so remove it" sweep [`sweep_orphan_endpoints`]
+/// runs for `*.sock` markers, for the `<state>/socket-path-<short>` files
+/// `wrap::publish_socket_path` writes. Only `wrap`'s own graceful exit
+/// unpublishes one, and this binary is `panic = "abort"`, so every kill or
+/// crash leaves one behind forever (46 of them on one real machine) --
+/// and `wrap::read_socket_path` with no session picks the NEWEST published
+/// file by mtime, with no liveness check of its own, so a dead session's
+/// leftover can be handed to a reader as if it were current.
+///
+/// Same probe-before-remove rule as the endpoint sweep, on the socket path
+/// the file NAMES: a supervisor that is alive but was never (or no longer)
+/// recorded in the registry still answers, and must keep its file.
+fn sweep_orphan_socket_paths(state: &StateDir, found: &[(Record, Liveness)]) {
+    let Ok(entries) = std::fs::read_dir(state.root()) else {
+        return;
+    };
+    let live: std::collections::BTreeSet<&str> = found
+        .iter()
+        .filter(|(_, liveness)| *liveness == Liveness::Live)
+        .map(|(record, _)| record.short.as_str())
+        .collect();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(short) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix(super::wrap::SOCKET_PATH_PREFIX))
+        else {
+            continue;
+        };
+        if live.contains(short) {
+            continue;
+        }
+        let answers = std::fs::read_to_string(&path)
+            .map(|s| s.trim().to_string())
+            .is_ok_and(|socket| {
+                !socket.is_empty() && super::signal::probe(std::path::Path::new(&socket))
+            });
+        if !answers {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// C9 (issue #99, 2026-08-23): an orphaned turn-signal endpoint -- a
@@ -1474,7 +1519,7 @@ pub const UNKNOWN_SENDER: &str = "unknown";
 /// id -- "nudged by <myself>", which was simply false.
 fn write_nudge_marker(state: &StateDir, short: &str, from: &str) {
     let _ = super::state::create_private_dir_all(&state.sessions());
-    let _ = std::fs::write(nudge_marker_path(state, short), from.as_bytes());
+    let _ = super::state::write_private(&nudge_marker_path(state, short), from);
 }
 
 /// Best-effort low-latency notification used after durable mail storage.
@@ -1528,7 +1573,10 @@ fn stall_marker_path(state: &StateDir, short: &str) -> PathBuf {
 /// which is what actually drives the nudge/terminate decision.
 pub fn write_stall_marker(state: &StateDir, short: &str, latched_at_secs: u64) {
     let _ = super::state::create_private_dir_all(&state.sessions());
-    let _ = std::fs::write(stall_marker_path(state, short), latched_at_secs.to_string());
+    let _ = super::state::write_private(
+        &stall_marker_path(state, short),
+        &latched_at_secs.to_string(),
+    );
 }
 
 /// Reads this session's stall latch, if armed -- the unix-seconds moment it
@@ -3180,6 +3228,117 @@ mod tests {
             !nudge_marker_path(&state, "99999999").exists(),
             "a marker with no record at all is swept too"
         );
+    }
+
+    /// `wrap::publish_socket_path` writes `<state>/socket-path-<short>` and
+    /// only a graceful exit unpublishes it, so a killed or crashed
+    /// supervisor leaves one behind forever (46 of them on one real machine)
+    /// -- and `wrap::read_socket_path` with no session picks the NEWEST such
+    /// file by mtime, with no liveness check at all. They are swept on the
+    /// same read as every other orphan.
+    #[test]
+    fn a_dead_sessions_published_socket_path_is_swept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+        let published = |short: &str| {
+            state
+                .root()
+                .join(format!("{}{short}", super::super::wrap::SOCKET_PATH_PREFIX))
+        };
+        // The socket file's STEM is what `signal::probe` derives its
+        // machine-global pipe name from on Windows, so it has to be unique
+        // to this process or a sibling test's live endpoint can answer the
+        // probe for a path this test only made up.
+        let publish = |short: &str| {
+            let socket = tmp
+                .path()
+                .join(format!("{short}-{}.sock", std::process::id()));
+            super::super::state::write_private(&published(short), &socket.display().to_string())
+                .expect("publish");
+        };
+
+        let live = record_for("11111111-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        let live_short = live.short.clone();
+        write_record(&state, &live);
+        publish(&live_short);
+
+        let mut dead = record_for("22222222-2222-4333-8444-555555555555", &repo, Verb::Exec);
+        dead.pid = dead_pid();
+        let dead_short = dead.short.clone();
+        write_record(&state, &dead);
+        publish(&dead_short);
+
+        publish("99999999");
+
+        let _ = list(&state);
+
+        assert!(
+            published(&live_short).is_file(),
+            "a live session's published socket path is left alone"
+        );
+        assert!(
+            !published(&dead_short).exists(),
+            "a dead session's published socket path is swept with its record"
+        );
+        assert!(
+            !published("99999999").exists(),
+            "a published socket path with no record at all is swept too"
+        );
+    }
+
+    /// Both markers are read by OTHER processes while their owner rewrites
+    /// them -- `claim_nudge_marker` could hand back an empty sender, and
+    /// `stall_marker` could lose the latch for a tick -- so neither may be
+    /// written with a truncating write. Every other writer of these files
+    /// already goes through `state::write_private`.
+    #[test]
+    fn marker_writes_are_atomic_for_a_concurrent_reader() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let short = "abcd1234";
+        write_nudge_marker(&state, short, "sender01");
+        write_stall_marker(&state, short, 1_700_000_000);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let nudge = nudge_marker_path(&state, short);
+            let stall = stall_marker_path(&state, short);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut torn = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(text) = std::fs::read_to_string(&nudge)
+                        && text.trim().is_empty()
+                    {
+                        torn += 1;
+                    }
+                    if let Ok(text) = std::fs::read_to_string(&stall)
+                        && text.trim().parse::<u64>().is_err()
+                    {
+                        torn += 1;
+                    }
+                }
+                torn
+            })
+        };
+
+        for i in 0..600u64 {
+            write_nudge_marker(&state, short, "sender01");
+            write_stall_marker(&state, short, 1_700_000_000 + i);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let torn = reader.join().expect("reader thread");
+
+        assert_eq!(
+            torn, 0,
+            "a concurrent reader saw a marker mid-write {torn} time(s)"
+        );
+        assert_eq!(
+            claim_nudge_marker(&state, short).as_deref(),
+            Some("sender01")
+        );
+        assert_eq!(stall_marker(&state, short), Some(1_700_000_599));
     }
 
     // F6: a unique-but-mistyped prefix must not be actionable.

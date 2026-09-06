@@ -714,6 +714,35 @@ fn status_path(state: &super::state::StateDir, short: &str) -> std::path::PathBu
     state.attention().join(format!("{short}.json"))
 }
 
+fn lock_path(state: &super::state::StateDir, short: &str) -> std::path::PathBuf {
+    state.attention().join(format!("{short}.lock"))
+}
+
+/// One advisory OS lock per attention record, mirroring `group.rs::GroupLock`
+/// and `seat.rs::SeatLock` (same `open_lock_file`, same "leave the file on
+/// disk" rule). Without it the load-compose-persist below is three separate
+/// syscall groups run from the permission hook, the workflow engine and the
+/// dashboard at once, and the last writer silently drops whatever the others
+/// just observed.
+struct AttentionLock(std::fs::File);
+
+impl Drop for AttentionLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// `None` when the lock cannot be taken. This ledger's writes are
+/// best-effort by contract (every call site must exit 0 regardless), so a
+/// lock failure degrades to the older unguarded read-modify-write rather
+/// than dropping the observation outright.
+fn lock_status(state: &super::state::StateDir, short: &str) -> Option<AttentionLock> {
+    let _ = super::state::create_private_dir_all(&state.attention());
+    let file = super::group::open_lock_file(&lock_path(state, short)).ok()?;
+    file.lock().ok()?;
+    Some(AttentionLock(file))
+}
+
 /// Reads the persisted status for `short`, or a fresh default when the file
 /// is missing or fails to parse.
 pub fn load(state: &super::state::StateDir, short: &str) -> SessionStatus {
@@ -735,6 +764,7 @@ pub fn record(
     observation: Observation,
     now: u64,
 ) -> SessionStatus {
+    let _guard = lock_status(state, short);
     let prev = load(state, short);
     let next = compose(Some(&prev), std::slice::from_ref(&observation), now);
     persist(state, short, &next);
@@ -744,6 +774,7 @@ pub fn record(
 /// The `mark_seen` counterpart to [`record`]: loads, clears `Unseen`, writes
 /// back. See [`mark_seen`]'s own doc comment for who may call this.
 pub fn mark_seen_io(state: &super::state::StateDir, short: &str) -> SessionStatus {
+    let _guard = lock_status(state, short);
     let prev = load(state, short);
     let before = prev.clone();
     let next = mark_seen(prev);
@@ -1050,6 +1081,61 @@ mod tests {
 
         let status = load(&state, short);
         assert_eq!(status, SessionStatus::default());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_record_and_mark_seen_do_not_lose_an_observation() {
+        let dir = std::env::temp_dir().join(format!(
+            "zirv-attention-test-race-{}-{}",
+            std::process::id(),
+            now_for_test()
+        ));
+        let state = super::super::state::StateDir::from_root(dir.clone());
+
+        for round in 0..200u64 {
+            let short = format!("race{round:04}");
+            persist(
+                &state,
+                &short,
+                &SessionStatus {
+                    lifecycle: Lifecycle::Working,
+                    visibility: Visibility::Unseen,
+                    ..Default::default()
+                },
+            );
+
+            let recorder = {
+                let state = super::super::state::StateDir::from_root(dir.clone());
+                let short = short.clone();
+                std::thread::spawn(move || {
+                    let observation = Observation::new(
+                        Authority::AdapterHook,
+                        "permission requested",
+                        100,
+                        round,
+                    )
+                    .with_attention(Attention::Approval);
+                    record(&state, &short, observation, round);
+                })
+            };
+            let acker = {
+                let state = super::super::state::StateDir::from_root(dir.clone());
+                let short = short.clone();
+                std::thread::spawn(move || {
+                    mark_seen_io(&state, &short);
+                })
+            };
+            recorder.join().expect("recorder thread");
+            acker.join().expect("acker thread");
+
+            assert_eq!(
+                load(&state, &short).attention,
+                Attention::Approval,
+                "round {round}: a recorded Approval must survive a concurrent mark_seen"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

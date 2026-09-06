@@ -1996,11 +1996,19 @@ const ORCHESTRATOR_ADVISORY_RATE: usize = 5;
 /// (surface it) rather than silently going quiet -- the annoyance of an
 /// extra note is a far cheaper failure mode than a session that never
 /// learns it should be delegating more.
+///
+/// Only the ledger's TAIL is parsed (`log::read_recent_orchestrator_blocks`):
+/// this runs on every Edit/Write/Bash hook and the file is never rotated, so
+/// a full read would grow without bound on the hottest path there is. A
+/// session whose own rows all sit inside the window -- every ordinary
+/// session -- counts exactly as it did before; one whose rows are older than
+/// the window simply starts its cadence over, which can only surface a note
+/// that would otherwise have been suppressed, never suppress one.
 pub(crate) fn orchestrator_advisory_should_surface(env: EnvLookup<'_>, session: &str) -> bool {
     let Ok(state) = StateDir::resolve(env) else {
         return true;
     };
-    let count = log::read_orchestrator_blocks(&state)
+    let count = log::read_recent_orchestrator_blocks(&state)
         .iter()
         .filter(|row| row.session == session && row.outcome == "advised")
         .count();
@@ -2702,6 +2710,98 @@ mod tests {
             stop_hook_active: false,
             source: source.to_string(),
         }
+    }
+
+    /// `orchestrator-blocks.jsonl` is never rotated and is read on EVERY
+    /// Edit/Write/Bash hook, so the advisory rate limit may only look at a
+    /// bounded tail of it. A ledger whose head carries this session's own
+    /// ancient rows must give the verdict the tail alone implies -- a
+    /// whole-file read would count those too and go silent instead.
+    #[test]
+    fn orchestrator_advisory_only_reads_the_tail_of_the_block_ledger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let env = |key: &str| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| dir.path().display().to_string())
+        };
+        fn row<'a>(session: &'a str, outcome: &'a str, ts: u64) -> log::OrchestratorBlock<'a> {
+            log::OrchestratorBlock {
+                ts,
+                session,
+                tool: "Edit",
+                target: "src/lib.rs",
+                reason: "orchestrator seat",
+                outcome,
+            }
+        }
+
+        for i in 0..2 {
+            log::append_orchestrator_block(&state, &row("mine", "advised", i)).expect("append");
+        }
+        for i in 0..10_000 {
+            log::append_orchestrator_block(&state, &row("other", "advised", 100 + i))
+                .expect("append");
+        }
+        for i in 0..5 {
+            log::append_orchestrator_block(&state, &row("mine", "advised", 20_000 + i))
+                .expect("append");
+        }
+
+        let bytes = std::fs::metadata(state.logs().join(log::ORCHESTRATOR_BLOCKS_FILE))
+            .expect("metadata")
+            .len();
+        assert!(
+            bytes > log::ORCHESTRATOR_BLOCK_TAIL_BYTES,
+            "the fixture must exceed the tail window to be a test of it ({bytes} bytes)"
+        );
+        assert!(
+            orchestrator_advisory_should_surface(&env, "mine"),
+            "5 advised rows inside the tail window is a multiple of the rate; the 2 ancient \
+             rows before it must not be counted"
+        );
+    }
+
+    /// The bounded read may not change the verdict for the ordinary case:
+    /// a ledger small enough to fit the tail window entirely counts exactly
+    /// as it always did.
+    #[test]
+    fn orchestrator_advisory_verdict_is_unchanged_for_a_small_ledger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().to_path_buf());
+        let env = |key: &str| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| dir.path().display().to_string())
+        };
+        fn row<'a>(session: &'a str, outcome: &'a str, ts: u64) -> log::OrchestratorBlock<'a> {
+            log::OrchestratorBlock {
+                ts,
+                session,
+                tool: "Edit",
+                target: "src/lib.rs",
+                reason: "orchestrator seat",
+                outcome,
+            }
+        }
+
+        assert!(
+            orchestrator_advisory_should_surface(&env, "mine"),
+            "an empty ledger surfaces the first note"
+        );
+        log::append_orchestrator_block(&state, &row("other", "advised", 1)).expect("append");
+        log::append_orchestrator_block(&state, &row("mine", "denied", 2)).expect("append");
+        log::append_orchestrator_block(&state, &row("mine", "advised", 3)).expect("append");
+        assert!(
+            !orchestrator_advisory_should_surface(&env, "mine"),
+            "one advised row of this session's own stays quiet"
+        );
+        for ts in 4..8 {
+            log::append_orchestrator_block(&state, &row("mine", "advised", ts)).expect("append");
+        }
+        assert!(
+            orchestrator_advisory_should_surface(&env, "mine"),
+            "the fifth surfaces again"
+        );
     }
 
     /// `source` gates everything: `resume`/`clear` inject a stored handoff,
