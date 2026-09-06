@@ -4765,19 +4765,27 @@ fn worker_pane_extra_args(
     session_id: &str,
     state: &StateDir,
 ) -> Vec<String> {
+    // Real signal, not an assumed one (2026-08-24 hardening): only a request
+    // that can vouch a human is present gets the permissive interactive
+    // posture; a scripted/headless spawn fails closed. Shared below (bug fix,
+    // 2026-09-06) so the read-only floor is resolved for the SAME launch
+    // surface this pane actually uses -- codex's exec-only `--ignore-rules`/
+    // `--ignore-user-config` used to reach an interactive pane's real
+    // top-level `codex [OPTIONS] [PROMPT]` launch (no `exec` subcommand)
+    // regardless of `req.interactive`, and that launch surface rejects both
+    // with a clap usage error (exit 2), killing the pane before it ever
+    // registered a session.
+    let launch_mode = if req.interactive {
+        adapters::LaunchMode::Interactive
+    } else {
+        adapters::LaunchMode::Headless
+    };
     let mut extra = pane_model_args(req, cfg, adapter);
     extra.extend(adapters::policy_launch_args(
         cfg,
         adapter,
         &req.flags,
-        // Real signal, not an assumed one (2026-08-24 hardening): only a
-        // request that can vouch a human is present gets the permissive
-        // interactive posture; a scripted/headless spawn fails closed.
-        if req.interactive {
-            adapters::LaunchMode::Interactive
-        } else {
-            adapters::LaunchMode::Headless
-        },
+        launch_mode,
     ));
     // 2026-09-06: the trailing `-- <flags>` the requester typed, in the same
     // position `agent::worker_launch_flags` puts them for an inline
@@ -4794,7 +4802,8 @@ fn worker_pane_extra_args(
     // Appended last, after any operator flag, exactly as `workflow::review::
     // reviewer_argv` appends its own floor: no argument may weaken it.
     if req.mode == super::permit::WorkerMode::ReadOnly
-        && let Some(read_only) = adapters::read_only_args_for_agent_name(adapter.name())
+        && let Some(read_only) =
+            adapters::read_only_args_for_agent_name(adapter.name(), launch_mode)
     {
         extra.extend(read_only);
     }
@@ -18668,6 +18677,59 @@ mod tests {
         assert!(
             !writing.iter().any(|arg| arg == floor),
             "an ordinary writing worker is unaffected: {writing:?}"
+        );
+    }
+
+    /// Bug fix (2026-09-06): a `--mode read-only` request fulfilled as an
+    /// INTERACTIVE dashboard pane used to die instantly with "pane exited
+    /// with code 2" -- `read_only_args_for_agent_name` carried codex's
+    /// `exec`-only `--ignore-rules --ignore-user-config` onto the real
+    /// top-level `codex [OPTIONS] [PROMPT]` launch a pane uses, which rejects
+    /// both with a clap usage error. Forces `ignore_flags_supported()` to
+    /// `true` so the assertion cannot pass by accident of whatever codex-cli
+    /// happens to be installed on the machine running the suite.
+    #[test]
+    fn a_read_only_interactive_codex_pane_never_carries_the_exec_only_ignore_flags() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_ignore_flags_forced(true)
+            .with_on_request_approval_forced(false)
+            .with_exec_ask_for_approval_forced(true);
+
+        let mut req = spawn_request("go", tmp.path());
+        req.agent = "codex".to_string();
+        req.mode = super::super::permit::WorkerMode::ReadOnly;
+        req.interactive = true;
+        let interactive = worker_pane_extra_args(&req, &cfg, &adapter, Vec::new(), "sess", &state);
+        assert!(
+            interactive
+                .windows(2)
+                .any(|w| w == ["--sandbox", "read-only"]),
+            "the sandbox pin must still reach an interactive pane: {interactive:?}"
+        );
+        assert!(
+            !interactive.iter().any(|a| a == "--ignore-rules"),
+            "an interactive pane's real CLI surface rejects this exec-only flag: {interactive:?}"
+        );
+        assert!(
+            !interactive.iter().any(|a| a == "--ignore-user-config"),
+            "an interactive pane's real CLI surface rejects this exec-only flag: {interactive:?}"
+        );
+
+        // The headless (non-interactive) pane counterpart is unaffected:
+        // that fork never launches the interactive `codex [OPTIONS] [PROMPT]`
+        // surface, so the exec-only floor is still correct there.
+        req.interactive = false;
+        let headless = worker_pane_extra_args(&req, &cfg, &adapter, Vec::new(), "sess", &state);
+        assert!(
+            headless.iter().any(|a| a == "--ignore-rules"),
+            "a headless pane keeps the stronger exec-only floor when supported: {headless:?}"
+        );
+        assert!(
+            headless.iter().any(|a| a == "--ignore-user-config"),
+            "a headless pane keeps the stronger exec-only floor when supported: {headless:?}"
         );
     }
 

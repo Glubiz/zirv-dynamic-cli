@@ -1248,6 +1248,24 @@ impl AgentAdapter for CodexAdapter {
         args
     }
 
+    /// Bug fix (2026-09-06): `--ignore-rules`/`--ignore-user-config` are
+    /// documented only on `codex exec --help`, never on the top-level
+    /// interactive `codex [OPTIONS] [PROMPT]` launch a dashboard pane uses
+    /// (no `exec` subcommand) -- verified by hand against codex-cli 0.153.4:
+    /// `codex --ignore-rules --model gpt-6-astra x` exits 2 with a clap
+    /// usage error, while `codex --help` lists no ignore flags at all (only
+    /// `codex exec --help` does). `read_only_args()` above added both
+    /// unconditionally whenever `ignore_flags_supported()` (an `exec --help`
+    /// probe) said yes, which killed every `--mode read-only` dashboard pane
+    /// instantly with "pane exited with code 2", before it ever registered a
+    /// session. This override carries only the one flag that is real on
+    /// BOTH surfaces -- never the exec-only pair, regardless of what the
+    /// exec probe reports, because it is never applicable to this launch
+    /// surface in the first place.
+    fn interactive_read_only_args(&self) -> Vec<String> {
+        vec!["--sandbox".to_string(), "read-only".to_string()]
+    }
+
     /// Issue #89: names the residual for the operator when the installed
     /// codex-cli's `codex exec --help` does not document `--ignore-rules`/
     /// `--ignore-user-config` (see `read_only_args`/`ignore_flags_supported`
@@ -1501,7 +1519,17 @@ impl AgentAdapter for CodexAdapter {
         use crate::commands::ctx::policy::Stance;
         let mut args = if policy.repo_fs_write == Stance::Deny || policy.shell_exec == Stance::Deny
         {
-            let mut args = self.read_only_args();
+            // Bug fix (2026-09-06): this floor used to be `self.
+            // read_only_args()` unconditionally, which carries the
+            // `exec`-only `--ignore-rules`/`--ignore-user-config` pair onto
+            // an interactive pane launch too -- that launch surface rejects
+            // both with a clap usage error (exit 2). Mode-aware, mirroring
+            // `interactive_read_only_args`'s own doc comment.
+            let mut args = if mode.is_interactive() {
+                self.interactive_read_only_args()
+            } else {
+                self.read_only_args()
+            };
             args.extend(self.approval_suppression_args(mode, "never"));
             args
         } else {
@@ -2894,6 +2922,71 @@ mod tests {
         assert_eq!(
             adapter.read_only_args(),
             vec!["--sandbox".to_string(), "read-only".to_string()]
+        );
+    }
+
+    /// Bug fix (2026-09-06): `--ignore-rules`/`--ignore-user-config` exist
+    /// only on `codex exec --help`, never on the top-level interactive
+    /// `codex [OPTIONS] [PROMPT]` launch a dashboard pane uses, which
+    /// rejects both with a clap usage error (exit 2) -- verified by hand
+    /// against codex-cli 0.153.4. `interactive_read_only_args` must never
+    /// carry either flag, even when `ignore_flags_supported()` (an `exec
+    /// --help` probe, irrelevant to this launch surface) says yes.
+    #[test]
+    fn interactive_read_only_args_never_carries_the_exec_only_ignore_flags() {
+        let supported = CodexAdapter::new(None).with_ignore_flags_forced(true);
+        assert_eq!(
+            supported.interactive_read_only_args(),
+            vec!["--sandbox".to_string(), "read-only".to_string()],
+            "the exec-only ignore flags must never reach an interactive launch"
+        );
+
+        let unsupported = CodexAdapter::new(None).with_ignore_flags_forced(false);
+        assert_eq!(
+            unsupported.interactive_read_only_args(),
+            vec!["--sandbox".to_string(), "read-only".to_string()],
+            "unaffected either way by the exec-only probe"
+        );
+    }
+
+    /// Companion of the fix above: `policy_args` under an Interactive mode
+    /// must resolve the SAME interactive-safe floor, not the raw `self.
+    /// read_only_args()` this method used to call unconditionally --
+    /// forcing the ignore flags "supported" here is what would have caught
+    /// the original bug, unlike the pre-existing interactive `policy_args`
+    /// test (`policy_args_keeps_the_plain_flag_on_an_interactive_launch_
+    /// regardless_of_the_exec_probe`), which happened to force them
+    /// unsupported and so passed either way.
+    #[test]
+    fn policy_args_excludes_the_exec_only_ignore_flags_on_an_interactive_launch_even_when_supported()
+     {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let adapter = CodexAdapter::new(None)
+            .with_ignore_flags_forced(true)
+            .with_exec_ask_for_approval_forced(true);
+        let policy = EffectivePolicy {
+            shell_exec: Stance::Deny,
+            ..EffectivePolicy::default()
+        };
+        let args = adapter.policy_args(&policy, super::super::LaunchMode::Interactive);
+        assert!(
+            args.windows(2).any(|w| w == ["--sandbox", "read-only"]),
+            "got {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--ignore-rules" || a == "--ignore-user-config"),
+            "an interactive launch's real CLI surface rejects these exec-only flags: {args:?}"
+        );
+
+        // The headless counterpart is unaffected: it still gets the
+        // stronger exec-only floor when supported.
+        let headless = adapter.policy_args(&policy, super::super::LaunchMode::Headless);
+        assert!(
+            headless.iter().any(|a| a == "--ignore-rules")
+                && headless.iter().any(|a| a == "--ignore-user-config"),
+            "got {headless:?}"
         );
     }
 
