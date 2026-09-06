@@ -1568,6 +1568,7 @@ fn attach_task_context_to_prompt(
     state: &super::state::StateDir,
     repo: &Path,
     prompt: String,
+    max_parent_outcome_bytes: usize,
 ) -> CtxResult<String> {
     let Some(task_id) = &args.task else {
         return Ok(prompt);
@@ -1581,7 +1582,7 @@ fn attach_task_context_to_prompt(
         card.parents.iter().filter_map(|id| cards.get(id)).collect();
     Ok(format!(
         "{prompt}{}",
-        super::task::compile_task_prompt(card, &parents)
+        super::task::compile_task_prompt(card, &parents, max_parent_outcome_bytes)
     ))
 }
 
@@ -2844,7 +2845,13 @@ pub fn run_with<W: Write>(
     // labelled -- same seam, same "both forks read this one binding"
     // guarantee as `--attach-artifact`/`--result-schema` above. Fails fast
     // when the named card does not exist in this repository.
-    let prompt = attach_task_context_to_prompt(args, &state, repo, prompt)?;
+    let prompt = attach_task_context_to_prompt(
+        args,
+        &state,
+        repo,
+        prompt,
+        cfg.task.max_parent_outcome_bytes,
+    )?;
 
     // Issue #223 §E: refuses before any routing/spawn decision below, so an
     // enforced session never even gets as far as picking a route or joining
@@ -4405,6 +4412,7 @@ mod tests {
             &state,
             repo.path(),
             "do the operator's own thing".to_string(),
+            crate::commands::ctx::config::TaskConfig::default().max_parent_outcome_bytes,
         )
         .expect("resolves");
         assert!(prompt.starts_with("do the operator's own thing"));
@@ -4414,14 +4422,89 @@ mod tests {
         assert!(prompt.contains("migrated the schema"));
     }
 
+    /// Issue #326 B1: `--task`'s own `cfg.task.max_parent_outcome_bytes`
+    /// reaches `compile_task_prompt` -- a tiny budget must cut a parent's
+    /// outcome, with an explicit note, rather than appending it verbatim.
+    #[test]
+    fn attach_task_context_to_prompt_applies_the_configured_parent_outcome_budget() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let repo_slug = crate::commands::ctx::state::repo_slug(repo.path());
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "parent-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "parent".to_string(),
+                brief: "b".to_string(),
+                parents: Vec::new(),
+                group_id: None,
+                workdir: None,
+                at: 1,
+            },
+        )
+        .expect("create parent");
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Completed {
+                id: "parent-1".to_string(),
+                outcome: "x".repeat(500),
+                at: 2,
+            },
+        )
+        .expect("complete parent");
+        crate::commands::ctx::task::append_event(
+            &state,
+            &repo_slug,
+            &crate::commands::ctx::task::Event::Created {
+                id: "child-1".to_string(),
+                repo_slug: repo_slug.clone(),
+                title: "child".to_string(),
+                brief: "wire up the new column".to_string(),
+                parents: vec!["parent-1".to_string()],
+                group_id: None,
+                workdir: None,
+                at: 3,
+            },
+        )
+        .expect("create child");
+
+        let mut args = args_for("claude", "do the operator's own thing");
+        args.task = Some("child-1".to_string());
+        let prompt = attach_task_context_to_prompt(
+            &args,
+            &state,
+            repo.path(),
+            "do the operator's own thing".to_string(),
+            16,
+        )
+        .expect("resolves");
+        assert!(
+            !prompt.contains(&"x".repeat(500)),
+            "the oversized outcome must not survive a 16 byte budget: {prompt}"
+        );
+        assert!(
+            prompt.contains("[truncated"),
+            "the cut must be noted explicitly: {prompt}"
+        );
+    }
+
     #[test]
     fn attach_task_context_to_prompt_fails_for_an_unknown_task_id() {
         let repo = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(repo.path().join("state"));
         let mut args = args_for("claude", "go");
         args.task = Some("does-not-exist".to_string());
-        let err = attach_task_context_to_prompt(&args, &state, repo.path(), "go".to_string())
-            .expect_err("no such task");
+        let err = attach_task_context_to_prompt(
+            &args,
+            &state,
+            repo.path(),
+            "go".to_string(),
+            crate::commands::ctx::config::TaskConfig::default().max_parent_outcome_bytes,
+        )
+        .expect_err("no such task");
         assert!(err.to_string().contains("does-not-exist"));
     }
 
@@ -4430,8 +4513,14 @@ mod tests {
         let repo = crate::commands::ctx::testenv::repo();
         let state = StateDir::from_root(repo.path().join("state"));
         let args = args_for("claude", "go");
-        let prompt = attach_task_context_to_prompt(&args, &state, repo.path(), "go".to_string())
-            .expect("resolves");
+        let prompt = attach_task_context_to_prompt(
+            &args,
+            &state,
+            repo.path(),
+            "go".to_string(),
+            crate::commands::ctx::config::TaskConfig::default().max_parent_outcome_bytes,
+        )
+        .expect("resolves");
         assert_eq!(prompt, "go");
     }
 

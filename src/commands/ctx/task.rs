@@ -748,21 +748,56 @@ pub fn respawn_decision(card: &Card, exit: ExitKind, max_attempts: u32) -> Respa
 }
 
 /// Formats `--task`'s own labelled block: `card.brief` plus every resolved
-/// parent's own `outcome`, verbatim -- appended after the operator's own
-/// prompt text by `agent::attach_task_context_to_prompt`. Pure formatting
-/// only; `parents` is whatever the caller already resolved (a parent id with
-/// no matching card is simply absent from the list, same "caller resolves,
-/// this only formats" split `ready_when_parents_done` draws).
-pub fn compile_task_prompt(card: &Card, parents: &[&Card]) -> String {
+/// parent's own `outcome` -- appended after the operator's own prompt text by
+/// `agent::attach_task_context_to_prompt`. Pure formatting only; `parents` is
+/// whatever the caller already resolved (a parent id with no matching card is
+/// simply absent from the list, same "caller resolves, this only formats"
+/// split `ready_when_parents_done` draws).
+///
+/// Issue #326 B1: every ancestor's `outcome` used to be appended verbatim,
+/// uncapped -- a task tree a few levels deep could inject an unbounded amount
+/// of prior prose into a fresh worker's very first turn. `max_parent_
+/// outcome_bytes` (`cfg.task.max_parent_outcome_bytes`, the caller's own
+/// resolved config) now bounds the combined block: parents are rendered most
+/// recently updated (`Card::updated_at`) first, in full, for as long as the
+/// budget lasts. Once one parent's own line would not fit what remains, EVERY
+/// parent from that point on is left out too, even an older one whose own
+/// line happens to be small enough to have fit on its own -- recency order is
+/// a priority, not a bin-packing problem -- and a single trailing line names
+/// exactly how many bytes and how many parents were cut, never a silent one.
+pub fn compile_task_prompt(
+    card: &Card,
+    parents: &[&Card],
+    max_parent_outcome_bytes: usize,
+) -> String {
     let mut out = format!("\n\n## TASK CARD {}\n{}\n", card.id, card.brief);
     if !parents.is_empty() {
         out.push_str("\n## PARENT OUTCOMES\n");
-        for parent in parents {
-            out.push_str(&format!(
+        let mut ordered: Vec<&Card> = parents.to_vec();
+        ordered.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
+        let mut spent = 0usize;
+        let mut cut_off = false;
+        let mut omitted_count = 0usize;
+        let mut omitted_bytes = 0usize;
+        for parent in ordered {
+            let line = format!(
                 "- {} ({}): {}\n",
                 parent.id,
                 parent.title,
                 parent.outcome.as_deref().unwrap_or("(no outcome recorded)")
+            );
+            if !cut_off && spent.saturating_add(line.len()) <= max_parent_outcome_bytes {
+                spent += line.len();
+                out.push_str(&line);
+            } else {
+                cut_off = true;
+                omitted_count += 1;
+                omitted_bytes += line.len();
+            }
+        }
+        if omitted_count > 0 {
+            out.push_str(&format!(
+                "- [truncated {omitted_bytes} bytes: {omitted_count} older parent outcome(s) omitted to fit the {max_parent_outcome_bytes} byte budget]\n"
             ));
         }
     }
@@ -2066,11 +2101,62 @@ mod tests {
         let card = sample_card("t1", State::Ready, vec!["p1".to_string()]);
         let mut p1 = sample_card("p1", State::Done, Vec::new());
         p1.outcome = Some("shipped the migration".to_string());
-        let text = compile_task_prompt(&card, &[&p1]);
+        let text = compile_task_prompt(&card, &[&p1], 4096);
         assert!(text.contains("TASK CARD t1"));
         assert!(text.contains("brief"));
         assert!(text.contains("p1"));
         assert!(text.contains("shipped the migration"));
+    }
+
+    /// Issue #326 B1: a parent tree whose combined outcomes exceed the byte
+    /// budget keeps the most recently updated parents in full and drops the
+    /// rest with an explicit "[truncated N bytes]"-shaped note -- never a
+    /// silent cut.
+    #[test]
+    fn compile_task_prompt_caps_the_aggregate_parent_outcome_bytes() {
+        let card = sample_card(
+            "t1",
+            State::Ready,
+            vec!["old".to_string(), "new".to_string()],
+        );
+        let mut old = sample_card("old", State::Done, Vec::new());
+        old.updated_at = 100;
+        old.outcome = Some("a".repeat(200));
+        let mut new = sample_card("new", State::Done, Vec::new());
+        new.updated_at = 200;
+        new.outcome = Some("b".repeat(200));
+
+        // A budget that fits the more recently updated parent's own line in
+        // full, but not both.
+        let text = compile_task_prompt(&card, &[&old, &new], 220);
+
+        assert!(
+            text.contains(&"b".repeat(200)),
+            "the most recently updated parent's outcome must survive in full: {text}"
+        );
+        assert!(
+            !text.contains(&"a".repeat(200)),
+            "the older parent's outcome must not appear once it no longer fits: {text}"
+        );
+        assert!(
+            text.contains("[truncated"),
+            "an omission must be noted explicitly, never silent: {text}"
+        );
+        assert!(
+            text.contains("1 older parent outcome"),
+            "the note must say how many parents were cut: {text}"
+        );
+    }
+
+    /// Issue #326 B1: nothing is cut, and no truncation note appears, when
+    /// every parent's own outcome already fits the budget.
+    #[test]
+    fn compile_task_prompt_omits_the_truncation_note_when_everything_fits() {
+        let card = sample_card("t1", State::Ready, vec!["p1".to_string()]);
+        let mut p1 = sample_card("p1", State::Done, Vec::new());
+        p1.outcome = Some("shipped the migration".to_string());
+        let text = compile_task_prompt(&card, &[&p1], 4096);
+        assert!(!text.contains("[truncated"), "got {text}");
     }
 
     // -- respawn_decision -----------------------------------------------------

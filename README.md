@@ -1260,6 +1260,7 @@ checkout:
 | `memory.harvest_max_bytes` | `ZIRV_CTX_MEMORY_HARVEST_MAX_BYTES` |
 | `memory.session_enabled` | `ZIRV_CTX_MEMORY_SESSION` |
 | `memory.journal_max_entries` | `ZIRV_CTX_MEMORY_JOURNAL_MAX_ENTRIES` |
+| `task.max_parent_outcome_bytes` | `ZIRV_CTX_TASK_MAX_PARENT_OUTCOME_BYTES` |
 | `dash.enabled` | `ZIRV_CTX_DASH` |
 | `dash.sidebar_cols` | `ZIRV_CTX_DASH_SIDEBAR_COLS` |
 | `dash.roster_max_age_secs` | `ZIRV_CTX_DASH_ROSTER_MAX_AGE_SECS` |
