@@ -3309,6 +3309,21 @@ pub fn run_with<W: Write>(
             None
         }
     };
+    // Audit finding G4: the sibling of `discard_minted_group`, for the
+    // invariant stated where the reservation is taken -- released on every
+    // failure path between here and a genuinely running child. The two
+    // pre-launch refusals below (`WorkerEnvelope::narrow`, the writer permit)
+    // unwound the group and returned without it, leaving a refused
+    // delegation's whole ceiling outstanding against the provider until this
+    // process exited; `dash::rollback_admission` already handled the
+    // identical writer refusal correctly. Best-effort like every other ledger
+    // write here, and idempotent, so calling it before a `writeln!` that may
+    // itself fail is safe.
+    let release_reservation = || {
+        if let Some(id) = &reservation_id {
+            let _ = super::reservation::release(&state, provider, id);
+        }
+    };
 
     // Issue #262: this worker's own delegation envelope, computed by
     // narrowing `parent_envelope` against what THIS delegation is asking
@@ -3330,6 +3345,7 @@ pub fn run_with<W: Write>(
             Ok(envelope) => envelope,
             Err(err) => {
                 discard_minted_group();
+                release_reservation();
                 writeln!(w, "failed: delegation envelope refused: {err}")?;
                 return Ok(2);
             }
@@ -3364,6 +3380,7 @@ pub fn run_with<W: Write>(
                 // delegation must not outlive it -- same discipline as
                 // every other pre-launch refusal above.
                 discard_minted_group();
+                release_reservation();
                 let reason = permit::describe_writer_refusal(
                     &refusal,
                     &state,
@@ -6664,6 +6681,43 @@ mod tests {
         assert!(
             text.contains("worker-a"),
             "the busy holder's own label must be named: got {text}"
+        );
+
+        drop(held);
+    }
+
+    /// Audit finding G4: the same refusal, one invariant deeper. `run_with`
+    /// reserves this delegation's token ceiling against its PROVIDER before
+    /// the writer permit is even asked for, promising (at the reservation
+    /// itself) to release it "on every failure path between here and a
+    /// genuinely running child". This path discarded the minted group and
+    /// returned without ever releasing, so a refused delegation left its
+    /// whole ceiling outstanding against the provider until the process
+    /// exited -- `dash::fulfill_spawn_request` already handled the identical
+    /// refusal through `rollback_admission`, which does release.
+    #[test]
+    fn a_writer_permit_refusal_releases_the_provider_reservation() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+        let env = base_env(&state_path);
+        let state = StateDir::from_root(state_path);
+
+        let tree = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        let held = permit::acquire_writer(&state, 1, "worker-a", &tree)
+            .expect("writer permit pre-held for the test");
+
+        let args = args_for("claude", "go");
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a writer-busy refusal is a structured exit, not an Err");
+        assert_eq!(code, exec::EXIT_WRITER_BUSY);
+
+        let outstanding = crate::commands::ctx::reservation::entries(&state, "anthropic");
+        assert!(
+            outstanding.is_empty(),
+            "a refusal that never launched a child must leave nothing reserved: {outstanding:?}"
         );
 
         drop(held);
