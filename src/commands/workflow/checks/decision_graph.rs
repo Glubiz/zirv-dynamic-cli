@@ -32,6 +32,15 @@ const SUPERSEDES_RE_SOURCE: &str = r"(?mi)^\*\*Supersedes:\*\*\s*(.+)$";
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
     let path = repo.join("docs/obsidian/Development/Decision Log.md");
+    if !path.exists() {
+        return BuiltinCheckResult::not_applicable(
+            ID,
+            PROVES,
+            FIX,
+            ORIGIN,
+            super::absent_input(&path),
+        );
+    }
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) => {
@@ -276,10 +285,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_is_inconclusive() {
+    fn missing_file_is_not_applicable() {
         let repo = tempdir().unwrap();
         let result = run(repo.path());
-        assert_eq!(result.outcome, super::super::BuiltinOutcome::Inconclusive);
+        assert_eq!(result.outcome, super::super::BuiltinOutcome::NotApplicable);
     }
 
     #[test]

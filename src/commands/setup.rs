@@ -2103,6 +2103,26 @@ fn write_backup_run(
     base: &Path,
     targets: &[PathBuf],
 ) -> SetupResult<PathBuf> {
+    write_backup_run_keeping(backup_root, kind, provider, scope, base, targets, &[])
+}
+
+/// `write_backup_run` plus a list of run ids this write's own pruning must
+/// never delete, mirroring `telemetry::prune_expired_except`'s `keep: &[&str]`
+/// shape. `restore` is the one caller that needs it: it writes a pre-restore
+/// safety backup *while reading* the run it is restoring, and that run is an
+/// ordinary pruning candidate -- past the retention cap the safety write
+/// deleted the backup mid-restore, so every target failed and the destination
+/// was left gone. See
+/// `restoring_an_old_run_past_the_retention_cap_does_not_delete_the_run_being_restored`.
+fn write_backup_run_keeping(
+    backup_root: &Path,
+    kind: BackupKind,
+    provider: ResetProvider,
+    scope: ResetScope,
+    base: &Path,
+    targets: &[PathBuf],
+    keep_ids: &[&str],
+) -> SetupResult<PathBuf> {
     let label = format!("{:?}-{:?}", provider, scope).to_ascii_lowercase();
     let backup_dir = unique_backup_dir(backup_root, &label);
     std::fs::create_dir_all(&backup_dir)?;
@@ -2141,7 +2161,7 @@ fn write_backup_run(
     // operator-layer config either way (`CtxConfig::load` always reads the
     // real home layer via `crate::utils::home_dir()` regardless of the
     // `repo` argument passed to it).
-    prune_backup_runs(backup_root, resolve_backup_retention_runs(base));
+    prune_backup_runs(backup_root, resolve_backup_retention_runs(base), keep_ids);
     Ok(backup_dir)
 }
 
@@ -2156,7 +2176,11 @@ fn write_backup_run(
 /// someone reaching for `restore` most wants, and a naive "keep the newest
 /// N" would delete exactly that one. See
 /// `pruning_a_backup_run_never_deletes_the_pinned_oldest_run_even_past_the_cap`.
-fn prune_backup_runs(backup_root: &Path, keep: usize) {
+/// `keep_ids` names further runs that must survive this pass regardless of
+/// the cap -- a run currently being read (`restore`) is not a deletion
+/// candidate; it does not count against `keep` either, for the same reason
+/// the pinned oldest does not.
+fn prune_backup_runs(backup_root: &Path, keep: usize, keep_ids: &[&str]) {
     let mut runs = discover_runs(backup_root);
     if runs.len() <= 1 {
         return;
@@ -2164,7 +2188,10 @@ fn prune_backup_runs(backup_root: &Path, keep: usize) {
     runs.sort_by_key(|run| run.manifest.created);
     // runs[0] is the pinned oldest; `prunable` excludes it entirely, so
     // `keep` bounds only the runs after it.
-    let prunable = &runs[1..];
+    let prunable = runs[1..]
+        .iter()
+        .filter(|run| !keep_ids.contains(&run.id.as_str()))
+        .collect::<Vec<_>>();
     if prunable.len() <= keep {
         return;
     }
@@ -3264,18 +3291,76 @@ fn print_restore_list<W: Write>(
     Ok(())
 }
 
-fn restore_target(backup_path: &Path, dest: &Path) -> SetupResult<()> {
-    if let Ok(metadata) = std::fs::symlink_metadata(dest) {
-        if metadata.file_type().is_symlink() {
-            return Err(format!("refusing to restore over symlink {}", dest.display()).into());
+/// The sibling path a restore stages its copy at before swapping it into
+/// place. Deterministic (not unique-per-run) so a staging path left behind by
+/// an interrupted restore is reclaimed by the next one rather than
+/// accumulating.
+fn restore_staging_path(dest: &Path) -> SetupResult<PathBuf> {
+    let parent = dest.parent().ok_or_else(|| {
+        format!(
+            "refusing to restore over {}: it has no parent",
+            dest.display()
+        )
+    })?;
+    let name = dest.file_name().ok_or_else(|| {
+        format!(
+            "refusing to restore over {}: it has no file name",
+            dest.display()
+        )
+    })?;
+    Ok(parent.join(format!(".{}.zirv-restore-tmp", name.to_string_lossy())))
+}
+
+fn remove_staged(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            let _ = std::fs::remove_dir_all(path);
         }
-        if metadata.is_dir() {
-            std::fs::remove_dir_all(dest)?;
-        } else {
-            std::fs::remove_file(dest)?;
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
         }
+        Err(_) => {}
     }
-    copy_for_backup(backup_path, dest)
+}
+
+/// Copy first, swap second: the backup is copied to a sibling staging path
+/// and only then does the current destination get removed and the staged copy
+/// renamed into place. Removing the destination up front (as this used to)
+/// meant an unreadable backup source -- an incomplete `files/` tree, a
+/// permission change under it -- destroyed the very file it was supposed to
+/// be replacing. See
+/// `restore_leaves_the_destination_intact_when_the_backup_source_is_unreadable`.
+fn restore_target(backup_path: &Path, dest: &Path) -> SetupResult<()> {
+    if std::fs::symlink_metadata(dest).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!("refusing to restore over symlink {}", dest.display()).into());
+    }
+
+    let staging = restore_staging_path(dest)?;
+    remove_staged(&staging);
+    if let Err(error) = copy_for_backup(backup_path, &staging) {
+        remove_staged(&staging);
+        return Err(error);
+    }
+
+    let removal = match std::fs::symlink_metadata(dest) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(dest),
+        Ok(_) => std::fs::remove_file(dest),
+        Err(_) => Ok(()),
+    };
+    if let Err(error) = removal {
+        remove_staged(&staging);
+        return Err(error.into());
+    }
+
+    // The destination is gone at this point, so a failed rename must leave
+    // the staged copy where an operator can still recover it by hand.
+    std::fs::rename(&staging, dest).map_err(|error| {
+        format!(
+            "restored copy is staged at {} but could not be moved into place: {error}",
+            staging.display()
+        )
+        .into()
+    })
 }
 
 fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) -> SetupResult<i32> {
@@ -3364,13 +3449,14 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
         .iter()
         .map(|target| target.source.clone())
         .collect::<Vec<_>>();
-    let safety_backup = write_backup_run(
+    let safety_backup = write_backup_run_keeping(
         backup_root,
         BackupKind::Restore,
         manifest.provider,
         manifest.scope,
         &manifest.base,
         &pre_restore_sources,
+        &[run.id.as_str()],
     )?;
 
     let mut written = Vec::new();
@@ -5023,7 +5109,7 @@ mod tests {
             write_fake_run(root.path(), id, created);
         }
 
-        prune_backup_runs(root.path(), 2);
+        prune_backup_runs(root.path(), 2, &[]);
 
         let remaining: BTreeSet<String> = discover_runs(root.path())
             .into_iter()
@@ -5039,13 +5125,139 @@ mod tests {
         );
     }
 
+    /// A restore that cannot read its backup source must leave the current
+    /// state exactly where it was: the destination used to be removed before
+    /// a single byte of the backup was read, so an incomplete `files/` tree
+    /// (or a permission change under it) destroyed the very file it was
+    /// supposed to be replacing.
+    #[test]
+    fn restore_leaves_the_destination_intact_when_the_backup_source_is_unreadable() {
+        let root = tempfile::tempdir().expect("root");
+
+        let file_dest = root.path().join("CLAUDE.md");
+        std::fs::write(&file_dest, "current\n").expect("file dest");
+        restore_target(&root.path().join("run/files/CLAUDE.md"), &file_dest)
+            .expect_err("an unreadable backup must fail");
+        assert_eq!(
+            std::fs::read_to_string(&file_dest).expect("file dest survives"),
+            "current\n"
+        );
+
+        let dir_dest = root.path().join(".claude");
+        std::fs::create_dir_all(&dir_dest).expect("dir dest");
+        std::fs::write(dir_dest.join("settings.json"), "{}\n").expect("dir dest file");
+        restore_target(&root.path().join("run/files/.claude"), &dir_dest)
+            .expect_err("an unreadable backup directory must fail");
+        assert_eq!(
+            std::fs::read_to_string(dir_dest.join("settings.json")).expect("dir dest survives"),
+            "{}\n"
+        );
+    }
+
+    /// Same shape as `write_fake_run`, plus one real backed-up file, so the
+    /// run is actually restorable.
+    fn write_fake_run_with_file(
+        root: &Path,
+        id: &str,
+        created: u64,
+        base: &Path,
+        source: &Path,
+        contents: &str,
+    ) {
+        let dir = root.join(id);
+        let relative = relative_path_buf(base, source);
+        let backed_up = dir.join("files").join(&relative);
+        std::fs::create_dir_all(backed_up.parent().expect("files parent")).expect("files dir");
+        std::fs::write(&backed_up, contents).expect("backed-up file");
+        let manifest = json!({
+            "schema_version": SUPPORTED_MANIFEST_SCHEMA_VERSION,
+            "kind": "reset",
+            "provider": "claude",
+            "scope": "project",
+            "base": base,
+            "created": created,
+            "targets": [{
+                "source": source,
+                "relative_path": relative,
+                "existed_before": true,
+            }],
+        });
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string(&manifest).expect("manifest json"),
+        )
+        .expect("write manifest");
+    }
+
+    /// The pre-restore safety backup prunes on write, and the run being
+    /// restored is an ordinary pruning candidate: past the retention cap it
+    /// was deleted out from under the restore that was reading it, so every
+    /// target failed with "the system cannot find the path specified" and the
+    /// destination was left gone.
+    #[test]
+    fn restoring_an_old_run_past_the_retention_cap_does_not_delete_the_run_being_restored() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("zirv dir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[setup]\nbackup_retention_runs = 1\n",
+        )
+        .expect("ctx.toml");
+
+        let backup_root = repo.path().join(".zirv/backups/ai-reset");
+        let target = repo.path().join("CLAUDE.md");
+        std::fs::write(&target, "current\n").expect("target");
+        for (id, created) in [
+            ("run01", 100),
+            ("run02", 200),
+            ("run03", 300),
+            ("run04", 400),
+        ] {
+            write_fake_run_with_file(
+                &backup_root,
+                id,
+                created,
+                repo.path(),
+                &target,
+                &format!("{id} contents\n"),
+            );
+        }
+
+        let run = discover_runs(&backup_root)
+            .into_iter()
+            .find(|run| run.id == "run02")
+            .expect("run02");
+        let args = RestoreArgs {
+            yes: true,
+            ..restore_args(repo.path())
+        };
+        let mut output = Vec::new();
+        restore_run(&mut output, &run, &args).expect("restore must not fail");
+
+        assert!(
+            backup_root.join("run02").is_dir(),
+            "the run being restored must survive the safety backup's own pruning: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("target"),
+            "run02 contents\n"
+        );
+        assert!(
+            !backup_root.join("run03").exists(),
+            "pruning must still bound every other run"
+        );
+    }
+
     #[test]
     fn pruning_is_a_no_op_when_the_run_count_is_already_within_the_cap() {
         let root = tempfile::tempdir().expect("root");
         for (id, created) in [("a", 100), ("b", 200)] {
             write_fake_run(root.path(), id, created);
         }
-        prune_backup_runs(root.path(), 10);
+        prune_backup_runs(root.path(), 10, &[]);
         assert_eq!(discover_runs(root.path()).len(), 2);
     }
 

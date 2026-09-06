@@ -113,6 +113,15 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
     let path = repo.join("src/commands/ctx/config.rs");
+    if !path.exists() {
+        return BuiltinCheckResult::not_applicable(
+            ID,
+            PROVES,
+            FIX,
+            ORIGIN,
+            super::absent_input(&path),
+        );
+    }
     let source = match std::fs::read_to_string(&path) {
         Ok(source) => source,
         Err(err) => {
@@ -284,8 +293,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_rs_is_inconclusive() {
+    fn missing_config_rs_is_not_applicable() {
         let repo = tempdir().unwrap();
+        let result = run(repo.path());
+        assert_eq!(result.outcome, super::super::BuiltinOutcome::NotApplicable);
+    }
+
+    /// A `config.rs` that EXISTS but whose tables this check can no longer
+    /// parse is a degraded gate, not an inapplicable one -- issue #268's ban
+    /// still applies to that case.
+    #[test]
+    fn an_unparseable_config_rs_stays_inconclusive() {
+        let repo = tempdir().unwrap();
+        write_config_rs(repo.path(), "// no ENV_MAP table here at all\n");
         let result = run(repo.path());
         assert_eq!(result.outcome, super::super::BuiltinOutcome::Inconclusive);
     }
