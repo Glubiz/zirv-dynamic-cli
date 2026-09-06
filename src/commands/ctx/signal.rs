@@ -518,6 +518,27 @@ mod win {
             std::thread::sleep(POLL);
         }
     }
+
+    /// The single-shot form [`super::probe`] needs. A probe asks "is anyone
+    /// listening right now", so unlike [`connect`] it must never retry:
+    /// `ERROR_FILE_NOT_FOUND` -- there is no such pipe -- is already the
+    /// definitive answer, and `ERROR_PIPE_BUSY` is the definitive *positive*
+    /// one, since a pipe with no free instance is still a pipe some server
+    /// has bound. `CONNECT_RETRY` exists for `send`, which has a message to
+    /// deliver and can afford to wait out an accept loop between
+    /// connections; a probe has nothing to deliver, and every caller of it
+    /// (`sessions::sweep_orphan_endpoints`, `sweep_orphan_socket_paths`)
+    /// runs inside `sessions::list`, which the dashboard calls on its own
+    /// startup path before the first frame is drawn. Spending a second per
+    /// leftover file there is the 3.25.0 startup freeze.
+    pub fn probe_once(name: &str) -> bool {
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+        match std::fs::OpenOptions::new().write(true).open(name) {
+            Ok(_) => true,
+            Err(error) => error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -653,7 +674,11 @@ pub fn probe(path: &Path) -> bool {
     let Ok(name) = win::pipe_name(path) else {
         return false;
     };
-    win::connect(&name).is_ok()
+    // `win::probe_once`, not `win::connect`: a probe must answer at once.
+    // See its doc comment -- `connect`'s one-second retry budget belongs to
+    // `send`, and paying it per leftover endpoint froze the dashboard before
+    // its first frame (3.25.0).
+    win::probe_once(&name)
 }
 
 /// Neither transport exists here, so `wrap` reports the failure once and runs
