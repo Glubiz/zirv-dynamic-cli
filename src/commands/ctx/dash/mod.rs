@@ -5306,6 +5306,7 @@ fn fulfill_spawn_request(
             // `agent::run_with` orchestrator-seat delegation -- issue
             // #328's same-harness exclusion is scoped to that call site.
             exclude: None,
+            requester: None,
         },
         req.force,
     );
@@ -9267,7 +9268,7 @@ pub fn run_dashboard(
         // pure in-memory state, the evaluation costs a capacity snapshot --
         // and both are no-ops until `fallback.auto_orchestrator_rollover`
         // is on.
-        if cfg.fallback.auto_orchestrator_rollover {
+        if cfg.auto_orchestrator_rollover() {
             settle_pending_rollover(&mut panes, cfg, state, &mut pending_rollover);
             if pending_rollover.is_none()
                 && due(

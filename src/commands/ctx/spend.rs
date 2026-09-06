@@ -314,7 +314,10 @@ fn parse_since(text: &str) -> Option<u64> {
             },
         },
     };
-    digits.parse::<u64>().ok().map(|n| n * multiplier)
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
 }
 
 /// Validates a supplied `--since` up front, before any ledger row is read.
@@ -820,5 +823,15 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("claude"), "got {text}");
         assert!(text.contains("$3.00"), "1M input tokens @ $3/M: {text}");
+    }
+
+    /// D-9: the unit multiplier overflowed `u64` on an absurd `--since`,
+    /// which panics in a debug build instead of reporting the value as
+    /// unparseable.
+    #[test]
+    fn an_overflowing_since_is_rejected_not_overflowed() {
+        assert_eq!(parse_since("999999999999999d"), None);
+        assert_eq!(parse_since("18446744073709551615h"), None);
+        assert_eq!(parse_since("24h"), Some(86_400));
     }
 }

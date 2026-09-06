@@ -2728,6 +2728,11 @@ pub fn run_with<W: Write>(
         .then(|| env(adapters::AGENT_ENV))
         .flatten();
 
+    // The delegating session's own registry row is not capacity this
+    // delegation has to compete with -- `pool.rs` and `rollover.rs` already
+    // excluded it, and without it here a `fallback.harness.<name>.max_active
+    // = 1` read as permanently `Draining` for that harness's own dispatches.
+    let requester = super::mail::session_identity(env);
     let route_request = super::fallback::RouteRequest {
         requested: &args.name,
         source_model: requested_model,
@@ -2736,6 +2741,7 @@ pub fn run_with<W: Write>(
         bounds,
         now,
         exclude: same_harness_exclude.as_deref(),
+        requester: requester.as_deref(),
     };
     let route = super::fallback::route_new_delegation(&state, &cfg, route_request, args.force);
     let mut routed_args = args.clone();
@@ -4455,6 +4461,7 @@ mod tests {
                     },
                     now,
                     exclude: None,
+                    requester: None,
                 },
                 false,
             ),

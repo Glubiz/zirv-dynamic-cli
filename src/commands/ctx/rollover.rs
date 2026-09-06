@@ -294,7 +294,7 @@ pub fn evaluate(
     if !cfg.fallback.enabled {
         return Evaluation::Skip("cross-harness fallback is disabled".to_string());
     }
-    if !cfg.fallback.auto_orchestrator_rollover {
+    if !cfg.auto_orchestrator_rollover() {
         return Evaluation::Skip("automatic orchestrator rollover is disabled".to_string());
     }
     if current.pinned {
@@ -391,6 +391,37 @@ pub fn evaluate(
         });
     }
 
+    // The other half of the balancing loop: nothing here ever returned the
+    // seat to the operator's primary harness once its own window reset --
+    // `evaluate` only triggered on the CURRENT seat's own pressure, and
+    // `on_resume` only fires for a seat that was actually parked, so a seat
+    // that rolled onto codex stayed there indefinitely. A seat sitting on a
+    // fallback harness reclaims `fallback.order[0]` once that primary reads
+    // `Ready` on a MEASURED (fresh, not `overage_covered`, never assumed)
+    // window with at least `min_candidate_headroom_pct` more projected
+    // headroom than the seat it would take back. Same idle boundary and
+    // cooldown as the proactive path: a reclaim is a convenience, never an
+    // emergency.
+    let reclaim = cfg
+        .fallback
+        .order
+        .first()
+        .filter(|primary| !primary.eq_ignore_ascii_case(&current.agent))
+        .and_then(|primary| snapshot.harness(primary))
+        .filter(|harness| harness.state == HarnessState::Ready)
+        .and_then(|harness| snapshot.provider(&harness.provider))
+        .filter(|provider| {
+            provider
+                .binding
+                .and_then(|i| provider.windows.get(i))
+                .is_some_and(|window| !window.stale && !window.overage_covered)
+        })
+        .and_then(|provider| allocator::projected_headroom(provider, cfg, 0))
+        .zip(source_headroom_pct)
+        .is_some_and(|(primary_pct, seat_pct)| {
+            primary_pct >= seat_pct + cfg.fallback.min_candidate_headroom_pct
+        });
+
     let binding_window = fresh.map(|window| window.window.clone());
     let reserved_tokens = source.map(|provider| provider.reserved_tokens).unwrap_or(0);
     let base = PoolEvent {
@@ -419,8 +450,9 @@ pub fn evaluate(
         source_headroom_pct,
         source_observed_at,
         source_hard_blocked,
-        auto_enabled: cfg.fallback.auto_orchestrator_rollover,
+        auto_enabled: cfg.auto_orchestrator_rollover(),
         idle,
+        reclaim,
         candidates: &candidates,
     };
     let trigger_cause = if source_hard_blocked {
@@ -437,6 +469,12 @@ pub fn evaluate(
                 headroom_pct,
                 observed_at: source_observed_at,
             })
+            .or_else(|| {
+                reclaim.then(|| seat::Cause::Reclaim {
+                    headroom_pct: source_headroom_pct.unwrap_or(0.0),
+                    observed_at: source_observed_at,
+                })
+            })
     };
 
     match seat::decide(&inputs, cfg) {
@@ -446,6 +484,7 @@ pub fn evaluate(
             cause,
         } => {
             let reactive = matches!(cause, seat::Cause::Reactive { .. });
+            let reclaimed = matches!(cause, seat::Cause::Reclaim { .. });
             match seat::prepare(
                 state,
                 seat_short,
@@ -470,6 +509,10 @@ pub fn evaluate(
                             generation: Some(generation),
                             reason: if reactive {
                                 "source harness is hard-blocked".to_string()
+                            } else if reclaimed {
+                                "reclaim primary: the primary harness has recovered more \
+                                 headroom than the current seat"
+                                    .to_string()
                             } else {
                                 "source harness is at or below the rollover headroom threshold"
                                     .to_string()
@@ -576,6 +619,7 @@ fn park_for_reset(
             },
             now,
             exclude: None,
+            requester: None,
         },
         &visited,
     ) else {
@@ -956,7 +1000,7 @@ mod tests {
             ..CtxConfig::default()
         };
         cfg.pace.estimator = false;
-        cfg.fallback.auto_orchestrator_rollover = true;
+        cfg.fallback.auto_orchestrator_rollover = Some(true);
         cfg.fallback.orchestrator_rollover_headroom_pct = Some(20.0);
         cfg.fallback.min_candidate_headroom_pct = 10.0;
         cfg
@@ -1333,13 +1377,13 @@ mod tests {
         store_usage(&state, "anthropic", 85.0, NOW);
         store_usage(&state, "openai", 5.0, NOW);
 
-        cfg.fallback.auto_orchestrator_rollover = false;
+        cfg.fallback.auto_orchestrator_rollover = Some(false);
         assert!(matches!(
             evaluate_now(&state, &cfg, true, None),
             Evaluation::Skip(_)
         ));
 
-        cfg.fallback.auto_orchestrator_rollover = true;
+        cfg.fallback.auto_orchestrator_rollover = Some(true);
         cfg.fallback.enabled = false;
         assert!(matches!(
             evaluate_now(&state, &cfg, true, None),
@@ -1427,6 +1471,102 @@ mod tests {
             second.matches(PLAN_CHANGED).count(),
             1,
             "an unchanged plan must not be logged again"
+        );
+    }
+
+    fn register_codex_seat(state: &StateDir) {
+        seat::register(
+            state,
+            SHORT,
+            SESSION,
+            "codex",
+            None,
+            "openai",
+            "orchestrator",
+            false,
+            NOW,
+        )
+        .expect("register seat");
+    }
+
+    /// D-4: nothing ever returned the seat to `fallback.order[0]` once that
+    /// harness's own window reset -- `evaluate` triggered only on the
+    /// CURRENT seat's own pressure, and `on_resume` only fires for a seat
+    /// that was parked. Work stayed on codex forever after one rollover.
+    #[test]
+    fn a_recovered_primary_reclaims_the_seat_from_its_fallback() {
+        let (_dir, state) = temp_state();
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let cfg = cfg();
+        register_codex_seat(&state);
+        store_usage(&state, "anthropic", 5.0, NOW);
+        store_usage(&state, "openai", 40.0, NOW);
+
+        let Evaluation::Rollover { request, .. } = evaluate_now(&state, &cfg, true, None) else {
+            panic!("a primary whose window has reset must reclaim the seat");
+        };
+        assert_eq!(request.target_agent, "claude");
+        assert!(request.automatic);
+    }
+
+    /// A seat already sitting on the primary never "reclaims" it: the
+    /// reclaim trigger must not fire for `order[0]` itself, or every healthy
+    /// orchestrator would evaluate a rollover onto itself.
+    #[test]
+    fn a_seat_already_on_the_primary_never_reclaims() {
+        let (_dir, state) = temp_state();
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let cfg = cfg();
+        register_seat(&state);
+        store_usage(&state, "anthropic", 5.0, NOW);
+        store_usage(&state, "openai", 1.0, NOW);
+
+        assert!(matches!(
+            evaluate_now(&state, &cfg, true, None),
+            Evaluation::Skip(_)
+        ));
+    }
+
+    /// The operator's decision reversing issue #358 (d): automatic
+    /// orchestrator rollover is ON by default whenever more than one harness
+    /// is enabled.
+    #[test]
+    fn automatic_rollover_is_on_by_default_with_two_enabled_harnesses() {
+        let (_dir, state) = temp_state();
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let mut cfg = cfg();
+        cfg.fallback.auto_orchestrator_rollover =
+            CtxConfig::default().fallback.auto_orchestrator_rollover;
+        register_seat(&state);
+        store_usage(&state, "anthropic", 85.0, NOW);
+        store_usage(&state, "openai", 5.0, NOW);
+
+        assert!(
+            matches!(
+                evaluate_now(&state, &cfg, true, None),
+                Evaluation::Rollover { .. }
+            ),
+            "an unconfigured two-harness roster rolls over automatically"
+        );
+    }
+
+    /// D-10 probe: `successor_readiness`'s two branches are genuinely
+    /// distinct, and a signal-less adapter is judged on quiescence alone.
+    #[test]
+    fn a_signal_less_successor_is_judged_on_quiescence_alone() {
+        let timeout = Duration::from_secs(60);
+        assert_eq!(
+            successor_readiness(true, false, false, true, Duration::from_secs(1), timeout),
+            Readiness::Ready,
+            "a signal-less adapter never reports a turn; quiescence is its only evidence"
+        );
+        assert_eq!(
+            successor_readiness(true, true, false, true, Duration::from_secs(1), timeout),
+            Readiness::Waiting,
+            "a signal-carrying adapter waits for its own signal, not for quiet"
         );
     }
 }

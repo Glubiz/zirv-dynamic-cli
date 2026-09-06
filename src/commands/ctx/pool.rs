@@ -136,6 +136,9 @@ fn cause_label(cause: &seat::Cause) -> String {
             format!("proactive ({headroom_pct:.1}% headroom)")
         }
         seat::Cause::Reactive { detail, .. } => format!("reactive: {detail}"),
+        seat::Cause::Reclaim { headroom_pct, .. } => {
+            format!("reclaim primary (seat was at {headroom_pct:.1}% headroom)")
+        }
         seat::Cause::Manual => "manual".to_string(),
     }
 }
