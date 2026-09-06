@@ -3228,31 +3228,57 @@ fn is_destructive_orchestrator_action(command: &str) -> bool {
             matches!(action.to_ascii_lowercase().as_str(), "uninstall" | "delete")
         }),
         "docker" => {
-            let prune = lower.windows(2).any(|pair| {
-                matches!(
-                    pair[0].as_str(),
-                    "system" | "builder" | "container" | "image" | "network" | "volume"
-                ) && pair[1] == "prune"
-            });
+            let noun_verb = |verb: &str| {
+                lower.windows(2).any(|pair| {
+                    matches!(
+                        pair[0].as_str(),
+                        "system" | "builder" | "container" | "image" | "network" | "volume"
+                    ) && pair[1] == verb
+                })
+            };
+            // A5 (2026-09-06 audit): a named `rm` tears the resource down as
+            // irrecoverably as the `prune` beside it, and a FORCED top-level
+            // `rm`/`rmi` removes a running container or an in-use image the
+            // daemon would otherwise have refused. A plain `docker rm <id>`
+            // of a stopped container stays silent -- that is ordinary
+            // cleanup the daemon itself already guards.
+            let forced_removal = first_positional(&tokens, &[])
+                .is_some_and(|action| matches!(action.to_ascii_lowercase().as_str(), "rm" | "rmi"))
+                && lower
+                    .iter()
+                    .any(|token| matches!(token.as_str(), "-f" | "--force"));
             let compose_volumes = lower.first().is_some_and(|token| token == "compose")
                 && lower.iter().any(|token| token == "down")
                 && lower
                     .iter()
                     .any(|token| matches!(token.as_str(), "-v" | "--volumes"));
-            prune || compose_volumes
+            noun_verb("prune") || noun_verb("rm") || forced_removal || compose_volumes
         }
-        "aws" => lower.iter().any(|token| {
-            [
-                "delete-",
-                "terminate-",
-                "deregister-",
-                "disable-",
-                "remove-",
-                "revoke-",
-            ]
-            .iter()
-            .any(|prefix| token.starts_with(prefix))
-        }),
+        "aws" => {
+            // A5: `s3 rb` removes a bucket and `s3 rm --recursive` empties a
+            // prefix; neither spells a `delete-`/`terminate-` verb, so the
+            // prefix scan below never saw them. A single-object `s3 rm` and
+            // every read verb stay silent.
+            let s3_verb = |verb: &str| {
+                lower
+                    .windows(2)
+                    .any(|pair| pair[0] == "s3" && pair[1] == verb)
+            };
+            s3_verb("rb")
+                || (s3_verb("rm") && lower.iter().any(|token| token == "--recursive"))
+                || lower.iter().any(|token| {
+                    [
+                        "delete-",
+                        "terminate-",
+                        "deregister-",
+                        "disable-",
+                        "remove-",
+                        "revoke-",
+                    ]
+                    .iter()
+                    .any(|prefix| token.starts_with(prefix))
+                })
+        }
         "az" | "gcloud" => lower
             .iter()
             .any(|token| matches!(token.as_str(), "delete" | "purge" | "destroy" | "remove")),
@@ -11509,6 +11535,45 @@ mod tests {
             Verdict::Ask,
             "powershell -Command must be unwrapped"
         );
+    }
+
+    /// A5 (2026-09-06 audit): the docker arm knew only `* prune` and
+    /// `compose down -v`, and the aws arm only the `delete-`/`terminate-`
+    /// verb prefixes, so the ordinary teardown spellings ran silently while
+    /// [[Command Safety]] promised "destructive Docker pruning/volume
+    /// teardown, cloud delete/terminate families ... ask".
+    #[test]
+    fn docker_and_aws_teardown_verbs_ask_like_their_prune_siblings() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "docker volume rm data",
+            "docker network rm bridge0",
+            "docker image rm app:latest",
+            "docker container rm web",
+            "docker rm -f c",
+            "docker rmi --force i",
+            "aws s3 rb s3://bucket --force",
+            "aws s3 rm s3://bucket --recursive",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Ask,
+                "{command} tears down state the same way a prune does"
+            );
+        }
+        for command in [
+            "docker ps -a",
+            "docker volume ls",
+            "docker rm c",
+            "aws s3 ls",
+            "aws s3 cp report.json s3://bucket/report.json",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command} is an ordinary read or a recoverable single-object action"
+            );
+        }
     }
 
     /// A4 (2026-09-06 audit): `unwrap_env_prefix` saw through `env` and bare
