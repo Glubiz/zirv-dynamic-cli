@@ -134,10 +134,12 @@ having a separate one, not a bug in the alias routing itself.
 - **`zirv chat`** — the same interactive orchestrator session the bare
   invocation starts.
 - **`zirv agent <name> <prompt> [-- flags]`** — delegates one task to a
-  supervised headless worker on another enabled harness: the same pacing,
-  rot detection and restart-with-handoff behavior `zirv ctx exec` gives a
-  hand-written invocation, as one command. Pass `-` as the prompt to read it
-  from stdin instead.
+  supervised worker on another enabled harness: the same pacing, rot
+  detection and restart-with-handoff behavior `zirv ctx exec` gives a
+  hand-written invocation, as one command. It lands in a dashboard pane
+  whenever a dashboard is live on this machine, and runs inline in this
+  terminal (announced in one line) when none is. Pass `-` as the prompt to
+  read it from stdin instead.
 
 #### Nested sessions are refused
 
@@ -161,7 +163,7 @@ which eventually verdicts a restart and ends the session the human was
 actually talking to. Pass `--allow-nested`, or set `ZIRV_ALLOW_NESTED=true`,
 if you mean it.
 
-The **headless** verbs — `zirv ctx exec`, `zirv ctx loop` and `zirv agent` —
+The **delegating** verbs — `zirv ctx exec`, `zirv ctx loop` and `zirv agent` —
 are deliberately *not* gated: delegating a task to a worker from inside a
 session is exactly what they are for, and a worker never takes the shared
 console over. Each of them still scrubs `ZIRV_CTX_SESSION`,
@@ -181,12 +183,15 @@ to the single-pane `wrap` session instead, with a one-line notice naming the
 floor; `--simple` skips the dashboard entirely.
 
 The first pane is always the orchestrator you are talking to. Further panes
-come from the `s` (spawn) dashboard command, or from a `zirv ctx agent`
-invocation run *inside* one of the dashboard's own panes, which asks the
-dashboard to open a fresh pane rather than running headless — an untrusted
-request the dashboard re-validates against live configuration (pane cap,
-adapter gate, working-directory match) before honoring it, never treated as
-authority on its own. Every live pane and its role are tracked in the same
+come from the `s` (spawn) dashboard command, or from any `zirv ctx agent`
+invocation on this machine — inside one of the dashboard's own panes, or from
+a plain terminal that simply found this dashboard live — which asks the
+dashboard to open a fresh pane rather than supervising the child itself. That
+is an untrusted request the dashboard re-validates against live configuration
+(pane cap, adapter gate, working-directory match) before honoring it, never
+treated as authority on its own; a request that arrives through the drop
+directory also has its widening fields (`force`, trailing harness flags)
+stripped before anything reads them. Every live pane and its role are tracked in the same
 session registry `zirv ctx status` reports (see [Session registry and
 nudging](#session-registry-and-nudging) above), so `zirv ctx nudge`/`zirv ctx
 send --to-session` can address one pane directly.
@@ -1099,7 +1104,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
 | `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat |
-| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised headless worker on another enabled harness (also `zirv agent`) |
+| `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal (also `zirv agent`) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
 | `zirv ctx nudge <prefix> --message <text>` | Wakes a live supervised session early with a message, instead of waiting for it to poll |
 | `zirv ctx remember --key <k> --text <t>` / `zirv ctx recall` / `zirv ctx forget <k>` | Reads and writes this repo's cross-session memory bank |
@@ -1504,7 +1509,29 @@ and forgets it on a restart because the fresh session writes a new file. Set
 survives restarts, which is what you want when the agent's hook cannot report
 one, and what tests use.
 
-### Headless supervision
+### Inline supervision
+
+A supervised run is either a **dashboard pane** — visible in a sidebar, its
+result mailed back — or an **inline** run in the terminal that started it.
+Those are the only two shapes; there is no invisible stdout-captured child.
+
+`zirv ctx exec` and `zirv ctx loop` are always inline: they supervise a child
+in this terminal, by definition. `zirv agent` chooses: if any dashboard is
+live on this machine it asks that dashboard for a pane — preferring the one
+you were launched from, then one already hosting this repository, then any
+live one — and prints the pane's short id. If none is live it says so in one
+line and supervises the child right here:
+
+```
+zirv ctx agent: no live dashboard -- running codex inline in this terminal
+```
+
+It never refuses, and it never launches a dashboard of its own. A pane carries
+everything a delegation asks for except a tool-call ceiling (no verified
+counter) and trailing `-- <flags>` beyond a `--model` pin (they would become
+argv on the pane's own harness child, and a spawn request is untrusted data);
+both are announced on stderr rather than dropped silently. `--timeout-secs`
+and `--max-restarts` are honoured either way.
 
 ```bash
 zirv ctx exec --prompt "$PROMPT" -- claude -p "$PROMPT" --session-id "$SID"
@@ -1530,7 +1557,7 @@ zirv ctx exec --agent claude --prompt "$PROMPT" -- --model opus  # extra flags
 This is what a YAML agent step uses, and it is why a prompt that happens to
 begin with `-` or to look like a flag is still just a prompt.
 
-### Exit codes for headless supervision
+### Exit codes for supervised runs
 
 | Code | Meaning |
 |---|---|
@@ -1878,12 +1905,18 @@ all, shipped default included. Supervision, pacing and hooks are unaffected.
 Whether a prompt was injected, and from which layers, is recorded in the decision
 log at every session start.
 
-### Low-noise interactive, fail-closed headless
+### Low-noise interactive, fail-closed unattended
+
+"Headless" here is a **launch mode** — whether a human is present to answer a
+permission prompt — not a spawn topology. `zirv chat`, `zirv ctx wrap` and a
+pane a human spawned from the dashboard's own overlay are *interactive*;
+`zirv ctx exec`, `zirv ctx loop`, `zirv agent` and any pane spawned by a
+request nobody vouched for are *headless*, however visible they are on screen.
 
 The permission rule is simple: **everyday and unknown commands run silently in
 an interactive session; a short list of genuinely dangerous commands prompts;
 a shorter irreversible, credential-exfiltrating, or zirv-self-destructive list
-is refused outright. Headless sessions stay fail-closed because nobody is
+is refused outright. Headless launches stay fail-closed because nobody is
 present to answer.** This is a launch-flag/hook layer, not injected instruction
 text, so `--simple` does not remove it—only `--no-supervise` (pure passthrough)
 or the explicit opt-out below do.

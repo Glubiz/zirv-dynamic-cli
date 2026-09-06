@@ -2616,6 +2616,50 @@ fn enforce_pane_token_budgets_with<F>(
     }
 }
 
+/// 2026-09-06: the pane-side mirror of `exec::run_with`'s wall clock. A
+/// delegation that asked for `--timeout-secs` used to hard-error rather than
+/// spawn a pane at all; it spawns one now, and this is what makes the ceiling
+/// real. Runs on the same [`FACTS_THROTTLE`] cadence as the token-budget
+/// sweep beside it -- a wall clock measured to the second does not need the
+/// render loop's tick rate -- and reports each stop exactly once, because
+/// `Pane::enforce_deadline` disarms the deadline in the same step.
+fn enforce_pane_deadlines(
+    panes: &mut [Pane],
+    cfg: &CtxConfig,
+    errors: &mut ErrorLog,
+    last_sweep: &mut Instant,
+    now: Instant,
+) {
+    if !due(*last_sweep, now, FACTS_THROTTLE) {
+        return;
+    }
+    *last_sweep = now;
+    for pane in panes {
+        if pane.deadline().is_none() {
+            continue;
+        }
+        let quit_sequence = adapters::select(Some(pane.agent()), &[], cfg)
+            .map(|adapter| adapter.quit_sequence().to_string())
+            .unwrap_or_default();
+        match pane.enforce_deadline(now, &quit_sequence) {
+            Ok(true) => push_error(
+                errors,
+                format!(
+                    "pane '{}' ({}) outran its --timeout-secs; stopped with exit {}",
+                    pane.title(),
+                    pane.short(),
+                    super::exec::EXIT_TIMEOUT
+                ),
+            ),
+            Ok(false) => {}
+            Err(e) => push_error(
+                errors,
+                format!("pane '{}' timeout enforcement failed: {e}", pane.short()),
+            ),
+        }
+    }
+}
+
 fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, repo: &Path) {
     let Some(usage) = pane_transcript_usage(pane, cfg, repo) else {
         return;
@@ -4140,6 +4184,12 @@ fn build_turn_env(
     mode: adapters::LaunchMode,
 ) -> (Vec<(String, String)>, Option<String>) {
     let pin = adapters::launch_mode_pin_env(mode);
+    // 2026-09-06: the mirror marker. A pane nobody vouched for is
+    // `LaunchMode::Headless` -- fail-closed on permission prompts -- and
+    // `workflow::engine::refusal_for` must read it the same way it reads an
+    // `exec` child's, or the interactive `brainstorm` skill runs in a pane
+    // with nobody able to answer it.
+    let headless = adapters::headless_marker_env(mode);
     match adapters::select(Some(agent_name), &[], cfg) {
         Ok(adapter) => {
             let socket = state.socket_for(session_id);
@@ -4171,11 +4221,17 @@ fn build_turn_env(
             if let Some(pair) = pin {
                 env.push(pair);
             }
+            if let Some(pair) = headless {
+                env.push(pair);
+            }
             (env, None)
         }
         Err(e) => {
             let mut env = vec![(adapters::AGENT_ENV.to_string(), agent_name.to_string())];
             if let Some(pair) = pin {
+                env.push(pair);
+            }
+            if let Some(pair) = headless {
                 env.push(pair);
             }
             (
@@ -4622,7 +4678,7 @@ fn worker_pane_extra_args(
     extra.extend(adapters::policy_launch_args(
         cfg,
         adapter,
-        &[],
+        &req.flags,
         // Real signal, not an assumed one (2026-08-24 hardening): only a
         // request that can vouch a human is present gets the permissive
         // interactive posture; a scripted/headless spawn fails closed.
@@ -4632,9 +4688,56 @@ fn worker_pane_extra_args(
             adapters::LaunchMode::Headless
         },
     ));
+    // 2026-09-06: the trailing `-- <flags>` the requester typed, in the same
+    // position `agent::worker_launch_flags` puts them for an inline
+    // supervised child (after the policy baseline, so an explicit pin wins).
+    // Empty for every request that arrived through the file-backed drop
+    // directory -- `sanitize_file_dropped_request` clears them there, because
+    // these become argv on this pane's real harness child.
+    extra.extend(req.flags.iter().cloned());
+    // 2026-09-06: `--mode read-only` is a NARROWING the pane must apply
+    // itself. It used to reach the pane only as a `Delegation::mode` label
+    // while the actual read-only argv travelled in the requester's trailing
+    // flags -- which a pane cannot carry across an untrusted channel, so a
+    // read-only delegation that landed on a pane silently ran writable.
+    // Appended last, after any operator flag, exactly as `workflow::review::
+    // reviewer_argv` appends its own floor: no argument may weaken it.
+    if req.mode == super::permit::WorkerMode::ReadOnly
+        && let Some(read_only) = adapters::read_only_args_for_agent_name(adapter.name())
+    {
+        extra.extend(read_only);
+    }
     extra.extend(adapter.extra_writable_root_args(&req.cwd, &state.mail()));
     extra.extend(pane_launch_extra(adapter, prompt_args, session_id));
     extra
+}
+
+/// Strips every WIDENING field from a request that arrived through the
+/// file-backed drop directory, before anything reads it.
+///
+/// A `SpawnRequest` is untrusted JSON: the requests directory is
+/// capability-protected by an unguessable token, not authenticated, and a
+/// same-uid sibling pane can enumerate and write into a channel it was never
+/// invited into (issue #179, accepted). Fields that only ever NARROW what a
+/// pane may do (`max_restarts`/`timeout_secs`/`max_tool_calls`, `mode`,
+/// `path_scope`, `no_network`, `depth`) are safe to honour from such a drop
+/// and are left alone. Two are not:
+///
+/// * `force` (dash review A2-2) suppresses this dashboard's own cross-harness
+///   rerouting and its spend gate, so a forged `"force": true` bought a
+///   placement the operator never asked for. Only the in-process Spawn
+///   overlay -- which builds its request in memory this instant -- may set it.
+/// * `flags` become argv tokens on the pane's real harness child, which is
+///   the whole permission posture. The one flag that survives is the model
+///   pin, and it travels separately in `model` (re-checked by
+///   `pane_model_args`), so clearing this loses nothing a pane could safely
+///   have honoured anyway.
+///
+/// Pure, so the rule is testable without a live dashboard.
+fn sanitize_file_dropped_request(mut req: spawnreq::SpawnRequest) -> spawnreq::SpawnRequest {
+    req.force = false;
+    req.flags.clear();
+    req
 }
 
 /// The `LaunchMode` [`fulfill_spawn_request`] feeds to `build_turn_env` for
@@ -5999,6 +6102,23 @@ fn fulfill_spawn_request(
     pane.set_intake_dir(pane_channel);
     pane.set_work_group_id(req.work_group_id.clone());
     pane.set_budget_tokens(budget_tokens);
+    // 2026-09-06: the requester's own `--timeout-secs`, armed from the moment
+    // the child actually exists. `--max-restarts` needs nothing here -- a
+    // pane's child is never restarted by zirv, so any restart budget is
+    // already satisfied -- and `--max-tool-calls` is reported just below
+    // rather than enforced, because a pane has no verified tool-call counter.
+    pane.set_timeout(Instant::now(), req.timeout_secs);
+    if let Some(calls) = req.max_tool_calls {
+        push_error(
+            errors,
+            format!(
+                "pane '{}' ({}) cannot enforce --max-tool-calls {calls} (no verified tool-call \
+                 counter); its token budget still applies",
+                pane.title(),
+                pane.short()
+            ),
+        );
+    }
     pane.set_reservation_id(reservation_id.clone());
     // Issue #249: the same server-verified value just pushed into this
     // pane's own `turn_env` above, stored here too so this dashboard's own
@@ -6157,6 +6277,10 @@ fn drain_one_channel(
 ) {
     let batch = claim_batch(spawnreq::take_requests(dir));
     for (stem, req) in batch {
+        // 2026-09-06: every request in this loop came off the file-backed
+        // drop directory, so its widening fields are stripped before
+        // anything below reads them -- see `sanitize_file_dropped_request`.
+        let req = sanitize_file_dropped_request(req);
         // `FILE_DROP_TRUSTED_INTERACTIVE` (never a bare `false`, on purpose
         // -- a named constant is harder to accidentally swap for
         // `req.interactive` in a future edit than a literal in a long
@@ -9294,6 +9418,11 @@ pub fn run_dashboard(
     let mut last_budget_sweep = Instant::now()
         .checked_sub(FACTS_THROTTLE)
         .unwrap_or_else(Instant::now);
+    // 2026-09-06: the wall-clock sweep beside it, on the same cadence and
+    // seeded the same way.
+    let mut last_deadline_sweep = Instant::now()
+        .checked_sub(FACTS_THROTTLE)
+        .unwrap_or_else(Instant::now);
     // Task B: per-pane dedup for the orchestrator mail advisory
     // (`advise_one_pane`), keyed by a pane's own zirv session id. Lives for
     // the whole dashboard run, not just one tick, so an unchanged inbox is
@@ -9379,6 +9508,13 @@ pub fn run_dashboard(
             repo,
             &mut errors,
             &mut last_budget_sweep,
+            Instant::now(),
+        );
+        enforce_pane_deadlines(
+            &mut panes,
+            cfg,
+            &mut errors,
+            &mut last_deadline_sweep,
             Instant::now(),
         );
         // R2: an exited pane leaves here -- registry record released, socket
@@ -9966,6 +10102,16 @@ pub fn run_dashboard(
                                                     path_scope: Vec::new(),
                                                     no_network: false,
                                                     depth: None,
+                                                    // The overlay asks for an
+                                                    // agent and a prompt: no
+                                                    // supervision ceilings and
+                                                    // no trailing flags, the
+                                                    // same as before those
+                                                    // fields existed.
+                                                    max_restarts: None,
+                                                    timeout_secs: None,
+                                                    max_tool_calls: None,
+                                                    flags: Vec::new(),
                                                 };
                                                 let panes_before_spawn = panes.len();
                                                 // `trusted_interactive: true` --
@@ -15976,6 +16122,10 @@ mod tests {
             path_scope: Vec::new(),
             no_network: false,
             depth: None,
+            max_restarts: None,
+            timeout_secs: None,
+            max_tool_calls: None,
+            flags: Vec::new(),
         }
     }
 
@@ -17903,15 +18053,15 @@ mod tests {
         );
     }
 
-    /// A2-2: `req.force` is NOT inert on this path. It flows straight into
+    /// A2-2, FLIPPED 2026-09-06: `req.force` used to flow straight into
     /// `fallback::route_new_delegation`, whose first line returns `None` for
-    /// a forced request, so a request carrying `"force": true` skips the
-    /// cross-harness rerouting its unforced sibling above receives. Pinned
-    /// here because the request is FILE-DROPPED and therefore untrusted: the
-    /// same field a trusted `--force` sets is settable by whatever dropped
-    /// the JSON.
+    /// a forced request -- so a file-dropped `"force": true`, forgeable by
+    /// anything that could reach the requests directory, bought a placement
+    /// on the requested harness by suppressing this dashboard's own
+    /// cross-harness reroute. `sanitize_file_dropped_request` now clears it,
+    /// so such a request is rerouted exactly like its unforced sibling above.
     #[test]
-    fn a_forced_spawn_request_skips_the_cross_harness_reroute() {
+    fn a_file_dropped_forced_spawn_request_no_longer_skips_the_cross_harness_reroute() {
         let repo = std::env::current_dir().expect("cwd");
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -17976,10 +18126,23 @@ mod tests {
         };
         cfg.pace.estimator = false;
 
-        let mut req = spawn_request("do the work", &repo);
-        req.agent = "claude".to_string();
-        req.work_group_id = Some("wg-forced-route".to_string());
-        req.force = true;
+        let mut dropped = spawn_request("do the work", &repo);
+        dropped.agent = "claude".to_string();
+        dropped.work_group_id = Some("wg-forced-route".to_string());
+        dropped.force = true;
+        dropped.flags = vec!["--dangerously-skip-permissions".to_string()];
+
+        let req = sanitize_file_dropped_request(dropped);
+        assert!(
+            !req.force,
+            "a file-dropped request may not carry an operator override"
+        );
+        assert!(
+            req.flags.is_empty(),
+            "and it may not put argv on the pane's harness child either: {:?}",
+            req.flags
+        );
+
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = ErrorLog::default();
@@ -18005,12 +18168,68 @@ mod tests {
             refusal.reason
         );
         assert!(
-            !errors
+            errors
                 .iter()
                 .any(|line| line.contains("dashboard spawn automatically routed")),
-            "an untrusted force skips the reroute the unforced request gets: {errors:?}"
+            "the reroute a forged force used to suppress must now happen: {errors:?}"
         );
         assert!(panes.is_empty(), "nothing spawned either way");
+    }
+
+    /// The other half of the trust rule: fields that can only ever NARROW
+    /// what a pane may do survive a file drop untouched. Clearing them would
+    /// hand a forged request MORE room than an honest one, which is the
+    /// opposite of fail-closed.
+    #[test]
+    fn a_file_drop_keeps_every_narrowing_field_it_carried() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut dropped = spawn_request("go", tmp.path());
+        dropped.max_restarts = Some(1);
+        dropped.timeout_secs = Some(120);
+        dropped.max_tool_calls = Some(9);
+        dropped.mode = super::super::permit::WorkerMode::ReadOnly;
+        dropped.no_network = true;
+        dropped.depth = Some(0);
+
+        let req = sanitize_file_dropped_request(dropped);
+
+        assert_eq!(req.max_restarts, Some(1));
+        assert_eq!(req.timeout_secs, Some(120));
+        assert_eq!(req.max_tool_calls, Some(9));
+        assert_eq!(req.mode, super::super::permit::WorkerMode::ReadOnly);
+        assert!(req.no_network);
+        assert_eq!(req.depth, Some(0));
+    }
+
+    /// 2026-09-06: `--mode read-only` used to reach a pane as a label while
+    /// the actual read-only argv travelled in the requester's trailing flags
+    /// -- which a pane cannot carry across an untrusted channel, so a
+    /// read-only delegation fulfilled by a pane silently ran writable. The
+    /// pane applies the adapter's own floor itself now.
+    #[test]
+    fn a_read_only_request_gets_the_adapters_read_only_floor_on_the_pane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let adapter = adapters::select(Some("claude"), &[], &cfg).expect("claude adapter");
+        let floor = "--disallowedTools=Write,Edit,Bash,NotebookEdit";
+
+        let mut req = spawn_request("go", tmp.path());
+        req.mode = super::super::permit::WorkerMode::ReadOnly;
+        let read_only =
+            worker_pane_extra_args(&req, &cfg, adapter.as_ref(), Vec::new(), "sess", &state);
+        assert!(
+            read_only.iter().any(|arg| arg == floor),
+            "the read-only floor must reach the pane's own argv: {read_only:?}"
+        );
+
+        req.mode = super::super::permit::WorkerMode::Writing;
+        let writing =
+            worker_pane_extra_args(&req, &cfg, adapter.as_ref(), Vec::new(), "sess", &state);
+        assert!(
+            !writing.iter().any(|arg| arg == floor),
+            "an ordinary writing worker is unaffected: {writing:?}"
+        );
     }
 
     /// Issue #230 item 3 (F2, review round): a REROUTED spawn's capability
@@ -19194,10 +19413,12 @@ mod tests {
     /// `req.force` set, exactly as an unforced request already does (the
     /// sibling tests above).
     ///
-    /// A2-2: `force` is NOT inert on the path as a whole. It still reaches
-    /// `fallback::route_new_delegation`, where it suppresses the
-    /// cross-harness reroute -- see
-    /// `a_forced_spawn_request_skips_the_cross_harness_reroute`.
+    /// A2-2 (2026-09-06): `force` reaching `fallback::route_new_delegation`
+    /// at all is now a property of the TRUSTED in-process path only --
+    /// `sanitize_file_dropped_request` clears it off every file drop, see
+    /// `a_file_dropped_forced_spawn_request_no_longer_skips_the_cross_
+    /// harness_reroute`. This test calls `fulfill_spawn_request` directly,
+    /// standing in for that trusted overlay path.
     #[test]
     fn fulfill_spawn_request_spawns_the_pane_regardless_of_force_once_usage_is_at_the_ceiling() {
         let repo = std::env::current_dir().expect("cwd");

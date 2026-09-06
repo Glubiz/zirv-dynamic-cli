@@ -30,10 +30,12 @@ use super::super::state::StateDir;
 
 /// Exported into every pane's own `turn_env`: names the directory a pane's
 /// own `zirv ctx agent` invocation writes a [`SpawnRequest`] into.
-/// Deliberately absent for any process outside a dashboard pane, so
-/// `agent.rs`'s own headless path is unaffected when this is unset -- see
-/// `sessions::nested_session_evidence`, which also treats a *set* value of
-/// this variable as proof a dashboard pane owns this terminal, alongside
+/// Deliberately absent for any process outside a dashboard pane -- which is
+/// a PREFERENCE, not a precondition: `agent::live_join_target` falls back to
+/// scanning `<state>/dash/*` for any live dashboard when this is unset, so a
+/// delegation issued from a plain terminal still lands in a visible pane.
+/// See also `sessions::nested_session_evidence`, which treats a *set* value
+/// of this variable as proof a dashboard pane owns this terminal, alongside
 /// `ZIRV_CTX_SESSION`/`ZIRV_CTX_SOCKET`.
 pub const DASH_REQUESTS_ENV: &str = "ZIRV_CTX_DASH_REQUESTS";
 
@@ -121,6 +123,12 @@ pub struct SpawnRequest {
     /// land on a live dashboard. `#[serde(default)]` makes `false` (no
     /// override) what an older request deserialises to, the same
     /// fail-closed default `interactive` above already establishes.
+    ///
+    /// Dash review A2-2 (2026-09-06): WIDENING, so it is cleared by `dash::
+    /// mod::sanitize_file_dropped_request` for every request that arrived
+    /// through the file-backed drop directory -- a forged `"force": true`
+    /// used to suppress this dashboard's own cross-harness rerouting. Only
+    /// the in-process Spawn overlay may set it.
     #[serde(default)]
     pub force: bool,
     /// Issue #228: a harness-agnostic `--workdir`, independent of `cwd`
@@ -185,6 +193,41 @@ pub struct SpawnRequest {
     /// Issue #262: mirrors `agent::AgentArgs::depth`.
     #[serde(default)]
     pub depth: Option<u8>,
+    /// The restart budget the requester asked for (`zirv ctx agent
+    /// --max-restarts`). A pane's child is never restarted by zirv at all --
+    /// `exec::run_with`'s restart loop belongs to the inline supervised path
+    /// -- so any ceiling here is already satisfied by construction; it is
+    /// carried so the fulfilling side can say so rather than the requester
+    /// having to guess. Only ever NARROWS, so it is honoured from an
+    /// untrusted drop too (see [`SpawnRequest`]'s own trust note below).
+    #[serde(default)]
+    pub max_restarts: Option<u32>,
+    /// The wall-clock ceiling the requester asked for (`zirv ctx agent
+    /// --timeout-secs`), enforced on the pane by `dash::mod::
+    /// enforce_pane_deadlines` exactly as `exec::run_with`'s own timeout
+    /// stops an inline supervised child: the adapter's quit sequence, then
+    /// `exec::EXIT_TIMEOUT`. Only ever NARROWS.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// The tool-call ceiling the requester asked for (`zirv ctx agent
+    /// --max-tool-calls`). A dashboard pane has no verified tool-call
+    /// counter, so this is carried and REPORTED (`fulfill_spawn_request`
+    /// pushes a notice naming it) rather than enforced -- the one ceiling of
+    /// the three a pane genuinely cannot hold.
+    #[serde(default)]
+    pub max_tool_calls: Option<u32>,
+    /// The trailing `-- <flags>` the requester typed, verbatim. WIDENING:
+    /// these become argv tokens on the pane's real harness child, so a
+    /// forged `"flags": ["--dangerously-skip-permissions"]` would hand a
+    /// pane a posture nobody granted it. `dash::mod::
+    /// sanitize_file_dropped_request` therefore CLEARS this on every request
+    /// that arrived through the file-backed drop directory; only the
+    /// dashboard's own in-process Spawn overlay (which builds its request in
+    /// memory this instant) may carry them. The one flag that survives a
+    /// drop is the model pin, which travels separately in `model` above and
+    /// is re-checked by `dash::mod::pane_model_args`.
+    #[serde(default)]
+    pub flags: Vec<String>,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -546,7 +589,49 @@ mod tests {
             path_scope: Vec::new(),
             no_network: false,
             depth: None,
+            max_restarts: None,
+            timeout_secs: None,
+            max_tool_calls: None,
+            flags: Vec::new(),
         }
+    }
+
+    /// The supervision ceilings a pane-bound delegation used to hard-error on
+    /// (`--max-restarts`/`--timeout-secs`/`--max-tool-calls`, and the
+    /// trailing `-- <flags>`) travel on the request now, through the same
+    /// plain serde shape every other field does.
+    #[test]
+    fn a_request_carrying_supervision_ceilings_round_trips() {
+        let mut req = sample_request();
+        req.max_restarts = Some(2);
+        req.timeout_secs = Some(900);
+        req.max_tool_calls = Some(40);
+        req.flags = vec!["--model".to_string(), "sonnet".to_string()];
+
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: SpawnRequest = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.max_restarts, Some(2));
+        assert_eq!(back.timeout_secs, Some(900));
+        assert_eq!(back.max_tool_calls, Some(40));
+        assert_eq!(
+            back.flags,
+            vec!["--model".to_string(), "sonnet".to_string()]
+        );
+        assert_eq!(back, req);
+    }
+
+    /// A request written by a build that predates those fields carries no
+    /// ceiling and no trailing flags -- never a wide-open one.
+    #[test]
+    fn a_request_without_the_supervision_fields_carries_no_ceilings_and_no_flags() {
+        let old = r#"{"agent":"codex","prompt":"do the thing","cwd":".",
+                      "requested_by":"sess-1"}"#;
+        let req: SpawnRequest = serde_json::from_str(old).expect("older requests still parse");
+        assert_eq!(req.max_restarts, None);
+        assert_eq!(req.timeout_secs, None);
+        assert_eq!(req.max_tool_calls, None);
+        assert!(req.flags.is_empty());
     }
 
     /// Issue #155, Phase 5(c): lineage travels with the request. Same-binary
