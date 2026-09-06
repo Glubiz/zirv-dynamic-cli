@@ -1122,6 +1122,7 @@ fn evaluate_candidate_outcome(
     let base = evaluate_single(policy, candidate, fallback);
     let outcome = apply_sql_outcome(policy, candidate, base);
     let outcome = apply_credential_outcome(candidate, outcome);
+    let outcome = apply_operator_config_outcome(candidate, outcome);
     let outcome = apply_network_outcome(candidate, outcome);
     let outcome = apply_recursive_delete_outcome(candidate, outcome);
     let outcome = apply_vcs_outcome(candidate, outcome, scratchpad_roots);
@@ -1229,6 +1230,30 @@ fn apply_credential_outcome(command: &str, base: Outcome) -> Outcome {
         verdict: Verdict::Deny,
         matched: Some(Rule {
             pattern: "<credential: sensitive-file access>".to_string(),
+            origin: Origin::BuiltIn,
+        }),
+    }
+}
+
+/// A3 (2026-09-06 audit): the operator's own `~/.zirv/` is the single
+/// configuration layer a repository may never contribute to (see `resolve`),
+/// and `zirv ctx permissions compile` is not the only way to reach it -- an
+/// ordinary redirection, copy, move or delete naming that path rewrites the
+/// policy governing the writer just as effectively. `Deny` for the same
+/// reason [`permissions_compile_write_deny_rule`] denies rather than asks: a
+/// headless-silenced `Ask` would be outrun by the broad `echo *`/`cp *`
+/// allow rules these spellings already match, and this runs after
+/// `evaluate_single` precisely so such an allow rule cannot short-circuit
+/// it. Reads stay silent, and a repository's own `.zirv/` is a different
+/// directory entirely.
+fn apply_operator_config_outcome(command: &str, base: Outcome) -> Outcome {
+    if base.verdict == Verdict::Deny || !writes_into_operator_zirv_config(command) {
+        return base;
+    }
+    Outcome {
+        verdict: Verdict::Deny,
+        matched: Some(Rule {
+            pattern: "<config: operator ~/.zirv write>".to_string(),
             origin: Origin::BuiltIn,
         }),
     }
@@ -3680,6 +3705,149 @@ fn is_sensitive_credential_access(command: &str) -> bool {
             .iter()
             .skip(1)
             .any(|token| sensitive_credential_path(token))
+}
+
+/// Path prefixes that name the operator's own home directory in the shells
+/// this module classifies, so `~/.zirv`, `$HOME/.zirv`, `%USERPROFILE%` and
+/// `$env:USERPROFILE` spellings all resolve to the same directory.
+const HOME_PATH_PREFIXES: &[&str] = &[
+    "~",
+    "$home",
+    "${home}",
+    "$env:home",
+    "$env:userprofile",
+    "$userprofile",
+    "%home%",
+    "%userprofile%",
+];
+
+/// Whether `path` -- already slash-normalized, lowercased and without a
+/// trailing separator -- is a user's home directory itself. An
+/// already-expanded `.zirv` path is the OPERATOR's configuration layer only
+/// when it sits directly in one; `/srv/repo/.zirv` is a checkout's own
+/// directory and stays writable.
+fn is_home_directory_path(path: &str) -> bool {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = match path.split_once(':') {
+        Some((drive, rest)) if drive.len() == 1 => rest.strip_prefix('/').unwrap_or(rest),
+        _ => path,
+    };
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    matches!(segments.as_slice(), ["root"] | ["home", _] | ["users", _])
+}
+
+/// Whether `raw` names a path under the operator's own `~/.zirv/` -- the one
+/// configuration layer `resolve` never lets a repository contribute to. An
+/// explicit home prefix proves it outright; an already-expanded absolute
+/// path qualifies only when [`is_home_directory_path`] holds for the
+/// directory containing `.zirv`, so a repository's own `.zirv/` is never
+/// mistaken for it.
+fn operator_zirv_path(raw: &str) -> bool {
+    let path = raw
+        .trim_start_matches('@')
+        .trim_matches(['\'', '"'])
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let path = path.trim_end_matches('/');
+    if HOME_PATH_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .is_some_and(|rest| rest == "/.zirv" || rest.starts_with("/.zirv/"))
+    }) {
+        return true;
+    }
+    let parent = if let Some(parent) = path.strip_suffix("/.zirv") {
+        parent
+    } else if let Some(index) = path.find("/.zirv/") {
+        &path[..index]
+    } else {
+        return false;
+    };
+    is_home_directory_path(parent)
+}
+
+/// Programs whose every non-flag operand is a path they write to or delete,
+/// so any of them landing in the operator's `~/.zirv/` is an attempt on that
+/// layer. `mv` belongs here rather than beside `cp`: a move deletes its
+/// source as well as writing its destination.
+const OPERATOR_CONFIG_WRITE_PROGRAMS: &[&str] = &[
+    "rm",
+    "del",
+    "erase",
+    "rmdir",
+    "rd",
+    "unlink",
+    "shred",
+    "truncate",
+    "remove-item",
+    "ri",
+    "mv",
+    "move",
+    "move-item",
+    "mi",
+    "tee",
+    "set-content",
+    "add-content",
+    "out-file",
+    "new-item",
+    "ni",
+];
+
+/// Programs that READ their leading operands and write only the last one, or
+/// an explicit destination flag: copying the operator's own config OUT is an
+/// ordinary read and stays silent.
+const OPERATOR_CONFIG_DESTINATION_PROGRAMS: &[&str] = &[
+    "cp",
+    "copy",
+    "copy-item",
+    "cpi",
+    "install",
+    "ln",
+    "rsync",
+    "scp",
+];
+
+/// The destination flags [`OPERATOR_CONFIG_DESTINATION_PROGRAMS`] accept in
+/// place of a trailing positional operand.
+const DESTINATION_FLAGS: &[&str] = &["-destination", "-dest", "-t", "--target-directory"];
+
+/// Whether `command` writes to or deletes anything under the operator's own
+/// `~/.zirv/`, in any of the spellings this module can resolve statically:
+/// an output redirection, or a write/delete program naming the path as an
+/// operand. Reads name no write target and never qualify.
+fn writes_into_operator_zirv_config(command: &str) -> bool {
+    if scan_redirection_targets(command)
+        .unwrap_or_default()
+        .iter()
+        .any(|target| operator_zirv_path(target))
+    {
+        return true;
+    }
+    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
+        return false;
+    };
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let program = sql_program_name(first);
+    let operands: Vec<&str> = tokens
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .filter(|token| !token.starts_with('-'))
+        .collect();
+    if OPERATOR_CONFIG_WRITE_PROGRAMS.contains(&program.as_str()) {
+        return operands.iter().copied().any(operator_zirv_path);
+    }
+    if OPERATOR_CONFIG_DESTINATION_PROGRAMS.contains(&program.as_str()) {
+        return operands.last().copied().is_some_and(operator_zirv_path)
+            || tokens.windows(2).any(|pair| {
+                DESTINATION_FLAGS
+                    .iter()
+                    .any(|flag| pair[0].eq_ignore_ascii_case(flag))
+                    && operator_zirv_path(&pair[1])
+            });
+    }
+    false
 }
 
 fn network_rule(verdict: Verdict, pattern: &str) -> Outcome {
@@ -11272,6 +11440,50 @@ mod tests {
             Verdict::Ask,
             "powershell -Command must be unwrapped"
         );
+    }
+
+    /// A3 (2026-09-06 audit): `zirv ctx permissions compile` was the only
+    /// spelling of "write the operator's own `~/.zirv/ctx.toml`" this module
+    /// recognised, so an ordinary redirection, copy, move or delete naming
+    /// that same file widened (or destroyed) the operator-only policy layer
+    /// with no prompt at all. A repository's own `.zirv/` is a different
+    /// directory and stays writable; reads stay silent.
+    #[test]
+    fn a_direct_write_into_the_operator_ctx_toml_is_denied_in_every_spelling() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            "echo 'allow = [\"*\"]' >> ~/.zirv/ctx.toml",
+            "printf 'allow' > $HOME/.zirv/ctx.toml",
+            "cp evil.toml ~/.zirv/ctx.toml",
+            "mv evil.toml ~/.zirv/ctx.toml",
+            "tee ~/.zirv/ctx.toml < evil.toml",
+            "Set-Content -Path ~/.zirv/ctx.toml -Value x",
+            r"Out-File -FilePath $env:USERPROFILE\.zirv\ctx.toml",
+            "rm ~/.zirv/ctx.toml",
+            r"del %USERPROFILE%\.zirv\ctx.toml",
+            "rm /home/josj/.zirv/ctx.toml",
+            r"cp evil.toml C:\Users\josj\.zirv\ctx.toml",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Deny,
+                "{command} writes the operator-only policy layer"
+            );
+        }
+        for command in [
+            "cat ~/.zirv/ctx.toml",
+            "grep allow ~/.zirv/ctx.toml",
+            "echo 'x' > .zirv/ctx.toml",
+            "cp template.toml .zirv/ctx.toml",
+            "rm .zirv/work/old.json",
+            "zirv ctx status",
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command} is a read or a repository-local write"
+            );
+        }
     }
 
     /// A2 (2026-09-06 audit): `cmd.exe` accepts its no-argument switches
