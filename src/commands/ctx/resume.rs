@@ -256,7 +256,12 @@ pub fn run_with<W: Write>(
         writeln!(w, "{prompt}")?;
         return Ok(0);
     }
-    let prompt = resume_prompt(
+    // T4 (C-5): the crash witness is PEEKED here and only consumed once the
+    // launch below actually commits (`sessions::launch_consuming_interrupted`)
+    // -- adapter selection, injection args, the shim guard and the spawn
+    // itself can all still fail, and taking the one-shot marker first
+    // destroyed the `<zirv_interrupted>` block for good.
+    let prompt = resume_prompt_dry_run(
         &state,
         repo,
         session.as_str(),
@@ -314,8 +319,8 @@ pub fn run_with<W: Write>(
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = command.exec();
-        Err(format!("could not start {}: {err}", adapter.name()).into())
+        super::sessions::launch_consuming_interrupted(&state, repo, || Err(command.exec()))
+            .map_err(|err| format!("could not start {}: {err}", adapter.name()).into())
     }
     #[cfg(not(unix))]
     {
@@ -334,7 +339,9 @@ pub fn run_with<W: Write>(
                 .collect();
             adapters::guard_cmd_shim_reparse(&program, &args)?;
         }
-        let status = command.status()?;
+        let mut child =
+            super::sessions::launch_consuming_interrupted(&state, repo, || command.spawn())?;
+        let status = child.wait()?;
         Ok(status.code().unwrap_or(1))
     }
 }
@@ -361,6 +368,56 @@ mod tests {
             gotchas: vec![],
             ..Handoff::default()
         }
+    }
+
+    #[test]
+    fn an_unknown_adapter_preserves_the_crash_witness() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        super::super::handoff::store(&state, tmp.path(), "old-session", &handoff()).expect("store");
+        let mut record = super::super::sessions::Record::new(
+            "deadbeef-2222-4333-8444-555555555555",
+            "claude",
+            tmp.path(),
+            super::super::sessions::Verb::Wrap,
+        );
+        // A really-dead pid, never a sentinel: `u32::MAX` is `-1` as a signed
+        // pid, and `kill(-1, 0)` succeeds on unix, so the record would read
+        // as ALIVE there and carry no crash witness at all.
+        record.pid = crate::commands::ctx::testenv::dead_pid();
+        record.in_flight = Some(super::super::sessions::InFlight {
+            since: 1,
+            turn: 2,
+            verb: "wrap".into(),
+        });
+        std::fs::create_dir_all(state.sessions()).expect("sessions dir");
+        super::super::state::write_private(
+            &state.sessions().join("deadbeef.json"),
+            &serde_json::to_string(&record).expect("serialize"),
+        )
+        .expect("write witness");
+        assert!(
+            super::super::sessions::peek_interrupted_in_flight(&state, tmp.path()).is_some(),
+            "the test's own crash witness must be readable before the resume runs"
+        );
+        let args = ResumeArgs {
+            agent: Some("bogus".into()),
+            print_prompt: false,
+            extra: Vec::new(),
+            simple: true,
+            allow_nested: true,
+        };
+        let err = run_with(&args, &mut Vec::new(), tmp.path(), &|key| {
+            (key == STATE_ENV).then(|| state.root().display().to_string())
+        })
+        .expect_err("unknown adapter");
+        assert!(err.to_string().contains("unknown agent"), "{err}");
+        assert!(
+            super::super::sessions::peek_interrupted_in_flight(&state, tmp.path()).is_some(),
+            "a failed resume must preserve the crash witness"
+        );
     }
 
     #[test]

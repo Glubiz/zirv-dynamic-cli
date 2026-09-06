@@ -513,6 +513,12 @@ pub fn run_with<W: Write>(
         generation: None,
         structural_only: false,
     };
+    // T4 (C-3): a previous handover attempt (or an automatic rollover that
+    // wrote one before this fix) can leave an ack sitting next to the
+    // request, and the poll below reads whatever is on disk -- so a brand
+    // new request would be "confirmed" by an answer to an older question.
+    // Discard any stale ack before the request goes out.
+    let _ = take_ack(&state, &short);
     write_request(&state, &short, &req)?;
 
     // wrap's pump loop ticks on its ordinary ~100ms cadence and checks for a
@@ -925,6 +931,52 @@ mod tests {
         );
         assert_eq!(req.generation, None, "it opened no seat transaction");
         assert!(!req.structural_only, "it still spends a distiller call");
+    }
+
+    #[test]
+    fn a_stale_ack_cannot_confirm_a_new_handover() {
+        let tmp = testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = testenv::HomeGuard::set(&home);
+        let state = state_in(&tmp.path().join("state"));
+        let session = "33333333-2222-4333-8444-555555555555";
+        let _guard = SessionGuard::register(
+            &state,
+            Record::new(session, "claude", tmp.path(), Verb::Wrap),
+        );
+        write_ack(
+            &state,
+            "33333333",
+            &HandoverAck {
+                ok: true,
+                ..Default::default()
+            },
+        );
+        let env: std::collections::HashMap<String, String> = [
+            (STATE_ENV.into(), state.root().display().to_string()),
+            (super::super::adapters::SESSION_ENV.into(), session.into()),
+            ("ZIRV_CTX_HANDOFF_TIMEOUT_SECS".into(), "0".into()),
+        ]
+        .into();
+        let args = HandoverArgs {
+            model: None,
+            agent: None,
+            dry_run: false,
+            force: false,
+        };
+        let mut out = Vec::new();
+        let result = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        assert!(
+            result.is_err(),
+            "a stale acknowledgement must not confirm a new request: {result:?}"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no running supervisor")
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
