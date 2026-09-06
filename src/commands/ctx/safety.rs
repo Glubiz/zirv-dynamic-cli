@@ -2542,10 +2542,7 @@ pub(crate) fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
         program.as_str(),
         "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
     ) {
-        let lower_rest = rest.to_ascii_lowercase();
-        let pos = lower_rest.find("-command")?;
-        let after = &rest[pos + "-command".len()..];
-        return Some(strip_quotes(after.trim()).to_string());
+        return find_powershell_command_flag(rest);
     }
     None
 }
@@ -2560,6 +2557,22 @@ pub(crate) fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
 /// mistaken for the inline-command flag itself.
 fn find_inline_command_flag(rest: &str) -> Option<String> {
     let chars: Vec<char> = rest.chars().collect();
+    for (start, end) in token_spans(&chars) {
+        let token: String = chars[start..end].iter().collect();
+        if is_inline_command_flag(&token) {
+            let after: String = chars[end..].iter().collect();
+            return Some(strip_quotes(after.trim_start()).to_string());
+        }
+    }
+    None
+}
+
+/// Quote-aware argv token spans over `chars`: one `(start, end)` char-index
+/// pair per whitespace-separated token, a quoted run kept whole. Shared by
+/// every inline-command-flag scanner in this module so they cannot disagree
+/// about where one token ends and the next begins.
+fn token_spans(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
     let mut i = 0usize;
     while i < chars.len() {
         while i < chars.len() && chars[i].is_whitespace() {
@@ -2589,11 +2602,55 @@ fn find_inline_command_flag(rest: &str) -> Option<String> {
             }
             i += 1;
         }
-        let token: String = chars[start..i].iter().collect();
-        if is_inline_command_flag(&token) {
-            let after: String = chars[i..].iter().collect();
-            return Some(strip_quotes(after.trim_start()).to_string());
+        spans.push((start, i));
+    }
+    spans
+}
+
+/// Whether `name` (a switch token with its leading `-`/`/` already removed,
+/// and any `:value` suffix already split off) selects PowerShell's inline-
+/// command switch. `powershell.exe`/`pwsh` resolve any unambiguous PREFIX of
+/// a parameter name and special-case the bare `-c` to `-Command`, so `-c`,
+/// `-Com` and `-comm` all execute their argument exactly like the full
+/// spelling. Every other `-C...` switch (`-EncodedCommand`,
+/// `-ConfigurationName`, `-CustomPipeName`) fails this test because its name
+/// is not a prefix of `command`. `-CommandWithArgs`/`-cwa` is a different
+/// switch with the identical "the argument is a command line" payload, so it
+/// is accepted too.
+fn is_powershell_command_flag(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if matches!(name.as_str(), "cwa" | "commandwithargs") {
+        return true;
+    }
+    !name.is_empty() && "command".starts_with(&name)
+}
+
+/// PowerShell's counterpart to [`find_inline_command_flag`]: a quote-aware
+/// token scan for the inline-command switch in any spelling
+/// [`is_powershell_command_flag`] accepts, including PowerShell's own
+/// `-Command:<value>` colon form. Returns everything after the switch,
+/// quote-stripped.
+fn find_powershell_command_flag(rest: &str) -> Option<String> {
+    let chars: Vec<char> = rest.chars().collect();
+    for (start, end) in token_spans(&chars) {
+        let token: String = chars[start..end].iter().collect();
+        let Some(body) = token.strip_prefix(['-', '/']) else {
+            continue;
+        };
+        let (name, colon) = match body.split_once(':') {
+            Some((name, _)) => (name, true),
+            None => (body, false),
+        };
+        if !is_powershell_command_flag(name) {
+            continue;
         }
+        let value_start = if colon {
+            start + 1 + name.chars().count() + 1
+        } else {
+            end
+        };
+        let after: String = chars[value_start..].iter().collect();
+        return Some(strip_quotes(after.trim_start()).to_string());
     }
     None
 }
@@ -11184,6 +11241,40 @@ mod tests {
             Verdict::Ask,
             "powershell -Command must be unwrapped"
         );
+    }
+
+    /// A1 (2026-09-06 audit): PowerShell resolves any unambiguous prefix of
+    /// `-Command`, and treats the bare `-c` as that switch outright, so
+    /// `powershell -c '<payload>'` runs exactly what `-Command '<payload>'`
+    /// runs. The substring search this arm used to do only recognised the
+    /// full spelling, so every abbreviation left the payload unclassified.
+    #[test]
+    fn powershell_command_flag_abbreviations_are_unwrapped_like_the_full_spelling() {
+        let policy = SafetyPolicy::default();
+        for (payload, expected) in [
+            ("rm -rf /", Verdict::Ask),
+            ("gh repo delete o/r", Verdict::Deny),
+            ("cat ~/.ssh/id_rsa", Verdict::Deny),
+        ] {
+            for program in ["powershell", "pwsh"] {
+                for flag in ["-Command", "-c", "-C", "-Com", "-comm"] {
+                    let command = format!("{program} {flag} \"{payload}\"");
+                    assert_eq!(
+                        evaluate(&policy, &command, LaunchMode::Interactive).verdict,
+                        expected,
+                        "{command} must classify like the -Command spelling"
+                    );
+                }
+            }
+        }
+        for flag in ["-EncodedCommand", "-ConfigurationName"] {
+            let command = format!("powershell {flag} \"rm -rf /\"");
+            assert_eq!(
+                evaluate(&policy, &command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command} names a different switch and must not unwrap"
+            );
+        }
     }
 
     /// Issue #132 review (2026-08-25, code-review round): `unwrap_env_prefix`
