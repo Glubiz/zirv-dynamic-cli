@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-05
+last-verified: 2026-09-06
 ---
 
 # _system-context
@@ -144,7 +144,7 @@ Run all four before claiming a change is done. Full detail: [[Getting Started]],
 
 ## State Directory Layout
 
-`StateDir::resolve` roots at `ZIRV_CTX_STATE_DIR`, else the OS state dir, else the OS local-data dir, then `zirv/ctx`. Subpaths: `handoffs/<repo_slug>/` (stored handoff docs), `s/` (turn-signal sockets, short name for the unix path-length limit), `logs/decisions.jsonl` (append-only context decision log), `logs/safety-decisions/<UTC-day>.jsonl` (privacy-preserving command verdicts with command/policy SHA-256 identities, never raw command text), `usage.json` (single machine-wide file, merged across sessions), `scoring/` (per-transcript incremental-scoring checkpoints), `status-snapshots/` (issue #246  --  one `StatusSnapshot` JSON per session, keyed by `input_hash(session)`, holding `zirv ctx status --diff`'s previous rendered sections), `objective/<repo_slug>.json` (issue #285  --  one durable objective record per repo). Unix directories are `0700` and files `0600`; Windows has no equivalent and is a no-op there. See [[Ctx Subsystem]].
+`StateDir::resolve` roots at `ZIRV_CTX_STATE_DIR`, else the OS state dir, else the OS local-data dir, then `zirv/ctx`. Subpaths: `handoffs/<repo_slug>/` (stored handoff docs), `s/` (turn-signal sockets, short name for the unix path-length limit), `logs/decisions.jsonl` (append-only context decision log), `logs/safety-decisions/<UTC-day>.jsonl` (privacy-preserving command verdicts with command/policy SHA-256 identities, never raw command text; retained 30 days as of 2026-09-06, `append_safety` prunes older buckets on every append -- see [[Known Issues]]'s `prune_safety_buckets` perf-note entry), `usage.json` (single machine-wide file, merged across sessions), `scoring/` (per-transcript incremental-scoring checkpoints), `status-snapshots/` (issue #246  --  one `StatusSnapshot` JSON per session, keyed by `input_hash(session)`, holding `zirv ctx status --diff`'s previous rendered sections), `objective/<repo_slug>.json` (issue #285  --  one durable objective record per repo, written with no interprocess lock -- see [[Known Issues]]), `rollouts/<short>.path`/`<short>.floor` (2026-09-06 -- the codex transcript pin `adapters/codex.rs` resolves once per session and never prunes, see [[Known Issues]]), `attention/<short>.json`/`<short>.lock` (issue #349's composed session status, the `.lock` sibling added 2026-09-06 to serialize the ledger's own read-modify-write). Unix directories are `0700` and files `0600`; Windows has no equivalent and is a no-op there. See [[Ctx Subsystem]].
 
 ## Documentation Contract
 
