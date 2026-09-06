@@ -22941,7 +22941,7 @@ mod tests {
         let mut errors = ErrorLog::default();
         let now = Instant::now();
         let mut last_sweep = now.checked_sub(FACTS_THROTTLE).unwrap_or(now);
-        enforce_pane_token_budgets(&mut panes, &cfg, &repo, &mut errors, &mut last_sweep, now);
+        enforce_pane_token_budgets(&mut panes, &cfg, &mut errors, &mut last_sweep, now);
         assert!(
             !matches!(panes[0].state(), PaneState::Ended(_)),
             "the first hard-stop observation gives the same one-tick grace as exec"
@@ -22949,7 +22949,6 @@ mod tests {
         enforce_pane_token_budgets(
             &mut panes,
             &cfg,
-            &repo,
             &mut errors,
             &mut last_sweep,
             now + FACTS_THROTTLE,
