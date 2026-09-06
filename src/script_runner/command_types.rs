@@ -132,6 +132,24 @@ impl CommandTypes {
         }
     }
 
+    /// Everything wrong with the step that `context` can settle without
+    /// running it -- today, a `${var}` the context has no value for.
+    ///
+    /// A-2/D-4: `--dry-run` printed each step and moved on, so `echo
+    /// ${missing}` dry-ran with exit 0 while the real run failed on the
+    /// same script. That is the same reasoning `AgentCommand::validate`
+    /// already applies at load time; unlike `validate` this one needs the
+    /// resolved context, so it runs per step at dry-run time instead.
+    pub fn check(&self, context: &HashMap<String, String>) -> Result<(), String> {
+        match self {
+            CommandTypes::Command(cmd) => cmd.check_unresolved_placeholders(context),
+            CommandTypes::Commands(cmds) => cmds
+                .iter()
+                .try_for_each(|cmd| cmd.check_unresolved_placeholders(context)),
+            CommandTypes::Agent(agent) => command::check_unresolved(&agent.prompt, context),
+        }
+    }
+
     pub fn description(&self) -> Option<String> {
         match self {
             CommandTypes::Command(cmd) => cmd.description.clone(),
