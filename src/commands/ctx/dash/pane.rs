@@ -1908,7 +1908,12 @@ impl Pane {
         if self.done {
             return Ok(());
         }
-        self.done = true;
+        // A3-1: `done` is set only once the polite quit has actually
+        // succeeded. It used to be set FIRST, so a failure here (a poisoned
+        // writer lock, a `quit_child` that could not reap the child) skipped
+        // every release below AND made `finish_shutdown` -- guarded by the
+        // same flag -- a permanent no-op. A pane whose quit failed is
+        // precisely the pane that still needs escalating.
         {
             let mut writer = self
                 .writer
@@ -1917,6 +1922,7 @@ impl Pane {
             let sink: &mut dyn Write = &mut **writer;
             wrap::quit_child(sink, &mut self.child, quit_sequence, QUIT_GRACE)?;
         }
+        self.done = true;
         // P2/P3: the child is gone (or as gone as `quit_child` could make
         // it), so it must leave the console-close registry and its job handle
         // must close -- an explicit call, not `Drop`, because the release
@@ -2213,6 +2219,13 @@ impl Pane {
         self.last_signal_at = None;
         self.launch_model = super::super::adapters::last_model_flag(&new_argv).map(str::to_string);
         self.measured_usage = None;
+        // A3-2: both latches belong to the CHILD, not to this pane -- the
+        // successor is a fresh child with its own fresh transcript, so it
+        // must be able to earn its own soft warning and its own HardStop
+        // grace tick. `set_budget_tokens` has always reset the pair for the
+        // same reason; a swap is the same kind of event.
+        self.budget_soft_warned = false;
+        self.budget_grace_given = false;
         self.last_output_at = None;
         self.last_local_input_at = None;
         self.injected_awaiting_turn = false;
@@ -3607,6 +3620,153 @@ pub(crate) mod tests {
         // the same kill. `finish_shutdown` is the escalation half on its own
         // -- already public, already used by the batched-shutdown path -- so
         // teardown here is immediate instead of a real multi-second wait.
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// A3-1: `shutdown` used to set `done` BEFORE the fallible work, so a
+    /// failure (here a poisoned writer lock) skipped `lifecycle.release`,
+    /// `unpublish_socket_path`, `rollover::forget` and `guard.release`
+    /// permanently AND made `finish_shutdown` -- the escalation half, guarded
+    /// by the same `done` -- a silent no-op. A pane whose polite quit failed
+    /// is exactly the pane that still needs escalating.
+    #[test]
+    fn a_shutdown_that_failed_before_its_cleanup_stays_escalatable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let mut spec = test_spec("44444444-2222-4333-8444-555555555555");
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let writer = Arc::clone(&pane.writer);
+        let _ = std::thread::spawn(move || {
+            let _held = writer.lock().expect("lock");
+            panic!("poison the pane writer");
+        })
+        .join();
+        assert!(
+            pane.writer.is_poisoned(),
+            "sanity: the writer lock is poisoned"
+        );
+
+        let socket_file = state
+            .root()
+            .join(wrap::socket_path_file_for(&pane.session_id));
+        assert!(
+            socket_file.exists(),
+            "sanity: the socket path was published"
+        );
+
+        pane.shutdown("")
+            .expect_err("a poisoned writer must fail the polite quit");
+        assert!(
+            !pane.done,
+            "a shutdown that never reached its cleanup must not mark the pane done"
+        );
+
+        pane.finish_shutdown()
+            .expect("the escalation half must still run");
+        assert!(pane.done, "the escalation half completed the shutdown");
+        assert!(
+            !socket_file.exists(),
+            "and ran the cleanup the failed shutdown skipped"
+        );
+    }
+
+    /// A3-2: `handover` resets every other piece of per-child state but left
+    /// `budget_soft_warned`/`budget_grace_given` latched from the
+    /// PREDECESSOR, so the successor -- a brand new child with its own fresh
+    /// transcript -- silently got no soft warning and no HardStop grace tick.
+    /// `set_budget_tokens` has always reset both; a swap is the same kind of
+    /// event.
+    #[cfg(unix)]
+    #[test]
+    fn a_handover_re_arms_the_successors_budget_warnings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let mut spec = test_spec("55555555-2222-4333-8444-555555555555");
+        spec.argv = long_lived_argv();
+        spec.agent_name = "claude".to_string();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_budget_tokens(Some(1_000));
+
+        let usage = crate::commands::ctx::event::TranscriptUsage {
+            input_tokens: 900,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens: 0,
+        };
+        assert!(
+            matches!(
+                pane.enforce_token_budget(&usage, "").expect("enforce"),
+                Some(PaneBudgetNotice::SoftWarn { .. })
+            ),
+            "the predecessor warns once"
+        );
+        assert!(
+            pane.enforce_token_budget(&usage, "")
+                .expect("enforce")
+                .is_none(),
+            "and never repeats itself for the same child"
+        );
+
+        let cfg = crate::commands::ctx::config::CtxConfig {
+            agent_bin: Some("sleep 5".to_string()),
+            ..Default::default()
+        };
+        let req = crate::commands::ctx::handover::HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+            interactive: false,
+            automatic: false,
+            generation: None,
+            structural_only: false,
+        };
+        pane.handover(
+            &cfg,
+            &req,
+            &crate::commands::ctx::handoff::Handoff::default(),
+            PromptRole::Worker,
+            &repo,
+            (80, 24),
+        )
+        .expect("handover succeeds");
+
+        assert!(
+            matches!(
+                pane.enforce_token_budget(&usage, "").expect("enforce"),
+                Some(PaneBudgetNotice::SoftWarn { .. })
+            ),
+            "the successor is a new child and must get its own soft warning"
+        );
+
         pane.finish_shutdown().expect("shutdown");
     }
 
