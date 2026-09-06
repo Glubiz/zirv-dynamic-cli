@@ -2191,16 +2191,7 @@ pub fn injection_args_for_session(
     // identical on every platform. `guard_cmd_shim_reparse` remains the
     // fail-closed backstop for the interactive positional prompt, the one
     // free-text slot still on a reparsed argv.
-    let through_cmd_shim = if launch.is_empty() {
-        // No passthrough argv: the adapter builds its own launch, so ask it.
-        adapter.launches_through_cmd_shim()
-    } else {
-        // The passthrough argv may already be resolved to `cmd.exe /c <shim>`
-        // (which is exactly what `chat::build_launch`/`ClaudeAdapter::base`
-        // produce for the interactive path), so detection has to recognise the
-        // launcher structure itself, not just re-resolve `launch.first()`.
-        super::adapters::launch_reparses_through_shim(launch)
-    };
+    let through_cmd_shim = launch_through_cmd_shim(adapter, launch);
 
     if let Some(flag) = adapter.system_prompt_file_flag()
         && (through_cmd_shim || adapter.supports_system_prompt_file(launch))
@@ -2320,6 +2311,157 @@ pub fn injection_args_for_session(
     }
 
     Ok(inline)
+}
+
+/// Whether `launch` reaches the agent through a Windows launcher that reparses
+/// its own command line. An empty `launch` means the adapter builds its own
+/// invocation, so it is asked directly; otherwise the argv may already be
+/// resolved to `cmd.exe /c <shim>` (exactly what `chat::build_launch`/
+/// `ClaudeAdapter::base` produce for the interactive path), so detection has to
+/// recognise the launcher structure itself rather than re-resolve
+/// `launch.first()`.
+fn launch_through_cmd_shim(adapter: &dyn AgentAdapter, launch: &[String]) -> bool {
+    if launch.is_empty() {
+        adapter.launches_through_cmd_shim()
+    } else {
+        super::adapters::launch_reparses_through_shim(launch)
+    }
+}
+
+/// Whether a composed system prompt for `launch` is delivered through a private
+/// file rather than on argv -- [`injection_args_for_session`]'s own condition,
+/// named so the interactive handoff path can ask the same question without
+/// duplicating it.
+pub fn delivers_system_prompt_by_file(adapter: &dyn AgentAdapter, launch: &[String]) -> bool {
+    adapter.system_prompt_file_flag().is_some()
+        && (launch_through_cmd_shim(adapter, launch) || adapter.supports_system_prompt_file(launch))
+}
+
+/// The positional prompt an interactive launch carries once the handoff itself
+/// has been moved into the system-prompt file. Deliberately one short line with
+/// no cmd.exe metacharacter in it, so it fits any command-line budget and
+/// clears `adapters::guard_cmd_shim_reparse` on a Windows `.cmd` shim install.
+pub const HANDOFF_BY_FILE_PROMPT: &str = "Continue from the handoff in your system prompt.";
+
+/// Heading the handoff is folded in under when it joins an already-composed
+/// system prompt, so the two stay distinguishable to the agent reading them.
+const HANDOFF_LAYER_HEADER: &str = "# Handoff for this session";
+
+/// Appended to a handoff that had to stay on argv and did not fit the budget.
+const POSITIONAL_TRUNCATION_NOTE: &str =
+    "\n\n[zirv: this handoff was truncated to fit the launch command line.]";
+
+/// The `<flag> <path>` (or `<flag>=<path>`) pair naming the system-prompt file
+/// in a launch's arguments.
+struct SystemPromptFileArg {
+    /// Index of the token that has to be rewritten to repoint the flag.
+    at: usize,
+    /// Whether that token is the single `<flag>=<path>` spelling.
+    joined: bool,
+    path: PathBuf,
+}
+
+/// Finds the system-prompt file argument in `args`. The LAST occurrence wins,
+/// matching the rule [`extract_user_prompt_flag`] documents for a repeated flag.
+fn system_prompt_file_arg(args: &[String], flag: &str) -> Option<SystemPromptFileArg> {
+    let joined = format!("{flag}=");
+    for (index, arg) in args.iter().enumerate().rev() {
+        if let Some(path) = arg.strip_prefix(&joined) {
+            return Some(SystemPromptFileArg {
+                at: index,
+                joined: true,
+                path: PathBuf::from(path),
+            });
+        }
+        if arg == flag
+            && let Some(path) = args.get(index + 1)
+        {
+            return Some(SystemPromptFileArg {
+                at: index + 1,
+                joined: false,
+                path: PathBuf::from(path),
+            });
+        }
+    }
+    None
+}
+
+/// Issue #220 for the INTERACTIVE launches: `resume`, `wrap`'s rot restart and
+/// a dashboard pane's handover all used to hand the whole handoff to the agent
+/// as a positional argument, with no size budget and no metacharacter budget.
+/// Both bounds are real on Windows: a stored handoff grows across restarts and
+/// a 93KB one overflowed `CreateProcessW`'s ~32KB command line (`os error
+/// 206`), and on an npm `.cmd` install `guard_cmd_shim_reparse` refused every
+/// one of them outright, because a handoff prompt is always multi-line and `\n`
+/// is a cmd.exe metacharacter -- which is to say the rot restart, `wrap`'s
+/// whole purpose, could never fire on the ordinary Windows install.
+///
+/// So the handoff travels the same way the composed prompt already does when
+/// the adapter has a file mechanism: folded into a private file under the state
+/// dir, named by exactly one `--append-system-prompt-file` occurrence, leaving
+/// [`HANDOFF_BY_FILE_PROMPT`] as the only free text on argv. `args` is rewritten
+/// in place -- the file the launch already carries is READ and re-emitted with
+/// the handoff appended rather than left alongside a second occurrence of the
+/// flag, because a repeated flag keeps only its last value.
+///
+/// The fallback -- an adapter with no file mechanism (codex), or a file that
+/// cannot be written -- is the old positional delivery, now bounded by
+/// [`INLINE_ARGV_PROMPT_BUDGET_BYTES`]. That still cannot pass the shim guard
+/// for a multi-line handoff, but a truncated prompt beats an unlaunchable
+/// command line.
+pub fn interactive_handoff_prompt(
+    adapter: &dyn AgentAdapter,
+    launch: &[String],
+    args: &mut Vec<String>,
+    handoff_prompt: &str,
+    state: &StateDir,
+    session: &str,
+) -> String {
+    if adapter.system_prompt_supported(launch)
+        && delivers_system_prompt_by_file(adapter, launch)
+        && let Some(flag) = adapter.system_prompt_file_flag()
+    {
+        let existing = system_prompt_file_arg(args, flag);
+        let composed = existing
+            .as_ref()
+            .and_then(|found| std::fs::read_to_string(&found.path).ok())
+            .unwrap_or_default();
+        let merged = if composed.trim().is_empty() {
+            handoff_prompt.to_string()
+        } else {
+            format!("{composed}\n\n{HANDOFF_LAYER_HEADER}\n\n{handoff_prompt}")
+        };
+        // A stem of its own, so the next restart re-reads the launch's own
+        // composed file rather than this one and the handoff can never compound
+        // into itself.
+        if let Ok(path) = write_prompt_file(state, &format!("{session}-handoff"), &merged) {
+            let path = path.display().to_string();
+            match existing {
+                Some(found) if found.joined => args[found.at] = format!("{flag}={path}"),
+                Some(found) => args[found.at] = path,
+                None => {
+                    args.push(flag.to_string());
+                    args.push(path);
+                }
+            }
+            return HANDOFF_BY_FILE_PROMPT.to_string();
+        }
+    }
+    bounded_positional_prompt(handoff_prompt)
+}
+
+/// The argv budget [`INLINE_ARGV_PROMPT_BUDGET_BYTES`] already applies to an
+/// inline-delivered composed prompt, applied to a positional handoff for the
+/// same reason and with the same headroom. Truncation is on a char boundary
+/// (`crate::utils::truncate_bytes`) and says so, rather than silently handing
+/// the agent half a sentence.
+fn bounded_positional_prompt(prompt: &str) -> String {
+    if prompt.len() <= INLINE_ARGV_PROMPT_BUDGET_BYTES {
+        return prompt.to_string();
+    }
+    let head = INLINE_ARGV_PROMPT_BUDGET_BYTES.saturating_sub(POSITIONAL_TRUNCATION_NOTE.len());
+    let kept = crate::utils::truncate_bytes(prompt.to_string(), Some(head));
+    format!("{kept}{POSITIONAL_TRUNCATION_NOTE}")
 }
 
 /// The prompt files this process has handed to an agent. A launch computes

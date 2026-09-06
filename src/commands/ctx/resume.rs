@@ -298,10 +298,24 @@ pub fn run_with<W: Write>(
         composed.as_ref(),
         adapter.system_prompt_supported(&[]),
     );
-    let extra: Vec<String> = user_extra
+    let mut extra: Vec<String> = user_extra
         .into_iter()
         .chain(prompt_args.iter().cloned())
         .collect();
+
+    // Issue #220: the handoff itself is the one piece of free text still headed
+    // for argv, and a stored handoff grows across restarts -- a 93KB one used
+    // to overflow the Windows command line outright. It rides the composed
+    // prompt's own private file instead whenever the adapter has one, leaving a
+    // single short line on argv; see `prompt::interactive_handoff_prompt`.
+    let prompt = super::prompt::interactive_handoff_prompt(
+        adapter.as_ref(),
+        &[],
+        &mut extra,
+        &prompt,
+        &state,
+        session.as_str(),
+    );
 
     let mut command = launch_command(
         adapter.as_ref(),
@@ -418,6 +432,51 @@ mod tests {
             super::super::sessions::peek_interrupted_in_flight(&state, tmp.path()).is_some(),
             "a failed resume must preserve the crash witness"
         );
+    }
+
+    /// Issue #220: `distill_prompt` carries the previous handoff forward into
+    /// the next one, so a stored handoff grows across restarts -- and the whole
+    /// thing used to be handed to the agent as one positional argument. A 93KB
+    /// one crosses `CreateProcessW`'s ~32KB command-line limit, so `zirv ctx
+    /// resume` failed outright with `os error 206` rather than resuming.
+    /// Windows-only: it is the platform whose ceiling a handoff can reach.
+    #[cfg(windows)]
+    #[test]
+    fn an_oversized_handoff_never_overflows_the_interactive_argv() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let huge = Handoff {
+            task: "x".repeat(93 * 1024),
+            ..handoff()
+        };
+        super::super::handoff::store(&state, tmp.path(), "old-session", &huge).expect("store");
+
+        // A directly executable system binary, so nothing here depends on an
+        // installed agent or on a `--help` probe: the only question this test
+        // asks is whether the command line zirv builds is one the OS can spawn
+        // at all. It rejects its arguments and exits immediately.
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let agent_bin = std::path::Path::new(&system_root)
+            .join("System32")
+            .join("whoami.exe")
+            .display()
+            .to_string();
+
+        let args = ResumeArgs {
+            agent: Some("claude".into()),
+            print_prompt: false,
+            extra: Vec::new(),
+            simple: true,
+            allow_nested: true,
+        };
+        run_with(&args, &mut Vec::new(), tmp.path(), &|key| match key {
+            STATE_ENV => Some(state.root().display().to_string()),
+            "ZIRV_CTX_AGENT_BIN" => Some(agent_bin.clone()),
+            _ => None,
+        })
+        .expect("an oversized handoff must still be launchable");
     }
 
     #[test]
