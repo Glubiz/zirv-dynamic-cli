@@ -2117,10 +2117,11 @@ impl Pane {
     /// `handover::resolve_swap_launch`/`build_turn_env` seams
     /// `wrap::perform_handover_swap` uses, so the two live-swap call sites
     /// can never drift on what a swap's fresh launch actually carries. The
-    /// handoff packet rides the same positional/task-prompt channel every
-    /// restart already uses (`wrap::restart_prompt` -- never a system-prompt
-    /// injection), so a target adapter with no system-prompt mechanism at
-    /// all (codex) receives it exactly the same way.
+    /// handoff packet is delivered by the one seam every restart shares
+    /// (`prompt::interactive_handoff_prompt` over `wrap::restart_prompt`):
+    /// through the successor's system-prompt file when it has one, and on the
+    /// bounded positional/task-prompt channel otherwise, so a target adapter
+    /// with no system-prompt mechanism at all (codex) still receives it.
     ///
     /// The caller has already decided this is a safe moment to act (`Pane::
     /// state() == PaneState::Idle`, or the operator's own explicit override)
@@ -2135,9 +2136,20 @@ impl Pane {
         repo: &Path,
         size: (u16, u16),
     ) -> CtxResult<()> {
-        let (new_adapter, extra) = super::super::handover::resolve_swap_launch(cfg, req)?;
+        let (new_adapter, mut extra) = super::super::handover::resolve_swap_launch(cfg, req)?;
         let new_argv: Vec<String> = {
-            let prompt_text = wrap::restart_prompt(handoff_note, &cfg.screen.thresholds());
+            // Issue #220: the same off-argv delivery `wrap`'s own restart uses
+            // -- a handover packet is multi-line too, so on a Windows `.cmd`
+            // install it was refused by `guard_cmd_shim_reparse` below and a
+            // large one could overflow the command line outright.
+            let prompt_text = super::super::prompt::interactive_handoff_prompt(
+                new_adapter.as_ref(),
+                &[],
+                &mut extra,
+                &wrap::restart_prompt(handoff_note, &cfg.screen.thresholds()),
+                &self.state_dir,
+                &self.session_id,
+            );
             let command = new_adapter.interactive_cmd(Some(&prompt_text), &extra);
             std::iter::once(command.get_program().to_string_lossy().to_string())
                 .chain(command.get_args().map(|a| a.to_string_lossy().to_string()))
