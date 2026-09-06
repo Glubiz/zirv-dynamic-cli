@@ -115,11 +115,11 @@ model = "fable"
 # [pace]
 # enabled = true                     # whether pace-to-reset throttling runs at all
 # max_percent = 99.0                 # a supervised window is kept at or below this usage percentage
-# collector_max_age_secs = 900       # collector readings older than this are treated as stale
-# estimator = true                   # whether the token estimator fallback runs when the collector is stale
-# five_hour_budget_tokens = 0        # 0 disables the estimator for the 5h window (no honest default)
-# seven_day_budget_tokens = 0        # 0 disables the estimator for the 7d window (no honest default)
-# count_cache_reads = false          # whether cache-read tokens count toward the estimator budget
+# collector_max_age_secs = 900       # NARROW-ONLY from a repo layer (ZIRV_CTX_PACE_COLLECTOR_MAX_AGE_SECS): collector readings older than this are treated as stale; a checkout may only LOWER it. Default: 900.
+# estimator = true                   # REPO-FORBIDDEN (ZIRV_CTX_PACE_ESTIMATOR): whether the token estimator fallback runs when the collector is stale. Default: true.
+# five_hour_budget_tokens = 0        # REPO-FORBIDDEN (ZIRV_CTX_FIVE_HOUR_BUDGET): 0 disables the estimator for the 5h window (no honest default).
+# seven_day_budget_tokens = 0        # REPO-FORBIDDEN (ZIRV_CTX_SEVEN_DAY_BUDGET): 0 disables the estimator for the 7d window (no honest default).
+# count_cache_reads = false          # REPO-FORBIDDEN (ZIRV_CTX_PACE_COUNT_CACHE_READS): whether cache-read tokens count toward the estimator budget. Default: false.
 # jitter_secs = 30                   # random jitter added to delays to avoid thundering-herd resumes
 # fallback_delay_secs = 900          # delay used when a window's resets_at is unknown
 # wait_slack_secs = 3600             # head-room added to the window length to form the default safety cap
