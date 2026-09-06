@@ -502,6 +502,19 @@ pub fn filter_key(prefix_armed: bool, key: KeyEvent) -> (bool, InputVerdict) {
         return (false, InputVerdict::Dash(DashAction::LiteralPrefix));
     }
 
+    // A chord is an UNMODIFIED key. The table below matches `key.code` alone,
+    // so without this `^A` followed by `Ctrl+Q` quit the dashboard -- and every
+    // pane's child with it -- when the operator only meant to send a control
+    // byte; `Ctrl+C`/`Ctrl+S`/`Ctrl+Z` fired their chords the same way. Only
+    // the literal-prefix case above carries a modifier and still means
+    // something here.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return (false, InputVerdict::ToChild(Vec::new()));
+    }
+
     let action = match key.code {
         KeyCode::Tab => Some(DashAction::NextPane),
         KeyCode::Up => Some(DashAction::SelectUp),
@@ -597,6 +610,36 @@ fn csi_tilde(n: u8, mods: KeyModifiers) -> Vec<u8> {
     }
 }
 
+/// The bytes `Ctrl+<c>` sends. M8: the non-alphabetic control combinations
+/// crossterm pre-maps to a plain char are listed out -- without them they
+/// typed a literal `4`/`7`/space instead of the C0 byte the operator meant.
+/// Shared by [`encode_key`]'s own CONTROL arm and its ALT fast-path, which
+/// prefixes an ESC to exactly these bytes for `Ctrl+Alt+<c>`.
+fn control_byte(c: char) -> Vec<u8> {
+    match c {
+        ' ' => vec![0x00],  // Ctrl+Space -> NUL
+        '4' => vec![0x1c],  // Ctrl+\  (legacy alias, delivered as Char('4'))
+        '5' => vec![0x1d],  // Ctrl+]  (legacy alias, delivered as Char('5'))
+        '6' => vec![0x1e],  // Ctrl+^  (legacy alias, delivered as Char('6'))
+        '7' => vec![0x1f],  // Ctrl+_  (legacy alias, delivered as Char('7'))
+        '\\' => vec![0x1c], // Ctrl+\  (literal, delivered once kitty is negotiated)
+        ']' => vec![0x1d],  // Ctrl+]  (literal, delivered once kitty is negotiated)
+        '^' => vec![0x1e],  // Ctrl+^  (literal, delivered once kitty is negotiated)
+        '_' => vec![0x1f],  // Ctrl+_  (literal, delivered once kitty is negotiated)
+        '/' => vec![0x1f],  // Ctrl+/  (kitty delivers the literal; same C0 as Ctrl+_)
+        '@' => vec![0x00],  // Ctrl+@  (kitty delivers the literal; NUL)
+        _ => {
+            let upper = c.to_ascii_uppercase();
+            if upper.is_ascii_alphabetic() {
+                vec![(upper as u8) & 0x1f]
+            } else {
+                let mut buf = [0u8; 4];
+                c.encode_utf8(&mut buf).as_bytes().to_vec()
+            }
+        }
+    }
+}
+
 /// `crossterm::event::KeyEvent` -> bytes to write to the active pane's pty.
 /// Covers the terminal basics: `Enter`, arrows, `Tab`/`BackTab`, navigation
 /// keys, function keys, `Alt-<x>`, `Ctrl-<x>`, and plain/UTF-8 characters.
@@ -623,9 +666,16 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
     if key.modifiers.contains(KeyModifiers::ALT)
         && let KeyCode::Char(c) = key.code
     {
-        let mut buf = [0u8; 4];
+        // Meta is a prefix ESC ON TOP of whatever the key already encodes to,
+        // so `Ctrl+Alt+<x>` is `ESC` plus the C0 byte -- not `ESC` plus the
+        // literal character, which dropped the control bit entirely.
         let mut bytes = vec![0x1b];
-        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        bytes.extend_from_slice(&if key.modifiers.contains(KeyModifiers::CONTROL) {
+            control_byte(c)
+        } else {
+            let mut buf = [0u8; 4];
+            c.encode_utf8(&mut buf).as_bytes().to_vec()
+        });
         return bytes;
     }
     match key.code {
@@ -689,33 +739,7 @@ pub fn encode_key(key: KeyEvent) -> Vec<u8> {
             12 => b"\x1b[24~".to_vec(),
             _ => Vec::new(),
         },
-        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            // M8: the non-alphabetic control combinations crossterm pre-maps to
-            // a plain char. Without these they typed a literal `4`/`7`/space
-            // instead of the C0 byte the operator meant.
-            match c {
-                ' ' => vec![0x00],  // Ctrl+Space -> NUL
-                '4' => vec![0x1c],  // Ctrl+\  (legacy alias, delivered as Char('4'))
-                '5' => vec![0x1d],  // Ctrl+]  (legacy alias, delivered as Char('5'))
-                '6' => vec![0x1e],  // Ctrl+^  (legacy alias, delivered as Char('6'))
-                '7' => vec![0x1f],  // Ctrl+_  (legacy alias, delivered as Char('7'))
-                '\\' => vec![0x1c], // Ctrl+\  (literal, delivered once kitty is negotiated)
-                ']' => vec![0x1d],  // Ctrl+]  (literal, delivered once kitty is negotiated)
-                '^' => vec![0x1e],  // Ctrl+^  (literal, delivered once kitty is negotiated)
-                '_' => vec![0x1f],  // Ctrl+_  (literal, delivered once kitty is negotiated)
-                '/' => vec![0x1f],  // Ctrl+/  (kitty delivers the literal; same C0 as Ctrl+_)
-                '@' => vec![0x00],  // Ctrl+@  (kitty delivers the literal; NUL)
-                _ => {
-                    let upper = c.to_ascii_uppercase();
-                    if upper.is_ascii_alphabetic() {
-                        vec![(upper as u8) & 0x1f]
-                    } else {
-                        let mut buf = [0u8; 4];
-                        c.encode_utf8(&mut buf).as_bytes().to_vec()
-                    }
-                }
-            }
-        }
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => control_byte(c),
         KeyCode::Char(c) => {
             let mut buf = [0u8; 4];
             c.encode_utf8(&mut buf).as_bytes().to_vec()
@@ -12174,6 +12198,40 @@ mod tests {
         let (armed, v) = filter_key(true, key(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(!armed);
         assert!(matches!(v, InputVerdict::ToChild(b) if b.is_empty()));
+    }
+
+    /// The chord table matched `KeyCode` alone, so `^A` then `Ctrl+Q` quit the
+    /// whole dashboard -- every pane's child with it -- when the operator was
+    /// only sending a control byte. A chord is an unmodified key.
+    #[test]
+    fn an_armed_prefix_followed_by_a_modified_key_is_not_a_chord() {
+        let (armed, v) = filter_key(true, key(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(!armed);
+        assert!(
+            matches!(v, InputVerdict::ToChild(ref b) if b.is_empty()),
+            "got {v:?}"
+        );
+
+        let (armed, v) = filter_key(true, key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!armed);
+        assert!(matches!(v, InputVerdict::Dash(DashAction::Quit)));
+    }
+
+    /// The ALT fast-path runs before the CONTROL arm, so `Ctrl+Alt+<x>` used
+    /// to encode as plain `Alt+<x>` -- the control bit was dropped and the
+    /// child saw a literal letter. Meta is a prefix ESC on top of the C0 byte,
+    /// not instead of it.
+    #[test]
+    fn alt_carries_the_control_bit_through_to_the_c0_byte() {
+        let both = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(encode_key(key(KeyCode::Char('m'), both)), b"\x1b\r");
+        assert_eq!(encode_key(key(KeyCode::Char(' '), both)), b"\x1b\0");
+        assert_eq!(encode_key(key(KeyCode::Char(']'), both)), b"\x1b\x1d");
+        assert_eq!(
+            encode_key(key(KeyCode::Char('m'), KeyModifiers::ALT)),
+            b"\x1bm",
+            "plain Alt is unchanged"
+        );
     }
 
     #[test]
