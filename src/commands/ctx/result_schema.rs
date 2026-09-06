@@ -224,11 +224,32 @@ pub fn render_contract_block(schema: &Schema) -> String {
 /// field -- an optional, non-enum one -- the example's own name/value pair
 /// already says everything the field list would have repeated, so the OUTPUT
 /// CONTRACT block no longer names it twice.
+///
+/// Issue #326 B7 (review round, P2): an `ObjArray` parent's own line is ALSO
+/// kept whenever any NESTED field renders one of its own, even when the
+/// parent itself is optional and non-enum. Without this, two differently-
+/// named optional `obj_array` fields whose nested constraint happens to
+/// share a field name -- `a` and `b` each containing a `bool` field `ok`,
+/// one schema requiring `a[].ok` and another requiring `b[].ok` -- rendered
+/// byte-for-byte identical indented `- ok: bool (required)` lines with no
+/// visible parent to tell them apart, since the parent heading naming
+/// WHICH array `ok` belongs to had been dropped as "redundant." A nested
+/// line's own association with its parent is not a constraint the JSON
+/// example can show either (the example nests `ok` inside `a`'s own array
+/// value, but nothing in the field LIST said so once the parent line was
+/// gone), so the parent's line is restored precisely in that case.
 fn render_fields(fields: &[Field], indent: usize, lines: &mut Vec<String>) {
     let pad = "  ".repeat(indent);
     for field in fields {
         let is_enum = matches!(field.kind, Kind::Enum(_));
-        if field.required || is_enum {
+        let nested_lines = if let Kind::ObjArray(nested) = &field.kind {
+            let mut collected = Vec::new();
+            render_fields(nested, indent + 1, &mut collected);
+            collected
+        } else {
+            Vec::new()
+        };
+        if field.required || is_enum || !nested_lines.is_empty() {
             let requirement = if field.required { " (required)" } else { "" };
             lines.push(format!(
                 "{pad}- {}: {}{requirement}",
@@ -236,9 +257,7 @@ fn render_fields(fields: &[Field], indent: usize, lines: &mut Vec<String>) {
                 kind_description(&field.kind)
             ));
         }
-        if let Kind::ObjArray(nested) = &field.kind {
-            render_fields(nested, indent + 1, lines);
-        }
+        lines.extend(nested_lines);
     }
 }
 
@@ -673,15 +692,18 @@ mod tests {
         let block = render_contract_block(&schema);
         assert!(block.starts_with("OUTPUT CONTRACT (machine-validated)"));
         assert!(block.contains("status: enum [done, blocked] (required)"));
-        // Issue #326 B7: `findings` is optional and not an enum, so the JSON
-        // example alone already says everything about it -- the redundant
-        // field-list line is gone, but its name still appears once, via the
-        // example.
+        // Issue #326 B7 (review round, P2): `findings` is itself optional and
+        // not an enum, but its OWN nested `file` field is required -- a
+        // constraint the JSON example cannot show for a nested field any
+        // more than for a top-level one -- so `findings`' own parent line is
+        // kept precisely so `file: string (required)` has a visible parent
+        // to belong to, rather than dropped as "redundant" and leaving that
+        // nested line orphaned.
         assert!(
-            !block.contains("findings: "),
-            "an optional non-enum field must not get its own redundant field-list line: {block}"
+            block.contains("findings: array of objects"),
+            "an optional ObjArray field must still get its own line when a nested field of \
+             its own is required: {block}"
         );
-        assert_eq!(block.matches("findings").count(), 1, "got {block}");
         assert!(block.contains("file: string (required)"));
         assert!(block.contains("fenced json block"));
         assert!(block.contains("```json"));
@@ -751,6 +773,65 @@ mod tests {
             2,
             "an enum field's name may appear in both the field list (with its allowed values) \
              and the example: {block}"
+        );
+    }
+
+    /// Issue #326 B7 (review round, P2): the bug. Omitting an optional
+    /// `ObjArray`'s own parent line, even when a nested field of its own
+    /// carries a constraint, destroys the association between that
+    /// constraint and WHICH parent it belongs to. Two schemas differing only
+    /// in whether `a[].ok` or `b[].ok` is required must not render
+    /// identically, and each must name the correct parent.
+    #[test]
+    fn render_contract_block_keeps_the_parent_heading_when_a_nested_field_is_required() {
+        fn schema_requiring(required_in_a: bool) -> Schema {
+            Schema {
+                fields: vec![
+                    Field {
+                        name: "a".to_string(),
+                        kind: Kind::ObjArray(vec![Field {
+                            name: "ok".to_string(),
+                            kind: Kind::Bool,
+                            required: required_in_a,
+                        }]),
+                        required: false,
+                    },
+                    Field {
+                        name: "b".to_string(),
+                        kind: Kind::ObjArray(vec![Field {
+                            name: "ok".to_string(),
+                            kind: Kind::Bool,
+                            required: !required_in_a,
+                        }]),
+                        required: false,
+                    },
+                ],
+            }
+        }
+        let schema_a = schema_requiring(true);
+        let schema_b = schema_requiring(false);
+        let block_a = render_contract_block(&schema_a);
+        let block_b = render_contract_block(&schema_b);
+
+        assert_ne!(
+            block_a, block_b,
+            "requiring a[].ok vs b[].ok must not render identically: {block_a}"
+        );
+        assert!(
+            block_a.contains("- a: array of objects") && block_a.contains("ok: bool (required)"),
+            "schema requiring a[].ok must name `a` as the parent carrying it: {block_a}"
+        );
+        assert!(
+            !block_a.contains("- b: "),
+            "b (nothing required inside it) must not get its own redundant line: {block_a}"
+        );
+        assert!(
+            block_b.contains("- b: array of objects") && block_b.contains("ok: bool (required)"),
+            "schema requiring b[].ok must name `b` as the parent carrying it: {block_b}"
+        );
+        assert!(
+            !block_b.contains("- a: "),
+            "a (nothing required inside it) must not get its own redundant line: {block_b}"
         );
     }
 

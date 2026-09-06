@@ -822,28 +822,74 @@ const PREVIOUS_HANDOFF_CAP_BYTES: usize = 8192;
 
 /// The non-protected sections of `prev.to_markdown()`, in the same order
 /// `to_markdown` itself renders them -- everything except `task`/
-/// `remaining`/`blocked`/`next_step`, which `capped_previous_handoff_
-/// markdown` renders separately and always keeps in full.
+/// `remaining`/`blocked`/`verification`/`next_step`, which
+/// `capped_previous_handoff_markdown` renders separately and always keeps in
+/// full.
 fn rest_sections_markdown(prev: &Handoff) -> String {
     let mut out = String::new();
     write_list(&mut out, "Constraints", &prev.constraints);
     write_list(&mut out, "Done", &prev.done);
     write_list(&mut out, "Key decisions", &prev.key_decisions);
-    out.push_str(&format!("## Verification\n{}\n\n", prev.verification));
     write_list(&mut out, "Files read", &prev.files_read);
     write_list(&mut out, "Files modified", &prev.files_modified);
     write_list(&mut out, "Gotchas learned", &prev.gotchas);
     out
 }
 
-/// Issue #326 B6: `prev.to_markdown()` capped to `budget` bytes -- but
-/// `task`/`remaining`/`blocked`/`next_step` (what the successor must do, and
-/// what is still outstanding) always survive in full regardless of budget;
-/// only the other, more historical sections (`Constraints`/`Done`/`Key
-/// decisions`/`Verification`/`Files read`/`Files modified`/`Gotchas
-/// learned`) are truncated, with an explicit "[truncated N bytes]" note,
-/// never a silent cut. A no-op, returning `prev.to_markdown()` unchanged,
-/// when the whole document already fits.
+/// Issue #326 B6 (review round 2): item-count cap for a protected LIST
+/// (`remaining`/`blocked`) inside `capped_previous_handoff_markdown`'s
+/// protected block. Those two are unbounded-count lists -- nothing upstream
+/// caps how many items a distilled handoff may carry -- so the protected
+/// block, which the byte budget below never trims, could otherwise grow
+/// without limit on its own even though every individual item is already
+/// bounded to `VERIFICATION_LINE_CHAR_CAP` (200 chars) by `write_list`'s own
+/// `normalize_rendered_line`. Keeps the most recent `PROTECTED_LIST_MAX_
+/// ITEMS` (the tail: whatever a distiller appended last is the most likely
+/// to still be live), with an explicit `[truncated: N older ... item(s)
+/// omitted]` note when anything was actually cut -- never silent.
+const PROTECTED_LIST_MAX_ITEMS: usize = 40;
+
+fn write_protected_list(out: &mut String, heading: &str, items: &[String]) {
+    if items.len() <= PROTECTED_LIST_MAX_ITEMS {
+        write_list(out, heading, items);
+        return;
+    }
+    let omitted = items.len() - PROTECTED_LIST_MAX_ITEMS;
+    let kept = &items[items.len() - PROTECTED_LIST_MAX_ITEMS..];
+    write_list(out, heading, kept);
+    out.push_str(&format!(
+        "[truncated: {omitted} older {heading} item(s) omitted to bound the protected block]\n\n"
+    ));
+}
+
+/// Issue #326 B6 (review round 1, P1; round 2 item-count follow-up):
+/// `prev.to_markdown()` capped to `budget` bytes -- but `task`/`remaining`/
+/// `blocked`/`verification`/`next_step` (what the successor must do, what is
+/// still outstanding, and whether the last checks actually passed) always
+/// survive, subject only to `PROTECTED_LIST_MAX_ITEMS`' own item-count cap
+/// on `remaining`/`blocked`, never to the byte `budget` below; only the
+/// other, more historical sections (`Constraints`/`Done`/`Key decisions`/
+/// `Files read`/`Files modified`/`Gotchas learned`) are truncated against
+/// `budget` itself, with an explicit "[truncated N bytes]" note, never a
+/// silent cut. `verification` moved into the protected set after review
+/// found it could otherwise be trimmed away alongside `Constraints`/`Done`/
+/// `Key decisions` -- a still-unresolved `FAILED: <test>` is exactly the
+/// kind of fact a generic truncation note must never substitute for; a
+/// successor that never sees it has no reason to re-run the failing check.
+///
+/// This is deliberately NOT a hard ceiling on the whole function's own
+/// output: the protected block's own worst case is `PROTECTED_LIST_MAX_
+/// ITEMS` items per list at up to ~203 bytes each (`write_list`'s 200-char
+/// cap plus its own `"- "`/newline) for `remaining`/`blocked`, PLUS
+/// `task`/`verification`/`next_step` at whatever byte length those three
+/// scalar fields happen to carry -- bounded to `PARSED_SCALAR_FIELD_CAP_
+/// BYTES` (2048 each) when the `Handoff` came from `parse_markdown` (the
+/// ordinary path: every stored/distilled handoff this function is ever
+/// actually called with), but NOT enforced by this function itself for a
+/// `Handoff` built directly with an arbitrarily large scalar field. `budget`
+/// bounds the REST of the document; it does not bound the protected block.
+/// A no-op, returning `prev.to_markdown()` unchanged, when the whole
+/// document already fits.
 fn capped_previous_handoff_markdown(prev: &Handoff, budget: usize) -> String {
     let full = prev.to_markdown();
     if full.len() <= budget {
@@ -851,8 +897,9 @@ fn capped_previous_handoff_markdown(prev: &Handoff, budget: usize) -> String {
     }
     let mut protected = String::new();
     protected.push_str(&format!("## Task\n{}\n\n", prev.task));
-    write_list(&mut protected, "Remaining", &prev.remaining);
-    write_list(&mut protected, "Blocked", &prev.blocked);
+    write_protected_list(&mut protected, "Remaining", &prev.remaining);
+    write_protected_list(&mut protected, "Blocked", &prev.blocked);
+    protected.push_str(&format!("## Verification\n{}\n\n", prev.verification));
     protected.push_str(&format!("## Next step\n{}\n\n", prev.next_step));
 
     let rest = rest_sections_markdown(prev);
@@ -1586,6 +1633,86 @@ mod tests {
         assert!(
             block.contains("[truncated"),
             "the cut historical sections must be noted explicitly, never silent: {block}"
+        );
+    }
+
+    /// Issue #326 B6 (review round 1, P1): `verification` used to live in the
+    /// truncatable historical block alongside `Constraints`/`Done`/`Key
+    /// decisions` -- an oversized previous doc could trim away a still-
+    /// unresolved FAILED verification, even though the failure is exactly the
+    /// fact a successor most needs to see next. `verification` is now
+    /// protected the same way `remaining`/`blocked`/`next_step` already are.
+    #[test]
+    fn the_previous_handoff_carry_over_never_trims_a_failed_verification() {
+        let huge_item = "x".repeat(300);
+        let previous = Handoff {
+            task: "Ship the webhook".to_string(),
+            constraints: vec![huge_item.clone(); 100],
+            done: vec![huge_item.clone(); 100],
+            key_decisions: vec![huge_item.clone(); 40],
+            gotchas: vec![huge_item; 40],
+            verification: "last run (command: `cargo test`) FAILED: suite::regression".to_string(),
+            next_step: "Fix suite::regression".to_string(),
+            ..Handoff::default()
+        };
+        assert!(
+            previous.to_markdown().len() > 32 * 1024,
+            "the fixture must actually exceed 32 KiB to be a test of the cap: {} bytes",
+            previous.to_markdown().len()
+        );
+
+        let prompt = distill_prompt(&ctx_sample(), Some(&previous));
+        assert!(
+            prompt.contains("suite::regression"),
+            "a failing test named in the previous handoff's verification must survive the cap \
+             verbatim, never lost to the generic truncation note: {prompt}"
+        );
+        assert!(
+            prompt.contains("FAILED"),
+            "the failure itself must survive: {prompt}"
+        );
+    }
+
+    /// Issue #326 B6 (review round 2): `remaining`/`blocked` are unbounded-
+    /// count lists -- being "protected" from the byte-budget truncation must
+    /// not mean unbounded. 1000 items (comfortably over the byte budget on
+    /// their own) must still yield a BOUNDED protected block, with an
+    /// explicit note naming how many older items were cut.
+    #[test]
+    fn the_protected_block_bounds_an_unbounded_remaining_list_by_item_count() {
+        let previous = Handoff {
+            task: "Ship the webhook".to_string(),
+            remaining: (0..1000)
+                .map(|i| format!("todo item {i:04} needs follow-up before shipping"))
+                .collect(),
+            next_step: "Keep going".to_string(),
+            ..Handoff::default()
+        };
+        assert!(
+            previous.to_markdown().len() > PREVIOUS_HANDOFF_CAP_BYTES,
+            "the fixture must actually exceed the cap to be a test of the count bound: {} bytes",
+            previous.to_markdown().len()
+        );
+
+        let capped = capped_previous_handoff_markdown(&previous, PREVIOUS_HANDOFF_CAP_BYTES);
+        assert!(
+            capped.contains("todo item 0999"),
+            "the most recently added item must survive: {capped}"
+        );
+        assert!(
+            !capped.contains("todo item 0000 "),
+            "the oldest items must not survive unbounded: {capped}"
+        );
+        assert!(
+            capped.contains("[truncated: 960 older Remaining item(s) omitted"),
+            "the count-cap note must name exactly how many were cut: {capped}"
+        );
+        assert!(
+            capped.len() < 1000 * 60,
+            "the protected block itself must be bounded by item count, not merely \"protected\" \
+             from the byte budget -- an unbounded rendering of all 1000 items would be far \
+             larger than this: {} bytes",
+            capped.len()
         );
     }
 
