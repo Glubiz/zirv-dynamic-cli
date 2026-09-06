@@ -1519,7 +1519,7 @@ pub const UNKNOWN_SENDER: &str = "unknown";
 /// id -- "nudged by <myself>", which was simply false.
 fn write_nudge_marker(state: &StateDir, short: &str, from: &str) {
     let _ = super::state::create_private_dir_all(&state.sessions());
-    let _ = std::fs::write(nudge_marker_path(state, short), from.as_bytes());
+    let _ = super::state::write_private(&nudge_marker_path(state, short), from);
 }
 
 /// Best-effort low-latency notification used after durable mail storage.
@@ -1573,7 +1573,10 @@ fn stall_marker_path(state: &StateDir, short: &str) -> PathBuf {
 /// which is what actually drives the nudge/terminate decision.
 pub fn write_stall_marker(state: &StateDir, short: &str, latched_at_secs: u64) {
     let _ = super::state::create_private_dir_all(&state.sessions());
-    let _ = std::fs::write(stall_marker_path(state, short), latched_at_secs.to_string());
+    let _ = super::state::write_private(
+        &stall_marker_path(state, short),
+        &latched_at_secs.to_string(),
+    );
 }
 
 /// Reads this session's stall latch, if armed -- the unix-seconds moment it
@@ -3281,6 +3284,60 @@ mod tests {
             !published("99999999").exists(),
             "a published socket path with no record at all is swept too"
         );
+    }
+
+    /// Both markers are read by OTHER processes while their owner rewrites
+    /// them -- `claim_nudge_marker` could hand back an empty sender, and
+    /// `stall_marker` could lose the latch for a tick -- so neither may be
+    /// written with a truncating write. Every other writer of these files
+    /// already goes through `state::write_private`.
+    #[test]
+    fn marker_writes_are_atomic_for_a_concurrent_reader() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let short = "abcd1234";
+        write_nudge_marker(&state, short, "sender01");
+        write_stall_marker(&state, short, 1_700_000_000);
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let nudge = nudge_marker_path(&state, short);
+            let stall = stall_marker_path(&state, short);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut torn = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(text) = std::fs::read_to_string(&nudge)
+                        && text.trim().is_empty()
+                    {
+                        torn += 1;
+                    }
+                    if let Ok(text) = std::fs::read_to_string(&stall)
+                        && text.trim().parse::<u64>().is_err()
+                    {
+                        torn += 1;
+                    }
+                }
+                torn
+            })
+        };
+
+        for i in 0..600u64 {
+            write_nudge_marker(&state, short, "sender01");
+            write_stall_marker(&state, short, 1_700_000_000 + i);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let torn = reader.join().expect("reader thread");
+
+        assert_eq!(
+            torn, 0,
+            "a concurrent reader saw a marker mid-write {torn} time(s)"
+        );
+        assert_eq!(
+            claim_nudge_marker(&state, short).as_deref(),
+            Some("sender01")
+        );
+        assert_eq!(stall_marker(&state, short), Some(1_700_000_599));
     }
 
     // F6: a unique-but-mistyped prefix must not be actionable.
