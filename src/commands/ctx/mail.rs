@@ -1114,7 +1114,7 @@ pub fn store_to(
 /// apart from an ordinary one purely from its own path, with no new field on
 /// `Message` and so no change to any of the many existing call sites across
 /// the codebase that build one. See the Decision Log entry on `--all`.
-fn store_fanout(
+pub(super) fn store_fanout(
     state: &StateDir,
     dest_slug: &str,
     sender_slug: &str,
