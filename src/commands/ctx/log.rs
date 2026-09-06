@@ -12,6 +12,14 @@ pub const DELEGATION_FILE: &str = "delegations.jsonl";
 pub const PERMISSION_PROMPTS_FILE: &str = "permission-prompts.jsonl";
 pub const ORCHESTRATOR_BLOCKS_FILE: &str = "orchestrator-blocks.jsonl";
 
+/// How many UTC days of `safety-decisions/` buckets [`append_safety`] keeps.
+/// The daily bucketing exists so retention can drop whole files without a
+/// cross-process truncate race; nothing enforced it, so the directory grew
+/// without bound (7.7 MB on one real machine) and every full read of it --
+/// `zirv ctx snapshot`'s two consumers among them -- paid for the whole
+/// history.
+pub const SAFETY_DECISION_RETENTION_DAYS: u64 = 30;
+
 /// `Decision::action` for the one-line marker written into the MAIN decision
 /// log alongside every delegation record.
 pub const DELEGATION_ACTION: &str = "delegation-complete";
@@ -333,7 +341,10 @@ pub fn append_delegation(state: &StateDir, record: &Delegation<'_>) -> CtxResult
 
 /// Appends to one UTC-day bucket. Daily files put a hard time boundary around
 /// retention/rotation without a cross-process truncate race between the many
-/// short-lived hook processes that may be writing concurrently.
+/// short-lived hook processes that may be writing concurrently -- and, since
+/// this task, actually enforce it: buckets older than
+/// [`SAFETY_DECISION_RETENTION_DAYS`] are dropped here, whole files at a
+/// time, so no reader ever races a partially rewritten log.
 pub fn append_safety(state: &StateDir, decision: &SafetyDecision<'_>) -> CtxResult<()> {
     let dir = state.logs().join(SAFETY_LOG_DIR);
     super::state::create_private_dir_all(&dir)?;
@@ -341,7 +352,37 @@ pub fn append_safety(state: &StateDir, decision: &SafetyDecision<'_>) -> CtxResu
     let path = dir.join(format!("{day:010}.jsonl"));
     let mut file = super::state::open_private_append(&path)?;
     writeln!(file, "{}", serde_json::to_string(decision)?)?;
+    drop(file);
+    prune_safety_buckets(&dir, day);
     Ok(())
+}
+
+/// Deletes every `<day>.jsonl` bucket in `dir` older than the retention
+/// window ending at `newest_day`. Best-effort throughout: a name that is not
+/// a zero-padded day number is left alone (an operator's own file in there
+/// is not ours to delete), and a failed unlink is ignored rather than
+/// failing the append that a hook depends on.
+fn prune_safety_buckets(dir: &std::path::Path, newest_day: u64) {
+    let cutoff = newest_day.saturating_sub(SAFETY_DECISION_RETENTION_DAYS);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(day) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if day < cutoff {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 pub fn tail(state: &StateDir, count: usize) -> CtxResult<Vec<String>> {
@@ -615,6 +656,60 @@ mod tests {
             records[1].matched_pattern.as_deref(),
             Some("<sandbox: escape_allow>")
         );
+    }
+
+    /// `safety-decisions/` is the only unbounded-growth log in the state
+    /// dir (7.7 MB across 13 buckets on one real machine), and the daily
+    /// bucketing exists precisely so retention can drop whole files. An
+    /// append prunes every bucket older than the window; the current bucket
+    /// and one exactly on the window boundary both stay.
+    #[test]
+    fn safety_buckets_older_than_the_retention_window_are_dropped_on_append() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = state.logs().join(SAFETY_LOG_DIR);
+        super::super::state::create_private_dir_all(&dir).expect("mkdir");
+
+        let today = 20_000u64;
+        let stale = today - SAFETY_DECISION_RETENTION_DAYS - 1;
+        let boundary = today - SAFETY_DECISION_RETENTION_DAYS;
+        for day in [stale, boundary] {
+            std::fs::write(dir.join(format!("{day:010}.jsonl")), "{}\n").expect("write");
+        }
+        let unrelated = dir.join("notes.txt");
+        std::fs::write(&unrelated, "keep me").expect("write");
+
+        append_safety(
+            &state,
+            &SafetyDecision {
+                ts: today * 86_400,
+                session: "s1",
+                mode: "interactive",
+                verdict: "ask",
+                command_sha256: "aaa",
+                policy_sha256: "p",
+                launch_policy_sha256: None,
+                attestation: "not-present",
+                matched_pattern: None,
+                origin: Some("built-in"),
+                platform: "linux",
+            },
+        )
+        .expect("append");
+
+        assert!(
+            !dir.join(format!("{stale:010}.jsonl")).exists(),
+            "a bucket past the retention window must be dropped"
+        );
+        assert!(
+            dir.join(format!("{boundary:010}.jsonl")).exists(),
+            "a bucket exactly on the window boundary must be kept"
+        );
+        assert!(
+            dir.join(format!("{today:010}.jsonl")).exists(),
+            "the bucket just appended to must be kept"
+        );
+        assert!(unrelated.exists(), "a non-bucket file must never be pruned");
     }
 
     /// Issue #320: a `safety-decisions/*.jsonl` line written before any
