@@ -5474,6 +5474,13 @@ mod tests {
     #[test]
     fn diff_second_call_with_no_change_prints_exactly_one_line() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // The pool section builds a `fallback::capacity_snapshot`, which
+        // refreshes every provider's passive usage source before ranking it.
+        // Left pointed at the developer's real home, the first call would
+        // import this machine's own codex rollout data and the second would
+        // then legitimately report a changed section.
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let state_root = tmp.path().join("state");
         let env = env_for_session(&state_root, "sess-diff-nochange");
         let args = StatusArgs {
@@ -5519,6 +5526,11 @@ mod tests {
     #[test]
     fn diff_reports_only_the_section_that_changed() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // Same isolation as `diff_second_call_with_no_change_prints_exactly_
+        // one_line`: the pool section's capacity snapshot refreshes passive
+        // usage sources out of the home directory.
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
         let env = env_for_session(state.root(), "sess-diff-changed");
