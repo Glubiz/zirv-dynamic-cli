@@ -439,6 +439,15 @@ impl StateDir {
     /// sibling of `sessions()`, and deliberately NOT inside it: a session is
     /// a live process, a group outlives every process in it and is the
     /// record of what a batch of delegated work was launched under.
+    /// `<state>/rollouts` -- one tiny pointer file per session naming the
+    /// codex rollout that session actually created. `codex exec` mints its
+    /// OWN session id, so a rollout is never named after the zirv session id
+    /// and has to be identified once, by start time, and then remembered;
+    /// see `adapters::codex::CodexAdapter::transcript_path`.
+    pub fn rollouts(&self) -> PathBuf {
+        self.0.join("rollouts")
+    }
+
     pub fn groups(&self) -> PathBuf {
         self.0.join("groups")
     }

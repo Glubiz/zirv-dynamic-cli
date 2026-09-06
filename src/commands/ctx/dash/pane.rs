@@ -57,6 +57,37 @@ pub enum PaneBudgetNotice {
     HardStop { used: u64, limit: u64 },
 }
 
+/// What a completed pane delegation needs to reach the cost ledger, gathered
+/// once by `dash::mod::fulfill_spawn_request` (the only place these values
+/// exist) and read back by `dash::mod::account_reaped_pane_spend` once the
+/// pane's own child exits.
+///
+/// 2026-09-06: without this, a delegation the dashboard accepted as a pane
+/// was never logged at all. `agent::run_with` returns at `Dispatch::
+/// Answered` the moment the ack lands -- long before the pane has run, let
+/// alone spent anything -- so the requester's own `log::append_delegation`
+/// call is unreachable on that path, and since headless spawns were removed
+/// that is EVERY delegation made while a dashboard is live.
+///
+/// `requester` is the session this row is attributed to, which is what
+/// `status::spend_status_line` and the dashboard footer filter their "this
+/// session" figures on. It is cost attribution, never authority: the
+/// server-verified `Pane::parent_session` is preferred, but a request that
+/// arrived on the dashboard's own shared drop directory (an orchestrator
+/// seat that is not itself a pane -- the ordinary case) proves no identity
+/// there, and falling back to what the request claimed is the difference
+/// between a row nobody can find and no row at all.
+#[derive(Debug, Clone)]
+pub struct DelegationFacts {
+    pub requester: String,
+    pub mode: super::super::permit::WorkerMode,
+    pub principal: String,
+    pub envelope_sha256: Option<String>,
+    /// When this pane's child was launched -- the pane-side equivalent of
+    /// `exec::ExecutionSegment::wall_ms`'s own clock.
+    pub started_at: Instant,
+}
+
 /// What `Pane::spawn` needs to launch and register a pane. `argv` is the
 /// full program-plus-arguments invocation -- built by the caller from an
 /// adapter's `interactive_cmd`/`build_launch`, prompt composition and
@@ -931,6 +962,11 @@ pub struct Pane {
     /// path: an operator-named `--workdir` under `.zirv/worktrees/` stays
     /// the operator's.
     owns_cwd: bool,
+    /// The ledger row this pane owes once its child exits, when it is
+    /// fulfilling a delegation at all -- `None` for the dashboard's own
+    /// orchestrator pane and for a restored pane, neither of which is
+    /// anybody's delegation. See [`DelegationFacts`].
+    delegation: Option<DelegationFacts>,
 }
 
 impl Pane {
@@ -1181,6 +1217,7 @@ impl Pane {
             writer_permit: None,
             cwd: cwd.to_path_buf(),
             owns_cwd: false,
+            delegation: None,
         })
     }
 
@@ -1834,6 +1871,18 @@ impl Pane {
     /// `dash::mod::sweep_one_pane`'s own trust-label input.
     pub fn parent_session(&self) -> Option<&str> {
         self.parent_session.as_deref()
+    }
+
+    /// Records what this pane owes the cost ledger. Set right after
+    /// `Pane::spawn` by `dash::mod::fulfill_spawn_request`, the same
+    /// "computed once, stored once" pattern `set_parent_session` above uses.
+    pub fn set_delegation(&mut self, facts: DelegationFacts) {
+        self.delegation = Some(facts);
+    }
+
+    /// See [`DelegationFacts`].
+    pub fn delegation(&self) -> Option<&DelegationFacts> {
+        self.delegation.as_ref()
     }
 
     /// This pane's own child process id, when the backend can report one --

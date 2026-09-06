@@ -287,6 +287,14 @@ pub struct CodexAdapter {
     /// a headless `codex exec` launch at all.
     #[cfg(test)]
     forced_exec_ask_for_approval_support: Option<bool>,
+    /// Test seam only, mirroring `home` exactly: pins the zirv state root
+    /// [`CodexAdapter::transcript_path`] resolves the session registry and
+    /// its own rollout pins from, instead of the real platform state
+    /// directory. `None` in a test means "resolve nothing", so a test that
+    /// never opts in cannot reach -- or write into -- the developer's own
+    /// state dir.
+    #[cfg(test)]
+    forced_state_root: Option<PathBuf>,
 }
 
 impl CodexAdapter {
@@ -308,6 +316,8 @@ impl CodexAdapter {
             forced_auto_review_support: None,
             #[cfg(test)]
             forced_exec_ask_for_approval_support: None,
+            #[cfg(test)]
+            forced_state_root: None,
         }
     }
 
@@ -315,6 +325,13 @@ impl CodexAdapter {
     #[cfg(test)]
     pub fn with_home(mut self, home: PathBuf) -> Self {
         self.home = Some(home);
+        self
+    }
+
+    /// Test seam: see the field's own doc comment.
+    #[cfg(test)]
+    pub fn with_state_root(mut self, root: PathBuf) -> Self {
+        self.forced_state_root = Some(root);
         self
     }
 
@@ -488,6 +505,51 @@ impl CodexAdapter {
             .clone()
             .or_else(|| crate::utils::home_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The zirv state root this adapter reads the session registry and its
+    /// own rollout pins from. `None` -- never a guess at a default -- when no
+    /// platform state directory can be resolved at all, which
+    /// [`AgentAdapter::transcript_path`] treats as "pin nothing, resolve
+    /// nothing".
+    #[cfg(test)]
+    fn state_dir(&self) -> Option<super::super::state::StateDir> {
+        self.forced_state_root
+            .clone()
+            .map(super::super::state::StateDir::from_root)
+    }
+
+    #[cfg(not(test))]
+    fn state_dir(&self) -> Option<super::super::state::StateDir> {
+        super::super::state::StateDir::resolve(&super::super::config::env_from_process()).ok()
+    }
+
+    /// Resolution 2 and 3 of [`AgentAdapter::transcript_path`] -- see its own
+    /// doc comment. Reading the pin is what makes the answer stable; writing
+    /// it is best-effort, because a pin that cannot be written costs a
+    /// repeated scan, never a wrong answer.
+    fn pinned_rollout(&self, sessions_root: &Path, session: &SessionRef) -> Option<PathBuf> {
+        let state = self.state_dir()?;
+        let short = super::super::sessions::short_id(session.id.as_str());
+        let pin = state.rollouts().join(format!("{short}.path"));
+        if let Ok(recorded) = std::fs::read_to_string(&pin) {
+            let recorded = PathBuf::from(recorded.trim());
+            if recorded.is_file() {
+                return Some(recorded);
+            }
+        }
+        let record = super::super::sessions::load_record(&state, &short)?;
+        // Truncated-to-the-second epoch, so this floor already sits up to a
+        // second BEFORE the registration it describes -- which is the right
+        // direction: a pane registers its record moments after the child is
+        // spawned, so codex's own `session_meta` can legitimately be stamped
+        // a few hundred milliseconds earlier than the registration.
+        let started_ms = record.started_at.saturating_mul(1_000);
+        let resolved = resolve_rollout(sessions_root, started_ms, &session.cwd)?;
+        if super::super::state::create_private_dir_all(&state.rollouts()).is_ok() {
+            let _ = super::super::state::write_private(&pin, &resolved.display().to_string());
+        }
+        Some(resolved)
     }
 }
 
@@ -843,6 +905,85 @@ fn find_rollout(dir: &Path, filename_suffix: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Every rollout file under `dir`, at any depth -- the collecting sibling of
+/// [`find_rollout`], for the case where no filename can be predicted at all.
+fn collect_rollouts(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollouts(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+/// The `(start_ms, cwd)` a rollout's own first record reports, or `None` for
+/// a file whose first line is not a parseable `session_meta`. Only the first
+/// line is read: a rollout grows to megabytes, and the one record that says
+/// when and where the session began is always its first.
+///
+/// The filename's own timestamp is deliberately NOT used -- codex names the
+/// file in LOCAL time (`rollout-2026-09-06T07-50-08-...`) while the record
+/// inside it is UTC (`2026-09-06T05:50:08.783Z`), so a filename comparison
+/// would be wrong by the machine's own UTC offset.
+fn rollout_session_meta(path: &Path) -> Option<(u64, Option<String>)> {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(file).read_line(&mut line).ok()?;
+    let row: Value = serde_json::from_str(line.trim()).ok()?;
+    if row.get("type").and_then(Value::as_str)? != "session_meta" {
+        return None;
+    }
+    let payload = row.get("payload")?;
+    let started = payload
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .or_else(|| row.get("timestamp").and_then(Value::as_str))
+        .and_then(window::parse_iso8601_utc_ms)?;
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some((started, cwd))
+}
+
+/// The rollout a session that began at `started_ms` and runs in `cwd` most
+/// plausibly created: the EARLIEST one that began at or after this session
+/// did, restricted to rollouts recorded in this session's own `cwd` whenever
+/// any of them are.
+///
+/// Earliest, not newest: with two codex runs live at once, "newest after my
+/// start" hands the older session the younger one's transcript, while "the
+/// first rollout to appear after I started" is exactly the one this session
+/// launched. The residual is two codex runs started in the SAME directory
+/// within the same second, which no signal available here can separate --
+/// which is why the caller pins the answer rather than recomputing it.
+fn resolve_rollout(sessions_root: &Path, started_ms: u64, cwd: &Path) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    collect_rollouts(sessions_root, &mut files);
+    let mut candidates: Vec<(u64, bool, PathBuf)> = files
+        .into_iter()
+        .filter_map(|path| {
+            let (started, recorded_cwd) = rollout_session_meta(&path)?;
+            if started < started_ms {
+                return None;
+            }
+            let same_cwd = recorded_cwd.is_some_and(|recorded| Path::new(&recorded) == cwd);
+            Some((started, same_cwd, path))
+        })
+        .collect();
+    if candidates.iter().any(|(_, same_cwd, _)| *same_cwd) {
+        candidates.retain(|(_, same_cwd, _)| *same_cwd);
+    }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+    candidates.into_iter().next().map(|(_, _, path)| path)
 }
 
 /// `value` rendered as a quoted TOML string, for embedding inside a `-c
@@ -1453,11 +1594,36 @@ impl AgentAdapter for CodexAdapter {
         1 + self.bin_args.len()
     }
 
+    /// Three resolutions, in descending order of certainty.
+    ///
+    /// 1. A rollout named after the zirv session id -- right whenever codex
+    ///    ever honours an id zirv chose, and cheap enough to keep trying.
+    /// 2. This session's own pin (`<state>/rollouts/<short>.path`), written
+    ///    by resolution 3 the first time it succeeded. Codex has no
+    ///    `--session-id` on any command surface (see `headless_cmd`'s own
+    ///    doc comment) and mints its own id, so resolution 1 never fires in
+    ///    practice and everything downstream -- `transcript_usage`, the
+    ///    pane budget sweep, `dash::account_reaped_pane_spend`, rot scoring
+    ///    -- read an absent file and saw a session that had spent nothing.
+    /// 3. The earliest rollout whose own `session_meta` record starts at or
+    ///    after the moment this session was registered, preferring one whose
+    ///    recorded `cwd` is this session's. Pinned once found, so later
+    ///    codex runs can never move an already-resolved session onto a
+    ///    different transcript.
+    ///
+    /// Resolutions 2 and 3 need the registry's own record of when this
+    /// session started, so they are skipped entirely when no state dir can
+    /// be resolved -- leaving exactly the pre-2026-09-06 behaviour.
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
         let sessions_root = self.home_dir().join(".codex").join("sessions");
         let suffix = format!("-{}.jsonl", session.id);
-        find_rollout(&sessions_root, &suffix)
-            .unwrap_or_else(|| sessions_root.join(format!("rollout{suffix}")))
+        if let Some(found) = find_rollout(&sessions_root, &suffix) {
+            return found;
+        }
+        if let Some(pinned) = self.pinned_rollout(&sessions_root, session) {
+            return pinned;
+        }
+        sessions_root.join(format!("rollout{suffix}"))
     }
 
     /// Derives normalized rot/usage events from the same rollout JSONL
@@ -3426,6 +3592,117 @@ mod tests {
             cwd: std::path::PathBuf::from("/work/repo"),
         };
         assert_eq!(adapter.transcript_path(&session), expected);
+    }
+
+    /// `codex exec` has no `--session-id` flag and mints its own id (see
+    /// `headless_cmd`'s own doc comment), so NO rollout is ever named after
+    /// the zirv session id: the suffix scan above finds nothing and every
+    /// codex delegation recorded zero tokens, which in turn made
+    /// `dash::account_reaped_pane_spend` early-return without ever settling
+    /// a codex pane's group/provider reservation. The rollout codex actually
+    /// created is resolved by its own `session_meta` start time against the
+    /// registry's record of when this session began, and pinned so a later
+    /// lookup stays on it however many codex runs follow.
+    #[test]
+    fn transcript_path_resolves_and_pins_the_rollout_codex_actually_minted() {
+        let home = tempfile::tempdir().expect("home");
+        let state_root = tempfile::tempdir().expect("state");
+        let day_dir = home.path().join(".codex/sessions/2026/09/06");
+        std::fs::create_dir_all(&day_dir).expect("mkdir");
+
+        let rollout = |name: &str, started: &str, input: u64, output: u64| -> PathBuf {
+            let path = day_dir.join(name);
+            let meta = serde_json::json!({
+                "timestamp": started,
+                "type": "session_meta",
+                "payload": {"id": "x", "timestamp": started, "cwd": "/work/repo"},
+            });
+            let tokens = serde_json::json!({
+                "timestamp": started,
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": 0,
+                    "output_tokens": output,
+                    "reasoning_output_tokens": 0,
+                    "total_tokens": input + output,
+                }}},
+            });
+            std::fs::write(&path, format!("{meta}\n{tokens}\n")).expect("write rollout");
+            path
+        };
+
+        // Before this session ever started -- a previous codex run.
+        rollout(
+            "rollout-2026-09-06T05-00-00-aaaaaaaa-1111-7111-8111-111111111111.jsonl",
+            "2026-09-06T05:00:00.000Z",
+            10,
+            10,
+        );
+        // The one this session actually launched.
+        let mine = rollout(
+            "rollout-2026-09-06T06-00-10-bbbbbbbb-2222-7222-8222-222222222222.jsonl",
+            "2026-09-06T06:00:10.000Z",
+            1200,
+            80,
+        );
+
+        let session_id = "11111111-2222-4333-8444-555555555555";
+        let short = crate::commands::ctx::sessions::short_id(session_id);
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_root.path().to_path_buf());
+        std::fs::create_dir_all(state.sessions()).expect("mkdir sessions");
+        let mut record = crate::commands::ctx::sessions::Record::new(
+            session_id,
+            "codex",
+            std::path::Path::new("/work/repo"),
+            crate::commands::ctx::sessions::Verb::Dash,
+        );
+        record.started_at = 1_788_674_400; // 2026-09-06T06:00:00Z
+        std::fs::write(
+            state.sessions().join(format!("{short}.json")),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("write record");
+
+        let adapter = CodexAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_state_root(state_root.path().to_path_buf());
+        let session = SessionRef {
+            id: SessionId::parse(session_id),
+            cwd: std::path::PathBuf::from("/work/repo"),
+        };
+
+        assert_eq!(
+            adapter.transcript_path(&session),
+            mine,
+            "the rollout whose own session_meta starts at/after this session did"
+        );
+        let body = std::fs::read_to_string(&mine).expect("read");
+        assert_eq!(
+            adapter.transcript_usage(&body),
+            Some(TranscriptUsage {
+                input_tokens: 1200,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 80,
+            }),
+            "a resolved rollout reports real tokens, not the zero an absent file reads as"
+        );
+
+        // A codex run that starts later must not steal an already-resolved
+        // session's transcript: the first resolution pinned it.
+        rollout(
+            "rollout-2026-09-06T07-00-00-cccccccc-3333-7333-8333-333333333333.jsonl",
+            "2026-09-06T07:00:00.000Z",
+            5,
+            5,
+        );
+        assert_eq!(
+            adapter.transcript_path(&session),
+            mine,
+            "a pinned rollout stays pinned once a later codex run appears"
+        );
     }
 
     /// `-m, --model <MODEL>` is verified on top-level `codex --help` too (see
