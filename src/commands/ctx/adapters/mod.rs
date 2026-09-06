@@ -2987,15 +2987,62 @@ pub fn policy_launch_args(
     flags: &[String],
     mode: LaunchMode,
 ) -> Vec<String> {
+    policy_launch_args_for_surface(cfg, adapter, flags, mode, mode)
+}
+
+/// The general form of [`policy_launch_args`] above, for the one caller
+/// whose approval-permissiveness signal and actual CLI launch surface can
+/// diverge: a dashboard pane (`dash::worker_pane_extra_args`, review round,
+/// issue #326) always launches through [`AgentAdapter::interactive_cmd`] --
+/// `SpawnRequest::interactive` never gates that choice, only whether this
+/// pane gets the permissive interactive approval posture or the fail-closed
+/// headless one (issue #230 finding 10). Every OTHER real-launch seam this
+/// module's own doc comment above lists passes one `mode` that already
+/// equals its real launch surface (`agent.rs`/`exec.rs`/`run_loop.rs` are
+/// always headless-launched; `chat.rs`/`wrap.rs`/`handover.rs` always
+/// interactive-launched), so `policy_launch_args` above still passes the
+/// same `mode` to both halves for them -- this split only matters for the
+/// one caller where it doesn't hold.
+///
+/// `approval_mode` feeds `default_sandbox_args` (and nothing else): its own
+/// argv is safe under either `LaunchMode` value regardless of the REAL
+/// surface -- `--ask-for-approval`/`--approve-for-me`/`-c approval_policy=`
+/// are all verified present on both codex's top-level interactive launch
+/// and `codex exec` (see `CodexAdapter::approval_suppression_args`'s own
+/// doc comment) -- so it is safe, and correct, to keep it driven by
+/// `SpawnRequest::interactive`'s fail-closed signal.
+///
+/// `surface_mode` feeds `policy_args`, because THAT is where a genuinely
+/// surface-unsafe choice lives: `CodexAdapter::policy_args`'s Deny-stance
+/// branch picks between `read_only_args()` (exec-only `--ignore-rules
+/// --ignore-user-config`, safe only on `codex exec`) and
+/// `interactive_read_only_args()` (never those two, safe on codex's
+/// top-level interactive launch too) -- see `AgentAdapter::
+/// interactive_read_only_args`'s own doc comment. Passing a `Headless`
+/// approval-permissiveness signal in as `surface_mode` too, for a
+/// `SpawnRequest { interactive: false, .. }` that is nonetheless fulfilled
+/// as a real interactive pane (an ordinary `zirv ctx agent` dispatch, which
+/// never claims `interactive` since it cannot vouch a human is watching the
+/// dashboard that might pick the request up -- `agent.rs`'s own doc comment
+/// on that field), reproduced the exact "pane exited with code 2" crash
+/// this whole fix exists to close, just through the canonical `[policy]`
+/// `Deny` stance instead of `--mode read-only`'s own floor.
+pub fn policy_launch_args_for_surface(
+    cfg: &CtxConfig,
+    adapter: &dyn AgentAdapter,
+    flags: &[String],
+    approval_mode: LaunchMode,
+    surface_mode: LaunchMode,
+) -> Vec<String> {
     if flags_pin_policy(flags) {
         return Vec::new();
     }
     let mut out = if cfg.sandbox.enabled {
-        adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety, mode)
+        adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety, approval_mode)
     } else {
         Vec::new()
     };
-    out.extend(adapter.policy_args(&cfg.policy, mode));
+    out.extend(adapter.policy_args(&cfg.policy, surface_mode));
     out
 }
 

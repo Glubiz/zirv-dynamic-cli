@@ -4767,25 +4767,38 @@ fn worker_pane_extra_args(
 ) -> Vec<String> {
     // Real signal, not an assumed one (2026-08-24 hardening): only a request
     // that can vouch a human is present gets the permissive interactive
-    // posture; a scripted/headless spawn fails closed. Shared below (bug fix,
-    // 2026-09-06) so the read-only floor is resolved for the SAME launch
-    // surface this pane actually uses -- codex's exec-only `--ignore-rules`/
-    // `--ignore-user-config` used to reach an interactive pane's real
-    // top-level `codex [OPTIONS] [PROMPT]` launch (no `exec` subcommand)
-    // regardless of `req.interactive`, and that launch surface rejects both
-    // with a clap usage error (exit 2), killing the pane before it ever
-    // registered a session.
-    let launch_mode = if req.interactive {
+    // APPROVAL posture (`default_sandbox_args`'s "never" vs "on-request");
+    // a scripted/headless spawn fails closed there. This does NOT describe
+    // the actual CLI launch surface below -- see `surface_mode`.
+    let approval_mode = if req.interactive {
         adapters::LaunchMode::Interactive
     } else {
         adapters::LaunchMode::Headless
     };
+    // Bug fix (2026-09-06 review round, issue #326): this function's own
+    // caller (`fulfill_spawn_request`) always builds this pane's real
+    // harness child via `adapter.interactive_cmd`, UNCONDITIONALLY --
+    // `req.interactive` never gates that choice, only `approval_mode`
+    // above. An ordinary `zirv ctx agent codex - --mode read-only` dispatch
+    // sets `interactive: false` on its `SpawnRequest` (that call site
+    // cannot vouch a human is watching whatever dashboard picks the request
+    // up -- see its own doc comment in `agent.rs`), yet a live dashboard
+    // still fulfills it as this same real interactive pane. Any argv choice
+    // that depends on the ACTUAL CLI surface -- codex's `read_only_args()`
+    // vs `interactive_read_only_args()`, since `--ignore-rules`/
+    // `--ignore-user-config` exist only on `codex exec --help` and the
+    // top-level interactive launch rejects both with a clap usage error,
+    // exit 2 -- must therefore be resolved against the surface this
+    // function always builds for, never against `approval_mode`/
+    // `req.interactive`.
+    let surface_mode = adapters::LaunchMode::Interactive;
     let mut extra = pane_model_args(req, cfg, adapter);
-    extra.extend(adapters::policy_launch_args(
+    extra.extend(adapters::policy_launch_args_for_surface(
         cfg,
         adapter,
         &req.flags,
-        launch_mode,
+        approval_mode,
+        surface_mode,
     ));
     // 2026-09-06: the trailing `-- <flags>` the requester typed, in the same
     // position `agent::worker_launch_flags` puts them for an inline
@@ -4801,9 +4814,10 @@ fn worker_pane_extra_args(
     // read-only delegation that landed on a pane silently ran writable.
     // Appended last, after any operator flag, exactly as `workflow::review::
     // reviewer_argv` appends its own floor: no argument may weaken it.
+    // `surface_mode`, not `approval_mode`, for the same reason as above.
     if req.mode == super::permit::WorkerMode::ReadOnly
         && let Some(read_only) =
-            adapters::read_only_args_for_agent_name(adapter.name(), launch_mode)
+            adapters::read_only_args_for_agent_name(adapter.name(), surface_mode)
     {
         extra.extend(read_only);
     }
@@ -18680,14 +18694,14 @@ mod tests {
         );
     }
 
-    /// Bug fix (2026-09-06): a `--mode read-only` request fulfilled as an
-    /// INTERACTIVE dashboard pane used to die instantly with "pane exited
-    /// with code 2" -- `read_only_args_for_agent_name` carried codex's
-    /// `exec`-only `--ignore-rules --ignore-user-config` onto the real
-    /// top-level `codex [OPTIONS] [PROMPT]` launch a pane uses, which rejects
-    /// both with a clap usage error. Forces `ignore_flags_supported()` to
-    /// `true` so the assertion cannot pass by accident of whatever codex-cli
-    /// happens to be installed on the machine running the suite.
+    /// Bug fix (2026-09-06): a `--mode read-only` request fulfilled as a
+    /// dashboard pane used to die instantly with "pane exited with code 2"
+    /// -- `read_only_args_for_agent_name` carried codex's `exec`-only
+    /// `--ignore-rules --ignore-user-config` onto the real top-level `codex
+    /// [OPTIONS] [PROMPT]` launch a pane uses, which rejects both with a
+    /// clap usage error. Forces `ignore_flags_supported()` to `true` so the
+    /// assertion cannot pass by accident of whatever codex-cli happens to
+    /// be installed on the machine running the suite.
     #[test]
     fn a_read_only_interactive_codex_pane_never_carries_the_exec_only_ignore_flags() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -18717,19 +18731,56 @@ mod tests {
             !interactive.iter().any(|a| a == "--ignore-user-config"),
             "an interactive pane's real CLI surface rejects this exec-only flag: {interactive:?}"
         );
+    }
 
-        // The headless (non-interactive) pane counterpart is unaffected:
-        // that fork never launches the interactive `codex [OPTIONS] [PROMPT]`
-        // surface, so the exec-only floor is still correct there.
+    /// Review round (issue #326): the crash this whole fix exists to close
+    /// reproduces specifically with `interactive: false` -- an ordinary
+    /// `zirv ctx agent codex - --mode read-only` dispatch always sets that
+    /// field (`agent.rs`'s own doc comment: that call site cannot vouch a
+    /// human is watching whatever dashboard picks the request up), yet
+    /// `fulfill_spawn_request` fulfills it as this SAME real interactive
+    /// pane (`adapter.interactive_cmd`) regardless. The prior fix, which
+    /// resolved the read-only floor against `req.interactive` instead of
+    /// the pane's actual CLI surface, still crashed on exactly this input.
+    /// The fix must ALSO keep the request's own restrictive (fail-closed)
+    /// approval posture -- `--ask-for-approval never` -- independent of the
+    /// read-only-floor's CLI-surface fix, per `default_sandbox_args`'s own
+    /// `approval_mode` (never `surface_mode`).
+    #[test]
+    fn a_read_only_non_interactive_request_fulfilled_as_a_pane_still_excludes_the_ignore_flags() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let adapter = super::super::adapters::codex::CodexAdapter::new(None)
+            .with_ignore_flags_forced(true)
+            .with_on_request_approval_forced(false)
+            .with_exec_ask_for_approval_forced(true);
+
+        let mut req = spawn_request("go", tmp.path());
+        req.agent = "codex".to_string();
+        req.mode = super::super::permit::WorkerMode::ReadOnly;
         req.interactive = false;
-        let headless = worker_pane_extra_args(&req, &cfg, &adapter, Vec::new(), "sess", &state);
+        let extra = worker_pane_extra_args(&req, &cfg, &adapter, Vec::new(), "sess", &state);
         assert!(
-            headless.iter().any(|a| a == "--ignore-rules"),
-            "a headless pane keeps the stronger exec-only floor when supported: {headless:?}"
+            extra.windows(2).any(|w| w == ["--sandbox", "read-only"]),
+            "the sandbox pin must still reach the pane: {extra:?}"
         );
         assert!(
-            headless.iter().any(|a| a == "--ignore-user-config"),
-            "a headless pane keeps the stronger exec-only floor when supported: {headless:?}"
+            !extra.iter().any(|a| a == "--ignore-rules"),
+            "this request is nonetheless fulfilled as a real interactive pane, which rejects \
+             this exec-only flag: {extra:?}"
+        );
+        assert!(
+            !extra.iter().any(|a| a == "--ignore-user-config"),
+            "this request is nonetheless fulfilled as a real interactive pane, which rejects \
+             this exec-only flag: {extra:?}"
+        );
+        assert!(
+            extra
+                .windows(2)
+                .any(|w| w == ["--ask-for-approval", "never"]),
+            "the request's own restrictive (fail-closed) approval posture must still hold, \
+             independent of the read-only-floor's CLI-surface fix: {extra:?}"
         );
     }
 
