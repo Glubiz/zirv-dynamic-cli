@@ -513,6 +513,41 @@ fn build_provider_capacity(
         });
     }
 
+    // Audit finding G2: a reading `pace::binding` dropped purely on age, but
+    // whose own window `window::available` still considers live, is real
+    // signal -- codex writes its rollout snapshots only during a turn, so
+    // every idle gap past `collector_max_age_secs` would otherwise erase a
+    // perfectly good percentage and rank the harness at the blanket
+    // `fallback.unknown_headroom_pct`. Recorded here as an extra, explicitly
+    // `stale` window; `binding` below still names only what genuinely binds,
+    // so no hard gate gains authority from it.
+    let displayable = super::window::available(&collector, now);
+    for (name, reading) in [
+        ("five_hour", displayable.five_hour.as_ref()),
+        ("seven_day", displayable.seven_day.as_ref()),
+    ] {
+        let Some(reading) = reading else { continue };
+        if windows.iter().any(|w| w.window == name) {
+            continue;
+        }
+        windows.push(allocator::WindowReading {
+            window: name.to_string(),
+            used_pct: reading.used_percentage,
+            headroom_pct: if reading.limit_reached {
+                0.0
+            } else {
+                (100.0 - reading.used_percentage).clamp(0.0, 100.0)
+            },
+            resets_at: reading.resets_at,
+            observed_at: reading.observed_at,
+            age_secs: super::window::age_secs(reading, now),
+            source: pace::Source::Collector.as_str().to_string(),
+            stale: true,
+            limit_reached: reading.limit_reached,
+            overage_covered: reading.overage_covered,
+        });
+    }
+
     let binding_window =
         pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace).map(|h| h.window);
     let binding = binding_window.and_then(|name| windows.iter().position(|w| w.window == name));

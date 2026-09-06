@@ -1009,11 +1009,11 @@ const START_TIME_TOLERANCE_SECS: u64 = 300;
 /// today's EPERM-is-alive behavior exactly, and must never read as falsely
 /// dead just because one side of the comparison is missing.
 ///
-/// Only called from the `#[cfg(unix)]` `record_is_alive` and from tests; the
-/// non-unix `record_is_alive` never reaches it, mirroring `parse_etime`'s own
-/// `#[cfg_attr(not(unix), allow(dead_code))]`.
-#[cfg_attr(not(unix), allow(dead_code))]
-fn start_time_disambiguates_dead(recorded: Option<u64>, current: Option<u64>) -> bool {
+/// `pub(crate)` since audit finding G4: `reservation::is_owner_alive` needs
+/// the identical comparison for a ledger entry that carries a stamped
+/// `pid_start_time` but no whole `Record`, and duplicating it there would
+/// fork `START_TIME_TOLERANCE_SECS` into two constants that could drift.
+pub(crate) fn start_time_disambiguates_dead(recorded: Option<u64>, current: Option<u64>) -> bool {
     match (recorded, current) {
         (Some(recorded), Some(current)) => recorded.abs_diff(current) > START_TIME_TOLERANCE_SECS,
         _ => false,
