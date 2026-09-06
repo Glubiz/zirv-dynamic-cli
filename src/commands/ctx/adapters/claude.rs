@@ -182,7 +182,9 @@ fork-type subagents, which inherit this session's model and ignore overrides.
 - Run code-review or verification passes only when your brief asks for them; the orchestrator that \
 spawned you owns review rounds.
 - Your final message is your report: lead with the outcome, keep it self-contained, and never dump \
-raw file contents into it.";
+raw file contents into it.
+- For test, build and log commands, run `zirv ctx run --compact -- <cmd>`: it keeps the full output \
+on disk and gives you a summary plus the id to retrieve it.";
 
 /// Claude's own layer for a `PromptRole::SubOrchestrator` session (see
 /// `AgentAdapter::sub_orchestrator_system_prompt`), spliced in place of
@@ -1446,6 +1448,19 @@ fn launch_settings_value(
                 "hooks": [{
                     "type": "command",
                     "command": "zirv ctx hook pretool"
+                }]
+            }],
+            // Issue #326: compact output. Runs AFTER the tool, on the tool's
+            // own result, and replaces it via `updatedToolOutput` -- the full
+            // output is stored verbatim under the state dir first, so this is
+            // compression, never loss. Deliberately a separate event from the
+            // `Bash|PowerShell` PreToolUse entry above: nothing here can
+            // touch a permission decision.
+            "PostToolUse": [{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook posttool"
                 }]
             }],
             "PermissionRequest": [{
@@ -3685,7 +3700,9 @@ mod tests {
         let settings = test_launch_settings();
         // Issue #334 added the two guard entries below; wiring the
         // `PermissionRequest`/`PermissionDenied` observers in must not
-        // perturb this array further.
+        // perturb this array further, and neither may issue #326's
+        // compact-output hook, which is a `PostToolUse` entry of its own
+        // (asserted below) and never touches this array at all.
         assert_eq!(
             settings["hooks"]["PreToolUse"],
             serde_json::json!([{
@@ -3716,6 +3733,25 @@ mod tests {
         }]);
         assert_eq!(settings["hooks"]["PermissionRequest"], observer);
         assert_eq!(settings["hooks"]["PermissionDenied"], observer);
+    }
+
+    /// Issue #326: the compact-output hook is wired as its own `PostToolUse`
+    /// entry on `Bash`, synchronously (no `"background": true`) -- a
+    /// background hook's `updatedToolOutput` would arrive after claude had
+    /// already been handed the original result.
+    #[test]
+    fn launch_settings_wire_the_compact_output_hook_on_post_tool_use() {
+        let settings = test_launch_settings();
+        assert_eq!(
+            settings["hooks"]["PostToolUse"],
+            serde_json::json!([{
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": "zirv ctx hook posttool"
+                }]
+            }])
+        );
     }
 
     #[test]

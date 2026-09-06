@@ -52,10 +52,25 @@ pub(crate) const CLAUDE_SESSION_START_HOOK: (&str, Option<&str>, &str) = (
     "zirv ctx hook session-start",
 );
 
+/// Issue #326's compact-output hook: `zirv ctx hook posttool`, matched on
+/// `Bash` results. Claude-only, same reasoning as `CLAUDE_SAFETY_HOOK` above
+/// and one step stronger -- it depends on claude's documented `PostToolUse`
+/// `hookSpecificOutput.updatedToolOutput` contract (a replacement value that
+/// does not match the tool's own output schema is ignored and the original is
+/// used), and codex has no equivalent event, so wiring it into
+/// `install_codex_hooks` would write a hook codex has nothing to fire.
+/// Registered synchronously, never as a background hook: a replacement that
+/// arrives after the result has reached the model replaces nothing.
+pub(crate) const CLAUDE_COMPACT_OUTPUT_HOOK: (&str, Option<&str>, &str) =
+    ("PostToolUse", Some("Bash"), "zirv ctx hook posttool");
+
 /// Every claude-only hook (`install_claude_integration`), never wired into
 /// `install_codex_hooks`.
-pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 2] =
-    [CLAUDE_SAFETY_HOOK, CLAUDE_SESSION_START_HOOK];
+pub(crate) const CLAUDE_ONLY_HOOKS: [(&str, Option<&str>, &str); 3] = [
+    CLAUDE_SAFETY_HOOK,
+    CLAUDE_SESSION_START_HOOK,
+    CLAUDE_COMPACT_OUTPUT_HOOK,
+];
 
 /// Total claude hooks `zirv setup` installs/reports on: `HARNESS_HOOKS`
 /// (shared with codex) plus every entry in `CLAUDE_ONLY_HOOKS`. Codex's own

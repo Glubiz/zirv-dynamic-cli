@@ -33,6 +33,10 @@ pub enum HookEvent {
     /// this seat's expensive model, and refuse an orchestrator seat's own
     /// direct edit of a repository file (issue #334).
     Pretool,
+    /// Claude PostToolUse hook: replace a large `Bash` tool result with a
+    /// compact, reversible summary before the model ever sees it (issue
+    /// #326). The original output is stored verbatim first.
+    Posttool,
     /// Observe Claude permission requests and denials without changing their
     /// flow. Sandboxed-command network prompts emit a `Notification` instead
     /// and do not invoke `PermissionRequest` hooks.
@@ -2214,6 +2218,139 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     Ok(0)
 }
 
+// -- PostToolUse: compact output (issue #326) ------------------------------
+
+/// Claude's `PostToolUse` stdin, narrowed to what the compact-output hook
+/// reads. Every field is optional with a zero default, the same rule every
+/// other payload in this file follows: a hook that fails to parse is a hook
+/// that silently stops working, so nothing here may be mandatory.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PostToolPayload {
+    pub tool_name: String,
+    pub tool_input: PostToolInput,
+    pub tool_response: BashToolOutput,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PostToolInput {
+    pub command: String,
+}
+
+/// The documented shape of claude's `Bash` tool result -- and therefore the
+/// exact shape a replacement must match. Claude Code validates a built-in
+/// tool's `updatedToolOutput` against its own schema and IGNORES a value that
+/// does not match, using the original instead, so this type is what makes the
+/// replacement take effect at all.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct BashToolOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub interrupted: bool,
+    pub is_image: bool,
+}
+
+/// Claude Code's own too-large-output notice. A result carrying one has
+/// ALREADY been truncated and spilled to a file by the harness itself, so
+/// compacting it again would summarize a truncation notice and hand back a
+/// retrieval id for text zirv never actually holds.
+fn already_offloaded(text: &str) -> bool {
+    text.contains("Output too large") && text.contains("saved to")
+}
+
+/// The `updatedToolOutput` envelope. `stderr` is emptied deliberately: the
+/// summary already folds both streams together (they were captured merged),
+/// and leaving the original stderr alongside it would put the very bytes this
+/// hook exists to remove straight back into the model's context.
+/// `interrupted` is carried through from the original -- it is a fact about
+/// the run, not about the output -- and `isImage` is always false, since a
+/// summary is text by construction.
+pub(crate) fn posttool_output(summary: &str, interrupted: bool) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "updatedToolOutput": {
+                "stdout": summary,
+                "stderr": "",
+                "interrupted": interrupted,
+                "isImage": false
+            }
+        }
+    })
+    .to_string()
+}
+
+/// The compact-output hook (issue #326). Replaces a large `Bash` tool result
+/// with a summary of it, after storing the original verbatim under the state
+/// dir so `zirv ctx output show <id>` can hand any of it back.
+///
+/// Fails open on every path -- an unparseable payload, a non-`Bash` tool, an
+/// image result, a result claude has already offloaded itself, output below
+/// the threshold, a disabled switch, an unresolvable state dir, or a failed
+/// persist -- by printing nothing and exiting 0, which claude reads as "no
+/// replacement, use the original". That ordering matters: nothing is ever
+/// replaced unless the full original is already on disk, so a summary can
+/// never be the only surviving copy. Nothing here may `unwrap`, `expect` or
+/// return `Err`: the release profile is `panic = "abort"`, and a hook that
+/// aborts takes the tool result with it.
+pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let Ok(payload) = serde_json::from_str::<PostToolPayload>(stdin) else {
+        return Ok(0);
+    };
+    if payload.tool_name != "Bash" || payload.tool_response.is_image {
+        return Ok(0);
+    }
+    let response = &payload.tool_response;
+    let combined = if response.stderr.is_empty() {
+        response.stdout.clone()
+    } else if response.stdout.is_empty() {
+        response.stderr.clone()
+    } else {
+        format!("{}\n{}", response.stdout, response.stderr)
+    };
+    if already_offloaded(&combined) {
+        return Ok(0);
+    }
+    let cwd = if payload.cwd.is_empty() {
+        let Ok(cwd) = std::env::current_dir() else {
+            return Ok(0);
+        };
+        cwd
+    } else {
+        PathBuf::from(&payload.cwd)
+    };
+    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    if !cfg.output.compact || combined.len() < cfg.output.compact_min_bytes {
+        return Ok(0);
+    }
+    let Ok(state) = StateDir::resolve(env) else {
+        return Ok(0);
+    };
+    let command = if payload.tool_input.command.trim().is_empty() {
+        vec!["(bash)".to_string()]
+    } else {
+        vec![payload.tool_input.command.clone()]
+    };
+    let Ok((_, summary)) = super::output::capture_text(
+        &state,
+        &cwd,
+        &command,
+        None,
+        &combined,
+        cfg.output.max_summary_bytes,
+    ) else {
+        // Nothing was stored, so nothing may be replaced: handing back a
+        // summary whose retrieval line names a file that does not exist would
+        // turn this from compression into loss.
+        return Ok(0);
+    };
+    let _ = writeln!(w, "{}", posttool_output(&summary, response.interrupted));
+    Ok(0)
+}
+
 /// Field names codex uses for the rollout path, most specific first. Populate
 /// from the verified notes file during Task A9/A10; the claude spelling stays
 /// last so a hook registered on either agent keeps working.
@@ -2396,6 +2533,7 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
         }
         HookEvent::PreCompact => run_pre_compact(w, &read_stdin(), &env),
         HookEvent::Pretool => run_pretool(w, &read_stdin(), &env),
+        HookEvent::Posttool => run_posttool(w, &read_stdin(), &env),
         HookEvent::Permission => run_permission(w, &read_stdin(), &env),
         HookEvent::SessionStart => run_session_start(w, &read_stdin(), &env),
         HookEvent::Notify { payload } => {
@@ -5191,6 +5329,276 @@ mod tests {
         .expect("an ordinary Bash payload must parse");
         assert_eq!(payload.tool_name, "Bash");
         assert_eq!(pretool_decision(SEAT, &payload), None);
+    }
+
+    // -- PostToolUse: compact output (issue #326) --------------------------
+
+    /// A verbose `cargo test`-shaped result: a lot of filler wrapped around
+    /// the handful of lines a compact summary must never lose.
+    fn noisy_output() -> String {
+        let mut text: String = (1..=400).map(|i| format!("filler line {i}\n")).collect();
+        text.push_str("error[E0308]: mismatched types\n");
+        text.push_str("  --> src/lib.rs:42:9\n");
+        text.push_str("warning: unused variable: `x`\n");
+        text.push_str("failures:\n\n");
+        text.push_str("    module::tests::alpha\n");
+        text.push_str("    module::tests::beta\n\n");
+        text.push_str(
+            "test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+        text
+    }
+
+    fn posttool_stdin(
+        cwd: &Path,
+        tool_name: &str,
+        command: &str,
+        response: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "session_id": "abc123",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": cwd.display().to_string(),
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool_name,
+            "tool_input": {"command": command},
+            "tool_response": response,
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string()
+    }
+
+    /// A temp home + repo + state dir, so the config load and the output
+    /// store inside `run_posttool` never touch the developer's own machine.
+    struct PostToolRig {
+        _dir: tempfile::TempDir,
+        repo: PathBuf,
+        state: PathBuf,
+        env: std::collections::HashMap<String, String>,
+        _home: crate::commands::ctx::testenv::HomeGuard,
+    }
+
+    fn posttool_rig(extra_env: &[(&str, &str)]) -> PostToolRig {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let repo = dir.path().join("repo");
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let guard = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let mut env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        env.extend(
+            extra_env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+        );
+        PostToolRig {
+            _dir: dir,
+            repo,
+            state,
+            env,
+            _home: guard,
+        }
+    }
+
+    fn run_post(rig: &PostToolRig, stdin: &str) -> String {
+        let mut out = Vec::new();
+        let code = run_posttool(&mut out, stdin, &|k| rig.env.get(k).cloned())
+            .expect("the compact-output hook must never error");
+        assert_eq!(code, 0, "the compact-output hook must never block");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    /// The headline behaviour: a large `Bash` result is replaced by a
+    /// shape-correct `updatedToolOutput` whose `stdout` keeps every line that
+    /// carried signal, and the original is on disk byte for byte.
+    #[test]
+    fn posttool_replaces_a_large_bash_result_with_a_shape_correct_summary() {
+        let rig = posttool_rig(&[]);
+        let original = noisy_output();
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "cargo test",
+                serde_json::json!({
+                    "stdout": original,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let hook = &parsed["hookSpecificOutput"];
+        assert_eq!(hook["hookEventName"], "PostToolUse");
+        let replacement = &hook["updatedToolOutput"];
+        // The exact `Bash` output shape: claude ignores a value that does not
+        // match its own schema and uses the original instead.
+        assert_eq!(replacement["stderr"], "");
+        assert_eq!(replacement["interrupted"], false);
+        assert_eq!(replacement["isImage"], false);
+        let summary = replacement["stdout"].as_str().expect("a summary");
+
+        assert!(summary.contains("test result: FAILED"), "{summary}");
+        for name in ["module::tests::alpha", "module::tests::beta"] {
+            assert!(summary.contains(name), "must name {name}: {summary}");
+        }
+        assert!(
+            summary.contains("error[E0308]") && summary.contains("--> src/lib.rs:42:9"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("full output: zirv ctx output show"),
+            "{summary}"
+        );
+        assert!(summary.len() <= 4096, "{} bytes", summary.len());
+        assert!(
+            summary.len() < original.len() / 4,
+            "the summary must be a fraction of the original: {} vs {}",
+            summary.len(),
+            original.len()
+        );
+
+        // The stored file is byte-identical to what claude handed the hook.
+        let dir = rig
+            .state
+            .join("outputs")
+            .join(crate::commands::ctx::state::repo_slug(&rig.repo));
+        let log = std::fs::read_dir(&dir)
+            .expect("outputs dir")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "log"))
+            .expect("a stored log");
+        assert_eq!(
+            std::fs::read(&log).expect("read log"),
+            original.as_bytes(),
+            "the persisted output must be byte-identical to the original"
+        );
+    }
+
+    /// Below the threshold there is nothing to save, so the original stands.
+    #[test]
+    fn posttool_leaves_a_small_result_alone() {
+        let rig = posttool_rig(&[]);
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "git status",
+                serde_json::json!({
+                    "stdout": "On branch main\nnothing to commit\n",
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(out.is_empty(), "{out}");
+    }
+
+    /// Every fail-open path: a tool this hook knows nothing about, an image
+    /// result, a result claude already offloaded itself, and stdin that is
+    /// not the documented payload at all.
+    #[test]
+    fn posttool_fails_open_on_everything_it_does_not_understand() {
+        let rig = posttool_rig(&[]);
+        let big = noisy_output();
+
+        for stdin in [
+            posttool_stdin(
+                &rig.repo,
+                "Read",
+                "",
+                serde_json::json!({"stdout": big.clone()}),
+            ),
+            posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "cargo test",
+                serde_json::json!({
+                    "stdout": big.clone(),
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": true,
+                }),
+            ),
+            posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "cargo test",
+                serde_json::json!({
+                    "stdout": format!("Output too large, saved to /tmp/x.txt\n{big}"),
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+            "this is not json".to_string(),
+            "{".to_string(),
+            "null".to_string(),
+            "{\"tool_name\":\"Bash\",\"tool_response\":\"not an object\"}".to_string(),
+        ] {
+            let out = run_post(&rig, &stdin);
+            assert!(out.is_empty(), "must stay silent on {stdin:.60}: {out}");
+        }
+    }
+
+    /// The operator's own switch is real, and it is the operator's alone --
+    /// `[output] compact` is `REPO_FORBIDDEN` in both directions (see
+    /// `config::OutputConfig`).
+    #[test]
+    fn posttool_respects_the_operator_switch() {
+        let rig = posttool_rig(&[("ZIRV_CTX_OUTPUT_COMPACT", "false")]);
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "cargo test",
+                serde_json::json!({
+                    "stdout": noisy_output(),
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(out.is_empty(), "{out}");
+    }
+
+    /// `interrupted` is a fact about the run, not about the output, so it
+    /// survives the replacement rather than being reset to the default.
+    #[test]
+    fn posttool_carries_the_interrupted_flag_through() {
+        let rig = posttool_rig(&[]);
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "cargo test",
+                serde_json::json!({
+                    "stdout": noisy_output(),
+                    "stderr": "",
+                    "interrupted": true,
+                    "isImage": false,
+                }),
+            ),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["updatedToolOutput"]["interrupted"],
+            true
+        );
     }
 
     // -- PreToolUse: the orchestrator-write guard (issues #328/#334) -------

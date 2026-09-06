@@ -19,3 +19,9 @@
 /CLAUDE.md -text
 /AGENTS.md -text
 /.zirv/context/*.md text eol=lf
+
+# Issue #326: the `zirv ctx run --compact` output fixtures are executed by
+# `sh`/`cmd` verbatim, so their line endings are load-bearing (`git archive`
+# would otherwise hand a CRLF `.sh` to `sh`, which chokes on it).
+/tests/fixtures/noisy-output.sh text eol=lf
+/tests/fixtures/noisy-output.cmd text eol=crlf

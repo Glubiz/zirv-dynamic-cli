@@ -1321,6 +1321,9 @@ checkout:
 | `price.stale_after_days` | `ZIRV_CTX_PRICE_STALE_AFTER_DAYS` |
 | `price.table_path` | `ZIRV_CTX_PRICE_TABLE_PATH` |
 | `search.max_output_bytes` | `ZIRV_CTX_SEARCH_MAX_OUTPUT_BYTES` |
+| `output.compact` | `ZIRV_CTX_OUTPUT_COMPACT` |
+| `output.compact_min_bytes` | `ZIRV_CTX_OUTPUT_COMPACT_MIN_BYTES` |
+| `output.max_summary_bytes` | `ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES` |
 | `fallback.orchestrator_rollover_headroom_pct` | `ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT` |
 | `fallback.rollover_cooldown_secs` | `ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS` |
 

@@ -24,7 +24,7 @@ const VERIFY_CONFIG_SCHEMA_VERSION: u32 = 1;
 /// un-narrowed and satisfy the freshness gate it was supposed to fail.
 pub(crate) const VERIFY_REPORT_SCHEMA_VERSION: u32 = 2;
 const MAX_CONFIG_BYTES: usize = 64 * 1024;
-const MAX_FAILURE_OUTPUT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_FAILURE_OUTPUT_BYTES: usize = 16 * 1024;
 /// Hard ceiling on a repository-supplied check's own timeout, independent of
 /// `workflow.repo_checks_enabled`. `CheckSpec::validate` allows up to a day,
 /// which for a checkout-authored command is a wall-clock denial of service
@@ -1526,7 +1526,11 @@ fn command_for_shell(command: &str) -> Command {
 /// against the capped tail alone. Every check's output goes through this
 /// path (`run_check`); only the retained-tail element is ever a display
 /// artifact.
-fn read_capped_tail_and_scan(
+/// `pub(crate)` (issue #326): also the classifier `ctx::output`'s
+/// `zirv ctx run --compact` capture reuses, so a compacted command's failing
+/// test names and summary recognition come from THIS scanner rather than a
+/// second, independently-drifting copy of the same rules.
+pub(crate) fn read_capped_tail_and_scan(
     mut reader: impl Read,
     cap: usize,
 ) -> (Vec<u8>, bool, std::collections::BTreeSet<String>, bool, u64) {
@@ -1580,7 +1584,7 @@ fn tail_text(bytes: &[u8], cap: usize) -> String {
 /// forge an "all checks passed" summary. Same treatment as `mail.rs` and
 /// `wrap.rs` give relayed text, except that `\n`/`\t` stay: a failure log is
 /// read as lines.
-fn scrub_output(text: &str) -> String {
+pub(crate) fn scrub_output(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_run = false;
     for ch in text.chars() {
