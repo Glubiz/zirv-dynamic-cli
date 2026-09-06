@@ -12,6 +12,12 @@ pub const DELEGATION_FILE: &str = "delegations.jsonl";
 pub const PERMISSION_PROMPTS_FILE: &str = "permission-prompts.jsonl";
 pub const ORCHESTRATOR_BLOCKS_FILE: &str = "orchestrator-blocks.jsonl";
 
+/// How many bytes at the END of `orchestrator-blocks.jsonl`
+/// [`read_recent_orchestrator_blocks`] parses. The file is never rotated and
+/// is read on EVERY Edit/Write/Bash hook, so the only bounded thing a hot
+/// path may do with it is look at its tail.
+pub const ORCHESTRATOR_BLOCK_TAIL_BYTES: u64 = 64 * 1024;
+
 /// How many UTC days of `safety-decisions/` buckets [`append_safety`] keeps.
 /// The daily bucketing exists so retention can drop whole files without a
 /// cross-process truncate race; nothing enforced it, so the directory grew
@@ -319,6 +325,42 @@ pub fn read_orchestrator_blocks(state: &StateDir) -> Vec<OrchestratorBlockRecord
         return Vec::new();
     };
     text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The same as [`read_orchestrator_blocks`] but reading at most the last
+/// [`ORCHESTRATOR_BLOCK_TAIL_BYTES`] of the file, for the hook hot path --
+/// this ledger is never rotated, so a full read grows without bound on a
+/// path that runs on every single Edit/Write/Bash. The read starts at the
+/// window boundary and discards the first, probably-partial line; a file
+/// smaller than the window is read whole and the results are identical.
+/// Same best-effort tolerance in every direction: an unreadable file or an
+/// unseekable handle is an empty list, a corrupt line is skipped.
+pub fn read_recent_orchestrator_blocks(state: &StateDir) -> Vec<OrchestratorBlockRecord> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = state.logs().join(ORCHESTRATOR_BLOCKS_FILE);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let from = len.saturating_sub(ORCHESTRATOR_BLOCK_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+    if from > 0 {
+        lines.next();
+    }
+    lines
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
 }
