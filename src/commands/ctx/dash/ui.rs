@@ -743,6 +743,11 @@ pub struct ErrorsView {
     pub cursor: usize,
     /// The shared list viewport's first drawn row (issue #354 phase 3).
     pub offset: usize,
+    /// A1-3: which entries this snapshot covers -- every kept error whose id
+    /// is below this. Closing the dialog acknowledges exactly those, so an
+    /// error that arrived while the dialog was open keeps holding the sticky
+    /// header line. `0` (the `Default`) covers nothing.
+    pub mark: u64,
 }
 
 /// Issue #354 phase 3: one thing the context menu can do to its target row.
@@ -2498,10 +2503,20 @@ pub fn render_footer_spend(
                 .unwrap_or_else(|| style::PLACEHOLDER.into())
         ));
     }
+    // A3-4: measured at the width the footer is actually DRAWN at, not at
+    // `u16::MAX`. `render_footer` below sheds segments as the terminal
+    // narrows; measuring the full-width footer instead made the spend
+    // segment look too wide to fit next to a tier that had already dropped
+    // half of itself, so it vanished while there was plenty of room.
     let base = match facts {
         FooterFacts::None => Vec::new(),
-        FooterFacts::Alive(v) => footer_alive_spans(v, bands.0, bands.1, u16::MAX),
-        FooterFacts::Dead(v) => footer_dead_spans(v, u16::MAX),
+        // A3-4: measured at the width the footer is actually DRAWN at, not
+        // at `u16::MAX`. `render_footer` below sheds segments as the
+        // terminal narrows; measuring the full-width footer instead made the
+        // spend segment look too wide to fit beside a tier that had already
+        // dropped half of itself, so it vanished with room to spare.
+        FooterFacts::Alive(v) => footer_alive_spans(v, bands.0, bands.1, area.width),
+        FooterFacts::Dead(v) => footer_dead_spans(v, area.width),
     };
     let base_width: usize = base.iter().map(|s| style::display_width(&s.content)).sum();
     render_footer(f, area, facts, bands.0, bands.1);
@@ -3202,7 +3217,17 @@ pub fn render_list_dialog(f: &mut Frame, area: Rect, spec: &ListDialogSpec) {
     while lines.len() < body_rows {
         lines.push(Line::from(""));
     }
-    if body_rows < inner.height as usize {
+    // A3-3: the blank spacer only exists when the interior has room for it
+    // ABOVE the hint row -- exactly the `blank_h` [`list_dialog_layout`]
+    // reserves. On a one-row interior the layout puts the hints on that row;
+    // drawing a spacer first pushed them off the bottom, so every click on
+    // the only visible row resolved as a hint that was never on screen.
+    // A3-3: the blank spacer exists only when the interior has room for it
+    // ABOVE the hint row -- exactly the `blank_h` [`list_dialog_layout`]
+    // reserves. On a one-row interior the layout puts the hints on that very
+    // row; drawing a spacer first pushed them off the bottom, so a click on
+    // the only visible row resolved as a hint that was never on screen.
+    if body_rows + 1 < inner.height as usize {
         lines.push(Line::from(""));
     }
     let mut hint_spans: Vec<Span> = Vec::new();
@@ -4257,6 +4282,85 @@ mod tests {
             assert_eq!(text.contains("$0.42 this session"), width == 200);
             assert!(text.contains("supervised"));
         }
+    }
+
+    /// A3-4: the spend segment is measured against the footer that is
+    /// actually DRAWN, not against a hypothetical `u16::MAX`-wide one. Once
+    /// the footer has shed a tier there is room beside it, and the spend
+    /// segment must take it.
+    #[test]
+    fn the_footer_spend_segment_is_measured_against_the_width_it_is_drawn_at() {
+        // Long enough that dropping the harness label is a big tier step --
+        // exactly the drop the fixed measurement can see.
+        let facts = || FooterAliveFacts {
+            harness: "claude-sonnet-4-5-2026".to_string(),
+            ..alive_footer_facts()
+        };
+        let alive = facts();
+        let mut aggregate = no_live_source();
+        aggregate.spend_micros = Some((420_000, Source::Live, Duration::ZERO));
+        let summary = SidebarSummary { aggregate };
+        let spend = "$0.42 this session";
+        let spend_w = style::display_width(spend);
+        let measure =
+            |cols: u16| -> usize { footer_seg_width_of(&footer_alive_spans(&alive, 40, 70, cols)) };
+
+        let width = (30u16..=200)
+            .find(|w| measure(*w) + 2 + spend_w <= *w as usize)
+            .expect("some width leaves room beside the drawn footer");
+        assert!(
+            measure(u16::MAX) + 2 + spend_w > width as usize,
+            "sanity: at {width} cols the spend segment only fits because the footer shed a tier"
+        );
+
+        let drawn = FooterFacts::Alive(facts());
+        let text = render_and_capture_text(Rect::new(0, 0, width, 1), |f, area| {
+            render_footer_spend(f, area, &drawn, (40, 70), &summary)
+        });
+        assert!(
+            text.contains(spend),
+            "{width} cols: the spend segment fits beside the drawn footer, got {text:?}"
+        );
+    }
+
+    fn footer_seg_width_of(spans: &[Span<'static>]) -> usize {
+        spans.iter().map(|s| style::display_width(&s.content)).sum()
+    }
+
+    /// A3-3: at a one-row interior [`list_dialog_layout`] puts the hint row
+    /// on `inner.y` itself. The renderer drew a blank spacer there and let
+    /// the hint row clip off the bottom, so a click on the only visible row
+    /// resolved as an `OverlayHint` that was never on screen.
+    #[test]
+    fn a_one_row_list_dialog_draws_its_hints_on_the_row_the_layout_hit_tests() {
+        let footer: &[(&str, &str)] = &[("esc", "close")];
+        let spec = ListDialogSpec {
+            title: "errors".to_string(),
+            count: None,
+            rows: vec![ListDialogRow::plain("only row".to_string())],
+            cursor: Some(0),
+            offset: 0,
+            footer,
+            warn: false,
+            empty_message: "(none)",
+            input: None,
+        };
+        let area = Rect::new(0, 0, 20, 3);
+        let geom = list_dialog_layout(area, &spec).expect("layout");
+        let (hint_rect, _) = geom.hints.first().expect("a clickable hint rect");
+
+        let mut term = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        term.draw(|f| render_list_dialog(f, area, &spec)).unwrap();
+        let buf = term.backend().buffer();
+        let drawn: String = (hint_rect.x..hint_rect.right())
+            .map(|x| buf[(x, hint_rect.y)].symbol())
+            .collect();
+
+        assert!(
+            drawn.contains("esc"),
+            "the row the layout hit-tests as a hint must be the row the renderer draws hints \
+             on, got {drawn:?}"
+        );
     }
 
     /// Issue #264, the render-path contract: with no live source at all, the
@@ -6430,6 +6534,7 @@ mod tests {
             ],
             cursor: 0,
             offset: 0,
+            mark: 0,
         };
         let overlay = Overlay::Errors(view);
         let area = Rect::new(0, 0, 60, 10);
@@ -6480,6 +6585,7 @@ mod tests {
             items: vec![repeated, acked],
             cursor: 0,
             offset: 0,
+            mark: 0,
         });
         let text = render_and_capture_text(Rect::new(0, 0, 70, 12), |f, area| {
             render_overlay(f, area, &overlay, 0)
@@ -6592,6 +6698,7 @@ mod tests {
                 items: vec![err_item("an error")],
                 cursor: 0,
                 offset: 0,
+                mark: 0,
             }),
             // Issue #354 phase 3: the two new list-shaped overlays go through
             // every degenerate-area and opacity test the others do.

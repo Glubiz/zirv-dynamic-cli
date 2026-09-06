@@ -301,6 +301,43 @@ fn select_row(
     }
 }
 
+/// Pure: which session row a session-scoped action (`^A i`, `^A n`, the
+/// action menu) addresses, or `None` when the cursor is parked on chrome.
+///
+/// Review finding A1-7: `selected` keeps naming whichever session row the
+/// cursor was last on while the cursor itself sits on the summary line or a
+/// group header, so an action read straight off `selected` acted on a
+/// session the operator was no longer pointing at. Chrome owns the cursor or
+/// nothing does.
+fn session_target(
+    chrome: Option<&Hit>,
+    rows: &[ui::SidebarRow],
+    selected: usize,
+) -> Option<String> {
+    if matches!(
+        chrome,
+        Some(Hit::SidebarSummary) | Some(Hit::GroupToggle(_))
+    ) {
+        return None;
+    }
+    rows.get(selected).map(|row| row.short.clone())
+}
+
+/// Pure: whether a left press at `(column, row)` starts zirv's own click-drag
+/// text selection over the focused pane. False while the child owns the mouse
+/// -- its own reports are forwarded instead, and a selection drawn on top of
+/// them would highlight cells the child is about to rewrite.
+fn press_starts_selection(main: Rect, column: u16, row: u16, wants_mouse: bool) -> bool {
+    main.contains(Position::new(column, row)) && !wants_mouse
+}
+
+/// Pure: whether a left drag over a mouse-owning pane should raise the
+/// "text selection is off" notice. Once per session, ever -- the gesture that
+/// silently does nothing is worth explaining exactly one time.
+const fn drag_needs_capture_hint(wants_mouse: bool, already_shown: bool) -> bool {
+    wants_mouse && !already_shown
+}
+
 /// Pure: `SelectUp`/`SelectDown` over the *tree* the roster actually drew
 /// (`order`, plus the summary line that always heads it), not over the flat
 /// pane vector -- so the cursor walks onto group headers and the summary the
@@ -319,7 +356,12 @@ fn navigate_roster(
     focused: usize,
     chrome: &mut Option<Hit>,
 ) -> (usize, usize) {
-    if !matches!(action, DashAction::SelectUp | DashAction::SelectDown) {
+    // A1-6: `order` is empty until the first successful draw fills
+    // `FrameSnapshot::roster`, and an empty tree is not a tree with only a
+    // summary line in it -- walking it parked the very first `Ctrl+A ↓` on
+    // the summary instead of moving. With no drawn tree to follow, fall back
+    // to the flat row list the pre-#354 keyboard already used.
+    if order.is_empty() || !matches!(action, DashAction::SelectUp | DashAction::SelectDown) {
         *chrome = None;
         return apply_navigation(
             action,
@@ -1805,6 +1847,23 @@ fn due(last: Instant, now: Instant, interval: Duration) -> bool {
     now.duration_since(last) >= interval
 }
 
+/// The delegation ledger's `(len, mtime_secs)`, or `(0, 0)` when there is no
+/// ledger yet. A1-4: one `stat` standing in for a full read-and-re-price of
+/// every row the ledger holds -- see [`FactsCache::spend_key`].
+fn delegation_ledger_fingerprint(state: &StateDir) -> (u64, u64) {
+    let path = state.logs().join(super::log::DELEGATION_FILE);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return (0, 0);
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (meta.len(), mtime)
+}
+
 /// The disk-backed part of the header's facts: everything `FactsCache::
 /// refresh_if_due` re-reads on the throttle. Kept separate from
 /// `ui::HeaderFacts` itself because the harness/error line and the live
@@ -1925,6 +1984,12 @@ struct FactsCache {
     disk: DiskFacts,
     registry: Vec<(sessions::Record, sessions::Liveness)>,
     last_refresh: Instant,
+    /// A1-4: the delegation ledger's `(len, mtime_secs)` as of the last time
+    /// `disk.spend` was actually folded. `None` until the first fold. The
+    /// ledger is append-only and grows on every row, so an unchanged
+    /// fingerprint means an unchanged file -- and re-reading and re-pricing
+    /// every row once a second, forever, buys nothing.
+    spend_key: Option<(u64, u64)>,
 }
 
 impl FactsCache {
@@ -1937,7 +2002,49 @@ impl FactsCache {
             disk: DiskFacts::default(),
             registry: Vec::new(),
             last_refresh: now.checked_sub(FACTS_THROTTLE).unwrap_or(now),
+            spend_key: None,
         }
+    }
+
+    /// A1-4: folds the delegation ledger into `disk.spend`, but only when the
+    /// ledger's own fingerprint moved since the last fold. `read_rows` is
+    /// injected so the skip is testable without a ledger on disk.
+    fn refresh_spend_with<F>(&mut self, fingerprint: (u64, u64), cfg: &CtxConfig, read_rows: F)
+    where
+        F: FnOnce() -> Vec<super::log::DelegationRow>,
+    {
+        if self.spend_key == Some(fingerprint) {
+            return;
+        }
+        self.spend_key = Some(fingerprint);
+        let delegation_rows = read_rows();
+        self.disk.spend = if delegation_rows.is_empty() {
+            None
+        } else {
+            let table = super::price::resolve_table(cfg);
+            let failed = delegation_rows
+                .iter()
+                .filter(|row| row.outcome != "ok")
+                .count() as u64;
+            let mut cost_micros: u64 = 0;
+            for row in &delegation_rows {
+                if let Some(model) = row.model.as_deref() {
+                    let usage = super::event::TranscriptUsage {
+                        input_tokens: row.input_tokens,
+                        cache_creation_input_tokens: row.cache_creation_input_tokens,
+                        cache_read_input_tokens: row.cache_read_input_tokens,
+                        output_tokens: row.output_tokens,
+                    };
+                    if let Some(cost) = super::price::price(model, &usage, &table) {
+                        cost_micros = cost_micros.saturating_add(cost);
+                    }
+                }
+            }
+            Some(AggregateSpendFacts {
+                failed,
+                cost_micros,
+            })
+        };
     }
 
     /// Every disk read the header and sidebar need, at most once per
@@ -2078,34 +2185,12 @@ impl FactsCache {
         // file read, same as `usage` right above -- never a scan, a poll, or
         // a network call. `None` when the ledger has no rows at all, so the
         // aggregate row renders `--` rather than a phantom `0`/`$0.00`.
-        let delegation_rows = super::log::read_delegations(state, usize::MAX);
-        self.disk.spend = if delegation_rows.is_empty() {
-            None
-        } else {
-            let table = super::price::resolve_table(cfg);
-            let failed = delegation_rows
-                .iter()
-                .filter(|row| row.outcome != "ok")
-                .count() as u64;
-            let mut cost_micros: u64 = 0;
-            for row in &delegation_rows {
-                if let Some(model) = row.model.as_deref() {
-                    let usage = super::event::TranscriptUsage {
-                        input_tokens: row.input_tokens,
-                        cache_creation_input_tokens: row.cache_creation_input_tokens,
-                        cache_read_input_tokens: row.cache_read_input_tokens,
-                        output_tokens: row.output_tokens,
-                    };
-                    if let Some(cost) = super::price::price(model, &usage, &table) {
-                        cost_micros = cost_micros.saturating_add(cost);
-                    }
-                }
-            }
-            Some(AggregateSpendFacts {
-                failed,
-                cost_micros,
-            })
-        };
+        // A1-4: a `stat`, not a full read-and-re-price of every delegation
+        // row, on the overwhelmingly common tick where the append-only
+        // ledger has not moved since the last one.
+        self.refresh_spend_with(delegation_ledger_fingerprint(state), cfg, || {
+            super::log::read_delegations(state, usize::MAX)
+        });
 
         // Rebuilt rather than updated in place: a reaped pane or a released
         // registry record must drop out of the map, not linger as a stale
@@ -2464,12 +2549,41 @@ fn enforce_pane_token_budgets(
     cfg: &CtxConfig,
     repo: &Path,
     errors: &mut ErrorLog,
+    last_sweep: &mut Instant,
+    now: Instant,
 ) {
+    enforce_pane_token_budgets_with(panes, cfg, errors, last_sweep, now, |pane| {
+        pane_transcript_usage(pane, cfg, repo)
+    });
+}
+
+/// The budget sweep with its transcript read injected, so the throttle guarding
+/// it is testable without a multi-megabyte transcript on disk.
+///
+/// A1-1: `usage_of` is a full `read_to_string` + parse of one pane's whole
+/// transcript, plus an `adapters::select` on either side of it. That is disk
+/// work, and disk work in this loop runs on [`FACTS_THROTTLE`] -- the same
+/// ~1s cadence `DiskFacts` and the mail sweep use -- not on the render
+/// loop's own 20-100 ticks a second.
+fn enforce_pane_token_budgets_with<F>(
+    panes: &mut [Pane],
+    cfg: &CtxConfig,
+    errors: &mut ErrorLog,
+    last_sweep: &mut Instant,
+    now: Instant,
+    mut usage_of: F,
+) where
+    F: FnMut(&Pane) -> Option<super::event::TranscriptUsage>,
+{
+    if !due(*last_sweep, now, FACTS_THROTTLE) {
+        return;
+    }
+    *last_sweep = now;
     for pane in panes {
         if pane.budget_tokens().is_none() {
             continue;
         }
-        let Some(usage) = pane_transcript_usage(pane, cfg, repo) else {
+        let Some(usage) = usage_of(pane) else {
             continue;
         };
         let quit_sequence = adapters::select(Some(pane.agent()), &[], cfg)
@@ -2545,6 +2659,33 @@ fn insert_fixup(old_pane_count: usize, new_pane_count: usize, selected: usize) -
     }
 }
 
+/// Pure: `selected` after the retained ended row at combined-roster index
+/// `restored_row` was relaunched into a pane.
+///
+/// A1-1 review finding A1-2: restoring grows `panes` (every view-only and
+/// retained row below shifts DOWN by the number of panes appended) and
+/// shrinks `retained` (every row after the restored one shifts back UP by
+/// one) in a single step, and `restore_ended_row` applied neither, so the
+/// sidebar cursor silently re-aimed at a different session. The restored row
+/// itself becomes the newest pane, so a cursor that was on it follows it
+/// there rather than landing on whatever slid into its old slot.
+fn restore_fixup(
+    old_pane_count: usize,
+    new_pane_count: usize,
+    restored_row: usize,
+    selected: usize,
+) -> usize {
+    if selected == restored_row {
+        return new_pane_count.saturating_sub(1);
+    }
+    let shifted = insert_fixup(old_pane_count, new_pane_count, selected);
+    if selected > restored_row {
+        shifted.saturating_sub(1)
+    } else {
+        shifted
+    }
+}
+
 /// Issue #209/v3 codex review finding 1: `reap_ended_panes` removes an ended
 /// pane from `panes` (and reindexes `focused`/`selected`) in the same tick it
 /// detects the exit -- well before `assemble_sidebar`/`assemble_footer_facts`
@@ -2596,7 +2737,15 @@ fn reap_ended_panes(
     last_exited: &mut Option<LastExited>,
     retained: &mut VecDeque<EndedRow>,
     kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
-) {
+) -> Vec<String> {
+    // A1-5: the module's own rule (`Notice`'s doc comment) is failures ->
+    // the sticky `\u{26a0}` error channel, confirmations -> the transient
+    // notice channel. A pane that exited 0 finished; routing it through
+    // `push_error` pinned the warning glyph and burned one of five
+    // `MAX_KEPT_ERRORS` slots a real failure needs. Returned rather than
+    // pushed here so the reap path keeps its existing parameter list and the
+    // one caller that owns a notice channel does the pushing.
+    let mut confirmations = Vec::new();
     let mut index = 0;
     while index < panes.len() {
         let PaneState::Ended(code) = panes[index].state() else {
@@ -2690,14 +2839,16 @@ fn reap_ended_panes(
         // registry snapshot no longer carries it.
         reaped_recent.insert(pane.short().to_string());
         reaped_codes.push(code);
-        push_error(
-            errors,
-            format!(
-                "pane '{}' ({}) ended (exit {code})",
-                pane.title(),
-                pane.short()
-            ),
+        let ended_line = format!(
+            "pane '{}' ({}) ended (exit {code})",
+            pane.title(),
+            pane.short()
         );
+        if code == 0 {
+            confirmations.push(ended_line);
+        } else {
+            push_error(errors, ended_line);
+        }
         if panes.is_empty() {
             *last_exited = Some(LastExited {
                 harness: pane.agent().to_string(),
@@ -2721,6 +2872,7 @@ fn reap_ended_panes(
         // Deliberately no `index += 1`: the next pane has shifted into this
         // slot and has not been looked at yet.
     }
+    confirmations
 }
 
 /// Review finding (2026-09), finding 2a: reclaims `cwd` if (and only if) the
@@ -2969,6 +3121,11 @@ const MAX_KEPT_ERRORS: usize = 5;
 /// with a count says strictly more in one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ErrorEntry {
+    /// Monotonic within one dashboard run. A1-3: `Ctrl+A e` acknowledges the
+    /// entries its own snapshot covered, and an id is the only stable way to
+    /// name them -- an index moves the moment the buffer cap drops an entry
+    /// off the front while the dialog is open.
+    id: u64,
     text: String,
     /// How many times in a row this exact message was pushed. `1` is the
     /// ordinary case and renders no count at all.
@@ -2991,6 +3148,7 @@ struct ErrorEntry {
 #[derive(Debug, Default)]
 struct ErrorLog {
     entries: Vec<ErrorEntry>,
+    next_id: u64,
 }
 
 impl ErrorLog {
@@ -3009,7 +3167,10 @@ impl ErrorLog {
             last.last = now;
             return;
         }
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
         self.entries.push(ErrorEntry {
+            id,
             text: message,
             count: 1,
             last: now,
@@ -3021,10 +3182,24 @@ impl ErrorLog {
         }
     }
 
-    /// Pure: marks every entry acknowledged. Never deletes anything.
-    fn acknowledge(&mut self) {
+    /// The id the NEXT recorded error will take -- what a dialog snapshot
+    /// stores so acknowledging it later covers exactly the entries it showed.
+    fn mark(&self) -> u64 {
+        self.next_id
+    }
+
+    /// Pure: marks acknowledged every entry the snapshot taken at `mark`
+    /// covered. Never deletes anything.
+    ///
+    /// A1-3: this used to acknowledge the whole buffer, including errors
+    /// pushed AFTER the dialog took its snapshot -- clearing the sticky
+    /// `\u{26a0}` for failures that were never on screen. An entry that
+    /// arrived after the snapshot keeps holding the line.
+    fn acknowledge(&mut self, mark: u64) {
         for entry in &mut self.entries {
-            entry.acked = true;
+            if entry.id < mark {
+                entry.acked = true;
+            }
         }
     }
 
@@ -6081,6 +6256,8 @@ fn restore_ended_row(
     errors: &mut ErrorLog,
     notices: &mut Vec<Notice>,
     now: Instant,
+    rows: &[ui::SidebarRow],
+    selected: &mut usize,
 ) {
     let Some(index) = retained.iter().position(|row| row.short == short) else {
         push_notice(notices, now, format!("restore: no ended row named {short}"));
@@ -6091,6 +6268,10 @@ fn restore_ended_row(
         return;
     };
     let requested_by = retained[index].requested_by.clone();
+    // A1-2: captured BEFORE the relaunch grows `panes` and shrinks
+    // `retained` -- the two index moves `restore_fixup` folds together.
+    let old_pane_count = panes.len();
+    let restored_row = rows.iter().position(|row| row.short == short);
     match fulfill_spawn_request(
         &request,
         FILE_DROP_TRUSTED_INTERACTIVE,
@@ -6107,6 +6288,9 @@ fn restore_ended_row(
         Ok((new_short, _)) => {
             retained.remove(index);
             kept_requests.insert(new_short.clone(), (request, requested_by));
+            if let Some(restored_row) = restored_row {
+                *selected = restore_fixup(old_pane_count, panes.len(), restored_row, *selected);
+            }
             push_notice(notices, now, format!("restored {short} as {new_short}"));
         }
         Err(refusal) => push_error(errors, format!("restore {short}: {}", refusal.reason)),
@@ -6584,7 +6768,12 @@ pub fn restore_overlay_reduce(
 /// Exactly one thing -- acknowledge the entries this dialog was opened over.
 /// The dialog itself stays pure; the buffer it names lives in the event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ErrorsAck;
+pub struct ErrorsAck {
+    /// The snapshot's own [`ui::ErrorsView::mark`] -- what the caller passes
+    /// to [`ErrorLog::acknowledge`] so only the entries this dialog actually
+    /// showed are acknowledged.
+    pub mark: u64,
+}
 
 /// Pure: one keystroke against the `Ctrl+A e` errors overlay.
 ///
@@ -6603,12 +6792,15 @@ pub fn errors_overlay_reduce(
         // Issue #354 phase 4 (deliverable D): `Enter` closes it too -- a
         // read-only list has nothing to activate, and an `Enter` that does
         // nothing at all is the inconsistency that phase removed.
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => (None, Some(ErrorsAck)),
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+            (None, Some(ErrorsAck { mark: view.mark }))
+        }
         KeyCode::Char('a') => {
+            let mark = view.mark;
             for item in &mut view.items {
                 item.acked = true;
             }
-            (Some(view), Some(ErrorsAck))
+            (Some(view), Some(ErrorsAck { mark }))
         }
         KeyCode::Down | KeyCode::Char('j') => {
             view.cursor = move_cursor(view.cursor, view.items.len(), 1);
@@ -6646,6 +6838,7 @@ fn build_errors_view(errors: &ErrorLog, now: Instant) -> ui::ErrorsView {
             .collect(),
         cursor: 0,
         offset: 0,
+        mark: errors.mark(),
     }
 }
 
@@ -9093,6 +9286,14 @@ pub fn run_dashboard(
     let mut last_mail_sweep = Instant::now()
         .checked_sub(FACTS_THROTTLE)
         .unwrap_or_else(Instant::now);
+    // A1-1: the per-pane budget sweep reads (and parses) every budgeted
+    // pane's whole transcript, so it belongs on the same ~1s disk cadence as
+    // the mail sweep and the header facts rather than on the render loop's
+    // own 50ms tick. Seeded a full interval in the past for the same reason
+    // `last_mail_sweep` is: the first tick sweeps immediately.
+    let mut last_budget_sweep = Instant::now()
+        .checked_sub(FACTS_THROTTLE)
+        .unwrap_or_else(Instant::now);
     // Task B: per-pane dedup for the orchestrator mail advisory
     // (`advise_one_pane`), keyed by a pane's own zirv session id. Lives for
     // the whole dashboard run, not just one tick, so an unchanged inbox is
@@ -9172,11 +9373,18 @@ pub fn run_dashboard(
             }
             pane.on_turn_signal();
         }
-        enforce_pane_token_budgets(&mut panes, cfg, repo, &mut errors);
+        enforce_pane_token_budgets(
+            &mut panes,
+            cfg,
+            repo,
+            &mut errors,
+            &mut last_budget_sweep,
+            Instant::now(),
+        );
         // R2: an exited pane leaves here -- registry record released, socket
         // unpublished, nudge queue dropped -- rather than sitting in the
         // vector as a corpse for the rest of the session.
-        reap_ended_panes(
+        let reap_confirmations = reap_ended_panes(
             &mut panes,
             &mut nudge_queues,
             cfg,
@@ -9191,6 +9399,9 @@ pub fn run_dashboard(
             &mut retained_ended,
             &mut kept_requests,
         );
+        for line in reap_confirmations {
+            push_notice(&mut notices, Instant::now(), line);
+        }
 
         // The geometry any pane spawned during this tick gets -- the terminal
         // as it is now, at this tick's zoom level. Shared by the request
@@ -10077,8 +10288,8 @@ pub fn run_dashboard(
                                             Some(v) => ui::Overlay::Errors(v),
                                             None => ui::Overlay::None,
                                         };
-                                        if ack.is_some() {
-                                            errors.acknowledge();
+                                        if let Some(ack) = ack {
+                                            errors.acknowledge(ack.mark);
                                         }
                                     }
                                     // Issue #354 phase 3: read-only, so there
@@ -10312,6 +10523,8 @@ pub fn run_dashboard(
                                                     &mut errors,
                                                     &mut notices,
                                                     now,
+                                                    &rows,
+                                                    &mut selected,
                                                 );
                                             }
                                             ui::MenuAction::Dismiss => {
@@ -10416,7 +10629,11 @@ pub fn run_dashboard(
                                             && chrome_selection == Some(Hit::SidebarSummary);
                                         let target = match action {
                                             DashAction::ContextMenu(id) => Some(id),
-                                            _ => rows.get(selected).map(|row| row.short.clone()),
+                                            _ => session_target(
+                                                chrome_selection.as_ref(),
+                                                &rows,
+                                                selected,
+                                            ),
                                         };
                                         if summary_selected {
                                             overlay = ui::Overlay::Menu(build_summary_menu_view());
@@ -10469,7 +10686,13 @@ pub fn run_dashboard(
                                         );
                                     }
                                     InputVerdict::Dash(DashAction::Inspect) => {
-                                        match rows.get(selected) {
+                                        match session_target(
+                                            chrome_selection.as_ref(),
+                                            &rows,
+                                            selected,
+                                        )
+                                        .and_then(|id| rows.iter().find(|r| r.short == id))
+                                        {
                                             Some(row) => {
                                                 let cwd =
                                                     row_cwd(&row.short, &panes, &retained_ended);
@@ -10501,7 +10724,11 @@ pub fn run_dashboard(
                                     // that cannot be restored, so this only
                                     // has to say so rather than guess.
                                     InputVerdict::Dash(DashAction::RestoreRow) => {
-                                        match rows.get(selected).map(|row| row.short.clone()) {
+                                        match session_target(
+                                            chrome_selection.as_ref(),
+                                            &rows,
+                                            selected,
+                                        ) {
                                             Some(short) => restore_ended_row(
                                                 &short,
                                                 &mut panes,
@@ -10516,6 +10743,8 @@ pub fn run_dashboard(
                                                 &mut errors,
                                                 &mut notices,
                                                 Instant::now(),
+                                                &rows,
+                                                &mut selected,
                                             ),
                                             None => push_notice(
                                                 &mut notices,
@@ -10728,23 +10957,16 @@ pub fn run_dashboard(
                                         // short id, resolved again at Enter time --
                                         // `selected` is only used to pick *which*
                                         // session is meant, here and now.
-                                        let target = if selected < panes.len() {
-                                            panes
-                                                .get(selected)
-                                                .map(|p| {
-                                                    ui::NudgeTarget::AttachedPane(
-                                                        p.short().to_string(),
-                                                    )
-                                                })
-                                                .unwrap_or(ui::NudgeTarget::None)
-                                        } else {
-                                            rows.get(selected)
-                                                .map(|row| {
-                                                    ui::NudgeTarget::ViewOnlySession(
-                                                        row.short.clone(),
-                                                    )
-                                                })
-                                                .unwrap_or(ui::NudgeTarget::None)
+                                        let target = match session_target(
+                                            chrome_selection.as_ref(),
+                                            &rows,
+                                            selected,
+                                        ) {
+                                            Some(short) if selected < panes.len() => {
+                                                ui::NudgeTarget::AttachedPane(short)
+                                            }
+                                            Some(short) => ui::NudgeTarget::ViewOnlySession(short),
+                                            None => ui::NudgeTarget::None,
                                         };
                                         overlay = ui::Overlay::Nudge(ui::NudgeDraft {
                                             target,
@@ -11048,9 +11270,13 @@ pub fn run_dashboard(
                                     // selection to go away.
                                     selection = None;
                                     let main = effective_main(full, sidebar_cols, zoomed);
-                                    if main.contains(Position::new(mouse.column, mouse.row))
-                                        && let Some(pane) = panes.get(focused)
-                                        && !pane.wants_mouse()
+                                    if let Some(pane) = panes.get(focused)
+                                        && press_starts_selection(
+                                            main,
+                                            mouse.column,
+                                            mouse.row,
+                                            pane.wants_mouse(),
+                                        )
                                     {
                                         let (rows, cols) = pane.screen().size();
                                         if let Some(cell) = pane_local_cell(
@@ -11087,7 +11313,10 @@ pub fn run_dashboard(
                                         // automatic mode switch (see
                                         // `mouse_capture_hint_shown`'s own doc
                                         // comment).
-                                        if !mouse_capture_hint_shown {
+                                        if drag_needs_capture_hint(
+                                            wants_mouse,
+                                            mouse_capture_hint_shown,
+                                        ) {
                                             mouse_capture_hint_shown = true;
                                             push_notice(
                                                 &mut notices,
@@ -12643,7 +12872,7 @@ mod tests {
         errors.record("mail send: disk full".into(), t0 + Duration::from_secs(1));
         assert!(errors.sticky_line().is_some());
 
-        errors.acknowledge();
+        errors.acknowledge(errors.mark());
         assert_eq!(errors.sticky_count(), 0);
         assert_eq!(errors.sticky_line(), None, "the header line clears");
         assert_eq!(errors.len(), 1, "acknowledgement is never a delete");
@@ -12677,6 +12906,7 @@ mod tests {
             items: vec![err_item("boom"), err_item("bang")],
             cursor: 0,
             offset: 0,
+            mark: 0,
         };
         for code in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('q')] {
             let (next, ack) = errors_overlay_reduce(view.clone(), key(code, KeyModifiers::NONE));
@@ -14735,6 +14965,287 @@ mod tests {
         assert!(panes.is_empty(), "sanity: the pane was reaped");
         let recorded = last_exited.expect("last_exited must be filled once panes is empty");
         assert_eq!(recorded.harness, "test-agent");
+    }
+
+    /// A1-5: the module's own rule -- failures go to the sticky `⚠` error
+    /// channel, confirmations go to the auto-expiring notice channel. A pane
+    /// that exited 0 finished; it did not fail, so it must not pin the
+    /// warning glyph nor consume one of the five `MAX_KEPT_ERRORS` slots a
+    /// real failure needs.
+    #[test]
+    fn reaping_a_clean_exit_is_a_notice_and_a_failure_is_still_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig::default();
+
+        let mut panes = Vec::new();
+        for (argv, session_id, title) in [
+            (
+                trivial_argv(),
+                "77771111-2222-4333-8444-555555555555",
+                "clean",
+            ),
+            (
+                failing_argv(),
+                "77772222-2222-4333-8444-555555555555",
+                "failed",
+            ),
+        ] {
+            panes.push(
+                Pane::spawn(
+                    PaneSpec {
+                        agent_name: "test-agent".to_string(),
+                        argv,
+                        role: prompt::PromptRole::Worker,
+                        verb: sessions::Verb::Dash,
+                        session_id: session_id.to_string(),
+                        title: title.to_string(),
+                    },
+                    &state,
+                    &repo,
+                    &repo,
+                    (80, 24),
+                    &[],
+                    true,
+                    pane::DEFAULT_IDLE_QUIET,
+                )
+                .expect("spawn"),
+            );
+        }
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new(), VecDeque::new()];
+        let (mut focused, mut selected) = (0usize, 0usize);
+        let mut errors = ErrorLog::default();
+
+        let mut confirmations: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !panes.is_empty() {
+            for pane in panes.iter_mut() {
+                pane.drain();
+            }
+            confirmations.extend(reap_ended_panes(
+                &mut panes,
+                &mut queues,
+                &cfg,
+                &state,
+                &repo,
+                &mut focused,
+                &mut selected,
+                &mut errors,
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &mut None,
+                &mut VecDeque::new(),
+                &mut HashMap::new(),
+            ));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(panes.is_empty(), "sanity: both panes were reaped");
+        assert!(
+            !errors.iter().any(|e| e.contains("(exit 0)")),
+            "a clean exit is a confirmation, not a sticky failure: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("(exit 1)")),
+            "a failing exit is still an error: {errors:?}"
+        );
+        assert!(
+            confirmations.iter().any(|c| c.contains("(exit 0)")),
+            "and the clean exit is still reported, as a notice: {confirmations:?}"
+        );
+        assert!(
+            !confirmations.iter().any(|c| c.contains("(exit 1)")),
+            "a failure never becomes a confirmation: {confirmations:?}"
+        );
+    }
+
+    /// A1-1: the budget sweep reads (and parses) every budgeted pane's whole
+    /// transcript, so it belongs on the ~1s disk cadence every other disk
+    /// fact in the loop uses -- not on the render loop's own 20-100 ticks a
+    /// second.
+    #[test]
+    fn the_pane_token_budget_sweep_is_throttled_to_the_facts_cadence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig::default();
+
+        let mut pane = Pane::spawn(
+            PaneSpec {
+                agent_name: "test-agent".to_string(),
+                argv: trivial_argv(),
+                role: prompt::PromptRole::Worker,
+                verb: sessions::Verb::Dash,
+                session_id: "77773333-2222-4333-8444-555555555555".to_string(),
+                title: "budgeted".to_string(),
+            },
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_budget_tokens(Some(1_000_000));
+        let mut panes = vec![pane];
+        let mut errors = ErrorLog::default();
+
+        let start = Instant::now();
+        let mut last_sweep = start.checked_sub(FACTS_THROTTLE).unwrap_or(start);
+        let mut reads = 0usize;
+        for tick in 0..100u64 {
+            let now = start + Duration::from_millis(tick * 5);
+            enforce_pane_token_budgets_with(
+                &mut panes,
+                &cfg,
+                &mut errors,
+                &mut last_sweep,
+                now,
+                |_| {
+                    reads += 1;
+                    None
+                },
+            );
+        }
+        assert_eq!(
+            reads, 1,
+            "100 ticks spanning under one throttle interval may read a budgeted pane's \
+             transcript once, not {reads} times"
+        );
+
+        for pane in &mut panes {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// A1-4: the delegation ledger is append-only, so an unchanged
+    /// `(len, mtime)` means unchanged rows. Re-reading the whole file and
+    /// re-pricing every row once a second, forever, bought nothing.
+    #[test]
+    fn the_delegation_ledger_is_re_priced_only_when_it_actually_changed() {
+        let cfg = CtxConfig::default();
+        let mut cache = FactsCache::new(Instant::now());
+        let mut reads = 0usize;
+
+        for _ in 0..5 {
+            cache.refresh_spend_with((128, 42), &cfg, || {
+                reads += 1;
+                Vec::new()
+            });
+        }
+        assert_eq!(
+            reads, 1,
+            "an unchanged ledger is folded once, not once per throttled tick"
+        );
+
+        cache.refresh_spend_with((256, 43), &cfg, || {
+            reads += 1;
+            Vec::new()
+        });
+        assert_eq!(reads, 2, "a grown ledger is re-read and re-priced");
+    }
+
+    /// A1-2: restoring a retained ended row grows `panes` and shrinks
+    /// `retained` in one step, so every index between the two moves. The
+    /// cursor must keep naming the same session (and follow the restored row
+    /// into its new pane when it was on that row).
+    #[test]
+    fn restoring_an_ended_row_keeps_the_sidebar_cursor_on_the_same_session() {
+        // Roster: [p0 p1][view-only][r_a r_b r_c] -- 2 panes, 1 view-only, 3
+        // retained; restoring appends one pane and removes one retained row.
+        assert_eq!(restore_fixup(2, 3, 3, 0), 0, "a pane row never moves");
+        assert_eq!(
+            restore_fixup(2, 3, 3, 2),
+            3,
+            "the view-only row is pushed down by the appended pane"
+        );
+        assert_eq!(
+            restore_fixup(2, 3, 3, 3),
+            2,
+            "the cursor follows the restored row into its new pane"
+        );
+        assert_eq!(restore_fixup(2, 3, 3, 4), 4, "r_b: pushed down, then back");
+        assert_eq!(restore_fixup(2, 3, 3, 5), 5, "r_c: pushed down, then back");
+        // Restoring the LAST retained row instead: nothing after it shifts
+        // back, so the rows before it only take the append.
+        assert_eq!(restore_fixup(2, 3, 5, 3), 4, "r_a takes only the append");
+        assert_eq!(restore_fixup(2, 3, 5, 4), 5, "r_b takes only the append");
+        assert_eq!(restore_fixup(2, 3, 5, 5), 2, "the cursor follows r_c");
+    }
+
+    /// A1-3: `Ctrl+A e` acknowledges the errors the operator actually saw.
+    /// An error that arrived AFTER the dialog took its snapshot was never on
+    /// screen, so closing the dialog must leave the sticky `⚠` up for it.
+    #[test]
+    fn acknowledging_the_errors_dialog_never_clears_an_error_it_never_showed() {
+        let now = Instant::now();
+        let mut errors = ErrorLog::default();
+        errors.record("supervisor a failed".to_string(), now);
+        let view = build_errors_view(&errors, now);
+        errors.record("supervisor b failed".to_string(), now);
+
+        let (next, ack) = errors_overlay_reduce(view, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(next.is_none(), "Esc closes the dialog");
+        errors.acknowledge(ack.expect("Esc acknowledges on the way out").mark);
+
+        assert_eq!(
+            errors.sticky_line().as_deref(),
+            Some("supervisor b failed"),
+            "the error that arrived after the snapshot was never seen: {errors:?}"
+        );
+    }
+
+    /// A1-6: `frame_snapshot.roster` is empty until the first successful
+    /// draw, so the very first `Ctrl+A ↓` used to park on the summary line
+    /// instead of moving. With no tree to walk, navigation falls back to the
+    /// flat row list.
+    #[test]
+    fn the_first_select_down_moves_before_any_frame_has_been_drawn() {
+        let panes = vec![
+            pane_row("worker01", "claude"),
+            pane_row("worker02", "claude"),
+            pane_row("lead0001", "codex"),
+        ];
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 0, 0, DASHBOARD_PID, 0);
+        let mut chrome = None;
+        assert_eq!(
+            navigate_roster(DashAction::SelectDown, &rows, &[], 0, 0, &mut chrome),
+            (1, 1),
+            "an empty roster order must not swallow the first move"
+        );
+        assert_eq!(chrome, None, "and must not park the cursor on the summary");
+    }
+
+    /// A1-7: chrome owns the cursor or nothing does. With the cursor on the
+    /// summary line or a group header there is no session row under it, so a
+    /// session-scoped action must not fall back to the stale `selected`
+    /// index.
+    #[test]
+    fn a_session_action_never_targets_a_row_the_cursor_left_for_chrome() {
+        let panes = vec![
+            pane_row("worker01", "claude"),
+            pane_row("lead0001", "codex"),
+        ];
+        let rows = assemble_sidebar(&panes, &[], &HashMap::new(), 1, 1, DASHBOARD_PID, 0);
+        assert_eq!(
+            session_target(None, &rows, 1).as_deref(),
+            Some("lead0001"),
+            "with no chrome the selected row is the target"
+        );
+        assert_eq!(
+            session_target(Some(&Hit::SidebarSummary), &rows, 1),
+            None,
+            "the summary line is not a session"
+        );
+        assert_eq!(
+            session_target(Some(&Hit::GroupToggle("wg".to_string())), &rows, 1),
+            None,
+            "neither is a group header"
+        );
     }
 
     #[test]
@@ -17392,6 +17903,116 @@ mod tests {
         );
     }
 
+    /// A2-2: `req.force` is NOT inert on this path. It flows straight into
+    /// `fallback::route_new_delegation`, whose first line returns `None` for
+    /// a forced request, so a request carrying `"force": true` skips the
+    /// cross-harness rerouting its unforced sibling above receives. Pinned
+    /// here because the request is FILE-DROPPED and therefore untrusted: the
+    /// same field a trusted `--force` sets is settable by whatever dropped
+    /// the JSON.
+    #[test]
+    fn a_forced_spawn_request_skips_the_cross_harness_reroute() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let now = crate::commands::ctx::state::now_secs();
+
+        crate::commands::ctx::window::store_for(
+            &state,
+            "anthropic",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store claude usage");
+        crate::commands::ctx::window::store_for(
+            &state,
+            "openai",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 10.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store codex usage");
+
+        let group = crate::commands::ctx::group::WorkGroup {
+            work_group_id: "wg-forced-route".to_string(),
+            parent_session_id: String::new(),
+            scope: "test batch".to_string(),
+            child_limit: 0,
+            token_budget: None,
+            spent_tokens: 0,
+            reserved_tokens: 0,
+            deadline_secs: None,
+            completion_contract: String::new(),
+            created_at: 0,
+            closed_at: None,
+            admitted_children: 0,
+            sub_orchestrator_session: None,
+        };
+        crate::commands::ctx::group::create(&state, &group).expect("create group");
+
+        let mut cfg = CtxConfig {
+            agent_bin: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
+            ..CtxConfig::default()
+        };
+        cfg.pace.estimator = false;
+
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "claude".to_string();
+        req.work_group_id = Some("wg-forced-route".to_string());
+        req.force = true;
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = ErrorLog::default();
+
+        let refusal = fulfill_spawn_request(
+            &req,
+            true,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        )
+        .expect_err("the full group stops the request either way");
+
+        assert!(
+            refusal.reason.contains("wg-forced-route"),
+            "got {}",
+            refusal.reason
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|line| line.contains("dashboard spawn automatically routed")),
+            "an untrusted force skips the reroute the unforced request gets: {errors:?}"
+        );
+        assert!(panes.is_empty(), "nothing spawned either way");
+    }
+
     /// Issue #230 item 3 (F2, review round): a REROUTED spawn's capability
     /// warnings must describe the EFFECTIVE (post-reroute) adapter, not the
     /// originally requested one -- `fulfill_spawn_request` computes them
@@ -18567,11 +19188,16 @@ mod tests {
     /// used to matter here because `SpawnGate::Refuse` was a hard block only
     /// `agent.rs::run_with`'s own trusted `--force` could lift, and this
     /// request's untrusted `force: true` had to be proven NOT to. Usage
-    /// headroom never blocks a spawn any more -- `force` is irrelevant to
-    /// this gate either way now -- so this proves the pane still spawns
-    /// (with the ceiling note, naming the reading age) with `req.force` set,
-    /// exactly as an unforced request already does (the sibling tests
-    /// above).
+    /// headroom never blocks a spawn any more -- `force` cannot make THIS
+    /// gate refuse or admit differently -- so this proves the pane still
+    /// spawns (with the ceiling note, naming the reading age) with
+    /// `req.force` set, exactly as an unforced request already does (the
+    /// sibling tests above).
+    ///
+    /// A2-2: `force` is NOT inert on the path as a whole. It still reaches
+    /// `fallback::route_new_delegation`, where it suppresses the
+    /// cross-harness reroute -- see
+    /// `a_forced_spawn_request_skips_the_cross_harness_reroute`.
     #[test]
     fn fulfill_spawn_request_spawns_the_pane_regardless_of_force_once_usage_is_at_the_ceiling() {
         let repo = std::env::current_dir().expect("cwd");
@@ -19775,6 +20401,8 @@ mod tests {
                 &mut errors,
                 &mut notices,
                 now,
+                &[],
+                &mut 0,
             );
         }
         assert!(panes.is_empty(), "nothing may be spawned");
@@ -19951,10 +20579,10 @@ mod tests {
         let overlay = ui::Overlay::Inspector(view);
         for (w, h) in [(80u16, 20u16), (120, 40), (200, 50)] {
             let text = render_overlay_text(w, h, &overlay);
-            assert!(
-                text.contains("dashboard") || text.contains("dashboard"),
-                "{w}x{h}: {text}"
-            );
+            // A2-3: the second operand used to repeat the first verbatim, so
+            // the subject the dialog is opened ON was never asserted at all.
+            assert!(text.contains("dashboard"), "{w}x{h}: {text}");
+            assert!(text.contains("a0000001"), "{w}x{h}: {text}");
             assert!(text.contains("harness"), "{w}x{h}: {text}");
         }
     }
@@ -20123,6 +20751,23 @@ mod tests {
     #[cfg(unix)]
     fn trivial_argv() -> Vec<String> {
         vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()]
+    }
+
+    /// The same trivial child, failing -- what a reap must keep routing to
+    /// the sticky error channel.
+    #[cfg(windows)]
+    fn failing_argv() -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "exit".to_string(),
+            "1".to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn failing_argv() -> Vec<String> {
+        vec!["sh".to_string(), "-c".to_string(), "exit 1".to_string()]
     }
 
     /// Issue #349: a pane going `Ended` files exactly one `QuietHeuristic`
@@ -21224,12 +21869,13 @@ mod tests {
         let mut errors = ErrorLog::default();
         let mut reaped_codes: Vec<i32> = Vec::new();
         let mut reaped_recent: HashSet<String> = HashSet::new();
+        let mut confirmations: Vec<String> = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline && !panes.is_empty() {
             for pane in panes.iter_mut() {
                 pane.drain();
             }
-            reap_ended_panes(
+            confirmations.extend(reap_ended_panes(
                 &mut panes,
                 &mut queues,
                 &cfg,
@@ -21243,7 +21889,7 @@ mod tests {
                 &mut None,
                 &mut VecDeque::new(),
                 &mut HashMap::new(),
-            );
+            ));
             std::thread::sleep(Duration::from_millis(50));
         }
 
@@ -21258,9 +21904,16 @@ mod tests {
             reaped_recent.contains(&short),
             "the reaped pane's short is tracked for ghost-row exclusion"
         );
+        // A1-5: this child exited 0, so the operator is still told which pane
+        // ended -- through the transient notice channel, not the sticky `⚠`
+        // one a genuine failure holds.
         assert!(
-            errors.iter().any(|e| e.contains("ended (exit")),
-            "the operator is told which pane ended: {errors:?}"
+            confirmations.iter().any(|c| c.contains("ended (exit")),
+            "the operator is told which pane ended: {confirmations:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("ended (exit")),
+            "and a clean exit never pins the sticky warning: {errors:?}"
         );
         // F4: the notice is retained for the exit to print (the header it was
         // written for goes away with the alternate screen), and the exit code
@@ -23960,23 +24613,21 @@ mod tests {
             ..Default::default()
         };
         let mut child_calls = Vec::new();
-        for wants_mouse in [false, true] {
-            for (x, y) in [(0, 0), (5, 2), (5, 3), (5, 11), (44, 20), (60, 39)] {
-                for kind in [
-                    MouseEventKind::ScrollUp,
-                    MouseEventKind::ScrollDown,
-                    MouseEventKind::Down(MouseButton::Left),
-                    MouseEventKind::Up(MouseButton::Right),
-                ] {
-                    let mouse = event::MouseEvent {
-                        kind,
-                        column: x,
-                        row: y,
-                        modifiers: KeyModifiers::NONE,
-                    };
-                    if route_mouse(&snap, mouse, true, false, false) == MouseRoute::Grid {
-                        child_calls.push((wants_mouse, kind));
-                    }
+        for (x, y) in [(0, 0), (5, 2), (5, 3), (5, 11), (44, 20), (60, 39)] {
+            for kind in [
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollDown,
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Right),
+            ] {
+                let mouse = event::MouseEvent {
+                    kind,
+                    column: x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                };
+                if route_mouse(&snap, mouse, true, false, false) == MouseRoute::Grid {
+                    child_calls.push(((x, y), kind));
                 }
             }
         }
@@ -24228,33 +24879,64 @@ mod tests {
             grid: Rect::new(45, 2, 35, 16),
             ..Default::default()
         };
-        for wants_mouse in [false, true] {
-            let mut calls = Vec::new();
-            for kind in [
-                MouseEventKind::ScrollUp,
-                MouseEventKind::Down(MouseButton::Left),
-                MouseEventKind::Up(MouseButton::Left),
-            ] {
-                let mouse = event::MouseEvent {
-                    kind,
-                    column: 50,
-                    row: 5,
-                    modifiers: KeyModifiers::NONE,
-                };
-                assert_eq!(
-                    route_mouse(&snap, mouse, true, true, true),
-                    MouseRoute::Consume
-                );
-                assert_eq!(
-                    route_mouse(&snap, mouse, false, false, true),
-                    MouseRoute::Consume
-                );
-                if route_mouse(&snap, mouse, true, false, false) == MouseRoute::Grid {
-                    calls.push((wants_mouse, kind));
-                }
+        let mut calls = Vec::new();
+        for kind in [
+            MouseEventKind::ScrollUp,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            let mouse = event::MouseEvent {
+                kind,
+                column: 50,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(
+                route_mouse(&snap, mouse, true, true, true),
+                MouseRoute::Consume
+            );
+            assert_eq!(
+                route_mouse(&snap, mouse, false, false, true),
+                MouseRoute::Consume
+            );
+            if route_mouse(&snap, mouse, true, false, false) == MouseRoute::Grid {
+                calls.push(kind);
             }
-            assert_eq!(calls.len(), 3);
         }
+        assert_eq!(calls.len(), 3);
+    }
+
+    /// A2-1: the two arms the deleted `wants_mouse` loops above never
+    /// reached. `route_mouse` says the event belongs to the grid; whether
+    /// zirv then draws its OWN selection over it is decided separately, by
+    /// whether the child already owns the mouse.
+    #[test]
+    fn a_mouse_owning_pane_suppresses_zirv_selection_and_explains_itself_once() {
+        let main = Rect::new(45, 2, 35, 16);
+        assert!(
+            press_starts_selection(main, 50, 5, false),
+            "a press inside the grid over a plain pane starts a selection"
+        );
+        assert!(
+            !press_starts_selection(main, 50, 5, true),
+            "the child owns the mouse, so zirv must not draw a selection over it"
+        );
+        assert!(
+            !press_starts_selection(main, 5, 5, false),
+            "a press outside the grid never starts one"
+        );
+        assert!(
+            drag_needs_capture_hint(true, false),
+            "the first silent drag over a mouse-owning pane explains itself"
+        );
+        assert!(
+            !drag_needs_capture_hint(true, true),
+            "and never explains itself twice"
+        );
+        assert!(
+            !drag_needs_capture_hint(false, false),
+            "a drag that really is selecting text has nothing to explain"
+        );
     }
 
     #[test]
@@ -24644,6 +25326,7 @@ mod tests {
             items: vec![err_item("boom")],
             cursor: 0,
             offset: 0,
+            mark: 0,
         };
         assert!(errors_overlay_reduce(errors.clone(), esc).0.is_none());
         assert!(errors_overlay_reduce(errors, enter).0.is_none());
@@ -24925,6 +25608,7 @@ mod tests {
             items: vec![err_item("boom")],
             cursor: 0,
             offset: 0,
+            mark: 0,
         });
         let none = ui::Overlay::None;
 
