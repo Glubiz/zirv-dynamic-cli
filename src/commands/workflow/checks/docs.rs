@@ -79,6 +79,15 @@ fn count_cfg_unix_tests(source: &str) -> usize {
 
 pub fn run_unix_tests_doc(repo: &Path) -> BuiltinCheckResult {
     let wrap_path = repo.join("src/commands/ctx/wrap.rs");
+    if !wrap_path.exists() {
+        return BuiltinCheckResult::not_applicable(
+            UNIX_TESTS_ID,
+            UNIX_TESTS_PROVES,
+            UNIX_TESTS_FIX,
+            UNIX_TESTS_ORIGIN,
+            super::absent_input(&wrap_path),
+        );
+    }
     let wrap_source = match std::fs::read_to_string(&wrap_path) {
         Ok(source) => source,
         Err(err) => {
@@ -94,6 +103,15 @@ pub fn run_unix_tests_doc(repo: &Path) -> BuiltinCheckResult {
     let actual = count_cfg_unix_tests(&wrap_source);
 
     let known_issues_path = repo.join("docs/obsidian/Development/Known Issues.md");
+    if !known_issues_path.exists() {
+        return BuiltinCheckResult::not_applicable(
+            UNIX_TESTS_ID,
+            UNIX_TESTS_PROVES,
+            UNIX_TESTS_FIX,
+            UNIX_TESTS_ORIGIN,
+            super::absent_input(&known_issues_path),
+        );
+    }
     let known_issues = match std::fs::read_to_string(&known_issues_path) {
         Ok(text) => text,
         Err(err) => {
@@ -210,6 +228,15 @@ pub fn run_doc_verbs(repo: &Path) -> BuiltinCheckResult {
     clap_verbs.remove("help");
 
     let doc_path = repo.join("docs/obsidian/Modules/Built-in Commands.md");
+    if !doc_path.exists() {
+        return BuiltinCheckResult::not_applicable(
+            DOC_VERBS_ID,
+            DOC_VERBS_PROVES,
+            DOC_VERBS_FIX,
+            DOC_VERBS_ORIGIN,
+            super::absent_input(&doc_path),
+        );
+    }
     let doc_text = match std::fs::read_to_string(&doc_path) {
         Ok(text) => text,
         Err(err) => {
@@ -329,10 +356,10 @@ fn cfg_after_test_still_counts() {
     }
 
     #[test]
-    fn missing_wrap_rs_is_inconclusive() {
+    fn missing_wrap_rs_is_not_applicable() {
         let repo = tempdir().unwrap();
         let result = run_unix_tests_doc(repo.path());
-        assert_eq!(result.outcome, super::super::BuiltinOutcome::Inconclusive);
+        assert_eq!(result.outcome, super::super::BuiltinOutcome::NotApplicable);
     }
 
     fn write_wrap_rs(repo: &Path, unix_test_count: usize) {

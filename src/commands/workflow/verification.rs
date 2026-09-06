@@ -2842,7 +2842,7 @@ fn write_builtin_lines(
             check.outcome.as_str(),
             scrub_line(&check.details)
         )?;
-        if check.outcome != super::checks::BuiltinOutcome::Pass {
+        if !check.outcome.is_passing() {
             writeln!(writer, "  proves: {}", scrub_line(check.proves))?;
             writeln!(writer, "  fix: {}", scrub_line(check.fix))?;
             writeln!(writer, "  origin: {}", scrub_line(check.origin))?;
@@ -2915,9 +2915,11 @@ pub fn run_verify(args: &VerifyArgs, writer: &mut impl Write) -> CtxResult<i32> 
         }
     }
     let builtins = super::checks::run_all(&repo, &repo_gates.builtin_checks_exclude);
-    let builtins_passed = builtins
-        .iter()
-        .all(|check| check.outcome == super::checks::BuiltinOutcome::Pass);
+    // `NotApplicable` counts as passing: most of these checks read zirv's own
+    // files, and their absence in another repository is a fact about that
+    // repository, not a failed invariant. `Inconclusive` still blocks (issue
+    // #268's degraded-gate ban).
+    let builtins_passed = builtins.iter().all(|check| check.outcome.is_passing());
 
     if args.builtin {
         if let Err(error) = write_builtin_report(writer, &builtins, args.run.json) {
@@ -3225,6 +3227,47 @@ mod tests {
             report.notes
         );
         assert!(!report.passed(), "a skipped check is not a passing check");
+    }
+
+    /// The builtin registry mostly checks zirv's own source and vault files.
+    /// In any other repository those inputs are absent, and a repo cannot opt
+    /// out (`workflow.builtin_checks_exclude` is REPO_FORBIDDEN), so counting
+    /// their absence against the run made `zirv verify` unable to exit 0
+    /// anywhere outside the zirv checkout even with a fully passing
+    /// `verify.toml`.
+    #[test]
+    fn builtin_self_checks_do_not_fail_verify_in_a_repository_that_is_not_zirv() {
+        let repo = git_repo();
+        let state_root = tempdir().unwrap();
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\n",
+                marker_command()
+            ),
+        );
+        let mut output = Vec::new();
+        let code = with_state(state_root.path(), || {
+            run_verify(
+                &VerifyArgs {
+                    run: RunArgs {
+                        repo: Some(repo.path().to_path_buf()),
+                        checks: Vec::new(),
+                        dry_run: false,
+                        json: false,
+                    },
+                    builtin: false,
+                },
+                &mut output,
+            )
+            .expect("verify runs")
+        });
+        assert_eq!(
+            code,
+            0,
+            "a non-zirv repository with a passing verify.toml must exit 0: {}",
+            String::from_utf8_lossy(&output)
+        );
     }
 
     /// A command that appends a marker to `path` (outside the repo) each time
