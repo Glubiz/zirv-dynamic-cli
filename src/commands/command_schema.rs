@@ -416,7 +416,16 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
         "zirv init",
         "Scaffold a .zirv directory in the current repository.",
         true,
-        Vec::new(),
+        vec![FlagEntry {
+            long: Some("yes".to_string()),
+            short: None,
+            takes_value: false,
+            help: Some(
+                "Answer yes to every confirmation; required when stdin is not a \
+                 terminal."
+                    .to_string(),
+            ),
+        }],
     ));
     entries.push(synthetic(
         "zirv create",

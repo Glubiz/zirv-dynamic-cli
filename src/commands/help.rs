@@ -338,6 +338,15 @@ fn write_builtins<W: Write>(
         ],
         colour,
     )?;
+    writeln!(writer, "{}", header(colour, "init only:"))?;
+    write_table(
+        writer,
+        &[Row {
+            name: "--yes",
+            desc: &["Answer yes to every confirmation; required when stdin is not a terminal"],
+        }],
+        colour,
+    )?;
     Ok(())
 }
 

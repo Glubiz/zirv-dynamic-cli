@@ -409,7 +409,7 @@ async fn main() {
             return;
         }
         "init" | "i" => {
-            if let Err(e) = init_zirv() {
+            if let Err(e) = init_zirv(input.yes) {
                 output::error(e);
                 std::process::exit(1);
             }
