@@ -2805,6 +2805,72 @@ pub(crate) fn unwrap_env_prefix(segment: &str) -> Option<String> {
     Some(tokens[i..].join(" "))
 }
 
+/// The ordinary process launchers that go on to run some OTHER program.
+/// [`SHELL_PIPE_WRAPPER_PROGRAMS`] already knew this much for a pipe TARGET;
+/// a leading prefix needs two more facts per launcher: which of its own
+/// flags take a SEPARATE value, and how many positional operands belong to
+/// the launcher itself (`timeout <duration>`, `flock <file>`,
+/// `chrt <priority>`, `taskset <mask>`) before the wrapped command starts.
+const LAUNCHER_PREFIXES: &[(&str, &[&str], usize)] = &[
+    ("nohup", &[], 0),
+    ("setsid", &[], 0),
+    (
+        "stdbuf",
+        &["-i", "-o", "-e", "--input", "--output", "--error"],
+        0,
+    ),
+    ("nice", &["-n", "--adjustment"], 0),
+    (
+        "ionice",
+        &["-c", "-n", "-p", "--class", "--classdata", "--pid"],
+        0,
+    ),
+    ("doas", &["-a", "-C", "-u"], 0),
+    ("timeout", &["-k", "--kill-after", "-s", "--signal"], 1),
+    (
+        "flock",
+        &["-w", "--wait", "--timeout", "-E", "--conflict-exit-code"],
+        1,
+    ),
+    ("chrt", &["-p", "--pid"], 1),
+    ("taskset", &["-c", "--cpu-list", "-p", "--pid"], 1),
+];
+
+/// One layer of launcher-prefix unwrapping -- [`unwrap_env_prefix`]'s
+/// sibling for every launcher that is not `env`. Peels the launcher's own
+/// flags (and their separate values) plus the positional operands that
+/// belong to it, and returns the command it goes on to run. `None` when
+/// `segment` names no launcher from [`LAUNCHER_PREFIXES`] or when nothing is
+/// left after the prefix: `timeout 5` and a bare `nice` launch nothing.
+/// Pushing the remainder as one more candidate can only NARROW a verdict --
+/// [`evaluate_candidates`] folds the most restrictive answer across every
+/// candidate it is given.
+pub(crate) fn unwrap_launcher_prefix(segment: &str) -> Option<String> {
+    let bare = strip_program_dir(segment);
+    let collapsed = collapse_whitespace(&bare);
+    let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+    let program = sql_program_name(tokens.first()?);
+    let (_, value_flags, operands) = LAUNCHER_PREFIXES
+        .iter()
+        .find(|(name, _, _)| *name == program)?;
+    let mut i = 1usize;
+    while let Some(token) = tokens.get(i) {
+        if !token.starts_with('-') {
+            break;
+        }
+        i += if value_flags
+            .iter()
+            .any(|flag| token.eq_ignore_ascii_case(flag))
+        {
+            2
+        } else {
+            1
+        };
+    }
+    i = i.saturating_add(*operands);
+    (i < tokens.len()).then(|| tokens[i..].join(" "))
+}
+
 fn push_candidate(candidates: &mut Vec<String>, candidate: String) {
     if candidates.len() < MAX_STRUCTURAL_CANDIDATES && !candidates.contains(&candidate) {
         candidates.push(candidate);
@@ -2857,6 +2923,9 @@ fn visit_executable_nodes(command: &str, depth: usize, candidates: &mut Vec<Stri
             visit_executable_nodes(&inner, depth + 1, candidates);
         }
         if let Some(inner) = unwrap_env_prefix(collapsed) {
+            visit_executable_nodes(&inner, depth + 1, candidates);
+        }
+        if let Some(inner) = unwrap_launcher_prefix(collapsed) {
             visit_executable_nodes(&inner, depth + 1, candidates);
         }
         // ISSUE #136: extraction runs against `raw_segment` -- the
@@ -11440,6 +11509,56 @@ mod tests {
             Verdict::Ask,
             "powershell -Command must be unwrapped"
         );
+    }
+
+    /// A4 (2026-09-06 audit): `unwrap_env_prefix` saw through `env` and bare
+    /// `VAR=value` prefixes only, so every other ordinary launcher --
+    /// `timeout`, `nohup`, `setsid`, `nice`, `stdbuf`, `flock`, ... -- hid
+    /// the program it launched from every classifier in this module.
+    #[test]
+    fn a_launcher_prefix_never_hides_the_program_it_launches() {
+        let policy = SafetyPolicy::default();
+        for (launched, bare) in [
+            ("timeout 5 gh repo delete o/r", "gh repo delete o/r"),
+            ("nohup cargo publish", "cargo publish"),
+            ("setsid gh auth token", "gh auth token"),
+            ("nice -n 5 cat ~/.ssh/id_rsa", "cat ~/.ssh/id_rsa"),
+            ("stdbuf -o0 rm -rf /", "rm -rf /"),
+            ("flock /tmp/lock rm -rf /", "rm -rf /"),
+            ("ionice -c 3 rm -rf /", "rm -rf /"),
+            ("chrt -f 10 rm -rf /", "rm -rf /"),
+            ("taskset 0x1 rm -rf /", "rm -rf /"),
+        ] {
+            let expected = evaluate(&policy, bare, LaunchMode::Interactive).verdict;
+            assert_ne!(
+                expected,
+                Verdict::Allow,
+                "{bare} must not be silent to begin with"
+            );
+            assert_eq!(
+                evaluate(&policy, launched, LaunchMode::Interactive).verdict,
+                expected,
+                "{launched} must classify like {bare}"
+            );
+        }
+        assert_eq!(
+            evaluate(&policy, "doas rm -rf /", LaunchMode::Interactive).verdict,
+            Verdict::Deny,
+            "doas escalates privilege exactly like sudo"
+        );
+        for command in ["timeout 5", "nice", "flock /tmp/lock"] {
+            assert!(
+                unwrap_launcher_prefix(command).is_none(),
+                "{command} launches no command of its own"
+            );
+        }
+        for command in ["timeout 5 cargo build", "nice -n 5 cargo test"] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Allow,
+                "{command} is ordinary paced development work"
+            );
+        }
     }
 
     /// A3 (2026-09-06 audit): `zirv ctx permissions compile` was the only
