@@ -578,7 +578,7 @@ pub fn model_hint(jsonl: &str) -> Option<String> {
 /// the same `message.id`. `requestId` is the fallback for a row carrying no
 /// message id; `None` means this row has no response identity at all and is
 /// counted on its own, which is exactly the pre-split behaviour.
-fn response_identity(row: &Value) -> Option<&str> {
+pub fn response_identity(row: &Value) -> Option<&str> {
     row.get("message")
         .and_then(|message| message.get("id"))
         .and_then(Value::as_str)
