@@ -2588,10 +2588,7 @@ fn reap_fixup(removed: usize, focused: usize, selected: usize) -> (usize, usize)
 /// session runs in -- claude by project slug, codex by the `cwd` its rollout's
 /// `session_meta` records -- so a worktree-hosted pane priced off the root
 /// repo read another pane's transcript, or none.
-fn pane_transcript_usage(
-    pane: &Pane,
-    cfg: &CtxConfig,
-) -> Option<super::event::TranscriptUsage> {
+fn pane_transcript_usage(pane: &Pane, cfg: &CtxConfig) -> Option<super::event::TranscriptUsage> {
     let adapter = adapters::select(Some(pane.agent()), &[], cfg).ok()?;
     let transcript = adapter.transcript_path(&SessionRef {
         id: SessionId::parse(pane.session_id()),
