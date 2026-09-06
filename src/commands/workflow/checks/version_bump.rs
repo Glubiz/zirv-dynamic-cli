@@ -22,9 +22,60 @@ const ORIGIN: &str = "CD duplicate-tag failures -- reminded twice (Development/D
      also enforced in CI by .github/workflows/ci.yaml's version-bump job";
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
-    let head_version = match toml_package_version(&repo.join("Cargo.toml")) {
-        Ok(version) => version,
-        Err(reason) => return BuiltinCheckResult::inconclusive(ID, PROVES, FIX, ORIGIN, reason),
+    let manifest_path = repo.join("Cargo.toml");
+    if !manifest_path.exists() {
+        return BuiltinCheckResult::not_applicable(
+            ID,
+            PROVES,
+            FIX,
+            ORIGIN,
+            super::absent_input(&manifest_path),
+        );
+    }
+    let manifest = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(err) => {
+            return BuiltinCheckResult::inconclusive(
+                ID,
+                PROVES,
+                FIX,
+                ORIGIN,
+                format!("cannot read {}: {err}", manifest_path.display()),
+            );
+        }
+    };
+    // What this check actually guards is zirv's OWN release pipeline (every
+    // merge to main publishes a release, and CD fails on a duplicate tag).
+    // Another crate's versioning policy is none of its business.
+    let package_name = parse_package_field(&manifest, "name");
+    if package_name.as_deref() != Some("zirv") {
+        return BuiltinCheckResult::not_applicable(
+            ID,
+            PROVES,
+            FIX,
+            ORIGIN,
+            format!(
+                "{} is not the zirv crate (package name {}) -- this check guards zirv's own \
+                 release pipeline",
+                manifest_path.display(),
+                package_name.as_deref().unwrap_or("absent")
+            ),
+        );
+    }
+    let head_version = match parse_package_field(&manifest, "version") {
+        Some(version) => version,
+        None => {
+            return BuiltinCheckResult::inconclusive(
+                ID,
+                PROVES,
+                FIX,
+                ORIGIN,
+                format!(
+                    "{} has no readable [package] version",
+                    manifest_path.display()
+                ),
+            );
+        }
     };
 
     match lock_zirv_version(repo) {
@@ -82,13 +133,6 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
     }
 }
 
-fn toml_package_version(path: &Path) -> Result<String, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-    parse_package_version(&text)
-        .ok_or_else(|| format!("{} has no readable [package] version", path.display()))
-}
-
 fn toml_package_version_at(repo: &Path, rev: &str) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
@@ -104,15 +148,15 @@ fn toml_package_version_at(repo: &Path, rev: &str) -> Result<String, String> {
         ));
     }
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    parse_package_version(&text)
+    parse_package_field(&text, "version")
         .ok_or_else(|| format!("{rev}:Cargo.toml has no readable [package] version"))
 }
 
-fn parse_package_version(text: &str) -> Option<String> {
+fn parse_package_field(text: &str, field: &str) -> Option<String> {
     let value: toml::Value = toml::from_str(text).ok()?;
     value
         .get("package")?
-        .get("version")?
+        .get(field)?
         .as_str()
         .map(str::to_string)
 }
@@ -234,6 +278,29 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    /// This check guards zirv's own release pipeline; another crate (or a
+    /// repository with no Cargo.toml at all) has no such rule to break, and
+    /// counting it against `zirv verify` there made the command unable to
+    /// exit 0 outside the zirv checkout.
+    #[test]
+    fn a_repository_that_is_not_the_zirv_crate_is_not_applicable() {
+        let absent = tempdir().unwrap();
+        assert_eq!(
+            run(absent.path()).outcome,
+            BuiltinOutcome::NotApplicable,
+            "no Cargo.toml at all"
+        );
+
+        let other = tempdir().unwrap();
+        std::fs::write(
+            other.path().join("Cargo.toml"),
+            "[package]\nname = \"somebody-elses-crate\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let result = run(other.path());
+        assert_eq!(result.outcome, BuiltinOutcome::NotApplicable, "{result:?}");
     }
 
     #[test]

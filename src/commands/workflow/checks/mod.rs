@@ -29,12 +29,20 @@ use serde::Serialize;
 /// (`ToolMissing`/`RunnerCrashed`/`NoTestsSelected`/...), and none of its
 /// variants describe what makes a builtin check here inconclusive ("no git
 /// available", "no base branch", "the doc's anchor comments are missing").
+///
+/// `NotApplicable` is the fourth verdict and the only non-blocking one
+/// besides `Pass`: most checks here read zirv's OWN files, and their absence
+/// in some other repository is a statement about the repository, not about
+/// the invariant. `Inconclusive` stays reserved for an input that EXISTS but
+/// could not be read or parsed -- that really is a degraded gate, and issue
+/// #268's ban still applies to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BuiltinOutcome {
     Pass,
     Fail,
     Inconclusive,
+    NotApplicable,
 }
 
 impl BuiltinOutcome {
@@ -43,7 +51,14 @@ impl BuiltinOutcome {
             Self::Pass => "pass",
             Self::Fail => "fail",
             Self::Inconclusive => "inconclusive",
+            Self::NotApplicable => "not-applicable",
         }
+    }
+
+    /// Whether this verdict lets `zirv verify` exit 0. A check that never
+    /// applied here blocks nothing.
+    pub fn is_passing(self) -> bool {
+        matches!(self, Self::Pass | Self::NotApplicable)
     }
 }
 
@@ -96,6 +111,23 @@ impl BuiltinCheckResult {
         }
     }
 
+    pub fn not_applicable(
+        id: &'static str,
+        proves: &'static str,
+        fix: &'static str,
+        origin: &'static str,
+        details: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            outcome: BuiltinOutcome::NotApplicable,
+            proves,
+            fix,
+            origin,
+            details: details.into(),
+        }
+    }
+
     pub fn inconclusive(
         id: &'static str,
         proves: &'static str,
@@ -112,6 +144,18 @@ impl BuiltinCheckResult {
             details: details.into(),
         }
     }
+}
+
+/// The `details` text every check uses when one of the zirv-repository files
+/// it reads is simply not there -- one wording, so `not-applicable` always
+/// names the missing input and says why that is not a verdict about the
+/// repository being verified.
+pub fn absent_input(path: &Path) -> String {
+    format!(
+        "{} is absent -- this check reads zirv's own source/vault files, so it does not apply to \
+         this repository",
+        path.display()
+    )
 }
 
 /// Every builtin check id, in the fixed run order -- also the completeness
@@ -164,6 +208,50 @@ mod tests {
             .map(|check| check.id)
             .collect();
         assert_eq!(produced, ALL_IDS);
+    }
+
+    /// Most of these checks read zirv's OWN files (`src/commands/ctx/
+    /// config.rs`, `docs/obsidian/...`, `.gitattributes`). In any other
+    /// repository those inputs are simply absent, which says nothing about
+    /// that repository -- reporting it as `Inconclusive` (or, for the version
+    /// bump, `Fail`) made `zirv verify` unable to exit 0 anywhere outside the
+    /// zirv checkout, and `workflow.builtin_checks_exclude` is REPO_FORBIDDEN
+    /// so a repo cannot opt out either.
+    #[test]
+    fn checks_whose_inputs_are_absent_are_not_applicable_not_inconclusive() {
+        let repo = tempfile::tempdir().unwrap();
+        let produced = run_all(repo.path(), &[]);
+        let unresolved: Vec<(&str, &str, &str)> = produced
+            .iter()
+            .filter(|check| {
+                matches!(
+                    check.outcome,
+                    BuiltinOutcome::Fail | BuiltinOutcome::Inconclusive
+                )
+            })
+            .map(|check| (check.id, check.outcome.as_str(), check.details.as_str()))
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "a check whose required input is simply absent must be not-applicable: {unresolved:?}"
+        );
+        let not_applicable: Vec<&str> = produced
+            .iter()
+            .filter(|check| check.outcome == BuiltinOutcome::NotApplicable)
+            .map(|check| check.id)
+            .collect();
+        assert_eq!(
+            not_applicable,
+            vec![
+                version_bump::ID,
+                forbidden::ID,
+                docs::UNIX_TESTS_ID,
+                docs::DOC_VERBS_ID,
+                decision_graph::ID,
+                eol::ID,
+            ],
+            "the repo-independent checks (argv, hooks) must still report a real verdict"
+        );
     }
 
     #[test]
