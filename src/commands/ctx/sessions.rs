@@ -3246,15 +3246,16 @@ mod tests {
                 .root()
                 .join(format!("{}{short}", super::super::wrap::SOCKET_PATH_PREFIX))
         };
+        // The socket file's STEM is what `signal::probe` derives its
+        // machine-global pipe name from on Windows, so it has to be unique
+        // to this process or a sibling test's live endpoint can answer the
+        // probe for a path this test only made up.
         let publish = |short: &str| {
-            super::super::state::write_private(
-                &published(short),
-                &tmp.path()
-                    .join(format!("{short}.sock"))
-                    .display()
-                    .to_string(),
-            )
-            .expect("publish");
+            let socket = tmp
+                .path()
+                .join(format!("{short}-{}.sock", std::process::id()));
+            super::super::state::write_private(&published(short), &socket.display().to_string())
+                .expect("publish");
         };
 
         let live = record_for("11111111-2222-4333-8444-555555555555", &repo, Verb::Exec);
