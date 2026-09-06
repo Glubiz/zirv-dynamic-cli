@@ -29,6 +29,20 @@ impl Script {
             let cmd_display = step.display(context);
             if dry_run {
                 crate::output::dry_run(index, total, &cmd_display);
+                // A-2/D-4: a dry run that reports success for a script the
+                // real run refuses is worse than no dry run at all -- the
+                // same principle `AgentCommand::validate` applies at load
+                // time, for the one check that needs the resolved context.
+                if let Err(e) = step.check(context) {
+                    crate::output::error(format!(
+                        "step {}/{} in script '{}': {}",
+                        index + 1,
+                        total,
+                        self.name,
+                        e
+                    ));
+                    return Err(e);
+                }
                 continue;
             }
             crate::output::step(index, total, &cmd_display);
@@ -83,6 +97,34 @@ mod tests {
 
         let result = script.run(&mut context, false).await;
         assert!(result.is_ok());
+    }
+
+    /// A-2/D-4: `--dry-run` printed each step and moved on without ever
+    /// consulting `context`, so `echo ${missing}` dry-ran with exit 0 while
+    /// the real run failed on the same script. `AgentCommand::validate` is
+    /// already called at load time for exactly this reason -- the two modes
+    /// must reject the same scripts.
+    #[tokio::test]
+    async fn a_dry_run_rejects_an_unresolved_placeholder_the_real_run_rejects() {
+        let script = Script {
+            name: "Unresolved".to_string(),
+            description: None,
+            params: None,
+            secrets: None,
+            commands: vec![CommandTypes::Command(Command {
+                command: "echo ${missing}".to_string(),
+                capture: None,
+                description: None,
+                options: None,
+            })],
+        };
+
+        let dry = script.run(&mut HashMap::new(), true).await;
+        let real = script.run(&mut HashMap::new(), false).await;
+
+        assert!(real.is_err(), "the real run must reject it: {real:?}");
+        let message = dry.expect_err("the dry run must reject it too");
+        assert!(message.contains("missing"), "got: {message}");
     }
 
     #[tokio::test]
