@@ -720,6 +720,7 @@ pub const SHIPPED_POSTURE_DENY: &[(&str, &str)] = &[
         "a remote download executed as a shell script, no space before the pipe",
     ),
     ("Bash(sudo *)", "privilege escalation"),
+    ("Bash(doas *)", "privilege escalation"),
     ("Bash(su *)", "privilege escalation"),
     (
         "Bash(security *)",
