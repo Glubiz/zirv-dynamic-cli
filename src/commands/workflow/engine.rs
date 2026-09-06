@@ -2313,7 +2313,17 @@ fn cap_workflow_context(rendered: String, max_bytes: usize) -> String {
         "\n[workflow context truncated -- {omitted} bytes omitted, cap \
          workflow.max_context_bytes={max_bytes}]\n"
     );
-    let keep = max_bytes.saturating_sub(marker.len());
+    // Review finding: `max_bytes.saturating_sub(marker.len())` alone still
+    // appended the FULL marker even when it alone was longer than
+    // `max_bytes` (a tiny operator-set cap), so the "capped" output could
+    // exceed its own budget. A cap too small to hold even the marker gets
+    // the marker itself, truncated -- an honest "cannot show this" beats
+    // output that overruns the ceiling it claims to enforce, the same rule
+    // `snapshot::cap_head_tail` uses for its own too-small-a-budget case.
+    if marker.len() >= max_bytes {
+        return crate::utils::truncate_bytes(marker, Some(max_bytes));
+    }
+    let keep = max_bytes - marker.len();
     let mut truncated = crate::utils::truncate_bytes(rendered, Some(keep));
     truncated.push_str(&marker);
     truncated
@@ -7049,6 +7059,26 @@ mod tests {
             context.starts_with("zirv workflow step"),
             "the head (task/step header) must be kept, not dropped: {context}"
         );
+    }
+
+    /// Review finding on the test above: `cap_workflow_context` used to
+    /// compute `keep = max_bytes.saturating_sub(marker.len())` and still
+    /// append the FULL marker regardless, so a `max_context_bytes` small
+    /// enough that the marker alone does not fit produced output LARGER
+    /// than its own cap -- a "capped" render that was not actually capped.
+    /// Every value here, including ones far smaller than the marker's own
+    /// length, must yield output that never exceeds `max_bytes`.
+    #[test]
+    fn cap_workflow_context_never_exceeds_its_own_budget_even_when_the_marker_does_not_fit() {
+        let rendered = "x".repeat(500);
+        for cap in [0usize, 1, 10, 30, 60, 8192] {
+            let capped = cap_workflow_context(rendered.clone(), cap);
+            assert!(
+                capped.len() <= cap,
+                "cap {cap}: output must never exceed its own budget, got {} bytes: {capped:?}",
+                capped.len()
+            );
+        }
     }
 
     #[test]
