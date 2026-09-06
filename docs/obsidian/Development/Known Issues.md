@@ -498,10 +498,37 @@ review, both now closed:**
    `powershell -File`) argv, not just one `resolve_program` would still
    rewrite.
 
-**Residual (usability, not security):** an *interactive* initial prompt that
-contains a raw cmd.exe metacharacter is still refused by the backstop on a
-Windows npm `.cmd` install (rephrase it). Headless is the common automation
-path and is not subject to this (FIX B delivers it via stdin).
+**The handoff half of that residual was never a usability nit, and is now
+fixed (issue #220, 2026-09-06).** The entry above used to record the leftover
+as "an interactive initial prompt containing a raw cmd.exe metacharacter is
+refused; rephrase it". That badly under-described it. The interactive prompt
+carrying a handoff -- `zirv ctx resume`, `wrap`'s rot restart, a dashboard
+pane's handover -- is not operator-typed text that can be rephrased: it is
+`wrap::restart_prompt`/`resume::resume_prompt` output, which is **always**
+multi-line, and `\n` is in `CMD_REPARSE_METACHARS`. So on the ordinary Windows
+npm `.cmd` claude install the backstop refused *every* handoff-carrying
+launch: `zirv ctx resume` exited 1, and in `wrap` `relaunch()` failed into
+`note_failure`, setting the one-way `degraded` flag -- the rot restart, the
+entire reason that supervisor exists, could never fire there. The same seam
+had no size budget either (the budget lived only in `exec.rs`), so a 93KB
+stored handoff -- handoffs grow across restarts, since `distill_prompt` carries
+the previous one forward -- overflowed `CreateProcessW`'s ~32KB command line
+and failed with `os error 206`.
+
+Both are closed by `prompt::interactive_handoff_prompt`: the handoff travels
+in the launch's own system-prompt file (one repointed
+`--append-system-prompt-file` occurrence, never a second one) and argv carries
+a single short metacharacter-free line. `guard_cmd_shim_reparse` is unchanged
+and still the fail-closed backstop. See [[Ctx Supervisors]], [[Ctx Adapters]].
+
+**Residual (usability, not security):** an *operator-typed* interactive first
+message containing a raw cmd.exe metacharacter (a `zirv chat` opening line, a
+dash worker task) is still refused by the backstop on a Windows npm `.cmd`
+install -- that one genuinely is rephrasable. So is a handoff on an adapter
+with no system-prompt file mechanism at all (codex): there the handoff stays
+positional, now size-bounded, but still refused on a `.cmd` shim launch.
+Headless is the common automation path and is not subject to either (FIX B
+delivers it via stdin).
 
 **The codex adapter's shim gap is closed.** `CodexAdapter::base()` now
 routes `self.program` through `resolve_program`, exactly like claude, so an
