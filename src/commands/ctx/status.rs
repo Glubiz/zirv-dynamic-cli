@@ -66,6 +66,21 @@ fn terminal_safe_writer_label(raw: &str, max_chars: usize) -> String {
         .collect()
 }
 
+/// How one [`memory::CadenceFinding`](super::memory::CadenceFinding) reads on
+/// the `memory cadence:` line. `memory::z_outliers` gates on `z.abs()`, so a
+/// finding fires on either side of the writer's own baseline and the sign is
+/// what says which: a short gap is the bursty case, a long one is a pause,
+/// and a size outlier is a large or a small write. One wording for all four
+/// reported the opposite of the number it printed.
+fn cadence_phrase(reason: super::memory::CadenceReason, z: f64) -> &'static str {
+    match (reason, z.is_sign_negative()) {
+        (super::memory::CadenceReason::Interval, true) => "wrote in a burst",
+        (super::memory::CadenceReason::Interval, false) => "paused unusually long between writes",
+        (super::memory::CadenceReason::Size, true) => "made an unusually small write",
+        (super::memory::CadenceReason::Size, false) => "made an unusually large write",
+    }
+}
+
 fn model_change_status_text(change: &super::event::ModelChange) -> String {
     format!(
         "model changed mid-session {} turns ago: `{}` -> `{}`",
@@ -1083,17 +1098,14 @@ fn render_report<W: Write>(
             // findings, never an error, so `status` never fails on this.
             let slug = repo_slug(repo);
             for finding in super::memory::cadence_for_shared(repo, &state, &slug, cfg) {
-                let reason = match finding.reason {
-                    super::memory::CadenceReason::Interval => "write interval",
-                    super::memory::CadenceReason::Size => "write size",
-                };
                 writeln!(
                     w,
                     "{}",
                     style::paint(
                         &format!(
-                            "memory cadence: {} looked bursty on {reason} (z={:.1})",
+                            "memory cadence: {} {} (z={:.1})",
                             terminal_safe_writer_label(&finding.writer, 64),
+                            cadence_phrase(finding.reason, finding.z_score),
                             finding.z_score
                         ),
                         Tone::Warn,
@@ -5725,6 +5737,32 @@ mod tests {
             "no control character or newline from a shared entry's Written-by may reach status output: {safe:?}"
         );
         assert_eq!(safe, "claude forged [31m");
+    }
+
+    /// `memory::z_outliers` gates on `z.abs()`, so a finding fires just as
+    /// readily on the LOW side -- an unusually small write, or an unusually
+    /// long pause between writes. Calling every one of those "bursty" tells
+    /// the operator the opposite of what the number says (a real status
+    /// showed `z=-4.6`, `-4.0` and `-2.2`, all labelled bursty).
+    #[test]
+    fn a_negative_cadence_z_is_not_reported_as_bursty() {
+        use super::super::memory::CadenceReason;
+        assert_eq!(
+            cadence_phrase(CadenceReason::Size, -4.6),
+            "made an unusually small write"
+        );
+        assert_eq!(
+            cadence_phrase(CadenceReason::Size, 4.6),
+            "made an unusually large write"
+        );
+        assert_eq!(
+            cadence_phrase(CadenceReason::Interval, 4.0),
+            "paused unusually long between writes"
+        );
+        assert_eq!(
+            cadence_phrase(CadenceReason::Interval, -4.0),
+            "wrote in a burst"
+        );
     }
 
     #[test]
