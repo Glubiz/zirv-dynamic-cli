@@ -1117,6 +1117,11 @@ fn run_with_clock_inner<W: Write>(
         .transcript
         .clone()
         .unwrap_or_else(|| derive_transcript(&session));
+    // Review round 2 (S1): gates the tick's transcript self-heal
+    // (`self_heal_transcript`). False only for the caller's own
+    // `--transcript`, and only until the first restart re-derives -- every
+    // path zirv derived itself may be re-resolved, an operator's may not.
+    let mut transcript_derived = args.transcript.is_none();
 
     // Surfaced once, upfront, rather than only when a restart is already
     // needed: an operator who never rots would otherwise never learn that
@@ -1526,6 +1531,9 @@ fn run_with_clock_inner<W: Write>(
         let mut stalled = false;
         let mut capacity_pattern = None;
         let mut account_pattern = None;
+        // Bound to a local so `transcript_derived` can hand the tick either
+        // this resolver or nothing at all (review round 2, S1).
+        let derive = || derive_transcript(&session);
         let outcome = supervise_run(
             &mut child,
             Instant::now() + timeout,
@@ -1557,7 +1565,7 @@ fn run_with_clock_inner<W: Write>(
             cfg.supervise.max_nudges,
             can_restart,
             &mut transcript,
-            &|| derive_transcript(&session),
+            transcript_derived.then_some(&derive as &dyn Fn() -> PathBuf),
             worker_budget,
             &prior_usage,
             prior_tool_calls,
@@ -1911,6 +1919,7 @@ fn run_with_clock_inner<W: Write>(
             session = SessionId::new_v4();
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
+            transcript_derived = true;
 
             // Issue #285: advances and persists the durable objective (if
             // any) against the spend just harvested, purely for the side
@@ -2505,6 +2514,7 @@ fn run_with_clock_inner<W: Write>(
             session = SessionId::new_v4();
             session_guard.refresh_session(session.as_str());
             transcript = derive_transcript(&session);
+            transcript_derived = true;
             prompt_args = super::prompt::injection_args_for_session(
                 adapter.as_ref(),
                 &[],
@@ -2831,6 +2841,7 @@ fn run_with_clock_inner<W: Write>(
         // The new session writes somewhere new, so the next iteration's watcher
         // must follow it rather than the file the killed child left behind.
         transcript = derive_transcript(&session);
+        transcript_derived = true;
         prompt_args = super::prompt::injection_args_for_session(
             adapter.as_ref(),
             &[],
@@ -3034,6 +3045,30 @@ fn evaluate_worker_budget(
     ))
 }
 
+/// The transcript path a supervision tick should switch to, or `None` to keep
+/// polling the current one.
+///
+/// Review round 1 (R4) added the self-heal: a path derived before the child
+/// was spawned can name a file the agent never writes (`codex exec` mints its
+/// own rollout id once it is running), so the adapter is asked again while the
+/// current path does not exist, accepting only an answer that names a
+/// DIFFERENT file which does.
+///
+/// Review round 2 (S1) narrows it to paths zirv itself derived, hence
+/// `resolve` being an `Option`. `--transcript` documents itself as the escape
+/// hatch for "the agent writes somewhere the adapter cannot derive": for such
+/// a run the adapter's guess is known-wrong by construction, so re-resolving
+/// onto it -- which an unconditional swap does the moment the operator's file
+/// has not been written yet and a stale derived one exists -- would silently
+/// supervise a file the operator never named.
+fn self_heal_transcript(current: &Path, resolve: Option<&dyn Fn() -> PathBuf>) -> Option<PathBuf> {
+    if current.exists() {
+        return None;
+    }
+    let candidate = resolve?();
+    (candidate != current && candidate.is_file()).then_some(candidate)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn supervise_run(
     child: &mut std::process::Child,
@@ -3098,9 +3133,10 @@ fn supervise_run(
     // asks the adapter again, but only while the current path does not exist
     // and only accepting an answer that names a DIFFERENT file which does:
     // one `exists()` per tick in the steady state, and never a redirect away
-    // from a transcript that is genuinely being written (an operator's own
-    // `--transcript` included).
-    resolve_transcript: &dyn Fn() -> PathBuf,
+    // from a transcript that is genuinely being written. Review round 2 (S1):
+    // `None` for an operator's own `--transcript`, which by definition names
+    // a file the adapter cannot derive -- see `self_heal_transcript`.
+    resolve_transcript: Option<&dyn Fn() -> PathBuf>,
     budget: agent::WorkerBudget,
     // Issue #169.2: every prior child's own already-harvested spend this
     // invocation has superseded, folded into every check below alongside
@@ -3154,12 +3190,9 @@ fn supervise_run(
     let mut stall_latch: Option<super::stall::StallLatch> = None;
     let mut last_mail_activity: Option<(usize, usize)> = None;
     let mut tick = || {
-        if !transcript.exists() {
-            let candidate = resolve_transcript();
-            if candidate != *transcript && candidate.is_file() {
-                *scorer = score::IncrementalScorer::new(candidate.clone());
-                *transcript = candidate;
-            }
+        if let Some(candidate) = self_heal_transcript(transcript, resolve_transcript) {
+            *scorer = score::IncrementalScorer::new(candidate.clone());
+            *transcript = candidate;
         }
         let lines = tap.try_lines();
         *account_pattern = account_pattern.or_else(|| pace::scan_for_account_exhausted(&lines));
@@ -5403,17 +5436,74 @@ mod tests {
     /// the child is spawned. For `codex exec` the rollout does not exist yet
     /// at that moment (codex mints its own id and writes `session_meta` only
     /// after it starts), so `pinned_rollout` answers `None` and the whole run
-    /// polls a `rollout-<zirv id>.jsonl` that never appears -- budgets, rot
-    /// and spend all blind. A real codex cannot be driven in-process, so the
-    /// same shape is reproduced here: a transcript pinned at spawn that is
-    /// never written, while the child writes the one the adapter can resolve.
-    /// The budget must still fire.
+    /// would poll a `rollout-<zirv id>.jsonl` that never appears -- budgets,
+    /// rot and spend all blind. A derived path that is still missing must
+    /// therefore follow the adapter's later, better answer.
     #[test]
-    fn a_transcript_missing_at_spawn_is_re_resolved_once_the_child_writes_one() {
+    fn a_derived_transcript_missing_at_spawn_is_re_resolved_once_the_child_writes_one() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let written = tmp.path().join("rollout-real.jsonl");
+        std::fs::write(&written, "{}\n").expect("write");
+        let derived = tmp.path().join("rollout-guessed.jsonl");
+
+        assert_eq!(
+            self_heal_transcript(&derived, Some(&|| written.clone())),
+            Some(written.clone()),
+            "a derived path that never appeared must follow the adapter's later answer"
+        );
+    }
+
+    /// The self-heal only ever moves off a path nothing is writing, and only
+    /// onto a file that actually exists: a transcript being written stays
+    /// pinned, and an answer that names another missing file is ignored
+    /// rather than swapped in.
+    #[test]
+    fn the_transcript_self_heal_never_leaves_a_live_file_or_lands_on_a_missing_one() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let live = tmp.path().join("live.jsonl");
+        std::fs::write(&live, "{}\n").expect("write");
+        let missing = tmp.path().join("missing.jsonl");
+        let other_missing = tmp.path().join("other-missing.jsonl");
+
+        assert_eq!(
+            self_heal_transcript(&live, Some(&|| other_missing.clone())),
+            None,
+            "a transcript that is genuinely being written is never redirected"
+        );
+        assert_eq!(
+            self_heal_transcript(&missing, Some(&|| other_missing.clone())),
+            None,
+            "a candidate that does not exist either is no improvement"
+        );
+    }
+
+    /// Review round 2 (S1), at the unit level: with no resolver at all --
+    /// what an operator's `--transcript` passes -- nothing is ever swapped
+    /// in, however tempting the adapter's own guess looks.
+    #[test]
+    fn the_transcript_self_heal_is_inert_without_a_resolver() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let operator = tmp.path().join("operator-mirror.jsonl");
+
+        assert_eq!(self_heal_transcript(&operator, None), None);
+    }
+
+    /// Review round 2 (S1): the self-heal above must stay confined to paths
+    /// zirv itself derived. `--transcript` exists precisely for "the agent
+    /// writes somewhere the adapter cannot derive", so redirecting it onto
+    /// the adapter's own guess -- which is exactly what an unconditional
+    /// re-resolution does while the operator's file has not been written yet
+    /// -- silently supervises the wrong file. Here the operator names a file
+    /// that never appears while the child fills the derived one with 12
+    /// over-budget turns: the run must ride out its deadline blind rather
+    /// than report a budget stop earned by a transcript it was never told to
+    /// watch.
+    #[test]
+    fn an_operators_explicit_transcript_is_never_redirected_by_re_resolution() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let state = tmp.path().join("state");
-        let session = "99999999-2222-4333-8444-555555555555";
+        let session = "99999999-3333-4333-8444-555555555555";
         let mut env = base_env(&state);
         env.insert("ZIRV_CTX_POLL_MS".to_string(), "50".to_string());
 
@@ -5424,13 +5514,13 @@ mod tests {
         let args = ExecArgs {
             agent: Some("claude".to_string()),
             session_id: Some(session.to_string()),
-            transcript: Some(tmp.path().join("never-written.jsonl")),
+            transcript: Some(tmp.path().join("operator-mirror.jsonl")),
             prompt: Some("do the work".to_string()),
             max_restarts: Some(0),
             budget_tokens: Some(10_000),
             max_tool_calls: None,
             objective: None,
-            timeout_secs: Some(15),
+            timeout_secs: Some(3),
             simple: false,
             reservation_id: None,
             command: fake_agent_command(session),
@@ -5443,8 +5533,8 @@ mod tests {
 
         assert_eq!(
             code.expect("runs"),
-            EXIT_BUDGET_EXHAUSTED,
-            "a transcript that never appears must be re-resolved, not polled forever"
+            EXIT_TIMEOUT,
+            "an explicit --transcript must never be swapped for the adapter's derived guess"
         );
     }
 
