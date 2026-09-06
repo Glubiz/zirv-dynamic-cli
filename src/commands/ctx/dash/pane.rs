@@ -433,6 +433,27 @@ pub(crate) fn submit_is_due(pending: Option<Instant>, now: Instant) -> bool {
     pending.is_some_and(|deadline| now >= deadline)
 }
 
+/// R1-1 (2026-09-06 review): the longest wall clock a pane will ever arm --
+/// 30 days, far past any real delegation and far short of what `Instant`
+/// arithmetic cannot represent. `SpawnRequest::timeout_secs` is untrusted
+/// JSON (`dash::mod::sanitize_file_dropped_request`'s own trust note), and a
+/// forged `18446744073709551615` used to reach `started + Duration::from_
+/// secs(secs)` AFTER the child had already spawned, where the overflow
+/// panicked -- with the release profile's `panic = "abort"`, that one line of
+/// JSON killed the whole dashboard. A ceiling this large is still, for every
+/// honest request, exactly the ceiling that was asked for.
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Pure: the deadline [`Pane::set_timeout`] arms for a `--timeout-secs` of
+/// `secs`, measured from `started`. Clamped to [`MAX_TIMEOUT_SECS`] first and
+/// added with `checked_add`, so no value of `secs` -- forged or otherwise --
+/// can panic; `None` (unrepresentable even after the clamp, which no real
+/// clock reaches) leaves the pane unbounded rather than aborting the process.
+/// Split out so the arithmetic is testable without a pty.
+pub(crate) fn deadline_for(started: Instant, secs: u64) -> Option<Instant> {
+    started.checked_add(Duration::from_secs(secs.min(MAX_TIMEOUT_SECS)))
+}
+
 /// The suffix `body_for_injection` appends when it had to cut a body short,
 /// so the agent can tell a message that ended from one that was clipped.
 const TRUNCATION_MARKER: &str = " \u{2026}[truncated]";
@@ -1669,8 +1690,15 @@ impl Pane {
     /// `--timeout-secs`, measured from `started` (the caller passes
     /// `Instant::now()` right after the spawn). `None` leaves the pane
     /// unbounded, exactly as before the field existed.
+    ///
+    /// R1-1 (2026-09-06 review): the ceiling arrives on an UNTRUSTED
+    /// `SpawnRequest`, so it goes through [`deadline_for`] rather than a bare
+    /// `started + Duration::from_secs(secs)` -- a request asking for
+    /// `u64::MAX` seconds used to overflow `Instant` and panic, which with
+    /// `panic = "abort"` took the whole dashboard (every other pane's live
+    /// child with it) down from one line of forged JSON.
     pub fn set_timeout(&mut self, started: Instant, timeout_secs: Option<u64>) {
-        self.deadline = timeout_secs.map(|secs| started + Duration::from_secs(secs));
+        self.deadline = timeout_secs.and_then(|secs| deadline_for(started, secs));
     }
 
     /// The armed wall clock, if any.
@@ -1684,8 +1712,25 @@ impl Pane {
     /// `exec::run_with` reports for an inline supervised child that outran
     /// `--timeout-secs`. `Ok(true)` exactly once, on the sweep that actually
     /// stopped it: the deadline is disarmed in the same step, so a pane is
-    /// never stopped (or reported) twice, and a child that already failed on
+    /// never stopped (or reported) twice, and a child that already ended on
     /// its own keeps its own exit code.
+    ///
+    /// R1-5 (2026-09-06 review): a child that has ALREADY exited is never
+    /// touched, whatever it exited with. `drain` records an exit the moment
+    /// the child ends and this sweep runs BEFORE `dash::mod::
+    /// reap_ended_panes` does, so a worker that finished cleanly a moment
+    /// before its deadline used to have its `0` rewritten to `EXIT_TIMEOUT`
+    /// -- a successful review or fix reported to its requester as a timeout.
+    ///
+    /// R1-6 (same review): the deadline is disarmed only once the child is
+    /// actually stopped. It used to be cleared FIRST, so a polite quit that
+    /// failed (a poisoned writer mutex, a `quit_child` that could not reap)
+    /// propagated its error while every later sweep skipped this pane
+    /// (`deadline: None`), leaving a live child running unbounded past the
+    /// ceiling that was supposed to stop it. A failed polite quit now
+    /// escalates through [`Self::finish_shutdown`] -- the same escalation
+    /// half the batched-shutdown path uses -- and only an escalation that
+    /// ALSO fails leaves the deadline armed for the next sweep to retry.
     pub fn enforce_deadline(&mut self, now: Instant, quit_sequence: &str) -> CtxResult<bool> {
         let Some(deadline) = self.deadline else {
             return Ok(false);
@@ -1693,15 +1738,22 @@ impl Pane {
         if now < deadline {
             return Ok(false);
         }
-        self.deadline = None;
-        if self.exit_code.is_some_and(|code| code != 0) {
+        if self.exit_code.is_some() {
+            // Nothing left to stop: disarm so no later sweep looks at this
+            // pane again, and report nothing -- the child's own exit is the
+            // outcome, and overwriting it would invent one.
+            self.deadline = None;
             return Ok(false);
         }
-        if self.exit_code == Some(0) {
-            self.exit_code = Some(super::super::exec::EXIT_TIMEOUT);
-            return Ok(true);
+        if let Err(polite) = self.shutdown(quit_sequence) {
+            self.finish_shutdown().map_err(|escalation| {
+                format!(
+                    "dashboard pane: timeout quit failed ({polite}); escalation failed too \
+                     ({escalation})"
+                )
+            })?;
         }
-        self.shutdown(quit_sequence)?;
+        self.deadline = None;
         self.exit_code = Some(super::super::exec::EXIT_TIMEOUT);
         Ok(true)
     }
@@ -3887,6 +3939,181 @@ pub(crate) mod tests {
         );
 
         pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// R1-1: `timeout_secs` is untrusted JSON. `u64::MAX` used to reach
+    /// `started + Duration::from_secs(secs)`, whose `Instant` overflow panics
+    /// -- and the release profile is `panic = "abort"`, so one forged request
+    /// took the whole dashboard down with every pane it was hosting. Pure, so
+    /// the arithmetic is pinned without a pty.
+    #[test]
+    fn an_unrepresentable_timeout_is_clamped_instead_of_panicking() {
+        let started = Instant::now();
+        assert_eq!(
+            deadline_for(started, u64::MAX),
+            started.checked_add(Duration::from_secs(MAX_TIMEOUT_SECS)),
+            "a forged ceiling is clamped to the pane ceiling, never added raw"
+        );
+        assert_eq!(
+            deadline_for(started, 900),
+            started.checked_add(Duration::from_secs(900)),
+            "an honest ceiling is exactly the ceiling that was asked for"
+        );
+        assert_eq!(deadline_for(started, 0), Some(started));
+    }
+
+    /// The same value through a real pane: arming it must neither panic nor
+    /// leave the pane immediately overdue.
+    #[test]
+    fn a_pane_armed_with_a_forged_timeout_is_not_instantly_overdue() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let mut spec = test_spec("77777777-2222-4333-8444-777777777777");
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let started = Instant::now();
+        pane.set_timeout(started, Some(u64::MAX));
+        assert_eq!(
+            pane.deadline(),
+            started.checked_add(Duration::from_secs(MAX_TIMEOUT_SECS)),
+            "the clamped ceiling is what the pane actually arms"
+        );
+        assert!(
+            !pane.enforce_deadline(started, "").expect("enforce"),
+            "and it is not already overdue"
+        );
+
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// R1-5: `enforce_pane_deadlines` runs BEFORE `reap_ended_panes`, so a
+    /// child that finished cleanly a moment before its deadline is still in
+    /// `panes` when the sweep arrives. Its observed `0` used to be rewritten
+    /// to `EXIT_TIMEOUT`, reporting a successful worker as timed out.
+    #[test]
+    fn a_child_that_already_exited_keeps_its_own_exit_code_through_a_deadline_sweep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        // `trivial_argv` exits 0 immediately -- exactly the race this is
+        // about, with the exit already observed when the sweep runs.
+        let mut pane = Pane::spawn(
+            test_spec("55555555-2222-4333-8444-999999999999"),
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let waited = std::time::Instant::now() + Duration::from_secs(30);
+        while !pane.try_exited() && std::time::Instant::now() < waited {
+            let _ = pane.drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(pane.state(), PaneState::Ended(0)),
+            "sanity: the child exited cleanly first: {:?}",
+            pane.state()
+        );
+
+        let started = Instant::now();
+        pane.set_timeout(started, Some(1));
+        assert!(
+            !pane
+                .enforce_deadline(started + Duration::from_secs(2), "")
+                .expect("enforce"),
+            "a finished pane is not something a deadline sweep stops"
+        );
+        assert!(
+            matches!(pane.state(), PaneState::Ended(0)),
+            "and its own exit code survives the sweep: {:?}",
+            pane.state()
+        );
+        assert!(
+            pane.deadline().is_none(),
+            "the deadline is disarmed either way, so no later sweep looks again"
+        );
+
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// R1-6: the deadline used to be disarmed before the polite quit ran, so
+    /// a quit that failed (a poisoned writer mutex, as in `a_shutdown_that_
+    /// failed_before_its_cleanup_stays_escalatable`) left a LIVE child behind
+    /// a `None` deadline every later sweep skipped. The failed quit now
+    /// escalates instead.
+    #[test]
+    fn a_deadline_whose_polite_quit_fails_still_terminates_the_child() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let mut spec = test_spec("99999999-2222-4333-8444-555555555555");
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let writer = Arc::clone(&pane.writer);
+        let _ = std::thread::spawn(move || {
+            let _held = writer.lock().expect("lock");
+            panic!("poison the pane writer");
+        })
+        .join();
+        assert!(
+            pane.writer.is_poisoned(),
+            "sanity: the writer lock is poisoned, so the polite quit must fail"
+        );
+
+        let started = Instant::now();
+        pane.set_timeout(started, Some(1));
+        assert!(
+            pane.enforce_deadline(started + Duration::from_secs(2), "")
+                .expect("a failed polite quit must escalate, not propagate"),
+            "the sweep reports the stop it actually performed"
+        );
+        assert!(
+            pane.done,
+            "the child is terminated by the escalation half, never left running"
+        );
+        assert!(
+            matches!(
+                pane.state(),
+                PaneState::Ended(code) if code == crate::commands::ctx::exec::EXIT_TIMEOUT
+            ),
+            "and it reports the timeout exit: {:?}",
+            pane.state()
+        );
+        assert!(pane.deadline().is_none(), "disarmed once it actually died");
     }
 
     /// Fix 3 (issue #249/#250 review): a handover's own successor child must

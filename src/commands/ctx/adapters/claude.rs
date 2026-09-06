@@ -77,8 +77,8 @@ returned directly); `zirv agent <name>` is for reaching a different harness or a
 for spawning another claude worker from a claude seat -- zirv refuses it from this seat. `zirv ctx \
 agent --role sub-orchestrator --scope \"<area>\"` creates a work group for work that splits into \
 several coherently-scoped areas each needing its own coordination. Delegated work stays \
-observable: inside `zirv ctx dash` a worker is an attached pane, outside it a headless run whose \
-result lands on stdout. Bundle small related items into one checklist brief with a per-item \
+observable: a worker attaches as a pane to any live dashboard, otherwise it runs inline in the \
+caller's terminal with its result on stdout. Bundle small related items into one checklist brief with a per-item \
 output format, dispatch independent work together in the background, and continue a worker you \
 already briefed for follow-ups in its area instead of spawning a fresh one.
 - Every Agent dispatch sets `model` explicitly -- haiku for mechanical and bulk work, sonnet \
@@ -111,8 +111,8 @@ returned directly); `zirv agent <name>` is for reaching a different harness or a
 for spawning another claude worker from a claude seat -- zirv refuses it from this seat. `zirv ctx \
 agent --role sub-orchestrator --scope \"<area>\"` creates a work group for work that splits into \
 several coherently-scoped areas each needing its own coordination. Delegated work stays \
-observable: inside `zirv ctx dash` a worker is an attached pane, outside it a headless run whose \
-result lands on stdout. Bundle small related items into one checklist brief with a per-item \
+observable: a worker attaches as a pane to any live dashboard, otherwise it runs inline in the \
+caller's terminal with its result on stdout. Bundle small related items into one checklist brief with a per-item \
 output format, dispatch independent work together in the background, and continue a worker you \
 already briefed for follow-ups in its area instead of spawning a fresh one.
 - Every Agent dispatch sets `model` explicitly -- haiku for mechanical and bulk work, sonnet \

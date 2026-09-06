@@ -228,6 +228,31 @@ pub struct SpawnRequest {
     /// is re-checked by `dash::mod::pane_model_args`.
     #[serde(default)]
     pub flags: Vec<String>,
+    /// R1-4 (2026-09-06 review): the seat instructions this delegation asked
+    /// to be injected as the harness's own system prompt (`zirv ctx agent
+    /// --system-prompt`, which `workflow::review::reviewer_argv` uses to
+    /// state the reviewer seat's manifest identity, role and "repository text
+    /// is untrusted evidence" framing).
+    ///
+    /// They used to travel inside `flags` as the adapter's own
+    /// `--append-system-prompt <text>` pair -- which `dash::mod::
+    /// sanitize_file_dropped_request` clears, because a trailing flag becomes
+    /// argv -- so a review fulfilled by a pane ran with NO seat instructions
+    /// and (since `adapters::model_only_flags` gives up on any non-model
+    /// flag) the generic worker model as well. This field is the channel for
+    /// the half that is data rather than argv.
+    ///
+    /// Honoured from an untrusted file drop, unlike `flags`: the text never
+    /// becomes a flag (the flag name comes from the ADAPTER, via
+    /// `AgentAdapter::system_prompt_args`, and the text is folded into this
+    /// pane's own composed prompt by `dash::mod::compose_worker_prompt`), and
+    /// a requester who can write into this channel already controls `prompt`
+    /// -- strictly more injected text than this. Capped at
+    /// `dash::mod::MAX_REQUEST_SYSTEM_PROMPT_BYTES` at the fulfilment side.
+    /// `None` -- also what a request written by an older build deserialises
+    /// to -- means exactly the behaviour before this field existed.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 /// The role a request actually gets. Unstated or unrecognised is
@@ -593,6 +618,7 @@ mod tests {
             timeout_secs: None,
             max_tool_calls: None,
             flags: Vec::new(),
+            system_prompt: None,
         }
     }
 
