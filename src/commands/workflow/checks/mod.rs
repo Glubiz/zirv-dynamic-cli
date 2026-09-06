@@ -31,11 +31,12 @@ use serde::Serialize;
 /// available", "no base branch", "the doc's anchor comments are missing").
 ///
 /// `NotApplicable` is the fourth verdict and the only non-blocking one
-/// besides `Pass`: most checks here read zirv's OWN files, and their absence
-/// in some other repository is a statement about the repository, not about
-/// the invariant. `Inconclusive` stays reserved for an input that EXISTS but
-/// could not be read or parsed -- that really is a degraded gate, and issue
-/// #268's ban still applies to it.
+/// besides `Pass`: most checks here guard zirv's OWN source and vault
+/// invariants, which are a statement about this repository and no other. See
+/// [`is_zirv_repo`], which decides that once, for every such check.
+/// `Inconclusive` stays reserved for an input this repository is supposed to
+/// have but that could not be found, read or parsed -- that really is a
+/// degraded gate, and issue #268's ban still applies to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BuiltinOutcome {
@@ -306,7 +307,8 @@ mod tests {
         std::fs::write(repo.path().join(".gitattributes"), "* text=auto\n").unwrap();
         std::fs::create_dir_all(repo.path().join("docs/obsidian/Development")).unwrap();
         std::fs::write(
-            repo.path().join("docs/obsidian/Development/Decision Log.md"),
+            repo.path()
+                .join("docs/obsidian/Development/Decision Log.md"),
             "# Decisions\n",
         )
         .unwrap();

@@ -552,7 +552,10 @@ impl CodexAdapter {
         // direction: a pane registers its record moments after the child is
         // spawned, so codex's own `session_meta` can legitimately be stamped
         // a few hundred milliseconds earlier than the registration.
-        let started_ms = record.started_at.saturating_mul(1_000).max(handover_floor_ms);
+        let started_ms = record
+            .started_at
+            .saturating_mul(1_000)
+            .max(handover_floor_ms);
         let resolved = resolve_rollout(sessions_root, started_ms, &session.cwd)?;
         if super::super::state::create_private_dir_all(&state.rollouts()).is_ok() {
             let _ = super::super::state::write_private(&pin, &resolved.display().to_string());
@@ -574,11 +577,7 @@ fn handover_floor(state: &super::super::state::StateDir, short: &str) -> PathBuf
 /// merely deleting it re-resolved onto that same file (the registration floor
 /// still admits it, and earliest wins). Best-effort throughout: a floor that
 /// cannot be written costs a stale resolution, never a wrong session.
-pub fn forget_transcript_pin(
-    state: &super::super::state::StateDir,
-    short: &str,
-    now_secs: u64,
-) {
+pub fn forget_transcript_pin(state: &super::super::state::StateDir, short: &str, now_secs: u64) {
     let rollouts = state.rollouts();
     let _ = std::fs::remove_file(rollouts.join(format!("{short}.path")));
     if super::super::state::create_private_dir_all(&rollouts).is_ok() {
