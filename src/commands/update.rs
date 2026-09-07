@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use super::report::GITHUB_REPOSITORY;
 
@@ -143,6 +144,91 @@ fn latest_release_json() -> UpdateResult<String> {
         .body_mut()
         .read_to_string()
         .map_err(|error| format!("GitHub returned an unreadable latest release: {error}").into())
+}
+
+/// Downloads the `.sha256` sidecar for a release asset. Returns `Ok(None)`
+/// for a 404 (an older release published before checksums existed) rather
+/// than erroring, so the caller can fail closed with a specific message
+/// instead of the generic "asset not found" wording `download_asset` uses
+/// for the binary itself.
+fn download_checksum(url: &str) -> UpdateResult<Option<Vec<u8>>> {
+    let response = http_agent()
+        .get(url)
+        .header("Accept", "text/plain")
+        .header("User-Agent", &format!("zirv/{}", env!("CARGO_PKG_VERSION")))
+        .config()
+        .timeout_global(Some(Duration::from_secs(DOWNLOAD_TIMEOUT_SECS)))
+        .build()
+        .call();
+    let mut response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
+        Err(error) => return Err(format!("could not download {url}: {error}").into()),
+    };
+    let bytes = response
+        .body_mut()
+        .with_config()
+        // A `<hex>  <filename>` line is well under a kilobyte; this only
+        // guards against a misbehaving/compromised server streaming
+        // something enormous instead of a checksum file.
+        .limit(4096)
+        .read_to_vec()
+        .map_err(|error| format!("could not read the downloaded checksum file: {error}"))?;
+    Ok(Some(bytes))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// Parses a `sha256sum`-format checksum file (`<64-hex-char digest>  <filename>`,
+/// one entry per line -- only the first line is read) and verifies `bytes`
+/// against it. Pure: no I/O, so every failure mode is unit-testable without
+/// a network stub.
+fn verify_checksum(bytes: &[u8], sha256_text: &str, expected_name: &str) -> UpdateResult<()> {
+    let line = sha256_text
+        .lines()
+        .next()
+        .ok_or("downloaded checksum file is empty")?;
+    let mut fields = line.split_whitespace();
+    let digest = fields
+        .next()
+        .ok_or_else(|| format!("malformed checksum line (no digest field): '{line}'"))?;
+    let name = fields
+        .next()
+        .ok_or_else(|| format!("malformed checksum line (no filename field): '{line}'"))?;
+    if fields.next().is_some() {
+        return Err(format!("malformed checksum line (unexpected extra field): '{line}'").into());
+    }
+    // `sha256sum -b` prefixes the filename with `*` for binary mode.
+    let name = name.trim_start_matches('*');
+    if name != expected_name {
+        return Err(format!(
+            "checksum file names an unexpected asset: expected '{expected_name}', got '{name}'"
+        )
+        .into());
+    }
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "malformed checksum line: '{digest}' is not a 64-character hex digest"
+        )
+        .into());
+    }
+    let expected_digest = digest.to_ascii_lowercase();
+    let actual_digest = to_hex(&Sha256::digest(bytes));
+    if actual_digest != expected_digest {
+        return Err(format!(
+            "checksum mismatch for {expected_name}: expected {expected_digest}, computed {actual_digest}; \
+             the download may be corrupted or tampered with -- not installing it"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn download_asset(url: &str) -> UpdateResult<Vec<u8>> {
@@ -396,6 +482,7 @@ fn replace_binary(target: &Path, binary: &[u8], version: &str) -> UpdateResult<(
 
 type LatestReleaseFn = dyn Fn() -> UpdateResult<String>;
 type DownloadFn = dyn Fn(&str) -> UpdateResult<Vec<u8>>;
+type ChecksumDownloadFn = dyn Fn(&str) -> UpdateResult<Option<Vec<u8>>>;
 type InstallFn = dyn Fn(&Path, &[u8], &str) -> UpdateResult<()>;
 
 struct UpdateContext<'a> {
@@ -405,6 +492,7 @@ struct UpdateContext<'a> {
     target_path: &'a Path,
     latest_release: &'a LatestReleaseFn,
     downloader: &'a DownloadFn,
+    checksum_downloader: &'a ChecksumDownloadFn,
     installer: &'a InstallFn,
 }
 
@@ -419,14 +507,34 @@ fn update_in(cli: &UpdateCli, context: &UpdateContext<'_>) -> UpdateResult<i32> 
         crate::output::note(reason);
         return Ok(0);
     }
+    let asset = asset_name(context.os, context.arch, &target_version)?;
     let url = asset_url(context.os, context.arch, &target_version)?;
     crate::output::note(format!(
         "Updating zirv {} to {target_version}",
         context.current_version,
     ));
     crate::output::note(format!("Downloading {url}"));
-    let asset = (context.downloader)(&url)?;
-    let binary = binary_from_asset(&asset)?;
+    let downloaded = (context.downloader)(&url)?;
+
+    let checksum_url = format!("{url}.sha256");
+    match (context.checksum_downloader)(&checksum_url)? {
+        Some(bytes) => {
+            let text = String::from_utf8(bytes)
+                .map_err(|_| format!("checksum file at {checksum_url} is not valid UTF-8"))?;
+            verify_checksum(&downloaded, &text, &asset)?;
+            crate::output::note("Checksum verified");
+        }
+        None => {
+            return Err(format!(
+                "release v{target_version} publishes no checksum for {asset} \
+                 ({checksum_url} returned 404); refusing to install an unverified binary. \
+                 Pass --version to install a release that publishes one."
+            )
+            .into());
+        }
+    }
+
+    let binary = binary_from_asset(&downloaded)?;
     (context.installer)(context.target_path, &binary, &target_version)?;
     crate::output::success(format!(
         "zirv {target_version} installed to {}",
@@ -472,6 +580,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         target_path: &target,
         latest_release: &latest_release_json,
         downloader: &download_asset,
+        checksum_downloader: &download_checksum,
         installer: &replace_binary,
     };
     match update_in(&cli, &context) {
@@ -549,12 +658,80 @@ mod tests {
             target_path: Path::new("/unused/zirv"),
             latest_release: &|| panic!("latest release transport must not run"),
             downloader: &|_| panic!("download transport must not run"),
+            checksum_downloader: &|_| panic!("checksum transport must not run"),
             installer: &|_, _, _| panic!("installer must not run"),
         };
         let error = update_in(&cli, &context)
             .expect_err("unsupported platform must fail")
             .to_string();
         assert!(error.contains("cargo install --git"), "got {error}");
+    }
+
+    #[test]
+    fn verify_checksum_accepts_a_matching_digest() {
+        let bytes = b"known binary bytes";
+        let digest = to_hex(&Sha256::digest(bytes));
+        let text = format!("{digest}  zirv-3.30.0-linux.tar.gz\n");
+        verify_checksum(bytes, &text, "zirv-3.30.0-linux.tar.gz").unwrap();
+    }
+
+    #[test]
+    fn verify_checksum_accepts_uppercase_hex() {
+        let bytes = b"known binary bytes";
+        let digest = to_hex(&Sha256::digest(bytes)).to_ascii_uppercase();
+        let text = format!("{digest}  zirv-3.30.0-linux.tar.gz\n");
+        verify_checksum(bytes, &text, "zirv-3.30.0-linux.tar.gz").unwrap();
+    }
+
+    #[test]
+    fn verify_checksum_rejects_a_mismatched_digest() {
+        let bytes = b"known binary bytes";
+        let wrong_digest = to_hex(&Sha256::digest(b"different bytes"));
+        let text = format!("{wrong_digest}  zirv-3.30.0-linux.tar.gz\n");
+        let error = verify_checksum(bytes, &text, "zirv-3.30.0-linux.tar.gz")
+            .expect_err("mismatched digest must fail")
+            .to_string();
+        assert!(error.contains("checksum mismatch"), "got {error}");
+        assert!(error.contains(&wrong_digest), "got {error}");
+    }
+
+    #[test]
+    fn verify_checksum_rejects_malformed_text() {
+        for text in [
+            "",
+            "not-a-real-checksum-line",
+            "abc123  zirv-3.30.0-linux.tar.gz",
+        ] {
+            let error = verify_checksum(b"bytes", text, "zirv-3.30.0-linux.tar.gz")
+                .expect_err(&format!("'{text}' must be rejected as malformed"))
+                .to_string();
+            assert!(
+                error.contains("malformed") || error.contains("empty"),
+                "got {error} for input {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_checksum_rejects_extra_fields() {
+        let bytes = b"known binary bytes";
+        let digest = to_hex(&Sha256::digest(bytes));
+        let text = format!("{digest}  zirv-3.30.0-linux.tar.gz  extra\n");
+        let error = verify_checksum(bytes, &text, "zirv-3.30.0-linux.tar.gz")
+            .expect_err("an extra field must be rejected")
+            .to_string();
+        assert!(error.contains("malformed"), "got {error}");
+    }
+
+    #[test]
+    fn verify_checksum_rejects_a_filename_mismatch() {
+        let bytes = b"known binary bytes";
+        let digest = to_hex(&Sha256::digest(bytes));
+        let text = format!("{digest}  zirv-3.30.0-windows.exe\n");
+        let error = verify_checksum(bytes, &text, "zirv-3.30.0-linux.tar.gz")
+            .expect_err("a filename mismatch must fail")
+            .to_string();
+        assert!(error.contains("unexpected asset"), "got {error}");
     }
 
     #[cfg(unix)]

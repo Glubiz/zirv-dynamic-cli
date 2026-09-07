@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-06
+last-verified: 2026-09-07
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-07 (track/330-c, v3.30.0): added a Windows Defender false-positive entry -- VERSIONINFO, published .sha256 checksums, and a verified `zirv update` shipped as this release's mitigation; code signing remains the real fix, tracked but out of scope -->
 <!-- Updated 2026-09-06 (feat/326-track-d, issue #326 fix): closed the interactive-pane codex ignore-flags crash (AgentAdapter::interactive_read_only_args); recorded a codex hook-trust finding instead -- `zirv ctx hook prompt`/`zirv ctx hook stop` run clean by hand and a live `codex exec` round-trip completed both hooks successfully against this machine's currently-persisted hooks.json/config.toml trust state, so the reported "hook: X Failed" is not reproducible here and now, and no zirv-side cause was found -->
 <!-- Updated 2026-09-06 (feat/326-track-c, orchestrator-side token trims): recorded that Claude Code auto-loads `.zirv/context/claude.md` as a nested CLAUDE.md on a case-insensitive filesystem, outside zirv's own dedupe -->
 <!-- Updated 2026-09-06 (feat/inner-workings-audit-2, ten fix tracks + a2-review1): recorded seven residuals surfaced by the second full-codebase audit's own fix tracks -- objective::store has no interprocess lock (a plain read-modify-write, roll_up_spend included); codex rollout .floor/.path pins under <state>/rollouts/ are never pruned once a session retires; setup.rs's deterministic restore staging path can race two concurrent restores of the same target; a single API response whose thinking splits across two block rows is credited its reported thinking-token total twice; dash::pane::Pane::launch_mode still reads a pane's ORIGINAL spawn mode after a handover; step Options' new deny_unknown_fields is a breaking change for a script carrying a stray option key; --yes is accepted and silently ignored on every non-init command; prune_safety_buckets does a full directory scan on every append_safety call -->
@@ -104,6 +105,21 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## Windows Defender false positive on zirv.exe
+
+Recorded 2026-09-07 (`track/330-c`, v3.30.0). Windows Defender has twice quarantined a released `zirv.exe` as a trojan. Root cause is the shape of the file, not its content: an unsigned binary, shipping (until this release) with no `VERSIONINFO` resource at all, that also downloads and executes a raw exe over the network and renames it over the currently-running binary (`zirv update`, `src/commands/update.rs`) -- a strong heuristic match for trojan-downloader behavior even though the code does exactly what it says.
+
+**What v3.30.0 changed (mitigation, not a fix):**
+- `build.rs` (Windows-only, via the `winresource` crate) embeds a real `VERSIONINFO` resource -- `ProductName`, `FileDescription`, `CompanyName`, `LegalCopyright`, `OriginalFilename`, `InternalName`, `FileVersion`/`ProductVersion` from `CARGO_PKG_VERSION` -- so the shipped exe at least identifies itself the way legitimate Windows software does. No-op on every other target (`CARGO_CFG_TARGET_OS` guard, not `#[cfg(windows)]`, so a cross-compile is driven by the target rather than the host).
+- `.github/workflows/cd.yaml` generates a `<artifact>.sha256` (the `sha256sum` text format, `<hex>  <filename>`, LF-terminated even from the Windows job's `Get-FileHash`) for every release artifact and publishes it alongside the binary/tarball.
+- `zirv update` (`src/commands/update.rs`) downloads `<asset>.sha256` from the same release after downloading the asset itself, and refuses to run `sanity_check`/`replace_binary` on a digest mismatch, naming both the expected and computed hex (`verify_checksum`, unit-tested for match/mismatch/malformed text/filename mismatch/uppercase hex). An older release that predates this change publishes no `.sha256` at all -- `zirv update` fails closed on that too (never silently skips verification), naming the release and pointing at `--version` to pick one that does. `install.sh` does the same when `sha256sum`/`shasum` is on `PATH` (a warning-and-skip only when neither tool exists at all).
+
+**What operators can do today (neither of these is a zirv code change):**
+- Submit the quarantined file at <https://www.microsoft.com/en-us/wdsi/filesubmission> as a software developer, so Defender's own model stops flagging future builds of the same shape.
+- Add a Defender exclusion for the install directory as a stopgap while a submission is pending.
+
+**What's still missing.** None of the above is code signing, which is what would actually change Defender's (and SmartScreen's) reputation scoring rather than just narrowing the heuristic match and letting an operator recover a corrupted/tampered download before it runs. Code signing needs an operator-owned signing account (Azure Trusted Signing or SignPath.io for OSS projects are the two realistic options) and was explicitly out of scope for this round. See the CD pipeline (`.github/workflows/cd.yaml`) for where a signing step would need to land, on the Windows build job's artifact before it is checksummed and uploaded.
 
 ## Codex's own hook-trust gate may fail `zirv`'s registered hooks in a way this repo cannot fix
 

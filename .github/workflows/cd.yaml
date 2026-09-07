@@ -97,12 +97,34 @@ jobs:
             rm zirv
           fi
 
+      - name: Checksum artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.get_version.outputs.version }}"
+          $artifact = "zirv-$ver-windows.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $artifact).Hash.ToLowerInvariant()
+          $line = "$hash  $artifact"
+          # sha256sum text format, LF-terminated -- Set-Content on Windows
+          # defaults to CRLF, which sha256sum -c rejects.
+          [System.IO.File]::WriteAllText("$artifact.sha256", "$line`n")
+
+      - name: Checksum artifact (Unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          V=${{ steps.get_version.outputs.version }}
+          SUF=${{ matrix.suffix }}
+          ARTIFACT="zirv-${V}-${SUF}.tar.gz"
+          sha256sum "$ARTIFACT" > "$ARTIFACT.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: zirv-${{ matrix.suffix }}
           path: |
             ${{ matrix.os == 'windows-latest' && format('zirv-{0}-windows.exe', steps.get_version.outputs.version) || format('zirv-{0}-{1}.tar.gz', steps.get_version.outputs.version, matrix.suffix) }}
+            ${{ matrix.os == 'windows-latest' && format('zirv-{0}-windows.exe.sha256', steps.get_version.outputs.version) || format('zirv-{0}-{1}.tar.gz.sha256', steps.get_version.outputs.version, matrix.suffix) }}
 
   release:
     name: Create GitHub Release & Upload Assets
@@ -176,8 +198,11 @@ jobs:
 
           gh release upload "$TAG" \
             "artifacts/zirv-${{ needs.build.outputs.version }}-windows.exe" \
+            "artifacts/zirv-${{ needs.build.outputs.version }}-windows.exe.sha256" \
             "artifacts/zirv-${{ needs.build.outputs.version }}-linux.tar.gz" \
+            "artifacts/zirv-${{ needs.build.outputs.version }}-linux.tar.gz.sha256" \
             "artifacts/zirv-${{ needs.build.outputs.version }}-macos.tar.gz" \
+            "artifacts/zirv-${{ needs.build.outputs.version }}-macos.tar.gz.sha256" \
             --clobber
           gh release edit "$TAG" --draft=false --latest
           echo "published=true" >> "$GITHUB_OUTPUT"

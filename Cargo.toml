@@ -1,6 +1,6 @@
 [package]
 name = "zirv"
-version = "3.29.1"
+version = "3.30.0"
 edition = "2024"
 authors = ["Jonathan Solskov <josj@zirv.io>"]
 description = "A CLI tool for executing developer-defined YAML scripts with support for interactive commands and OS-specific execution."
@@ -60,6 +60,13 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
+
+# Windows-only VERSIONINFO resource (issue #326: Defender false-positive
+# hardening) -- embeds ProductName/FileDescription/CompanyName/etc. into the
+# built exe so it carries real metadata an unsigned, resource-less binary
+# does not. See build.rs, which is a no-op on every other target.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [profile.release]
 opt-level       = "z"
