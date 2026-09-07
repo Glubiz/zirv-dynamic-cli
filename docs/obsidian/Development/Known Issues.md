@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-07 (fix/3.30.0-input-latency-defender, v3.30.0): recorded a third Windows dev-machine test baseline name, commands::ctx::dash::pane::tests::a_signal_less_pane_stays_uninjectable_for_a_full_window_after_its_own_injection, failing on unmodified main at 09f913a -->
 <!-- Updated 2026-09-07 (track/330-c, v3.30.0): added a Windows Defender false-positive entry -- VERSIONINFO, published .sha256 checksums, and a verified `zirv update` shipped as this release's mitigation; code signing remains the real fix, tracked but out of scope -->
 <!-- Updated 2026-09-06 (feat/326-track-d, issue #326 fix): closed the interactive-pane codex ignore-flags crash (AgentAdapter::interactive_read_only_args); recorded a codex hook-trust finding instead -- `zirv ctx hook prompt`/`zirv ctx hook stop` run clean by hand and a live `codex exec` round-trip completed both hooks successfully against this machine's currently-persisted hooks.json/config.toml trust state, so the reported "hook: X Failed" is not reproducible here and now, and no zirv-side cause was found -->
 <!-- Updated 2026-09-06 (feat/326-track-c, orchestrator-side token trims): recorded that Claude Code auto-loads `.zirv/context/claude.md` as a nested CLAUDE.md on a case-insensitive filesystem, outside zirv's own dedupe -->
@@ -1150,6 +1151,8 @@ the default parallel test runner.
 ## `commands::ctx::supervise::tests::terminate_*` SIGTERM tests flake under parallel load (this Windows dev machine)
 
 `terminate_stops_a_child_that_ignores_sigterm`/`terminate_pid_stops_a_process_that_ignores_sigterm` (and their already-dead siblings) spawn a real child, send it a grace-period SIGTERM-equivalent, and assert it stops within a bounded window — under `nextest`'s default parallel `-j 8` scheduling on this host, enough concurrent process spawns/kills contend for the same OS-level teardown budget that the grace window is occasionally missed. Both tests pass reliably run in isolation and under the required serial `cargo test -- --test-threads=1` (see "Tests must run with `--test-threads=1`" above); this is scheduling contention under load, not a defect in `terminate`/`terminate_pid` themselves. Alongside the existing `wrap::win::` exit-code/turn-signal baseline failures documented in this repo's own `CLAUDE.md` ("This Windows dev machine" section) — diff the sorted failure-NAME list against `main`, don't chase either class.
+
+**A third baseline name recorded 2026-09-07 (`fix/3.30.0-input-latency-defender`):** `commands::ctx::dash::pane::tests::a_signal_less_pane_stays_uninjectable_for_a_full_window_after_its_own_injection` fails on unmodified `main` at `09f913a` on this same Windows dev box, reproduced twice. Not investigated further and not chased on this branch — recorded here so it is diffed out of the sorted failure-NAME list the same way the other two classes above already are, rather than misread as a regression this branch introduced.
 
 ## `wrap`'s pty-harness tests wedge their spawned child on at least one macOS machine
 

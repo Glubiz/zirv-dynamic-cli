@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-08-30
+last-verified: 2026-09-07
 ---
 
 # Technology Stack
@@ -40,7 +40,7 @@ last-verified: 2026-08-30
 | `futures` | 0.3.32 | Async combinators |
 | `slab` | 0.4.12 | Slot-keyed allocation, used in the `ctx` supervisor machinery |
 | `regex` | 1 | Detecting unresolved `${...}` placeholders after substitution |
-| `sha2` | 0.11.0 | Stable SHA-256 identities for immutable launch-policy snapshots, privacy-preserving command-decision audit correlation, and tamper detection in the Claude safety-hook attestation |
+| `sha2` | 0.11.0 | Stable SHA-256 identities for immutable launch-policy snapshots, privacy-preserving command-decision audit correlation, and tamper detection in the Claude safety-hook attestation. Also backs `zirv update`'s checksum verification (v3.30.0, issue #326): `verify_checksum` hashes the downloaded release asset and compares it against the `.sha256` sidecar CD now publishes — see [[Known Issues]]'s Windows Defender false-positive entry and [[Built-in Commands]]'s `update` entry |
 | `portable-pty` | 0.9.0 | Cross-platform PTY for `zirv ctx wrap`'s interactive supervision, and for each of the dashboard's own panes (`dash::pane`) |
 | `uuid` (v4) | 1.24.0 | Session IDs for `ctx` transcripts and supervised runs |
 | `crossterm` | 0.29 | Terminal event/key input and raw-mode primitives for the dashboard's own event loop (`dash/mod.rs`) |
@@ -55,6 +55,12 @@ last-verified: 2026-08-30
 |---|---|---|---|
 | `libc` | 0.2.183 | `cfg(unix)` | Unix system calls needed by `ctx` process/terminal primitives and workflow process-group cleanup on verification or interactive-artifact timeout |
 | `windows-sys` (Win32_Foundation, Win32_Security, Win32_Storage_FileSystem, Win32_System_Console, Win32_System_IO, Win32_System_JobObjects, Win32_System_Pipes, Win32_System_Threading) | 0.61.2 | `cfg(windows)` | Console-mode and named-pipe APIs for `ctx wrap` on Windows. `Win32_System_JobObjects` (added 2026-08-16) is `ctx::supervise::JobGuard`'s kill-on-close job object, the kernel-enforced backstop that reaps a supervised agent's whole process tree when zirv itself dies with no user code running (`taskkill /F`, a crash, `panic = "abort"`) — see [[Ctx Supervisors]]. Named explicitly rather than relying on the transitive copy pulled in by `console`/`dirs-sys`/`mio`/`tempfile`, to avoid a second win32 binding crate |
+
+### Build-dependencies (platform-specific)
+
+| Crate | Version | Scope | Purpose |
+|---|---|---|---|
+| `winresource` | 0.1 | `cfg(windows)` (`[target.'cfg(windows)'.build-dependencies]`) | v3.30.0, issue #326 — `build.rs` uses it to compile a `VERSIONINFO` resource (`ProductName`/`FileDescription`/`CompanyName`/`LegalCopyright`/`OriginalFilename`/`InternalName`/`FileVersion`/`ProductVersion`, from `CARGO_PKG_VERSION`) into the built exe. Mitigates Windows Defender repeatedly quarantining released `zirv.exe` builds as a trojan — an unsigned binary with no version resource at all is a stronger heuristic match than one that identifies itself the way legitimate Windows software does; real code signing is still out of scope, see [[Known Issues]]. `build.rs` guards on `CARGO_CFG_TARGET_OS == "windows"` rather than `#[cfg(windows)]`, so a cross-compile is driven by the target, not the host running `cargo`, and is a no-op on every other target. Needs `rc.exe` (MSVC) or `windres` (GNU) on `PATH`; `resource.compile()` failing panics the build rather than silently shipping an exe with no version resource |
 
 ### Dev-dependencies
 
