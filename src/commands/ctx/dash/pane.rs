@@ -731,6 +731,15 @@ pub(crate) const DRAIN_BUDGET_BYTES: usize = 256 * 1024;
 /// across panes. Separated from [`Pane::drain_with_budget`] so the budget
 /// behaviour is testable against a plain `mpsc` channel without a real pty
 /// child.
+///
+/// The budget is checked AFTER a message is taken, not before, so `more` is
+/// only ever `false` when this call actually observed the channel empty (or
+/// disconnected). Review finding 2 turns on that direction being exact:
+/// `Pane::has_pending_output` gates the reap on it, and a pane reaped while
+/// its child's last lines were still queued loses them for good. The cost is
+/// that one call can overshoot its share by at most one message (the reader's
+/// 8 KiB buffer) -- which the pre-check version did too, one message before
+/// crossing the line instead of one after.
 fn drain_into(
     rx: &mpsc::Receiver<Vec<u8>>,
     parser: &mut vt100::Parser,
@@ -739,19 +748,20 @@ fn drain_into(
     let mut processed = 0usize;
     let mut any = false;
     loop {
-        if processed >= budget {
-            // Stopped on the budget, not on an empty channel: treat as
-            // "more may remain" so the loop returns here next tick. Nothing
-            // is dropped -- what is left stays queued exactly as it was.
-            return (any, true, processed);
-        }
         match rx.try_recv() {
             Ok(bytes) => {
                 processed += bytes.len();
                 parser.process(&bytes);
                 any = true;
+                if processed >= budget {
+                    // Stopped on the budget, not on an empty channel: treat
+                    // as "more may remain" so the loop returns here next
+                    // tick. Nothing is dropped -- what is left stays queued
+                    // exactly as it was.
+                    return (any, true, processed);
+                }
             }
-            // Empty or Disconnected: nothing more to take right now.
+            // Empty or Disconnected: this pane has nothing more to take.
             Err(_) => return (any, false, processed),
         }
     }
@@ -785,6 +795,14 @@ pub struct Pane {
     lifecycle: supervise::ChildGuard,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     rx: mpsc::Receiver<Vec<u8>>,
+    /// Issue #330 (review finding 2): whether the last drain left this pane's
+    /// reader channel unfinished -- it stopped on its share of the tick's
+    /// budget rather than on an empty channel. `dash::reap_ended_panes` holds
+    /// an exited pane back while this is set: with the budget now shared
+    /// across panes, an exited pane can easily go a tick with its last lines
+    /// still queued, and reaping it there would drop the one thing the
+    /// operator most needs to see -- what the child said before it died.
+    pending_output: bool,
     server: Option<SignalServer>,
     guard: SessionGuard,
     state_dir: StateDir,
@@ -1219,6 +1237,7 @@ impl Pane {
             lifecycle,
             writer,
             rx,
+            pending_output: false,
             server,
             guard,
             state_dir: state.clone(),
@@ -1296,6 +1315,7 @@ impl Pane {
     pub fn drain_with_budget(&mut self, budget: usize) -> (bool, bool, usize) {
         self.poll_exit();
         let (any, more, used) = drain_into(&self.rx, &mut self.parser, budget);
+        self.pending_output = more;
         if any {
             // O1: recorded, not acted on. Whether these bytes mean "a new turn
             // started" or "the harness repainted the one that just ended" is
@@ -1341,6 +1361,12 @@ impl Pane {
             self.user_typed_since_turn = false;
         }
         (any, more, used)
+    }
+
+    /// Whether the last drain stopped on its budget with bytes still queued.
+    /// `dash::reap_ended_panes`' hold-back gate -- see [`Pane::pending_output`].
+    pub fn has_pending_output(&self) -> bool {
+        self.pending_output
     }
 
     /// The current screen, for `dash::ui`'s renderers. Already reflects this
@@ -2538,6 +2564,9 @@ impl Pane {
         self.lifecycle = lifecycle;
         self.writer = writer;
         self.rx = rx;
+        // A fresh channel has nothing outstanding on it: whatever the old
+        // child left queued died with its receiver.
+        self.pending_output = false;
         self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
         self.turn_signal_capable = turn_signal_capable;
         self.idle_quiet = idle_quiet;

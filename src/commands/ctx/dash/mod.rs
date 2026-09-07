@@ -1949,12 +1949,21 @@ fn drain_order(count: usize, focused: usize, start: usize) -> Vec<usize> {
 /// `count` panes in [`drain_order`], returning the indices that actually
 /// produced output.
 ///
-/// `drain_one(index, remaining)` returns `(any, used)`. Every pane is visited
-/// even once the budget is gone -- a visit is also how a pane's child exit is
-/// noticed and how a signal-less pane's turn flags retire -- so the panes at
-/// the back of the order are asked to parse zero bytes rather than skipped.
-/// Nothing is ever dropped: what a pane could not parse this tick stays queued
-/// for the next one.
+/// `drain_one(index, share)` returns `(any, used)`. Every pane is visited --
+/// a visit is also how a pane's child exit is noticed and how a signal-less
+/// pane's turn flags retire -- and nothing is ever dropped: what a pane could
+/// not parse this tick stays queued for the next one.
+///
+/// Review finding 1: the focused pane gets first call on the budget, but a
+/// capped one. Uncapped, a focused pane streaming faster than the whole
+/// budget took all of it every tick, and the unfocused panes behind it never
+/// drained at all -- their channels grew without bound and their quiescence
+/// and turn-signal logic, which only ever runs off a drain, never saw
+/// another byte. So every other pane keeps a reserved floor of
+/// `budget / (2 * count)`, which is what the focused pane's share is reduced
+/// by; a share an earlier pane leaves unspent flows to the ones behind it,
+/// and anything still unspent at the end flows back to the focused pane, so a
+/// firehose next to quiet neighbours still gets the whole tick's budget.
 ///
 /// `drain_one` is a closure so the sharing itself is testable with plain byte
 /// counters, without a pty child or a terminal.
@@ -1968,14 +1977,32 @@ fn drain_shared_budget<F>(
 where
     F: FnMut(usize, usize) -> (bool, usize),
 {
+    let order = drain_order(count, focused, start);
+    if order.is_empty() {
+        return Vec::new();
+    }
+    // Half the budget, split evenly, is what the unfocused panes are
+    // guaranteed between them; the focused pane may spend the rest.
+    let reserve = budget / (2 * count);
     let mut produced = Vec::new();
     let mut remaining = budget;
-    for idx in drain_order(count, focused, start) {
-        let (any, used) = drain_one(idx, remaining);
+    for (position, idx) in order.iter().copied().enumerate() {
+        // Still owed to the panes queued behind this one, and therefore not
+        // this pane's to spend.
+        let owed = reserve.saturating_mul(order.len() - position - 1);
+        let (any, used) = drain_one(idx, remaining.saturating_sub(owed));
         if any {
             produced.push(idx);
         }
         remaining = remaining.saturating_sub(used);
+    }
+    // What the unfocused panes did not need goes back to the pane the
+    // operator is actually watching.
+    if remaining > 0 && focused < count {
+        let (any, _used) = drain_one(focused, remaining);
+        if any && !produced.contains(&focused) {
+            produced.push(focused);
+        }
     }
     produced
 }
@@ -2256,6 +2283,14 @@ struct FactsRefresher {
     /// background half. A dashboard that cannot start a thread still shows a
     /// correct sidebar -- it just pays the old latency for it.
     inline: Option<FactsInputs>,
+    /// When the inline fallback last collected. Review finding 3: the tick
+    /// asks on EVERY iteration now (that is the point of the swap being
+    /// decoupled from the throttle), so without a clock of its own the
+    /// fallback would read the whole state directory up to 100 times a
+    /// second -- far worse than the once-a-second it replaced. Inert while
+    /// the thread is running, which is the only case that is not a
+    /// pathology.
+    last_inline: std::cell::Cell<Instant>,
 }
 
 impl FactsRefresher {
@@ -2301,6 +2336,13 @@ impl FactsRefresher {
             rx,
             stop,
             inline: (!spawned).then_some(inputs),
+            // Seeded a full interval in the past so the first ask collects
+            // immediately, the same reasoning `FactsCache::new` documents.
+            last_inline: std::cell::Cell::new(
+                Instant::now()
+                    .checked_sub(FACTS_THROTTLE)
+                    .unwrap_or_else(Instant::now),
+            ),
         }
     }
 
@@ -2319,8 +2361,16 @@ impl FactsRefresher {
     /// not finished a cycle since the last call. Never blocks: `try_recv` in a
     /// loop keeping only the last, so a tick costs one channel probe however
     /// far behind a busy machine has left the thread.
-    fn take_latest(&self) -> Option<FactsSnapshot> {
+    ///
+    /// `now` is the tick's own clock, and is used only by the inline
+    /// fallback, which stands in for the thread's cadence with a throttle of
+    /// its own (review finding 3).
+    fn take_latest(&self, now: Instant) -> Option<FactsSnapshot> {
         if let Some(inputs) = self.inline.as_ref() {
+            if !due(self.last_inline.get(), now, FACTS_THROTTLE) {
+                return None;
+            }
+            self.last_inline.set(now);
             let ids = lock_group_ids(&self.group_ids);
             return Some(collect_facts_snapshot(inputs, &ids));
         }
@@ -3241,6 +3291,20 @@ fn reap_ended_panes(
             index += 1;
             continue;
         };
+        // Issue #330 (review finding 2): an exited pane whose reader channel
+        // is not drained yet keeps its place for another tick. The vt100
+        // budget is shared across panes now, so a pane can genuinely reach
+        // its exit with its last lines still queued -- and reaping it here
+        // would retire the row, drop the parser and take exactly the output
+        // the operator needs to understand the exit with it. `drain_with_
+        // budget` reports `more` only when it stopped on the budget rather
+        // than on an empty channel, so this can hold a pane back for a tick
+        // but never forever: the next drain that reaches the end of the
+        // channel clears it.
+        if panes[index].has_pending_output() {
+            index += 1;
+            continue;
+        }
         if panes[index].delivery_sender.is_some() {
             let mut notices = Vec::new();
             report_unconfirmed_submission(
@@ -10422,6 +10486,7 @@ pub fn run_dashboard(
             // the operator has demonstrably now read.
             facts_cache.disk.attention.insert(short, acked);
         }
+        let facts_now = Instant::now();
         let facts_refreshed = facts_cache.refresh_if_due(
             cfg,
             state,
@@ -10431,8 +10496,8 @@ pub fn run_dashboard(
                 session_short: &dashboard_short,
             },
             &panes,
-            Instant::now(),
-            || facts_refresher.take_latest(),
+            facts_now,
+            || facts_refresher.take_latest(facts_now),
         );
         if facts_refreshed {
             // What the refresher's next cycle should load groups for: this
@@ -15085,8 +15150,12 @@ mod tests {
         .expect("store claude's reading");
 
         let mut cache = FactsCache::new(now);
+        // An empty snapshot: this test is about the throttled block's own
+        // `window::load_for` reads, and a real one would have the refresher's
+        // pool read (`fallback::capacity_snapshot` -> `pace::refresh_sources`)
+        // store a provider window of its own into this very state dir first.
         cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
-            snapshot(&state, &repo, &cfg)
+            Some(FactsSnapshot::default())
         });
 
         let claude = cache
@@ -15139,8 +15208,12 @@ mod tests {
         .expect("store an expired reading");
 
         let mut cache = FactsCache::new(now);
+        // An empty snapshot: this test is about the throttled block's own
+        // `window::load_for` reads, and a real one would have the refresher's
+        // pool read (`fallback::capacity_snapshot` -> `pace::refresh_sources`)
+        // store a provider window of its own into this very state dir first.
         cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
-            snapshot(&state, &repo, &cfg)
+            Some(FactsSnapshot::default())
         });
 
         let claude = cache
@@ -15172,6 +15245,7 @@ mod tests {
             rx,
             stop: Arc::new(AtomicBool::new(false)),
             inline: None,
+            last_inline: std::cell::Cell::new(Instant::now()),
         };
         let release = Arc::new(AtomicBool::new(false));
         let thread_release = Arc::clone(&release);
@@ -15192,7 +15266,7 @@ mod tests {
         cache.disk.mail = Some((0, 0));
         cache.disk.memory_count = 2;
         assert!(
-            !cache.apply_snapshot(refresher.take_latest()),
+            !cache.apply_snapshot(refresher.take_latest(Instant::now())),
             "a refresher mid-cycle has published nothing to swap in"
         );
         assert_eq!(
@@ -15203,11 +15277,53 @@ mod tests {
 
         release.store(true, Ordering::Relaxed);
         publisher.join().expect("the publisher finishes");
-        assert!(cache.apply_snapshot(refresher.take_latest()));
+        assert!(cache.apply_snapshot(refresher.take_latest(Instant::now())));
         assert_eq!(
             (cache.disk.mail, cache.disk.memory_count),
             (Some((3, 0)), 7),
             "the newest snapshot wins; a tick never replays a stale backlog"
+        );
+    }
+
+    /// Review finding 3: the tick asks for a snapshot on EVERY iteration
+    /// now, so the inline fallback -- the arm that stands in when the
+    /// refresher thread could not be spawned at all -- needs a cadence of its
+    /// own. Without one it would read the whole state directory up to a
+    /// hundred times a second, far worse than the once-a-second it replaced.
+    #[test]
+    fn the_inline_facts_fallback_collects_at_most_once_per_throttle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let now = Instant::now();
+        let (_tx, rx) = mpsc::channel();
+        let refresher = FactsRefresher {
+            group_ids: Arc::new(Mutex::new(Vec::new())),
+            rx,
+            stop: Arc::new(AtomicBool::new(false)),
+            inline: Some(FactsInputs {
+                state: state.clone(),
+                repo: repo.clone(),
+                agent_name: "claude".to_string(),
+                session_short: "sess0000".to_string(),
+                mail_enabled: cfg.mail.enabled,
+                cfg: cfg.clone(),
+            }),
+            last_inline: std::cell::Cell::new(now.checked_sub(FACTS_THROTTLE).unwrap_or(now)),
+        };
+
+        assert!(
+            refresher.take_latest(now).is_some(),
+            "seeded a full interval in the past, the first ask collects"
+        );
+        assert!(
+            refresher.take_latest(now + FACTS_THROTTLE / 2).is_none(),
+            "every tick inside the window costs nothing at all"
+        );
+        assert!(
+            refresher.take_latest(now + FACTS_THROTTLE).is_some(),
+            "and the next window collects again"
         );
     }
 
@@ -15304,12 +15420,14 @@ mod tests {
             })
         };
 
-        assert_eq!(tick(1, 0, &mut queued), vec![1, 0]);
+        // Focused pane 1 may spend 150 - 2 * (150 / 6) = 100 of the 150, and
+        // each unfocused pane keeps its floor of 25.
+        assert_eq!(tick(1, 0, &mut queued), vec![1, 0, 2]);
         assert_eq!(
             queued,
-            [50, 0, 100],
-            "the focused pane drains in full, the next in the rotation takes \
-             the remainder, and the last one waits"
+            [75, 0, 75],
+            "the focused pane drains in full first, and the two behind it \
+             still get their reserved floor"
         );
 
         assert_eq!(tick(1, 1, &mut queued), vec![2, 0]);
@@ -15317,6 +15435,57 @@ mod tests {
             queued,
             [0, 0, 0],
             "two ticks parse every byte that was queued: nothing is ever dropped"
+        );
+    }
+
+    /// Review finding 1: a focused pane streaming faster than the whole tick
+    /// budget must not starve the panes behind it -- uncapped it took all of
+    /// it every tick, and an unfocused pane's channel then grew without bound
+    /// while its quiescence and turn-signal logic, which only ever runs off a
+    /// drain, never saw another byte.
+    #[test]
+    fn a_focused_firehose_cannot_starve_the_panes_behind_it() {
+        let mut queued = [100_000usize, 100, 100];
+        let mut drained = [0usize; 3];
+        // Scoped so the borrow of `drained` ends before it is read back.
+        {
+            let mut tick = |focused: usize, start: usize, queued: &mut [usize; 3]| {
+                drain_shared_budget(3, focused, start, 150, |idx, share| {
+                    let used = queued[idx].min(share);
+                    queued[idx] -= used;
+                    drained[idx] += used;
+                    (used > 0, used)
+                })
+            };
+            tick(0, 0, &mut queued);
+            tick(0, 1, &mut queued);
+        }
+
+        assert!(
+            drained[1] > 0 && drained[2] > 0,
+            "every unfocused pane with queued bytes drained something over \
+             two ticks: {drained:?}"
+        );
+        assert_eq!(
+            drained[0], 200,
+            "the focused pane still goes first, up to its cap of \
+             150 - 2 * 25 per tick"
+        );
+
+        // ...and with the neighbours quiet, the share they did not need flows
+        // back, so a focused firehose alone still spends the whole tick.
+        let mut alone = [100_000usize, 0, 0];
+        let mut spent = 0usize;
+        drain_shared_budget(3, 0, 0, 150, |idx, share| {
+            let used = alone[idx].min(share);
+            alone[idx] -= used;
+            spent += used;
+            (used > 0, used)
+        });
+        assert_eq!(
+            spent, 150,
+            "an unused reserve flows back to the focused pane rather than \
+             being left on the table"
         );
     }
 
@@ -16229,6 +16398,120 @@ mod tests {
         assert!(panes.is_empty(), "sanity: the pane was reaped");
         let recorded = last_exited.expect("last_exited must be filled once panes is empty");
         assert_eq!(recorded.harness, "test-agent");
+    }
+
+    /// Review finding 2: a pane whose child has exited with its last lines
+    /// still sitting in the reader channel must not be reaped on that tick.
+    /// The vt100 budget is shared across panes now (issue #330), so an exited
+    /// pane can easily reach the reap with output outstanding -- and reaping
+    /// it there retires the row and drops the parser, taking exactly the
+    /// output the operator needs to understand the exit with it.
+    #[test]
+    fn an_exited_pane_is_not_reaped_while_its_last_output_is_still_queued() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let cfg = CtxConfig::default();
+
+        let mut panes = vec![
+            Pane::spawn(
+                PaneSpec {
+                    agent_name: "test-agent".to_string(),
+                    argv: chatty_argv(),
+                    role: prompt::PromptRole::Worker,
+                    verb: sessions::Verb::Dash,
+                    session_id: "77779999-2222-4333-8444-555555555555".to_string(),
+                    title: "chatty".to_string(),
+                },
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        let (mut focused, mut selected) = (0usize, 0usize);
+        let mut errors = ErrorLog::default();
+        let mut reap = |panes: &mut Vec<Pane>, queues: &mut Vec<VecDeque<String>>| {
+            reap_ended_panes(
+                panes,
+                queues,
+                &cfg,
+                &state,
+                &repo,
+                &mut focused,
+                &mut selected,
+                &mut errors,
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &mut None,
+                &mut VecDeque::new(),
+                &mut HashMap::new(),
+            );
+        };
+
+        // Wait for the child to exit WITHOUT draining: `on_turn_signal` polls
+        // the exit status and never touches the reader channel, so everything
+        // the child printed is still queued when it goes `Ended`.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !matches!(panes[0].state(), PaneState::Ended(_)) {
+            panes[0].on_turn_signal();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(panes[0].state(), PaneState::Ended(_)),
+            "the trivial child must exit within the deadline, got {:?}",
+            panes[0].state()
+        );
+
+        // A tick whose shared budget was spent on the panes ahead of this
+        // one: the drain stops on the budget with the channel unfinished.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !panes[0].has_pending_output() {
+            panes[0].drain_with_budget(1);
+            if !panes[0].has_pending_output() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(
+            panes[0].has_pending_output(),
+            "the child's output must reach the channel for this test to mean anything"
+        );
+
+        reap(&mut panes, &mut queues);
+        assert_eq!(
+            panes.len(),
+            1,
+            "an exited pane keeps its place while its output is still queued"
+        );
+
+        // The following ticks drain it to the end, and the operator sees the
+        // last lines.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !panes[0].last_line().contains("zirv330") {
+            panes[0].drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            panes[0].last_line().contains("zirv330"),
+            "the child's output reached the screen before the reap: {:?}",
+            panes[0].last_line()
+        );
+        assert!(
+            !panes[0].has_pending_output(),
+            "a drain that reached the end of the channel clears the hold"
+        );
+
+        reap(&mut panes, &mut queues);
+        assert!(
+            panes.is_empty(),
+            "and with nothing left queued it is reaped on the next tick"
+        );
     }
 
     /// A1-5: the module's own rule -- failures go to the sticky `⚠` error
@@ -22567,6 +22850,26 @@ mod tests {
     #[cfg(unix)]
     fn trivial_argv() -> Vec<String> {
         vec!["sh".to_string(), "-c".to_string(), "exit 0".to_string()]
+    }
+
+    /// A trivial child that prints one recognisable line and exits -- output
+    /// that must still reach the screen before the pane is reaped.
+    #[cfg(windows)]
+    fn chatty_argv() -> Vec<String> {
+        vec![
+            "cmd".to_string(),
+            "/c".to_string(),
+            "echo zirv330".to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn chatty_argv() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo zirv330".to_string(),
+        ]
     }
 
     /// The same trivial child, failing -- what a reap must keep routing to
