@@ -43,6 +43,7 @@ semantic verb unless raw control is specifically needed.
 - `zirv ctx agent`: delegate one task to a session; it runs to completion
   and returns, so no separate wait/poll verb exists. `--worktree` isolates
   the work in its own git worktree.
+- `zirv ctx config show` / `zirv ctx config set` / `zirv ctx config add`: inspect or edit operator `~/.zirv/ctx.toml`; writes ask for approval and preserve comments.
 - `zirv ctx send` / `zirv ctx inbox`: exchange notes between sessions.
 - `zirv ctx nudge`: interrupt a live session with a message.
 - `zirv ctx handover`: swap the orchestrator seat's model or harness,
