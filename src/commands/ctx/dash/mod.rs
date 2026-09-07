@@ -2058,12 +2058,13 @@ struct DiskFacts {
     /// indistinguishable from "checked and found none".
     spend: Option<AggregateSpendFacts>,
     /// Issue #358 (task T6a): one [`ui::HarnessStrip`] per harness `cfg.
-    /// fallback.order` names, for the aggregate row's own pool strip -- read
-    /// on the same throttled tick as `usage` right above, off the identical
-    /// `fallback::capacity_snapshot` the fallback/status surfaces already
-    /// build (a plain read of already-stored usage windows plus the
-    /// registry, never a scan/poll/network call). Empty when the repo
-    /// configures no fallback order at all.
+    /// fallback.order` names, for the aggregate row's own pool strip -- off
+    /// the identical `fallback::capacity_snapshot` the fallback/status
+    /// surfaces already build. Empty when the repo configures no fallback
+    /// order at all. Composed by the background refresher and swapped in
+    /// whole (see [`FactsSnapshot::pool_harnesses`]): that call lists the
+    /// session registry itself, so unlike `usage` right above it is not a
+    /// plain file read and has no business on the tick.
     pool_harnesses: Vec<ui::HarnessStrip>,
     /// This dashboard's own orchestrator seat's `"gen N"` label (`seat::
     /// load`, keyed by `FactsOwner::session_short`), `None` until a seat is
@@ -2114,20 +2115,29 @@ struct FactsOwner<'a> {
 /// The disk-derived facts that are read OFF the UI thread, published whole by
 /// [`FactsRefresher`] and swapped into [`FactsCache`] by the tick.
 ///
-/// Exactly the four reads whose cost is a function of machine-wide history
-/// rather than of this dashboard's own panes -- above all `sessions::list`,
-/// which reads and parses every `sessions/*.json` on the machine and then
-/// sweeps the state directory, probing each orphan socket synchronously
-/// (`signal::probe`, a named-pipe open on Windows). On the UI thread that is
-/// keystroke latency: the tick reaches `event::poll` only after it finishes,
-/// once a second, forever. Everything else `FactsCache::refresh_if_due` reads
-/// is keyed to this dashboard's own panes and stays on the tick.
+/// Exactly the reads whose cost is a function of machine-wide history rather
+/// than of this dashboard's own panes -- above all `sessions::list`, which
+/// reads and parses every `sessions/*.json` on the machine and then sweeps the
+/// state directory, probing each orphan socket synchronously (`signal::probe`,
+/// a named-pipe open on Windows). On the UI thread that is keystroke latency:
+/// the tick reaches `event::poll` only after it finishes, once a second,
+/// forever. Everything else `FactsCache::refresh_if_due` reads is keyed to
+/// this dashboard's own panes and stays on the tick.
 #[derive(Default)]
 struct FactsSnapshot {
     mail: Option<(usize, usize)>,
     memory_count: usize,
     registry: Vec<(sessions::Record, sessions::Liveness)>,
     groups: HashMap<String, super::group::WorkGroup>,
+    /// Issue #358 (task T6a): the aggregate row's pool strip. Here rather
+    /// than on the tick because `fallback::capacity_snapshot` calls
+    /// `sessions::list` itself (`fallback.rs`), so leaving it behind would
+    /// have kept the very sweep this snapshot exists to move -- and its
+    /// `refresh_ranked_providers` can walk a codex rollout tree on top of
+    /// that. Composed all the way into [`ui::HarnessStrip`]s on the
+    /// refresher's thread: the mapping is pure, so nothing is gained by
+    /// carrying the raw snapshot back to the loop.
+    pool_harnesses: Vec<ui::HarnessStrip>,
 }
 
 /// Everything [`collect_facts_snapshot`] needs and a background thread cannot
@@ -2142,6 +2152,10 @@ struct FactsInputs {
     agent_name: String,
     session_short: String,
     mail_enabled: bool,
+    /// The dashboard's own config, cloned rather than borrowed for the same
+    /// reason the rest of this struct is: it is loaded once at launch and
+    /// never reassigned for the life of the loop.
+    cfg: CtxConfig,
 }
 
 /// The reads behind one [`FactsSnapshot`], in one place so the background
@@ -2153,6 +2167,7 @@ fn collect_facts_snapshot(inputs: &FactsInputs, group_ids: &[String]) -> FactsSn
         agent_name,
         session_short,
         mail_enabled,
+        cfg,
     } = inputs;
     let mail = mail::unread_counts(state, repo, agent_name, session_short, *mail_enabled);
     let slug = super::state::repo_slug(repo);
@@ -2174,7 +2189,49 @@ fn collect_facts_snapshot(inputs: &FactsInputs, group_ids: &[String]) -> FactsSn
         memory_count,
         registry,
         groups,
+        // The thread's own clock: `now_secs` is wall time, and this snapshot
+        // is only ever read against wall time (`window::available`'s own
+        // freshness checks live inside the call).
+        pool_harnesses: pool_strips(state, cfg, super::state::now_secs()),
     }
+}
+
+/// Issue #358 (task T6a): the aggregate row's own pool strip.
+/// `fallback::capacity_snapshot` is a read of already-stored usage windows
+/// plus the session registry -- never a poller and never an outbound request
+/// -- but it is a `sessions::list` and, through `refresh_ranked_providers`, a
+/// possible rollout scan, so it runs on the refresher's thread with the rest
+/// of the machine-wide reads. `requester`/`requested` are both `None`: this is
+/// a repo-wide overview, not a placement decision for one particular unit of
+/// work, so nothing needs excluding from the live `active` count and no
+/// harness outside `cfg.fallback.order` needs to be forced in.
+fn pool_strips(state: &StateDir, cfg: &CtxConfig, now_secs: u64) -> Vec<ui::HarnessStrip> {
+    let snapshot = fallback::capacity_snapshot(state, cfg, now_secs, None, None);
+    snapshot
+        .harnesses
+        .iter()
+        .map(|harness| {
+            // Audit finding G2: the strip reports the reading the allocator
+            // ranks on, so an idle codex whose rollout snapshot has aged past
+            // `collector_max_age_secs` reads `stale 53%` rather than the old
+            // `unknown --`. `harness.state` itself is unchanged -- `classify`
+            // still refuses an unbinding reading as a hard-gate authority.
+            let ranking = snapshot
+                .provider(&harness.provider)
+                .and_then(super::allocator::ranking_window);
+            let state =
+                if harness.state == super::allocator::HarnessState::Unknown && ranking.is_some() {
+                    "stale".to_string()
+                } else {
+                    harness.state.as_str().to_string()
+                };
+            ui::HarnessStrip {
+                name: harness.name.clone(),
+                state,
+                headroom_pct: ranking.map(|w| w.headroom_pct),
+            }
+        })
+        .collect()
 }
 
 /// How many slices the refresher's sleep between cycles is cut into, so a quit
@@ -2202,13 +2259,14 @@ struct FactsRefresher {
 }
 
 impl FactsRefresher {
-    fn spawn(state: &StateDir, owner: FactsOwner<'_>, mail_enabled: bool) -> Self {
+    fn spawn(state: &StateDir, owner: FactsOwner<'_>, cfg: &CtxConfig) -> Self {
         let inputs = FactsInputs {
             state: state.clone(),
             repo: owner.repo.to_path_buf(),
             agent_name: owner.agent_name.to_string(),
             session_short: owner.session_short.to_string(),
-            mail_enabled,
+            mail_enabled: cfg.mail.enabled,
+            cfg: cfg.clone(),
         };
         let (tx, rx) = mpsc::channel();
         let group_ids = Arc::new(Mutex::new(Vec::new()));
@@ -2391,6 +2449,7 @@ impl FactsCache {
         self.disk.mail = snapshot.mail;
         self.disk.memory_count = snapshot.memory_count;
         self.disk.groups = snapshot.groups;
+        self.disk.pool_harnesses = snapshot.pool_harnesses;
         self.registry = snapshot.registry;
         true
     }
@@ -2401,19 +2460,25 @@ impl FactsCache {
     ///
     /// `take_snapshot` is the non-blocking hand-off from the background
     /// [`FactsRefresher`] -- the machine-wide reads (mail, memory bank, the
-    /// session registry, the work groups) happen on its thread and are only
-    /// swapped in here. It is a closure rather than a value so it is claimed
-    /// *after* the throttle check: a snapshot that arrives between two due
-    /// ticks stays in the channel instead of being taken and thrown away,
-    /// which would leave the registry a full window staler than it needs
-    /// to be.
+    /// session registry, the work groups, the pool strip) happen on its
+    /// thread and are only swapped in here.
     ///
-    /// Returns whether it actually re-read. Issue #354 phase 2 hangs
+    /// Deliberately claimed on EVERY tick, ahead of and independently of the
+    /// throttle (review finding 1). Tying the swap to `last_refresh` meant a
+    /// due tick that found nothing waiting still consumed the window: the
+    /// refresher starts after `FactsCache::new` has already seeded itself
+    /// due, so the very first due tick almost always missed and the sidebar
+    /// stayed empty for a second window -- and any later cycle that slipped
+    /// past a due tick cost another whole one. The throttled block below
+    /// keeps its own clock, so a tick that only swaps stays free of disk.
+    ///
+    /// Returns whether the tick refreshed anything: the throttled block ran,
+    /// a snapshot landed, or both. Issue #354 phase 2 hangs
     /// [`FactsCache::refresh_attention`] off that answer rather than off a
     /// second throttle of its own: the attention statuses have to be exactly
     /// as fresh as the registry listing they are keyed against, and a second
-    /// clock could only ever drift them apart. That is why the swap happens
-    /// here, inside the due branch, and never on a tick of its own.
+    /// clock could only ever drift them apart. Reporting a swap-only tick as
+    /// a refresh is what keeps that true now that the two can happen apart.
     fn refresh_if_due<F>(
         &mut self,
         cfg: &CtxConfig,
@@ -2426,8 +2491,9 @@ impl FactsCache {
     where
         F: FnOnce() -> Option<FactsSnapshot>,
     {
+        let swapped = self.apply_snapshot(take_snapshot());
         if !due(self.last_refresh, now, FACTS_THROTTLE) {
-            return false;
+            return swapped;
         }
         self.last_refresh = now;
 
@@ -2437,7 +2503,6 @@ impl FactsCache {
             session_short,
         } = owner;
 
-        self.apply_snapshot(take_snapshot());
         // Issue #354: the sidebar's `since` line, on this same throttled
         // cadence -- a state-change clock that only ever moves when the state
         // actually changed, pruned to the live panes so a reaped pane leaves
@@ -2497,43 +2562,6 @@ impl FactsCache {
             })
             .collect();
 
-        // Issue #358 (task T6a): the aggregate row's own pool strip, same
-        // throttled tick as `usage` right above -- `fallback::capacity_
-        // snapshot` is itself a plain read of already-stored usage windows
-        // plus the session registry (`sessions::list`), never a scan, a
-        // poll, or a network call, matching every other read on this tick.
-        // `requester`/`requested` are both `None`: this is a repo-wide
-        // overview, not a placement decision for one particular unit of
-        // work, so nothing needs excluding from the live `active` count and
-        // no harness outside `cfg.fallback.order` needs to be forced in.
-        let pool_snapshot = fallback::capacity_snapshot(state, cfg, now_secs, None, None);
-        self.disk.pool_harnesses = pool_snapshot
-            .harnesses
-            .iter()
-            .map(|harness| {
-                // Audit finding G2: the strip reports the reading the
-                // allocator ranks on, so an idle codex whose rollout
-                // snapshot has aged past `collector_max_age_secs` reads
-                // `stale 53%` rather than the old `unknown --`. `harness.
-                // state` itself is unchanged -- `classify` still refuses an
-                // unbinding reading as a hard-gate authority.
-                let ranking = pool_snapshot
-                    .provider(&harness.provider)
-                    .and_then(super::allocator::ranking_window);
-                let state = if harness.state == super::allocator::HarnessState::Unknown
-                    && ranking.is_some()
-                {
-                    "stale".to_string()
-                } else {
-                    harness.state.as_str().to_string()
-                };
-                ui::HarnessStrip {
-                    name: harness.name.clone(),
-                    state,
-                    headroom_pct: ranking.map(|w| w.headroom_pct),
-                }
-            })
-            .collect();
         // The dashboard's own orchestrator seat -- `FactsOwner::session_
         // short` is this dashboard's own registry short id (D2's own
         // "deliberately the dashboard's own identity" convention, the same
@@ -10052,7 +10080,7 @@ pub fn run_dashboard(
             agent_name: &agent_name,
             session_short: &dashboard_short,
         },
-        cfg.mail.enabled,
+        cfg,
     );
     // L13: transient, auto-expiring header notices (info), kept apart from the
     // sticky `errors` channel (⚠) so a confirmation like "spawned … as …"
@@ -13951,9 +13979,48 @@ mod tests {
                 agent_name: owner.agent_name.to_string(),
                 session_short: owner.session_short.to_string(),
                 mail_enabled: cfg.mail.enabled,
+                cfg: cfg.clone(),
             },
             &[],
         ))
+    }
+
+    /// A stand-in for [`FactsRefresher`] inside a cache test. The tick asks on
+    /// every frame, exactly as it does in production; only a cycle the test
+    /// has armed answers, so "what the refresher published" and "what the tick
+    /// read for itself" stay distinguishable. The snapshot it hands over is
+    /// the real one ([`snapshot`]).
+    struct FakeRefresher<'a> {
+        state: &'a StateDir,
+        repo: &'a Path,
+        cfg: &'a CtxConfig,
+        armed: std::cell::Cell<bool>,
+    }
+
+    impl<'a> FakeRefresher<'a> {
+        /// Armed: a dashboard always starts with the refresher's first cycle
+        /// pending.
+        fn new(state: &'a StateDir, repo: &'a Path, cfg: &'a CtxConfig) -> Self {
+            Self {
+                state,
+                repo,
+                cfg,
+                armed: std::cell::Cell::new(true),
+            }
+        }
+
+        /// The refresher has finished another cycle.
+        fn arm(&self) {
+            self.armed.set(true);
+        }
+
+        /// What `FactsRefresher::take_latest` hands the tick.
+        fn take(&self) -> Option<FactsSnapshot> {
+            if !self.armed.replace(false) {
+                return None;
+            }
+            snapshot(self.state, self.repo, self.cfg)
+        }
     }
 
     /// This test module's stand-in for "the running dashboard's own pid" --
@@ -14767,13 +14834,12 @@ mod tests {
         };
 
         let start = Instant::now();
+        let refresher = FakeRefresher::new(&state, &repo, &cfg);
         let mut cache = FactsCache::new(start);
         // 40 frames inside one throttle window -- the dashboard's own poll is
         // 10-50ms, so this is well under a second of real time.
         for _ in 0..40 {
-            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], start, || {
-                snapshot(&state, &repo, &cfg)
-            }) {
+            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], start, || refresher.take()) {
                 cache.refresh_attention(&shorts, &counting);
             }
         }
@@ -14783,12 +14849,12 @@ mod tests {
             "one read per throttle window, not per frame"
         );
 
-        // The next window reads again, and only once more.
+        // The next window -- with the refresher's next cycle landing in it --
+        // reads again, and only once more.
+        refresher.arm();
         let later = start + FACTS_THROTTLE + Duration::from_millis(1);
         for _ in 0..40 {
-            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || {
-                snapshot(&state, &repo, &cfg)
-            }) {
+            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || refresher.take()) {
                 cache.refresh_attention(&shorts, &counting);
             }
         }
@@ -15117,8 +15183,7 @@ mod tests {
                 let _ = tx.send(FactsSnapshot {
                     mail: Some((unread, 0)),
                     memory_count,
-                    registry: Vec::new(),
-                    groups: HashMap::new(),
+                    ..FactsSnapshot::default()
                 });
             }
         });
@@ -15144,6 +15209,50 @@ mod tests {
             (Some((3, 0)), 7),
             "the newest snapshot wins; a tick never replays a stale backlog"
         );
+    }
+
+    /// Review finding 1: the swap is claimed on every tick, not once per
+    /// `FACTS_THROTTLE`. Tied to the throttle, a due tick that found nothing
+    /// waiting -- which the very first one almost always is, since the
+    /// refresher only starts after `FactsCache::new` has seeded itself due --
+    /// consumed the window, and the sidebar stayed empty for a second one.
+    #[test]
+    fn a_snapshot_landing_between_due_ticks_is_swapped_in_by_the_very_next_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let cfg = CtxConfig::default();
+        let now = Instant::now();
+        let mut cache = FactsCache::new(now);
+
+        // The first due tick, with the refresher still on its first cycle.
+        assert!(
+            cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || None),
+            "the throttled block still ran"
+        );
+        assert_eq!(cache.disk.memory_count, 0, "nothing was published yet");
+
+        // 10ms later -- nowhere near due -- the refresher's first snapshot
+        // finally lands.
+        let soon = now + Duration::from_millis(10);
+        assert!(
+            cache.refresh_if_due(&cfg, &state, owner(&repo), &[], soon, || Some(
+                FactsSnapshot {
+                    memory_count: 9,
+                    ..FactsSnapshot::default()
+                }
+            )),
+            "a swapped snapshot is a refreshed tick: the attention statuses \
+             have to be re-keyed to the registry that came with it"
+        );
+        assert_eq!(
+            cache.disk.memory_count, 9,
+            "swapped in on the very next tick, not held back for the next window"
+        );
+
+        // ...and a tick with neither a snapshot nor a due window is not a
+        // refresh at all, so the throttled reads stay throttled.
+        assert!(!cache.refresh_if_due(&cfg, &state, owner(&repo), &[], soon, || None));
     }
 
     /// Issue #330: the spawn-request channels are read on their own cadence,
@@ -15211,26 +15320,33 @@ mod tests {
         );
     }
 
+    /// Issue #330: the header's mail counts come from the background
+    /// refresher and from nowhere else. This is the stronger successor to the
+    /// old "refreshes immediately, then honors the throttle" test: the tick
+    /// used to re-read `mail::unread_counts` itself once a window, so the
+    /// throttle was the only thing standing between the sidebar and a
+    /// per-frame read. Now the tick never reads mail at all, and whatever the
+    /// refresher publishes lands on the very next tick that asks.
     #[test]
-    fn facts_cache_refreshes_immediately_then_honors_the_throttle() {
+    fn facts_cache_takes_its_mail_counts_from_the_refresher_and_never_reads_them_itself() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         let cfg = CtxConfig::default();
         let now = Instant::now();
 
+        let refresher = FakeRefresher::new(&state, &repo, &cfg);
         let mut cache = FactsCache::new(now);
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
-            snapshot(&state, &repo, &cfg)
-        });
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || refresher.take());
         assert_eq!(
             cache.disk.mail,
             Some((0, 0)),
-            "the first check must refresh even though `last_refresh` was just set"
+            "the refresher's first cycle lands on the first tick that asks"
         );
 
-        // A message stored right after that first refresh must not be seen
-        // again until the throttle elapses.
+        // A message stored right after that first cycle is invisible until
+        // the refresher publishes again -- however many ticks go by, and
+        // whether or not the throttled block runs on them.
         let slug = super::super::state::repo_slug(&repo);
         mail::store(
             &state,
@@ -15247,43 +15363,52 @@ mod tests {
         )
         .expect("store");
 
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
-            snapshot(&state, &repo, &cfg)
-        });
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || refresher.take());
         assert_eq!(
             cache.disk.mail,
             Some((0, 0)),
-            "within the throttle window, the cached facts must not change"
+            "with no new cycle published, the cached counts stand"
         );
 
         let later = now + FACTS_THROTTLE;
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || {
-            snapshot(&state, &repo, &cfg)
-        });
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || refresher.take());
+        assert_eq!(
+            cache.disk.mail,
+            Some((0, 0)),
+            "and a due tick changes nothing either: the tick has no mail read \
+             of its own left to make"
+        );
+
+        // The refresher's next cycle carries it -- on a tick that is NOT due,
+        // proving the swap is independent of the throttled block.
+        refresher.arm();
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || refresher.take());
         assert_eq!(
             cache.disk.mail,
             Some((1, 0)),
-            "once the throttle elapses, the disk-backed facts refresh"
+            "the published counts land on the next tick that asks"
         );
     }
 
     /// The session registry and the rot scores are disk-backed, and both are
     /// rebuilt every ~20fps frame if they are not folded into this cache. An
-    /// earlier round of this dashboard shipped exactly that regression, so the
-    /// throttle is pinned here rather than assumed: a record written *after* a
-    /// refresh must stay invisible until the window elapses.
+    /// earlier round of this dashboard shipped exactly that regression, so
+    /// where each one comes from is pinned here rather than assumed: the
+    /// registry listing only ever arrives from the background refresher
+    /// (issue #330 -- `sessions::list` is the machine-wide sweep that must
+    /// never sit on the tick), while the scores stay on the throttled block
+    /// and are keyed against whatever listing was swapped in first.
     #[test]
-    fn the_registry_and_scores_are_read_on_the_facts_throttle_only() {
+    fn the_registry_comes_from_the_refresher_and_the_scores_off_the_throttled_tick() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         let cfg = CtxConfig::default();
         let now = Instant::now();
 
+        let refresher = FakeRefresher::new(&state, &repo, &cfg);
         let mut cache = FactsCache::new(now);
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
-            snapshot(&state, &repo, &cfg)
-        });
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || refresher.take());
         assert!(cache.registry.is_empty(), "nothing is registered yet");
         assert!(
             cache.disk.scores.is_empty(),
@@ -15295,22 +15420,20 @@ mod tests {
             registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
         );
 
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
-            snapshot(&state, &repo, &cfg)
-        });
+        let later = now + FACTS_THROTTLE;
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || refresher.take());
         assert!(
             cache.registry.is_empty(),
-            "within the throttle window nothing re-reads the registry"
+            "a due tick lists no sessions of its own: the record is invisible \
+             until the refresher publishes it"
         );
 
-        let later = now + FACTS_THROTTLE;
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || {
-            snapshot(&state, &repo, &cfg)
-        });
+        refresher.arm();
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || refresher.take());
         assert_eq!(
             cache.registry.len(),
             1,
-            "once the throttle elapses the registry refreshes"
+            "the refresher's next cycle carries it, throttle or no throttle"
         );
         assert!(
             cache.disk.scores.is_empty(),
