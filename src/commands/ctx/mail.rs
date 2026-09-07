@@ -1207,6 +1207,7 @@ pub(super) fn sent_since(
     to_session: &str,
     since: u64,
 ) -> bool {
+    let from_session = sessions::short_id(from_session);
     let mailbox = state.mail().join(repo_slug);
     [mailbox.clone(), mailbox.join("read")]
         .iter()
@@ -1214,7 +1215,8 @@ pub(super) fn sent_since(
         .filter_map(|path| std::fs::read_to_string(path).ok())
         .map(|text| parse_markdown(&text))
         .any(|msg| {
-            msg.from_session == from_session
+            sessions::short_id(&msg.from_session) == from_session
+                && !msg.from_agent.eq_ignore_ascii_case("zirv")
                 && msg.to_session.as_deref() == Some(to_session)
                 && msg.sent >= since
         })
@@ -2400,19 +2402,35 @@ mod tests {
         let state = StateDir::from_root(tmp.path().join("state"));
         let cfg = CtxConfig::default();
         let message = Message {
-            from_session: "dddddddd".to_string(),
+            from_session: "dddddddd-2222-4333-8444-555555555555".to_string(),
             from_agent: "codex".to_string(),
             to: "any".to_string(),
             to_session: Some("aaaa1111".to_string()),
             sent: 100,
             body: "report sent".to_string(),
         };
+        let notice = Message {
+            from_session: "dddddddd".to_string(),
+            from_agent: "zirv".to_string(),
+            sent: 101,
+            ..message.clone()
+        };
+        let notice_path = store(&state, "repo", &notice, &cfg).expect("store system notice");
+        assert!(!sent_since(&state, "repo", "dddddddd", "aaaa1111", 100));
         let path = store(&state, "repo", &message, &cfg).expect("store");
         for read in [false, true] {
             if read {
                 consume(&state, "repo", &path).expect("consume");
+                consume(&state, "repo", &notice_path).expect("consume system notice");
             }
             assert!(sent_since(&state, "repo", "dddddddd", "aaaa1111", 100));
+            assert!(sent_since(
+                &state,
+                "repo",
+                &message.from_session,
+                "aaaa1111",
+                100
+            ));
             assert!(!sent_since(&state, "repo", "dddddddd", "aaaa1111", 101));
             assert!(!sent_since(&state, "repo", "eeeeeeee", "aaaa1111", 100));
             assert!(!sent_since(&state, "repo", "dddddddd", "bbbb2222", 100));
