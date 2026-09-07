@@ -3,6 +3,7 @@ use std::process::Command;
 
 pub mod claude;
 pub mod codex;
+pub mod pi;
 
 use super::CtxResult;
 use super::config::{CtxConfig, OrchestratorWrites};
@@ -2493,12 +2494,20 @@ fn make_codex(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(codex::CodexAdapter::new(bin))
 }
 
+fn make_pi(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(pi::PiAdapter::new(bin))
+}
+
 /// The single source of truth for which adapters exist: a name paired with a
 /// constructor. Adding an adapter is one entry here (plus its own module) --
 /// `all`, `select`'s fallback, `describe_known_adapters`, `resolve_default`
 /// and `readiness_note` all walk this table rather than naming adapters by
 /// hand, so none of them can drift from it.
-pub const ADAPTERS: &[(&str, AdapterCtor)] = &[("claude", make_claude), ("codex", make_codex)];
+pub const ADAPTERS: &[(&str, AdapterCtor)] = &[
+    ("claude", make_claude),
+    ("codex", make_codex),
+    ("pi", make_pi),
+];
 
 pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
     ADAPTERS.iter().map(|(_, ctor)| ctor(bin)).collect()
@@ -5741,9 +5750,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_exposes_both_v1_adapters() {
+    fn registry_exposes_every_registered_adapter() {
         let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["claude", "codex"]);
+        assert_eq!(names, vec!["claude", "codex", "pi"]);
     }
 
     /// The registry table is the one place a new adapter is wired in: `all`
@@ -5904,17 +5913,24 @@ mod tests {
         assert_eq!(origin, DefaultOrigin::FirstEnabledReady);
     }
 
-    /// Disabling both known adapters leaves nothing to fall back to; the
+    /// Disabling every known adapter leaves nothing to fall back to; the
     /// error must aggregate one line per adapter naming its own reason,
     /// reusing the gate's refusal text and each adapter's own `ready()` text
-    /// rather than inventing new wording.
+    /// rather than inventing new wording. Issue #386: `pi` disabled too --
+    /// otherwise, with pi left enabled and `ready()` (it fails open on a
+    /// missing binary, same as every adapter), the loop in `resolve_default`
+    /// would reach pi as an enabled-and-ready candidate and return the
+    /// EARLIER "repo may narrow but not silently choose 'pi' for you"
+    /// refusal instead of ever reaching the "no agent is both enabled and
+    /// ready" branch this test means to exercise.
     #[test]
     fn when_no_adapter_is_both_enabled_and_ready_the_error_names_each_one_and_why() {
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/.settings.toml"),
-            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n",
+            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n\
+             [agents.pi]\nenabled = false\n",
         )
         .expect("write");
         let home = tempfile::tempdir().expect("tempdir");
