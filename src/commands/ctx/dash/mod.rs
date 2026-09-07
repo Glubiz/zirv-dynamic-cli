@@ -16491,9 +16491,11 @@ mod tests {
         );
 
         // The following ticks drain it to the end, and the operator sees the
-        // last lines.
+        // last lines. Loop on the hold, not on the text: a plain pty (unix)
+        // delivers the text in the very first message, so the 1-byte drain
+        // above already put it on screen while the hold is still set.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && !panes[0].last_line().contains("zirv330") {
+        while Instant::now() < deadline && panes[0].has_pending_output() {
             panes[0].drain();
             std::thread::sleep(Duration::from_millis(20));
         }

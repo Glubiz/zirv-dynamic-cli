@@ -745,6 +745,13 @@ fn drain_into(
     parser: &mut vt100::Parser,
     budget: usize,
 ) -> (bool, bool, usize) {
+    // Final review: a zero share takes nothing. Without this guard the
+    // post-check below would still grant one free message per pane, so a
+    // tick's overshoot would grow with the pane count instead of staying at
+    // one message per pane that actually had a share.
+    if budget == 0 {
+        return (false, true, 0);
+    }
     let mut processed = 0usize;
     let mut any = false;
     loop {
@@ -1311,7 +1318,9 @@ impl Pane {
     /// longer scales with the number of workers. A pane handed a budget of
     /// zero still polls its child's exit status and still retires a
     /// signal-less pane's turn flags; only the parsing waits for the next
-    /// tick, with every unparsed byte left queued exactly where it was.
+    /// tick, with every unparsed byte left queued exactly where it was. A
+    /// positive share may overshoot by at most one reader message (8 KiB),
+    /// see [`drain_into`].
     pub fn drain_with_budget(&mut self, budget: usize) -> (bool, bool, usize) {
         self.poll_exit();
         let (any, more, used) = drain_into(&self.rx, &mut self.parser, budget);
@@ -5552,6 +5561,20 @@ pub(crate) mod tests {
             "the budget cut the drain short with bytes still queued"
         );
         assert!(rx.try_recv().is_ok(), "messages remain on the channel");
+    }
+
+    /// Final review: a zero share must not take even one message, or the
+    /// tick's overshoot grows with the pane count.
+    #[test]
+    fn drain_into_with_no_budget_takes_nothing_and_keeps_the_hold() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(b"abcd".to_vec()).expect("send");
+        let mut parser = vt100::Parser::new(4, 40, 0);
+        let (any, more, used) = drain_into(&rx, &mut parser, 0);
+        assert!(!any);
+        assert_eq!(used, 0);
+        assert!(more, "nothing was observed, so the pane stays held");
+        assert!(rx.try_recv().is_ok(), "the message is still queued");
     }
 
     /// A channel that empties under budget reports nothing remaining; a drained
