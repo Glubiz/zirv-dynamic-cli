@@ -3,6 +3,7 @@ use std::process::Command;
 
 pub mod claude;
 pub mod codex;
+pub mod copilot;
 pub mod gemini;
 pub mod opencode;
 pub mod pi;
@@ -2496,6 +2497,10 @@ fn make_codex(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(codex::CodexAdapter::new(bin))
 }
 
+fn make_copilot(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(copilot::CopilotAdapter::new(bin))
+}
+
 fn make_gemini(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(gemini::GeminiAdapter::new(bin))
 }
@@ -2516,6 +2521,7 @@ fn make_pi(bin: Option<&str>) -> Box<dyn AgentAdapter> {
 pub const ADAPTERS: &[(&str, AdapterCtor)] = &[
     ("claude", make_claude),
     ("codex", make_codex),
+    ("copilot", make_copilot),
     ("gemini", make_gemini),
     ("opencode", make_opencode),
     ("pi", make_pi),
@@ -5777,7 +5783,10 @@ mod tests {
     #[test]
     fn registry_exposes_every_registered_adapter() {
         let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["claude", "codex", "gemini", "opencode", "pi"]);
+        assert_eq!(
+            names,
+            vec!["claude", "codex", "copilot", "gemini", "opencode", "pi"]
+        );
     }
 
     /// The registry table is the one place a new adapter is wired in: `all`

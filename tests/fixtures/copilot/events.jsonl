@@ -1,0 +1,13 @@
+{"type":"session.start","timestamp":"2026-09-07T10:00:00.000Z","data":{"context":{"repository":"acme/widget","branch":"main"}}}
+{"type":"user.message","timestamp":"2026-09-07T10:00:01.000Z","data":{"content":"Add a health check endpoint"}}
+{"type":"assistant.turn_start","timestamp":"2026-09-07T10:00:02.000Z","data":{"turnId":"turn-1"}}
+{"type":"tool.execution_start","timestamp":"2026-09-07T10:00:03.000Z","data":{"toolName":"read","arguments":{"path":"src/router.ts"}}}
+{"type":"tool.execution_complete","timestamp":"2026-09-07T10:00:04.000Z","data":{"success":true}}
+{"type":"tool.execution_start","timestamp":"2026-09-07T10:00:05.000Z","data":{"toolName":"write","arguments":{"path":"src/router.ts"}}}
+{"type":"tool.execution_complete","timestamp":"2026-09-07T10:00:06.000Z","data":{"success":false}}
+{"type":"session.shutdown","id":"shutdown-1","timestamp":"2026-09-07T10:07:00.000Z","data":{"modelMetrics":{"claude-sonnet-4.5":{"usage":{"inputTokens":1200,"outputTokens":300,"cacheReadTokens":200,"cacheWriteTokens":100,"reasoningTokens":0},"requests":{"count":2}}}}}
+{"type":"user.message","timestamp":"2026-09-07T10:08:00.000Z","data":{"content":"Also add a test"}}
+{"type":"assistant.turn_start","timestamp":"2026-09-07T10:08:01.000Z","data":{"turnId":"turn-2"}}
+{"type":"tool.execution_start","timestamp":"2026-09-07T10:08:02.000Z","data":{"toolName":"write","arguments":{"path":"src/router.test.ts"}}}
+{"type":"tool.execution_complete","timestamp":"2026-09-07T10:08:03.000Z","data":{"success":true}}
+{"type":"session.shutdown","id":"shutdown-2","timestamp":"2026-09-07T10:10:00.000Z","data":{"modelMetrics":{"gpt-5.3-codex":{"usage":{"inputTokens":500,"outputTokens":120,"cacheReadTokens":0,"cacheWriteTokens":0,"reasoningTokens":40},"requests":{"count":1}}}}}
