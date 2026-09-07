@@ -133,6 +133,14 @@ pub(crate) fn run_with_clock<W: Write>(
     let announcer =
         super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
     let adapter = adapters::select(args.agent.as_deref().or(cfg.agent.as_deref()), &[], &cfg)?;
+    // The pinned model this run actually launches with, if an operator's own
+    // `--extra -- --model <name>` (or codex's `-m` alias) names one -- the
+    // same `last_model_flag` scan `exec::run_with_clock_inner` uses for its
+    // own `execution_model`. Resolved once here, since `args.extra` never
+    // changes across cycles, and reused by every `provider_for_model` call
+    // below so this loop's usage/pacing state files under the account this
+    // pinned model actually spends rather than the adapter's static default.
+    let cycle_model = adapters::last_model_flag(&args.extra);
     let state = StateDir::resolve(env)?;
     // Issue #249: this loop's own supervising session, if any -- resolved
     // once, from `env` alone, and reused for every cycle's mail rendering.
@@ -233,9 +241,12 @@ pub(crate) fn run_with_clock<W: Write>(
             now_fn,
             sleep_fn,
             None,
-            adapter.provider(),
+            adapter.provider_for_model(cycle_model),
             pace::PaceGate {
-                use_credits: cfg.pace.use_credits.for_provider(adapter.provider()),
+                use_credits: cfg
+                    .pace
+                    .use_credits
+                    .for_provider(adapter.provider_for_model(cycle_model)),
                 poller: cfg
                     .pace
                     .poll_enabled
@@ -535,7 +546,12 @@ pub(crate) fn run_with_clock<W: Write>(
                     &mut std::io::stderr(),
                 ) {
                     let now = now_fn();
-                    match pace::confirm_limit_hit(&state, &cfg.pace, now, adapter.provider()) {
+                    match pace::confirm_limit_hit(
+                        &state,
+                        &cfg.pace,
+                        now,
+                        adapter.provider_for_model(cycle_model),
+                    ) {
                         pace::LimitConfirmation::Confirmed { detail } => {
                             limit_hit = true;
                             limit_confirmation_detail = Some(detail);
@@ -642,7 +658,12 @@ pub(crate) fn run_with_clock<W: Write>(
                 );
                 if limit_text_seen {
                     let now = now_fn();
-                    match pace::confirm_limit_hit(&state, &cfg.pace, now, adapter.provider()) {
+                    match pace::confirm_limit_hit(
+                        &state,
+                        &cfg.pace,
+                        now,
+                        adapter.provider_for_model(cycle_model),
+                    ) {
                         pace::LimitConfirmation::Confirmed { detail } => {
                             limit_hit = true;
                             limit_confirmation_detail = Some(detail);
@@ -864,7 +885,7 @@ pub(crate) fn run_with_clock<W: Write>(
                 now_fn,
                 sleep_fn,
                 None,
-                adapter.provider(),
+                adapter.provider_for_model(cycle_model),
                 pace::PaceGate {
                     // A vendor-reported limit hit parks even with use_credits
                     // enabled: the vendor limiting us means credits are

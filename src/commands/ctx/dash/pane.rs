@@ -1217,7 +1217,10 @@ impl Pane {
                 &session_id,
                 &agent_name,
                 seat_model.as_deref(),
-                super::super::adapters::provider_for_agent_name(Some(&agent_name)),
+                super::super::adapters::provider_for_agent_and_model(
+                    Some(&agent_name),
+                    seat_model.as_deref(),
+                ),
                 role.label(),
                 super::super::seat::pin_from_env(&super::super::config::env_from_process()),
                 super::super::state::now_secs(),
@@ -2544,6 +2547,15 @@ impl Pane {
         // Move it: release the old entry and open a fresh one on the new
         // provider for the same token ceiling, so exactly one settle later
         // hits the right ledger.
+        //
+        // Track C (#383) note: deliberately left on the static, name-only
+        // lookup rather than `provider_for_model` -- `Pane` retains no
+        // launched-model field of its own, and `account_reaped_pane_spend`'s
+        // own settle call (`dash/mod.rs`) resolves its provider the same
+        // name-only way from `pane.agent()`. Reserve and settle must stay on
+        // the identical resolution for one pane's whole lifecycle, so both
+        // ends of this pairing wait on `Pane` carrying its own resolved
+        // model before either can safely go per-model.
         let old_provider =
             super::super::adapters::provider_for_agent_name(Some(&self.agent_name)).to_string();
         if let Some(old_id) = self.reservation_id.take() {

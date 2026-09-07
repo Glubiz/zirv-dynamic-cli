@@ -204,10 +204,15 @@ fn candidate_headroom(
     state: &StateDir,
     cfg: &CtxConfig,
     name: &str,
+    // The translated model this candidate would actually launch with, when
+    // the caller has already resolved one (`handover::equivalent_model`/
+    // `equivalent_delegation_model`) -- `None` when no candidate model is in
+    // hand yet, which falls back to the adapter's static `provider()`.
+    model: Option<&str>,
     bounds: TaskBounds,
     now: u64,
 ) -> Option<CandidateHeadroom> {
-    let provider = adapters::provider_for_agent_name(Some(name));
+    let provider = adapters::provider_for_agent_and_model(Some(name), model);
     let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
     if matches!(
         pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace),
@@ -237,9 +242,10 @@ fn requested_reading(
     state: &StateDir,
     cfg: &CtxConfig,
     name: &str,
+    model: Option<&str>,
     now: u64,
 ) -> Option<pace::SpawnHeadroom> {
-    let provider = adapters::provider_for_agent_name(Some(name));
+    let provider = adapters::provider_for_agent_and_model(Some(name), model);
     let (collector, estimator) = pace::current_windows(state, &cfg.pace, now, provider);
     pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
 }
@@ -267,6 +273,13 @@ pub fn candidate_allowed_by_capacity(cfg: &CtxConfig, name: &str, bounds: TaskBo
 /// for instance). Matched through [`is_same_session`], because the production
 /// caller (`agent::run_with`) passes a SHORT id while the registry rows hold
 /// full session ids.
+///
+/// Track C (#383) note: every provider lookup in this function and
+/// `refresh_ranked_providers` stays on the static, name-only
+/// `provider_for_agent_name` -- this snapshot enumerates every configured
+/// harness NAME generically (`cfg.fallback.order`), not one candidate's
+/// translated launch, so there is no single pinned model to resolve
+/// `provider_for_model` against.
 pub fn capacity_snapshot(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -619,10 +632,10 @@ fn best_alternate(
         if request.bounds.tool_calls.is_some() && !candidate_adapter.counts_tool_calls() {
             continue;
         }
-        let Some(headroom) = candidate_headroom(state, cfg, name, request.bounds, request.now)
-        else {
-            continue;
-        };
+        // Resolved before `candidate_headroom` below (reordered from this
+        // function's original layout), so the headroom read for a
+        // multi-provider candidate uses the model it would actually launch
+        // with rather than the adapter's static default.
         let model = if request.delegation {
             handover::equivalent_delegation_model(
                 request.requested,
@@ -641,6 +654,16 @@ fn best_alternate(
             )
         };
         let Some(model) = model else {
+            continue;
+        };
+        let Some(headroom) = candidate_headroom(
+            state,
+            cfg,
+            name,
+            Some(model.as_str()),
+            request.bounds,
+            request.now,
+        ) else {
             continue;
         };
         let replace = match &best {
@@ -689,7 +712,8 @@ pub fn route_new_delegation(
         return None;
     }
 
-    let provider = adapters::provider_for_agent_name(Some(request.requested));
+    let provider =
+        adapters::provider_for_agent_and_model(Some(request.requested), request.source_model);
     let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace);
     let source_reading =
@@ -860,7 +884,8 @@ pub fn earliest_reset_choice(
         return None;
     }
 
-    let requested_provider = adapters::provider_for_agent_name(Some(request.requested));
+    let requested_provider =
+        adapters::provider_for_agent_and_model(Some(request.requested), request.source_model);
     let (collector, estimator) =
         pace::current_windows(state, &cfg.pace, request.now, requested_provider);
     let requested_reset =
@@ -914,7 +939,7 @@ pub fn earliest_reset_choice(
         let Some(model) = model else {
             continue;
         };
-        let provider = candidate_adapter.provider();
+        let provider = candidate_adapter.provider_for_model(Some(model.as_str()));
         let (collector, estimator) = pace::current_windows(state, &cfg.pace, request.now, provider);
         let Some(reset) = pace::spawn_reset(&collector, estimator.as_ref(), request.now, &cfg.pace)
         else {
@@ -955,7 +980,13 @@ pub fn route_blocked_session(
     if !cfg.fallback.enabled {
         return None;
     }
-    let requested_reading = requested_reading(state, cfg, request.requested, request.now);
+    let requested_reading = requested_reading(
+        state,
+        cfg,
+        request.requested,
+        request.source_model,
+        request.now,
+    );
 
     if cfg.fallback.adaptive_delegation {
         let snapshot = capacity_snapshot(

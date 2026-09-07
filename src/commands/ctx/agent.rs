@@ -1479,6 +1479,21 @@ pub(crate) fn headless_worker_flags(
     flags
 }
 
+/// Track C (#383): the pinned model a delegation's own usage/pacing/
+/// reservation seam (`run_with`'s own `provider` local, just below its call
+/// site) should resolve `AgentAdapter::provider_for_model` against --
+/// `route`'s own translated model when `route_new_delegation` rerouted this
+/// delegation to a different harness/model pair, else the originally
+/// requested `--model` (`requested_model`). Pure and standalone so the exact
+/// model-selection rule this seam depends on is testable without a live
+/// route or adapter.
+fn effective_delegation_model<'a>(
+    route: Option<&'a super::fallback::Route>,
+    requested_model: Option<&'a str>,
+) -> Option<&'a str> {
+    route.map(|route| route.model.as_str()).or(requested_model)
+}
+
 /// Issue #252 (2026-09-01): appends the same extra writable-root argv
 /// `dash::worker_pane_extra_args` has always added unconditionally for a
 /// dashboard-spawned worker pane, to a headless `zirv agent` delegation's own
@@ -2946,12 +2961,21 @@ pub fn run_with<W: Write>(
     } else {
         pace::Seat::Cli
     };
+    // Resolved before `refresh_sources` below (reordered from the original
+    // computation site a few lines down), so the pinned model this
+    // delegation is actually about to request is in hand for
+    // `provider_for_model` rather than falling back to the adapter's static
+    // default -- `headless_worker_flags` is pure over `cfg`/`args`/
+    // `requested_adapter` and does not depend on anything `refresh_sources`
+    // itself touches.
+    let requested_command = headless_worker_flags(&cfg, args, requested_adapter.as_ref());
+    let requested_model = adapters::last_model_flag(&requested_command);
     let mut refresh_flags = pace::PaceGateFlags::default();
     pace::refresh_sources(
         &state,
         &cfg.pace,
         now,
-        requested_adapter.provider(),
+        requested_adapter.provider_for_model(requested_model),
         &pace::PaceGate {
             use_credits: false,
             poller: None,
@@ -2959,8 +2983,6 @@ pub fn run_with<W: Write>(
         },
         &mut refresh_flags,
     );
-    let requested_command = headless_worker_flags(&cfg, args, requested_adapter.as_ref());
-    let requested_model = adapters::last_model_flag(&requested_command);
     let source_model_explicit = flags_pin_model(&args.flags);
     let bounds = super::fallback::TaskBounds {
         tokens: args.budget_tokens,
@@ -3044,7 +3066,15 @@ pub fn run_with<W: Write>(
     // `rollover.rs` -- both genuinely different situations: a session
     // already spending that the provider itself just refused, not a
     // delegation that has not started yet.
-    let provider = adapters::provider_for_agent_name(Some(&routed_args.name));
+    // The pinned model this delegation is actually about to launch with:
+    // `route.model` when `route_new_delegation` rerouted it to a different
+    // harness/model pair above, else the originally requested `--model`
+    // (`requested_model`, resolved before `refresh_sources` above). Both this
+    // reading and the reservation/settlement further down key off the SAME
+    // `provider` local, so a multi-provider adapter's reserve and settle
+    // always land on the same ledger for one delegation.
+    let effective_model = effective_delegation_model(route_applied.as_ref(), requested_model);
+    let provider = adapters::provider_for_agent_and_model(Some(&routed_args.name), effective_model);
     let (collector, estimator) = pace::current_windows(&state, &cfg.pace, now, provider);
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
     let reading_age = pace::spawn_headroom(&collector, estimator.as_ref(), now, &cfg.pace)
@@ -4040,6 +4070,74 @@ mod tests {
             "account-exhausted"
         );
         assert_eq!(delegation_outcome(1), "failed");
+    }
+
+    /// Track C (#383): a helper for building a minimal `fallback::Route`
+    /// naming only the fields `effective_delegation_model` reads.
+    fn test_route(model: &str) -> fallback::Route {
+        fallback::Route {
+            requested: "claude".to_string(),
+            selected: "codex".to_string(),
+            model: model.to_string(),
+            reason: fallback::RouteReason::Exhausted,
+            requested_headroom_pct: None,
+            requested_age_secs: None,
+            requested_observed_at: None,
+            selected_headroom_pct: 50.0,
+            selected_headroom_assumed: false,
+            binding_window: None,
+            reserved_tokens: 0,
+        }
+    }
+
+    /// Track C (#383): the worker-spawn seam (`run_with`'s own `provider`
+    /// local) resolves `provider_for_agent_and_model` against a route's own
+    /// translated model whenever `route_new_delegation` actually rerouted
+    /// this delegation -- the route's model wins even when the original
+    /// request also pinned one, since the route's model is what the
+    /// SELECTED harness actually launches with.
+    #[test]
+    fn effective_delegation_model_prefers_the_routes_own_model() {
+        let route = test_route("gpt-5.6-terra");
+        assert_eq!(
+            effective_delegation_model(Some(&route), Some("opus")),
+            Some("gpt-5.6-terra")
+        );
+    }
+
+    /// No reroute happened (`route: None`): the seam falls back to the
+    /// originally requested `--model`, exactly what this delegation is about
+    /// to launch with.
+    #[test]
+    fn effective_delegation_model_falls_back_to_the_requested_model_with_no_route() {
+        assert_eq!(effective_delegation_model(None, Some("opus")), Some("opus"));
+    }
+
+    /// Neither a route nor a requested model: the seam has nothing to
+    /// resolve, and `provider_for_agent_and_model`'s own `None` path (the
+    /// adapter's static default) takes over -- unchanged from before this
+    /// track's addition of `provider_for_model`.
+    #[test]
+    fn effective_delegation_model_is_none_with_neither_source() {
+        assert_eq!(effective_delegation_model(None, None), None);
+    }
+
+    /// Track C (#383): the free function the seam actually calls
+    /// (`adapters::provider_for_agent_and_model`) turns that resolved model
+    /// into the provider `pace::current_windows`/the token-reservation
+    /// ledger key off -- proven here end to end with the real "codex"
+    /// adapter (whose `provider_for_model` keeps the trait's own default, so
+    /// the model is honestly irrelevant to its outcome, but the resolution
+    /// path itself -- name -> registry adapter -> `provider_for_model(model)`
+    /// -- is exactly what the seam exercises).
+    #[test]
+    fn the_delegation_seam_resolves_provider_through_provider_for_model() {
+        let route = test_route("gpt-5.6-terra");
+        let model = effective_delegation_model(Some(&route), None);
+        assert_eq!(
+            adapters::provider_for_agent_and_model(Some("codex"), model),
+            "openai"
+        );
     }
 
     fn test_classification() -> crate::commands::workflow::classify::Classification {

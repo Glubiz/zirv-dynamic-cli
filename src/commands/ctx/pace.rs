@@ -3910,6 +3910,172 @@ mod tests {
         );
     }
 
+    use crate::commands::ctx::adapters::AgentAdapter;
+
+    /// Track C (#383): a stand-in for an upcoming multi-provider adapter,
+    /// identical in shape to `adapters::tests::MultiProviderStubAdapter` --
+    /// duplicated locally rather than shared, matching this crate's own
+    /// per-file test-stub convention (`NoOverrideAdapter`, `EventlessAdapter`,
+    /// `SentinelAdapter`).
+    #[derive(Debug)]
+    struct MultiProviderStubAdapter;
+
+    impl AgentAdapter for MultiProviderStubAdapter {
+        fn name(&self) -> &'static str {
+            "multi-provider-stub"
+        }
+
+        fn program(&self) -> &str {
+            "multi-provider-stub"
+        }
+
+        fn provider(&self) -> &'static str {
+            "anthropic"
+        }
+
+        fn provider_for_model(&self, model: Option<&str>) -> &'static str {
+            match model.and_then(|m| m.split('/').next()) {
+                Some("google") => "google",
+                _ => self.provider(),
+            }
+        }
+
+        fn ready(&self) -> crate::commands::ctx::CtxResult<()> {
+            Ok(())
+        }
+
+        fn detect(&self, _command: &[String]) -> bool {
+            false
+        }
+
+        fn headless_cmd(
+            &self,
+            _prompt: &str,
+            _session: &crate::commands::ctx::event::SessionId,
+            _extra: &[String],
+        ) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn interactive_cmd(
+            &self,
+            _initial_prompt: Option<&str>,
+            _extra: &[String],
+        ) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn distiller_cmd(&self, _model: &str) -> std::process::Command {
+            std::process::Command::new("true")
+        }
+
+        fn read_only_args(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn system_prompt_args(&self, _prompt: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn transcript_path(
+            &self,
+            _session: &crate::commands::ctx::event::SessionRef,
+        ) -> std::path::PathBuf {
+            std::path::PathBuf::new()
+        }
+
+        fn parse_events(&self, _jsonl: &str) -> Vec<crate::commands::ctx::event::NormalizedEvent> {
+            Vec::new()
+        }
+
+        fn structural_context(
+            &self,
+            _jsonl: &str,
+            _last_n: usize,
+        ) -> crate::commands::ctx::event::StructuralContext {
+            crate::commands::ctx::event::StructuralContext::default()
+        }
+
+        fn compact_command(&self) -> Option<&'static str> {
+            None
+        }
+
+        fn quit_sequence(&self) -> &'static str {
+            ""
+        }
+
+        fn capabilities(&self) -> crate::commands::ctx::event::Capabilities {
+            crate::commands::ctx::event::Capabilities::default()
+        }
+
+        fn register_turn_signal(
+            &self,
+            _session: &crate::commands::ctx::event::SessionRef,
+            _socket: &std::path::Path,
+        ) -> crate::commands::ctx::adapters::TurnSignalSetup {
+            crate::commands::ctx::adapters::TurnSignalSetup {
+                env: Vec::new(),
+                instructions: String::new(),
+            }
+        }
+    }
+
+    /// Track C (#383), the pacing-rule check the deliverable calls for: a
+    /// provider slug with no usage collector file -- everything but
+    /// anthropic/openai today, including whatever `provider_for_model`
+    /// resolves a multi-provider adapter's pinned model to -- must fall
+    /// through this exact same "no window data" blind path
+    /// (`has_no_usage_source`, above) and never sleep on a window reset.
+    /// `wait_for_window` never sees the adapter itself (every caller already
+    /// resolves a provider slug before calling it), so this feeds it exactly
+    /// what a rewired call site (`exec.rs`/`run_loop.rs`/`wrap.rs`) would
+    /// now pass: `adapter.provider_for_model(Some(pinned_model))`.
+    #[test]
+    fn a_multi_provider_adapters_resolved_provider_falls_through_to_the_blind_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let clock = FakeClock::new(NOW);
+        let mut out = Vec::new();
+        let mut flags = PaceGateFlags::default();
+        let cfg = PaceConfig::default();
+        let adapter = MultiProviderStubAdapter;
+
+        let provider = adapter.provider_for_model(Some("google/gemini-3-pro"));
+        assert_eq!(provider, "google", "sanity: this is the seam under test");
+
+        let outcome = wait_for_window(
+            &mut out,
+            &state,
+            &cfg,
+            "loop",
+            "sess",
+            &|| *clock.now.borrow(),
+            &|d| {
+                clock.slept.borrow_mut().push(d.as_secs());
+                *clock.now.borrow_mut() += d.as_secs();
+            },
+            None,
+            provider,
+            PaceGate {
+                use_credits: false,
+                poller: None,
+                initial_launch: false,
+            },
+            &mut flags,
+        );
+
+        assert_eq!(
+            outcome.waited_secs, cfg.blind_delay_secs,
+            "the bounded blind delay, never a window-reset wait"
+        );
+        assert_eq!(outcome.source, Source::None);
+        assert_eq!(
+            clock.slept.borrow().as_slice(),
+            &[cfg.blind_delay_secs],
+            "exactly one bounded sleep, not a wait for google's own reset"
+        );
+    }
+
     /// Item 1: a machine with no collector at all (no statusline tee, no
     /// working poll) but a configured estimator budget must not take the
     /// no-usage-source early return -- that would silently disable
