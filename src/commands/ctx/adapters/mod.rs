@@ -4,6 +4,7 @@ use std::process::Command;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
+pub mod droid;
 pub mod gemini;
 pub mod opencode;
 pub mod pi;
@@ -2501,6 +2502,10 @@ fn make_copilot(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(copilot::CopilotAdapter::new(bin))
 }
 
+fn make_droid(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(droid::DroidAdapter::new(bin))
+}
+
 fn make_gemini(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(gemini::GeminiAdapter::new(bin))
 }
@@ -2522,6 +2527,7 @@ pub const ADAPTERS: &[(&str, AdapterCtor)] = &[
     ("claude", make_claude),
     ("codex", make_codex),
     ("copilot", make_copilot),
+    ("droid", make_droid),
     ("gemini", make_gemini),
     ("opencode", make_opencode),
     ("pi", make_pi),
@@ -5785,7 +5791,7 @@ mod tests {
         let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
-            vec!["claude", "codex", "copilot", "gemini", "opencode", "pi"]
+            vec!["claude", "codex", "copilot", "droid", "gemini", "opencode", "pi"]
         );
     }
 
