@@ -9803,6 +9803,13 @@ pub fn run_dashboard(
     // its own stashes nothing and still starts.
     let _ = term::stash_current_console();
     let _ = term::install_console_restore_handler();
+    // Issue #330: from here on this thread IS the dashboard -- it reads the
+    // operator's keys and paints every frame -- so it is raised above the
+    // below-normal build work the panes it supervises are running. The
+    // dashboard's own PROCESS class stays untouched (see `priority::Posture`):
+    // a worker pane's child is lowered individually at its spawn, precisely
+    // so this UI never has to lower itself to lower them.
+    super::priority::raise_current_thread();
     if let Err(e) = enable_raw_mode() {
         abort_setup(&mut panes, cfg, &requests_dir);
         restore_panic_hook(&previous_panic_hook);
