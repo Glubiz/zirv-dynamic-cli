@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-06
+last-verified: 2026-09-07
 ---
 
 # Untrusted Configuration
@@ -272,6 +272,10 @@ This was probed against the installed Claude Code CLI (2.1.220), not assumed —
 `CodexAdapter::distiller_cmd` pins `--sandbox read-only`, Codex's analogue of Claude's `--disallowedTools=...` pin. For normal direct launches, Codex now also has a verified per-run prompt mechanism: `-c developer_instructions=<TOML string>`, documented by Codex's public config schema as a developer-role message. `AgentAdapter::system_prompt_supported(launch)` narrows that capability for Windows `.cmd`/`.ps1` shell-shim launches: repository-authored prompt text is never placed on an argv that a shell reparses, so those launches retain the previous fallback/withhold behavior rather than weakening the command-injection boundary. `collect_surfaces` continues to read the repo/nested AGENTS.md hierarchy and Codex config independently for analysis.
 
 **Codex's interactive approval posture is entirely operator-owned (issue #222, v3.5.0).** `~/.codex/config.toml`'s `approval_policy` key sits in the same "operator reads, zirv never writes" trust bucket as claude's `.claude/settings.json`: `adapters::codex::resolve_codex_approval_posture` reads it best-effort (never `Some` on any doubt) purely to advise, never to gate — `wrap::run_with` emits a one-time `zirv ▸` advisory when the posture reads `untrusted`, and zirv never rewrites the file. Codex has no verified per-command approval hook the way claude's `PreToolUse` gives it, so there is no mechanism here to pre-approve anything against, unlike #224's claude built-in partition. See [[Ctx Adapters]] and [[Command Safety]].
+
+### OpenCode's own repo config can widen an adapter-injected agent (issue #385, 2026-09-07)
+
+`OpenCodeAdapter` delivers a per-launch system-prompt override and its read-only permission map through a zirv-owned agent definition, materialized to a JSON file pointed at by the `OPENCODE_CONFIG` environment variable — the only delivery channel OpenCode exposes for this at all (there is no `--config <path>` CLI flag upstream). OpenCode's own config loader (`config.ts`) merges layers in a fixed order: `global config -> OPENCODE_CONFIG flag -> project config`. A repository's own committed `opencode.json` is that project config, so it loads AFTER zirv's `OPENCODE_CONFIG` layer and can redefine the exact same agent name zirv just configured — overriding the read-only permission deny or the injected system prompt zirv set for a distiller/reviewer/read-only worker launch. This is the one wave-1/2 adapter delivery mechanism that can currently be WIDENED by repo-owned config rather than only narrowed, the opposite of the fold every other surface on this page enforces; see [[Known Issues]] for the open residual and [[Ctx Adapters]]'s opencode section for the verified merge-order citation.
 
 ### The canonical `.zirv/context/` layer
 
