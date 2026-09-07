@@ -8,9 +8,12 @@
 //! `docs/obsidian/Development/Known Issues.md`), but it is a real,
 //! zero-cost mitigation.
 //!
-//! Guarded on `CARGO_CFG_TARGET_OS` rather than `#[cfg(windows)]` so a
-//! cross-compile (building a Windows target from a non-Windows host, or
-//! vice versa) is driven by the *target*, not the host running `cargo`.
+//! Two guards: `CARGO_CFG_TARGET_OS` picks the *target* (a Windows host
+//! building a non-Windows target embeds nothing), and `#[cfg(windows)]` on
+//! the embedder matches the `winresource` build-dependency, which Cargo
+//! resolves for the *host* -- so a Windows exe cross-compiled from Linux or
+//! macOS ships without the resource rather than failing to build. Release
+//! artifacts are built natively on a Windows runner (`cd.yaml`).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
