@@ -6317,6 +6317,12 @@ fn fulfill_spawn_request(
     // already satisfied -- and `--max-tool-calls` is reported just below
     // rather than enforced, because a pane has no verified tool-call counter.
     pane.set_timeout(Instant::now(), req.timeout_secs);
+    if let Some(warning) = super::agent::codex_read_only_build_warning(adapter.name(), req.mode) {
+        push_error(
+            errors,
+            format!("pane '{}' ({}): {warning}", pane.title(), pane.short()),
+        );
+    }
     if let Some(calls) = req.max_tool_calls {
         push_error(
             errors,

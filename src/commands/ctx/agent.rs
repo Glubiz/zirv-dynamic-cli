@@ -141,8 +141,9 @@ pub struct AgentArgs {
     /// for the worker's whole lifetime, exclusive per checkout (see
     /// `--worktree` below); `read-only` never takes one. Travels on the
     /// `Delegation` row this run logs (`log::Delegation::mode`); the
-    /// workflow engine's own auto-spawned review/test/verify workers are
-    /// always `read-only` (`workflow::engine::auto_spawn_decision`).
+    /// workflow engine classifies Review as `read-only` and Test/Verify as
+    /// `writing` (`workflow::engine::auto_spawn_decision`). Codex read-only
+    /// denies build artifact and cache writes, so build/test commands fail.
     #[arg(long, value_enum, default_value_t = WorkerMode::Writing)]
     pub mode: WorkerMode,
     /// Issue #267: allocates a fresh `git worktree add` sibling of `repo` at
@@ -745,6 +746,17 @@ fn warn_about_paths_outside_launch_repo(prompt: &str, launch_repo: &Path, home: 
             launch_repo.display()
         );
     }
+}
+
+pub(super) fn codex_read_only_build_warning(
+    adapter_name: &str,
+    mode: WorkerMode,
+) -> Option<&'static str> {
+    (adapter_name.eq_ignore_ascii_case("codex") && mode == WorkerMode::ReadOnly).then_some(
+        "codex --sandbox read-only denies every write, including target/ and cargo's registry cache, \
+         so build/test commands fail in this seat; for a seat that must compile use the default \
+         writing mode with a brief that forbids source edits",
+    )
 }
 
 /// Issue #364: Codex's Windows sandbox denies the resolved linked-worktree
@@ -3114,7 +3126,9 @@ pub fn run_with<W: Write>(
     };
 
     // Warn after harness routing and before the pane/headless fork.
-    if cfg!(windows)
+    if let Some(warning) = codex_read_only_build_warning(&args.name, args.mode) {
+        eprintln!("zirv ctx agent: {warning}");
+    } else if cfg!(windows)
         && args.name.eq_ignore_ascii_case("codex")
         && let Some(warning) = codex_worktree_sandbox_warning(
             &args.name,
@@ -6376,6 +6390,27 @@ mod tests {
             repo.to_path_buf(),
             "no --workdir is today's unchanged behaviour"
         );
+    }
+
+    #[test]
+    fn codex_read_only_build_warning_only_warns_for_codex_read_only() {
+        for name in ["codex", "CODEX"] {
+            assert_eq!(
+                codex_read_only_build_warning(name, WorkerMode::ReadOnly),
+                Some(
+                    "codex --sandbox read-only denies every write, including target/ and cargo's registry cache, \
+                     so build/test commands fail in this seat; for a seat that must compile use the default \
+                     writing mode with a brief that forbids source edits"
+                )
+            );
+            assert_eq!(
+                codex_read_only_build_warning(name, WorkerMode::Writing),
+                None
+            );
+        }
+        for mode in [WorkerMode::ReadOnly, WorkerMode::Writing] {
+            assert_eq!(codex_read_only_build_warning("claude", mode), None);
+        }
     }
 
     #[test]

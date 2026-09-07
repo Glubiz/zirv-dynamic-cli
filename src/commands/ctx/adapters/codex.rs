@@ -1345,6 +1345,9 @@ impl AgentAdapter for CodexAdapter {
     ///
     /// - **Repo filesystem writes** are `Degraded` at `Deny`: read-only really
     ///   does block writes inside the repo, just not by denying any tool.
+    ///   Verified on macOS with codex-cli 0.153.4 (2026-09-07): read-only
+    ///   denies `target/` and `~/.cargo` writes, so compiling is impossible;
+    ///   builds need `workspace-write` with those paths in its writable roots.
     /// - **Writes outside the repo** are `Degraded` at `Deny` the same way,
     ///   via `--sandbox workspace-write` (writes confined to the workspace).
     ///
