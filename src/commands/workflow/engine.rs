@@ -2876,13 +2876,9 @@ fn format_wall_clock(ms: u64) -> String {
 pub(crate) struct AutoSpawn {
     pub phase: WorkflowPhase,
     pub argv: Vec<String>,
-    /// Issue #267: every phase [`auto_spawn_decision`] can currently produce
-    /// an `AutoSpawn` for -- Review, Test, Verify -- is `read-only`: none of
-    /// `workflow review run`/`test changed`/`verify` needs to edit the
-    /// checkout to do its job. An eventual implement-step auto-spawn (not
-    /// yet wired here) is `writing` by [`crate::commands::ctx::permit::
-    /// WorkerMode`]'s own default, so this field only ever needs to name the
-    /// exception, not the rule.
+    /// Review is read-only; Test and Verify need writing mode for build
+    /// artifacts and caches. Not yet consumed by `spawn_auto_worker`, which
+    /// launches zirv subprocesses directly rather than delegating workers.
     pub mode: crate::commands::ctx::permit::WorkerMode,
     /// Issue #264: the task class this auto-spawn's own work is, alongside
     /// `mode` above -- for a future caller that threads it onto the
@@ -2961,12 +2957,14 @@ pub(crate) fn auto_spawn_decision(
         WorkflowPhase::Verify => vec!["verify".to_string(), "--repo".to_string(), repo],
         _ => unreachable!("filtered above"),
     };
-    // Issue #267: review/test/verify spawns are all read-only -- see
-    // `AutoSpawn::mode`'s own doc comment.
     Ok(AutoSpawn {
         phase,
         argv,
-        mode: crate::commands::ctx::permit::WorkerMode::ReadOnly,
+        mode: if phase == WorkflowPhase::Review {
+            crate::commands::ctx::permit::WorkerMode::ReadOnly
+        } else {
+            crate::commands::ctx::permit::WorkerMode::Writing
+        },
         // Issue #264: Review is its own class; Test and Verify are both
         // "did the checkout pass" work, so both map to `TaskClass::Test`.
         task_class: match phase {
@@ -3927,8 +3925,8 @@ mod tests {
         assert_eq!(test.phase, WorkflowPhase::Test);
         assert_eq!(
             test.mode,
-            crate::commands::ctx::permit::WorkerMode::ReadOnly,
-            "issue #267: a test spawn is read-only"
+            crate::commands::ctx::permit::WorkerMode::Writing,
+            "issue #371: a test spawn needs to write build artifacts and caches"
         );
         assert_eq!(
             test.task_class,
@@ -3955,8 +3953,8 @@ mod tests {
         assert_eq!(verify.phase, WorkflowPhase::Verify);
         assert_eq!(
             verify.mode,
-            crate::commands::ctx::permit::WorkerMode::ReadOnly,
-            "issue #267: a verify spawn is read-only"
+            crate::commands::ctx::permit::WorkerMode::Writing,
+            "issue #371: a verify spawn needs to write build artifacts and caches"
         );
         assert_eq!(
             verify.task_class,
