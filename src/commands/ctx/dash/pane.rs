@@ -712,30 +712,38 @@ fn scroll_parser(parser: &mut vt100::Parser, delta: isize) -> ScrollOutcome {
     }
 }
 
-/// The most bytes one [`Pane::drain`] feeds the vt100 parser before it yields
-/// back to the event loop (M10). 256 KiB is many screens' worth of output --
-/// far more than a redraw ever shows -- so a normal burst still drains in one
-/// call, while a firehose (`cat big.log`) is bounded to this per tick.
-const DRAIN_BUDGET_BYTES: usize = 256 * 1024;
+/// The most bytes one tick feeds the vt100 parsers before it yields back to
+/// the event loop (M10). 256 KiB is many screens' worth of output -- far more
+/// than a redraw ever shows -- so a normal burst still drains in one call,
+/// while a firehose (`cat big.log`) is bounded to this per tick.
+///
+/// Issue #330: this is the budget for the whole tick, shared across every
+/// pane (`dash::drain_shared_budget`), not one each. Per pane it meant eight
+/// workers streaming could put 2 MiB of vt100 parsing between a keystroke and
+/// the `event::poll` that would have read it.
+pub(crate) const DRAIN_BUDGET_BYTES: usize = 256 * 1024;
 
 /// Pure-ish: pumps queued messages from `rx` into `parser` until either the
 /// channel is empty or `budget` bytes have been processed. Returns
-/// `(any, more)` -- whether anything was processed, and whether the budget cut
-/// the drain short (bytes may still be queued). Separated from [`Pane::drain`]
-/// so the budget behaviour is testable against a plain `mpsc` channel without
-/// a real pty child.
+/// `(any, more, used)` -- whether anything was processed, whether the budget
+/// cut the drain short (bytes may still be queued), and how much of the budget
+/// this call actually spent, which is what lets the caller share one budget
+/// across panes. Separated from [`Pane::drain_with_budget`] so the budget
+/// behaviour is testable against a plain `mpsc` channel without a real pty
+/// child.
 fn drain_into(
     rx: &mpsc::Receiver<Vec<u8>>,
     parser: &mut vt100::Parser,
     budget: usize,
-) -> (bool, bool) {
+) -> (bool, bool, usize) {
     let mut processed = 0usize;
     let mut any = false;
     loop {
         if processed >= budget {
             // Stopped on the budget, not on an empty channel: treat as
-            // "more may remain" so the loop returns here next tick.
-            return (any, true);
+            // "more may remain" so the loop returns here next tick. Nothing
+            // is dropped -- what is left stays queued exactly as it was.
+            return (any, true, processed);
         }
         match rx.try_recv() {
             Ok(bytes) => {
@@ -744,7 +752,7 @@ fn drain_into(
                 any = true;
             }
             // Empty or Disconnected: nothing more to take right now.
-            Err(_) => return (any, false),
+            Err(_) => return (any, false, processed),
         }
     }
 }
@@ -1255,8 +1263,24 @@ impl Pane {
     /// under it -- see `dash::output_cancels_selection` -- without a second,
     /// separate probe of whether this call did anything.
     pub fn drain(&mut self) -> (bool, bool) {
+        let (any, more, _used) = self.drain_with_budget(DRAIN_BUDGET_BYTES);
+        (any, more)
+    }
+
+    /// [`Pane::drain`] with the caller's own share of this tick's budget, also
+    /// reporting how many bytes it spent.
+    ///
+    /// Issue #330: the event loop hands out one [`DRAIN_BUDGET_BYTES`] across
+    /// all panes per tick (`dash::drain_shared_budget`) instead of that much
+    /// to each, so a busy dashboard's parsing cost -- which is keystroke
+    /// latency, since the tick reaches `event::poll` only afterwards -- no
+    /// longer scales with the number of workers. A pane handed a budget of
+    /// zero still polls its child's exit status and still retires a
+    /// signal-less pane's turn flags; only the parsing waits for the next
+    /// tick, with every unparsed byte left queued exactly where it was.
+    pub fn drain_with_budget(&mut self, budget: usize) -> (bool, bool, usize) {
         self.poll_exit();
-        let (any, more) = drain_into(&self.rx, &mut self.parser, DRAIN_BUDGET_BYTES);
+        let (any, more, used) = drain_into(&self.rx, &mut self.parser, budget);
         if any {
             // O1: recorded, not acted on. Whether these bytes mean "a new turn
             // started" or "the harness repainted the one that just ended" is
@@ -1301,7 +1325,7 @@ impl Pane {
             self.injected_awaiting_turn = false;
             self.user_typed_since_turn = false;
         }
-        (any, more)
+        (any, more, used)
     }
 
     /// The current screen, for `dash::ui`'s renderers. Already reflects this
@@ -5463,8 +5487,13 @@ pub(crate) mod tests {
             tx.send(b"abcd".to_vec()).expect("send");
         }
         let mut parser = vt100::Parser::new(4, 40, 0);
-        let (any, more) = drain_into(&rx, &mut parser, 10);
+        let (any, more, used) = drain_into(&rx, &mut parser, 10);
         assert!(any, "some bytes were processed");
+        assert_eq!(
+            used, 12,
+            "the spend it reports back is what it actually parsed, so a caller \
+             sharing one budget across panes can subtract it"
+        );
         assert!(
             more,
             "the budget cut the drain short with bytes still queued"
@@ -5479,16 +5508,18 @@ pub(crate) mod tests {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         tx.send(b"hi".to_vec()).expect("send");
         let mut parser = vt100::Parser::new(4, 40, 0);
-        let (any, more) = drain_into(&rx, &mut parser, 1024);
+        let (any, more, used) = drain_into(&rx, &mut parser, 1024);
         assert!(any);
+        assert_eq!(used, 2);
         assert!(
             !more,
             "an emptied channel under budget has nothing remaining"
         );
 
         drop(tx);
-        let (any2, more2) = drain_into(&rx, &mut parser, 1024);
+        let (any2, more2, used2) = drain_into(&rx, &mut parser, 1024);
         assert!(!any2 && !more2, "a drained, closed channel is quiet");
+        assert_eq!(used2, 0);
     }
 
     /// M9: the batched-shutdown primitives -- ask to quit without waiting, then
