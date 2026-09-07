@@ -3456,6 +3456,13 @@ pub fn command_matches_adapter(
 /// (same issue, the other half: eligibility says a linked worktree pane may
 /// run, this says its shared git dir must actually be writable once it does).
 pub(crate) fn git_common_dir(path: &Path) -> Option<PathBuf> {
+    git_dirs(path).map(|(_, common_dir)| common_dir)
+}
+
+/// The canonicalised working-tree git dir and shared common dir, resolved
+/// in one git invocation with the same environment isolation as `git_common_dir`.
+/// An unresolvable own gitdir falls back to the common dir, preserving common-dir lookup.
+pub(crate) fn git_dirs(path: &Path) -> Option<(PathBuf, PathBuf)> {
     let output = std::process::Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
@@ -3464,6 +3471,7 @@ pub(crate) fn git_common_dir(path: &Path) -> Option<PathBuf> {
         .arg("-C")
         .arg(path)
         .arg("rev-parse")
+        .arg("--git-dir")
         .arg("--git-common-dir")
         .output()
         .ok()?;
@@ -3471,17 +3479,17 @@ pub(crate) fn git_common_dir(path: &Path) -> Option<PathBuf> {
         return None;
     }
     let raw = String::from_utf8_lossy(&output.stdout);
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let candidate = PathBuf::from(raw);
-    let resolved = if candidate.is_absolute() {
-        candidate
-    } else {
-        path.join(candidate)
+    let mut lines = raw.lines();
+    let resolve = |raw: &str| {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        std::fs::canonicalize(path.join(raw)).ok()
     };
-    std::fs::canonicalize(&resolved).ok()
+    let git_dir = resolve(lines.next()?);
+    let common_dir = resolve(lines.next()?)?;
+    Some((git_dir.unwrap_or_else(|| common_dir.clone()), common_dir))
 }
 
 #[cfg(test)]

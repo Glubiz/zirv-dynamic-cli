@@ -1631,11 +1631,16 @@ impl AgentAdapter for CodexAdapter {
     /// `.git` was "already covered" by the cwd root was the bug. `mail_dir`
     /// is always added too: it sits under the state root, always outside
     /// `cwd`, regardless of worktree shape.
+    /// A linked worktree's own git dir is also named explicitly (#364),
+    /// since Codex can protect the directory its `.git` file points to.
     fn extra_writable_root_args(&self, cwd: &Path, mail_dir: &Path) -> Vec<String> {
         let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let mut roots: Vec<PathBuf> = Vec::new();
-        if let Some(git_dir) = super::git_common_dir(&cwd) {
-            roots.push(git_dir);
+        if let Some((git_dir, common_dir)) = super::git_dirs(&cwd) {
+            roots.push(common_dir);
+            if !roots.contains(&git_dir) {
+                roots.push(git_dir);
+            }
         }
         let mail_dir = mail_dir.to_path_buf();
         if !roots.contains(&mail_dir) {
@@ -3613,6 +3618,50 @@ mod tests {
         );
     }
 
+    fn init_linked_worktree(main_repo: &Path, linked_path: &Path) {
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(main_repo)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "test"]);
+        run_git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+        run_git(&["worktree", "add", linked_path.to_str().expect("utf8 path")]);
+        assert!(linked_path.join(".git").is_file());
+    }
+
+    /// Issue #364: the gitdir behind a linked worktree's `.git` pointer
+    /// must be named separately from its shared common dir.
+    #[test]
+    fn extra_writable_root_args_adds_the_own_git_dir_for_a_linked_worktree() {
+        let main_repo = tempfile::tempdir().expect("tempdir");
+        let linked = tempfile::tempdir().expect("tempdir");
+        let linked_path = linked.path().join("worktree");
+        init_linked_worktree(main_repo.path(), &linked_path);
+
+        let common_dir = std::fs::canonicalize(main_repo.path().join(".git")).expect("common dir");
+        let git_dir = std::fs::canonicalize(common_dir.join("worktrees/worktree")).expect("gitdir");
+        let mail_dir = linked.path().join("mail");
+        let args = CodexAdapter::new(None).extra_writable_root_args(&linked_path, &mail_dir);
+        assert_eq!(
+            args,
+            vec![
+                "-c".to_string(),
+                format!(
+                    "sandbox_workspace_write.writable_roots=[{},{},{}]",
+                    toml_quoted_string(&common_dir.display().to_string()),
+                    toml_quoted_string(&git_dir.display().to_string()),
+                    toml_quoted_string(&mail_dir.display().to_string()),
+                ),
+            ],
+        );
+    }
+
     /// The regression this round fixes, exercised end to end through the
     /// real guard rather than only inspecting `toml_quoted_string`'s output
     /// (2026-08-26): `extra_writable_root_args`'s own argv, appended after a
@@ -3625,23 +3674,22 @@ mod tests {
     #[test]
     fn no_extra_writable_root_arg_ever_trips_the_cmd_shim_reparse_guard() {
         let repo = tempfile::tempdir().expect("tempdir");
-        std::process::Command::new("git")
-            .arg("init")
-            .arg("-q")
-            .arg(repo.path())
-            .status()
-            .expect("git init");
+        let linked = tempfile::tempdir().expect("tempdir");
+        let linked_path = linked.path().join("worktree");
+        init_linked_worktree(repo.path(), &linked_path);
         let state_root = tempfile::tempdir().expect("tempdir");
         let mail_dir = state_root.path().join("mail");
 
         let adapter = CodexAdapter::new(None);
-        let extra = adapter.extra_writable_root_args(repo.path(), &mail_dir);
-        assert!(!extra.is_empty(), "the mail root alone must still add args");
+        for cwd in [repo.path(), linked_path.as_path()] {
+            let extra = adapter.extra_writable_root_args(cwd, &mail_dir);
+            assert!(!extra.is_empty(), "the mail root alone must still add args");
 
-        let mut shim_args = vec!["/c".to_string(), "codex.cmd".to_string()];
-        shim_args.extend(extra);
-        crate::commands::ctx::adapters::guard_cmd_shim_reparse("cmd.exe", &shim_args)
-            .expect("extra_writable_root_args must never trip the cmd-shim reparse guard");
+            let mut shim_args = vec!["/c".to_string(), "codex.cmd".to_string()];
+            shim_args.extend(extra);
+            crate::commands::ctx::adapters::guard_cmd_shim_reparse("cmd.exe", &shim_args)
+                .expect("extra_writable_root_args must never trip the cmd-shim reparse guard");
+        }
     }
 
     /// Issue "codex approval hell" (2026-08-26): an operator's own `-c

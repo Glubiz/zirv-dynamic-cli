@@ -747,6 +747,27 @@ fn warn_about_paths_outside_launch_repo(prompt: &str, launch_repo: &Path, home: 
     }
 }
 
+/// Issue #364: Codex's Windows sandbox denies the resolved linked-worktree
+/// gitdir even when it is covered by the writable roots.
+fn codex_worktree_sandbox_warning(
+    adapter_name: &str,
+    git_dirs: Option<(PathBuf, PathBuf)>,
+    windows: bool,
+) -> Option<String> {
+    if !windows || !adapter_name.eq_ignore_ascii_case("codex") {
+        return None;
+    }
+    let (git_dir, common_dir) = git_dirs?;
+    if git_dir == common_dir {
+        return None;
+    }
+    Some(format!(
+        "warning: codex's Windows sandbox denies writes to the worktree gitdir {}; the worker \
+         can build and test but not stage or commit -- leave commits to the orchestrator",
+        git_dir.display()
+    ))
+}
+
 /// The soft threshold, as a fraction of a budget. At or above it the worker
 /// is nudged to wrap up and checkpoint while it still has room to write a
 /// usable result; at the budget itself it is stopped.
@@ -3081,6 +3102,18 @@ pub fn run_with<W: Write>(
             super::group::discard_if_unused(&state, id);
         }
     };
+
+    // Warn after harness routing and before the pane/headless fork.
+    if cfg!(windows)
+        && args.name.eq_ignore_ascii_case("codex")
+        && let Some(warning) = codex_worktree_sandbox_warning(
+            &args.name,
+            adapters::git_dirs(&effective_launch_repo(args.workdir.as_deref(), repo)),
+            cfg!(windows),
+        )
+    {
+        eprintln!("{warning}");
+    }
 
     // 2026-09-06: there is no opt-out any more. A delegation is a visible
     // pane whenever any live dashboard can host it, and the supervised child
@@ -6335,6 +6368,59 @@ mod tests {
             effective_launch_repo(None, repo),
             repo.to_path_buf(),
             "no --workdir is today's unchanged behaviour"
+        );
+    }
+
+    #[test]
+    fn codex_worktree_sandbox_warning_only_warns_for_codex_on_windows_in_a_linked_worktree() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "test"]);
+        run_git(&["commit", "--allow-empty", "-q", "-m", "init"]);
+        let linked = tempfile::tempdir().expect("tempdir");
+        let linked_path = linked.path().join("worktree");
+        run_git(&["worktree", "add", linked_path.to_str().expect("utf8 path")]);
+        let dirs = adapters::git_dirs(&linked_path).expect("linked git dirs");
+        assert_eq!(
+            codex_worktree_sandbox_warning("codex", Some(dirs.clone()), true),
+            Some(format!(
+                "warning: codex's Windows sandbox denies writes to the worktree gitdir {}; the worker \
+                 can build and test but not stage or commit -- leave commits to the orchestrator",
+                dirs.0.display()
+            ))
+        );
+        assert_eq!(
+            codex_worktree_sandbox_warning("codex", Some(dirs.clone()), false),
+            None
+        );
+        assert_eq!(
+            codex_worktree_sandbox_warning("claude", Some(dirs), true),
+            None
+        );
+        assert_eq!(codex_worktree_sandbox_warning("codex", None, true), None);
+    }
+
+    #[test]
+    fn codex_worktree_sandbox_warning_is_silent_for_a_main_checkout() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert!(git_init(repo.path()), "git init");
+        let dirs = adapters::git_dirs(repo.path()).expect("main git dirs");
+        assert_eq!(
+            codex_worktree_sandbox_warning("codex", Some(dirs), true),
+            None
         );
     }
 
