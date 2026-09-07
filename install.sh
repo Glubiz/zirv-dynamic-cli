@@ -45,6 +45,37 @@ detect_platform() {
     esac
 }
 
+verify_checksum() {
+    tmpdir="$1"
+    archive="$2"
+    url="$3"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        checker="sha256sum -c"
+    elif command -v shasum >/dev/null 2>&1; then
+        checker="shasum -a 256 -c"
+    else
+        echo "Warning: neither sha256sum nor shasum is available; skipping checksum verification." >&2
+        return 0
+    fi
+
+    checksum_url="${url}.sha256"
+    echo "Downloading ${checksum_url}..."
+    if ! curl -sSfL -o "${tmpdir}/${archive}.sha256" "$checksum_url"; then
+        echo "Error: this release does not publish a checksum for ${archive} (${checksum_url})." >&2
+        echo "Refusing to install an unverified download. Pass a version that publishes one:" >&2
+        echo "  https://github.com/${REPO}/releases" >&2
+        exit 1
+    fi
+
+    if ! ( cd "$tmpdir" && $checker "${archive}.sha256" ); then
+        echo "Error: checksum verification failed for ${archive}." >&2
+        echo "The download may be corrupted or tampered with -- not installing it." >&2
+        exit 1
+    fi
+    echo "Checksum verified."
+}
+
 main() {
     VERSION="${1:-$(get_latest_version)}"
     if [ -z "$VERSION" ]; then
@@ -67,6 +98,8 @@ main() {
         echo "Check that v${VERSION} exists: https://github.com/${REPO}/releases" >&2
         exit 1
     }
+
+    verify_checksum "$TMPDIR" "$ARCHIVE" "$URL"
 
     echo "Extracting..."
     tar -xzf "${TMPDIR}/${ARCHIVE}" -C "$TMPDIR"
