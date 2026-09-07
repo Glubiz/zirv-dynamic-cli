@@ -169,15 +169,10 @@ fn run_supervised(agent: &str, prompt: &str, flags: &[String], repo: &Path) -> R
     use crate::commands::ctx::event::SessionId;
     use crate::commands::ctx::exec::{self, ExecArgs};
 
-    // Issue #330: a script `agent:` step is a delegated worker session driven
-    // in-process, so from here on this script-runner process is a worker
-    // supervisor and takes the worker posture -- applied before the adapter
-    // is even selected, i.e. well before the harness child (and the cargo
-    // runs under it) inherit a class from it. See `ctx::priority`.
-    crate::commands::ctx::priority::apply_process(crate::commands::ctx::priority::posture_for(
-        crate::commands::ctx::prompt::PromptRole::Worker,
-    ));
-
+    // Issue #330: the worker posture for a script `agent:` step is applied at
+    // the process's own dispatch (`main`, gated on `Script::has_agent_step`),
+    // not here -- this function is driven in-process by unit tests, which
+    // must never lower the test binary they run in.
     let env = env_from_process();
     let cfg = CtxConfig::load(repo, &env).map_err(|e| e.to_string())?;
     // Selecting the adapter here (rather than deferring entirely to `exec::run_with`)

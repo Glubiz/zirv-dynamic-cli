@@ -3585,18 +3585,6 @@ fn supervise_run(
 }
 
 pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
-    // Issue #330: `exec` is a delegated session by construction (see this
-    // module's own `PromptRole::Worker` stamps below -- there is no role
-    // parameter to get wrong), so this whole process takes the worker
-    // posture. Applied at the CLI entry, before any child exists: the
-    // lowered class is inherited by the harness this supervises and, in
-    // turn, by the cargo processes that harness runs -- which is the point.
-    // Placed here rather than inside `run_with`/`run_with_clock_inner` so
-    // that a caller which merely *drives* the supervisor in-process (the
-    // unit tests) does not lower a process it does not own.
-    super::priority::apply_process(super::priority::posture_for(
-        super::prompt::PromptRole::Worker,
-    ));
     let repo = std::env::current_dir()?;
     let ambient = env_from_process();
     // Issue #249/#250 review: this is a DIRECT CLI entry, not a supervisor

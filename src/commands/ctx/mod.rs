@@ -566,6 +566,26 @@ pub fn dispatch(args: &[String]) -> i32 {
         }
     };
 
+    // Issue #330: the one place a `zirv ctx` PROCESS learns which kind of
+    // session it is about to become, and the last one before any of it runs.
+    // `exec`, `loop` and `agent` are the three verbs that supervise delegated
+    // work (`PromptRole::Worker` throughout those modules -- none of them
+    // takes a role parameter to get wrong), so this process takes the worker
+    // posture here and every child it goes on to spawn, harness and cargo
+    // alike, inherits it. `zirv agent ...` and `zirv chat` arrive here too:
+    // `main`'s top-level aliases rewrite argv and route through this same
+    // dispatch. Deliberately at the dispatch rather than inside those
+    // modules' own `run()` functions -- unit tests call those directly, and a
+    // test binary must never lower a process it does not own. `wrap`/`chat`
+    // are not listed: the interactive posture belongs to the launch itself
+    // (see `wrap::run_with`) and only ever raises a thread.
+    if matches!(
+        &cli.verb,
+        CtxVerb::Exec(_) | CtxVerb::Loop(_) | CtxVerb::Agent(_)
+    ) {
+        priority::apply_process(priority::posture_for(prompt::PromptRole::Worker));
+    }
+
     let mut out = std::io::stdout();
     let result = match &cli.verb {
         CtxVerb::Config(a) => config_cmd::run(a, &mut out),

@@ -19,6 +19,22 @@ pub struct Script {
 }
 
 impl Script {
+    /// Whether any step of this script delegates to a supervised agent.
+    ///
+    /// Issue #330: an `agent:` step runs its supervisor IN this process, so a
+    /// script that has one makes the whole script-runner process a worker
+    /// supervisor -- and the harness it spawns, plus every cargo run under
+    /// that harness, inherits this process's scheduling class. `main` asks
+    /// this before it runs the script, which is the only seam on that path
+    /// no unit test drives (`Script::run` and the step's own `execute` are
+    /// both exercised in-process). Pure, so the decision itself stays
+    /// testable without spawning anything.
+    pub fn has_agent_step(&self) -> bool {
+        self.commands
+            .iter()
+            .any(|step| matches!(step, CommandTypes::Agent(_)))
+    }
+
     pub async fn run(
         &self,
         context: &mut HashMap<String, String>,
@@ -278,6 +294,57 @@ mod tests {
         let mut context = HashMap::new();
         let result = script.run(&mut context, true).await;
         assert!(result.is_ok(), "dry run must not execute the agent step");
+    }
+
+    /// Issue #330: `main` lowers the script-runner process's scheduling class
+    /// for a script that delegates to an agent, and only for such a script --
+    /// an ordinary shell script is the operator's own foreground work and
+    /// must keep the class it was launched with.
+    #[test]
+    fn only_a_script_with_an_agent_step_reports_one() {
+        let shell_only = Script {
+            name: "Shell".to_string(),
+            description: None,
+            params: None,
+            secrets: None,
+            commands: vec![CommandTypes::Command(Command {
+                command: "echo hello".to_string(),
+                capture: None,
+                description: None,
+                options: None,
+            })],
+        };
+        assert!(!shell_only.has_agent_step());
+
+        let empty = Script {
+            commands: vec![],
+            ..shell_only.clone()
+        };
+        assert!(!empty.has_agent_step());
+
+        let with_agent = Script {
+            commands: vec![
+                CommandTypes::Command(Command {
+                    command: "echo hello".to_string(),
+                    capture: None,
+                    description: None,
+                    options: None,
+                }),
+                CommandTypes::Agent(AgentCommand {
+                    agent: "claude".to_string(),
+                    prompt: "do the work".to_string(),
+                    flags: None,
+                    description: None,
+                    options: None,
+                    capture: None,
+                }),
+            ],
+            ..shell_only.clone()
+        };
+        assert!(
+            with_agent.has_agent_step(),
+            "an agent step anywhere in the script counts, not just the first"
+        );
     }
 
     #[tokio::test]
