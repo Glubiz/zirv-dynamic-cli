@@ -2954,6 +2954,7 @@ fn reap_ended_panes(
                 ended_meta.exited_at,
             );
         }
+        report_settled_pane(&mut panes[index], state, cfg, errors);
         push_retained_ended(retained, retained_row, MAX_RETAINED_ENDED_ROWS);
         let pane = panes.remove(index);
         // Review finding (2026-09), finding 2a: captured before `pane` is
@@ -8278,9 +8279,14 @@ fn next_deliverable(queue: &mut VecDeque<String>, injectable: bool) -> Option<St
 /// to the agent must not be marked read).
 pub(crate) trait Injector {
     fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()>;
+    fn track_delivery_sender(&mut self, _sender: &str) {}
 }
 
 impl Injector for Pane {
+    fn track_delivery_sender(&mut self, sender: &str) {
+        self.delivery_sender = Some(sessions::short_id(sender));
+    }
+
     fn try_inject(&mut self, label: &str, body: &str) -> CtxResult<()> {
         self.inject_visible(label, body)
     }
@@ -8424,7 +8430,10 @@ fn sweep_one_pane<I: Injector>(
         cap,
     );
     match deliver_and_consume(injector, state, slug, short, &label, &path, &body) {
-        Ok(()) => true,
+        Ok(()) => {
+            injector.track_delivery_sender(&msg.from_session);
+            true
+        }
         Err(e) => {
             push_error(errors, format!("mail sweep: {e}"));
             false
@@ -8734,22 +8743,125 @@ fn deliver_queued_nudges(
 /// tick -- could serially freeze redraw and input for the sum of their
 /// delays (up to ~1.35s across nine panes and three sweeps).
 ///
-/// Called every tick, unthrottled by `FACTS_THROTTLE`: a 50ms deadline has
-/// to be checked far more often than once a second, or an injection would
-/// sit unsubmitted for up to a second past its own deadline. `Pane::
-/// submit_pending` is itself cheap and safe to call on a pane with nothing
-/// pending (a no-op `Ok(())`), and a write that fails simply leaves that
-/// pane's `pending_submit` set for the next tick to retry -- see
-/// `dash::pane::write_submit_cr`'s own doc comment for why a retried lone
-/// `\r` is always safe.
-fn drain_pending_submits(panes: &mut [Pane], errors: &mut ErrorLog) {
+/// Called every tick so echo settling does not wait for the mail sweep's cadence.
+/// A failed write is reported once and cancelled rather than retried indefinitely.
+fn drain_pending_submits(
+    panes: &mut [Pane],
+    errors: &mut ErrorLog,
+    state: &StateDir,
+    cfg: &CtxConfig,
+    notices: &mut Vec<Notice>,
+) {
     let now = Instant::now();
     for pane in panes.iter_mut() {
         if pane.pending_submit_due(now)
             && let Err(e) = pane.submit_pending()
         {
             push_error(errors, format!("submit {}: {e}", pane.short()));
+            pane.cancel_submission();
+            report_unconfirmed_submission(pane, state, cfg, errors, notices, now);
         }
+    }
+}
+
+fn store_pane_system_mail(
+    pane: &Pane,
+    recipient: &str,
+    body: String,
+    state: &StateDir,
+    cfg: &CtxConfig,
+) -> CtxResult<()> {
+    let short = sessions::short_id(recipient);
+    let sender_slug = super::state::repo_slug(pane.cwd());
+    let dest_slug = sessions::load_record(state, &short)
+        .map(|record| record.repo_slug)
+        .unwrap_or_else(|| sender_slug.clone());
+    mail::store_to(
+        state,
+        &dest_slug,
+        &sender_slug,
+        &mail::Message {
+            from_session: pane.short().to_string(),
+            from_agent: "zirv".to_string(),
+            to: "any".to_string(),
+            to_session: Some(short),
+            sent: super::state::now_secs(),
+            body,
+        },
+        cfg,
+    )?;
+    Ok(())
+}
+
+fn confirm_pane_submissions(
+    panes: &mut [Pane],
+    state: &StateDir,
+    cfg: &CtxConfig,
+    errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
+    now: Instant,
+) {
+    for pane in panes {
+        let unconfirmed = match pane.check_submission(now) {
+            Ok(unconfirmed) => unconfirmed,
+            Err(error) => {
+                push_error(errors, format!("submit {}: {error}", pane.short()));
+                true
+            }
+        };
+        if !unconfirmed {
+            continue;
+        }
+        report_unconfirmed_submission(pane, state, cfg, errors, notices, now);
+    }
+}
+
+fn report_unconfirmed_submission(
+    pane: &mut Pane,
+    state: &StateDir,
+    cfg: &CtxConfig,
+    errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
+    now: Instant,
+) {
+    let body = format!(
+        "text was typed into pane {} ({}) but submission is unconfirmed: it may not have been submitted and may need Enter or a resend",
+        pane.short(),
+        pane.agent()
+    );
+    if let Some(sender) = pane.delivery_sender.take()
+        && let Err(error) = store_pane_system_mail(pane, &sender, body.clone(), state, cfg)
+    {
+        push_error(errors, format!("delivery report: {error}"));
+    }
+    push_notice(notices, now, format!("zirv ▸ {body}"));
+}
+
+fn report_settled_pane(pane: &mut Pane, state: &StateDir, cfg: &CtxConfig, errors: &mut ErrorLog) {
+    if pane.verb() != sessions::Verb::Dash || pane.settled_mail_sent {
+        return;
+    }
+    let Some(recipient) = pane.report_to().map(str::to_string) else {
+        return;
+    };
+    let ended = matches!(pane.state(), PaneState::Ended(_));
+    if !ended
+        && super::attention::project(&super::attention::load(state, pane.short()))
+            != super::attention::Projection::DoneUnread
+    {
+        return;
+    }
+    let tail = pane.screen_tail();
+    let outcome = if ended { "ended" } else { "settled" };
+    let body = format!(
+        "pane {} ({}, {}) {outcome} with unread output\n\n{tail}",
+        pane.short(),
+        pane.agent(),
+        pane.cwd().display()
+    );
+    match store_pane_system_mail(pane, &recipient, body, state, cfg) {
+        Ok(()) => pane.settled_mail_sent = true,
+        Err(error) => push_error(errors, format!("settled report: {error}")),
     }
 }
 
@@ -9706,6 +9818,14 @@ pub fn run_dashboard(
         // R2: an exited pane leaves here -- registry record released, socket
         // unpublished, nudge queue dropped -- rather than sitting in the
         // vector as a corpse for the rest of the session.
+        confirm_pane_submissions(
+            &mut panes,
+            state,
+            cfg,
+            &mut errors,
+            &mut notices,
+            Instant::now(),
+        );
         let reap_confirmations = reap_ended_panes(
             &mut panes,
             &mut nudge_queues,
@@ -9826,7 +9946,7 @@ pub fn run_dashboard(
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
         // F1/F2: every tick, not throttled -- see `drain_pending_submits`'s
         // own doc comment.
-        drain_pending_submits(&mut panes, &mut errors);
+        drain_pending_submits(&mut panes, &mut errors, state, cfg, &mut notices);
 
         // Facts + sidebar rows, computed BEFORE input handling: the Nudge
         // dialog's attached-vs-view-only routing and the SelectUp/SelectDown
@@ -9932,6 +10052,9 @@ pub fn run_dashboard(
         // per tick purely to re-render (see its own doc comment), so doing
         // it there would double-fire for the same tick's own transition.
         sync_quiet_heuristic_attention(&panes, state, &mut quiet_lifecycle);
+        for pane in &mut panes {
+            report_settled_pane(pane, state, cfg, &mut errors);
+        }
         let rows = assemble_sidebar(
             &build_pane_rows(&panes, &retained_ended),
             &visible_registry,
@@ -22199,7 +22322,13 @@ mod tests {
         assert!(panes[0].has_pending_submit(), "sanity: a submit is owed");
 
         // Too early: the drain must not touch it yet.
-        drain_pending_submits(&mut panes, &mut errors);
+        drain_pending_submits(
+            &mut panes,
+            &mut errors,
+            &state,
+            &CtxConfig::default(),
+            &mut Vec::new(),
+        );
         assert!(
             panes[0].has_pending_submit(),
             "a pending submit inside its settle gap must not be drained early"
@@ -22209,7 +22338,13 @@ mod tests {
         std::thread::sleep(
             crate::commands::ctx::dash::pane::INJECTION_SUBMIT_DELAY + Duration::from_millis(20),
         );
-        drain_pending_submits(&mut panes, &mut errors);
+        drain_pending_submits(
+            &mut panes,
+            &mut errors,
+            &state,
+            &CtxConfig::default(),
+            &mut Vec::new(),
+        );
         assert!(
             !panes[0].has_pending_submit(),
             "due once the settle gap has actually elapsed"
@@ -22331,6 +22466,216 @@ mod tests {
              signal ever sent"
         );
         pane
+    }
+
+    #[test]
+    fn unconfirmed_mail_submission_notifies_sender_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        let slug = super::super::state::repo_slug(tmp.path());
+        let message = mail::Message {
+            from_session: "aaaa1111".to_string(),
+            from_agent: "claude".to_string(),
+            to: "any".to_string(),
+            to_session: Some(pane.short().to_string()),
+            sent: super::super::state::now_secs(),
+            body: "please continue".to_string(),
+        };
+        let source = mail::store_to(&state, &slug, &slug, &message, &cfg).expect("store");
+        let mut panes = vec![pane];
+        let mut errors = ErrorLog::default();
+        let mut notices = Vec::new();
+        mail_sweep(
+            &mut panes,
+            &cfg,
+            &state,
+            tmp.path(),
+            &mut HashMap::new(),
+            &mut errors,
+        );
+        assert!(!source.exists(), "source is consumed once");
+        panes[0].submit_pending().expect("submit");
+        let now = Instant::now();
+        confirm_pane_submissions(
+            &mut panes,
+            &state,
+            &cfg,
+            &mut errors,
+            &mut notices,
+            now + Duration::from_secs(1),
+        );
+        assert!(
+            mail::list(&state, &slug, None, Some("aaaa1111"))
+                .expect("list")
+                .is_empty()
+        );
+        confirm_pane_submissions(
+            &mut panes,
+            &state,
+            &cfg,
+            &mut errors,
+            &mut notices,
+            now + Duration::from_secs(2),
+        );
+        confirm_pane_submissions(
+            &mut panes,
+            &state,
+            &cfg,
+            &mut errors,
+            &mut notices,
+            now + Duration::from_secs(3),
+        );
+        let replies = mail::list(&state, &slug, None, Some("aaaa1111")).expect("list");
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].1.body.contains("submission is unconfirmed"));
+        assert_eq!(notices.len(), 1);
+        assert!(errors.is_empty(), "{errors:?}");
+        panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn ended_worker_reports_without_becoming_injectable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "dddddddd-2222-4333-8444-555555555555".to_string(),
+            title: "worker".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            tmp.path(),
+            tmp.path(),
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_report_to(Some("aaaa1111".to_string()));
+        let mut panes = vec![pane];
+        let mut errors = ErrorLog::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !matches!(panes[0].state(), PaneState::Ended(_)) {
+            panes[0].drain();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(panes[0].state(), PaneState::Ended(_)));
+        assert!(!panes[0].injectable());
+        reap_ended_panes(
+            &mut panes,
+            &mut vec![VecDeque::new()],
+            &CtxConfig::default(),
+            &state,
+            tmp.path(),
+            &mut 0,
+            &mut 0,
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &mut None,
+            &mut VecDeque::new(),
+            &mut HashMap::new(),
+        );
+        assert!(panes.is_empty());
+        let messages = mail::list(
+            &state,
+            &super::super::state::repo_slug(tmp.path()),
+            None,
+            Some("aaaa1111"),
+        )
+        .expect("list");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].1.body.contains("ended with unread output"));
+    }
+
+    #[test]
+    fn settled_worker_without_requester_sends_no_mail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        report_settled_pane(
+            &mut pane,
+            &state,
+            &CtxConfig::default(),
+            &mut ErrorLog::default(),
+        );
+        assert!(
+            mail::list(
+                &state,
+                &super::super::state::repo_slug(tmp.path()),
+                None,
+                None
+            )
+            .expect("list")
+            .is_empty()
+        );
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn settled_worker_mails_requester_once_with_screen_output() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        pane.set_report_to(Some("aaaa1111".to_string()));
+        super::super::attention::record(
+            &state,
+            pane.short(),
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::QuietHeuristic,
+                "working",
+                50,
+                super::super::state::now_secs(),
+            )
+            .with_lifecycle(super::super::attention::Lifecycle::Working),
+            super::super::state::now_secs(),
+        );
+        let mut panes = vec![pane];
+        let mut cache = HashMap::new();
+        sync_quiet_heuristic_attention(&panes, &state, &mut cache);
+        report_settled_pane(
+            &mut panes[0],
+            &state,
+            &CtxConfig::default(),
+            &mut ErrorLog::default(),
+        );
+        sync_quiet_heuristic_attention(&panes, &state, &mut cache);
+        report_settled_pane(
+            &mut panes[0],
+            &state,
+            &CtxConfig::default(),
+            &mut ErrorLog::default(),
+        );
+        let messages = mail::list(
+            &state,
+            &super::super::state::repo_slug(tmp.path()),
+            None,
+            Some("aaaa1111"),
+        )
+        .expect("list");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].1.body.contains("settled with unread output"));
+        assert!(messages[0].1.body.contains("hello"));
+        panes[0].finish_shutdown().expect("shutdown");
     }
 
     #[test]
@@ -23283,6 +23628,10 @@ mod tests {
         );
 
         assert!(signal_until_idle(&mut panes[0], &state, session_id));
+        assert!(
+            !panes[0].has_pending_submit(),
+            "the completed turn must retire its deferred Enter without writing it"
+        );
         deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
         assert!(queues[0].is_empty(), "and delivers once that turn ends too");
 
@@ -23371,6 +23720,10 @@ mod tests {
 
         // And the next turn boundary is what releases it.
         assert!(signal_until_idle(&mut panes[0], &state, session_id));
+        assert!(
+            !panes[0].has_pending_submit(),
+            "the completed turn must retire its deferred Enter without writing it"
+        );
         deliver_queued_nudges(&mut panes, &mut queues, &mut errors);
         assert!(
             queues[0].is_empty(),

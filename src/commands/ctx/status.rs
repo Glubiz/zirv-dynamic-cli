@@ -1268,11 +1268,6 @@ fn render_report<W: Write>(
     // would actually consume never disagree.
     let mail_agent = env(AGENT_ENV);
     let mail_session = mail::session_identity(env);
-    // Issue #100 (2026-08-23): a message whose `To-session` names a session
-    // that no longer exists used to inflate "unread" forever -- swept here,
-    // before the count below, and reported separately so an operator can
-    // tell a stale addressee from a message actually waiting to be read.
-    let mail_swept = mail::sweep_undeliverable(&state, &mail_slug);
     match mail::list(
         &state,
         &mail_slug,
@@ -1282,20 +1277,11 @@ fn render_report<W: Write>(
         Ok(messages) => {
             let count = messages.len();
             let count_tone = if count == 0 { Tone::Muted } else { Tone::Plain };
-            let swept_note = if mail_swept > 0 {
-                format!(" ({mail_swept} undeliverable, swept)")
-            } else {
-                String::new()
-            };
             writeln!(
                 w,
                 "{} {}",
                 label(colour, "mail:"),
-                style::paint(
-                    &format!("\u{2709} {count} unread{swept_note}"),
-                    count_tone,
-                    colour
-                )
+                style::paint(&format!("\u{2709} {count} unread"), count_tone, colour)
             )?;
         }
         Err(_) => writeln!(
@@ -1309,7 +1295,11 @@ fn render_report<W: Write>(
         let recent_mail =
             mail::recent_flow_lines(&state, crate::commands::ctx::state::now_secs(), 5);
         if !recent_mail.is_empty() {
-            writeln!(w, "{}", label(colour, "mail flow (last hour):"))?;
+            writeln!(
+                w,
+                "{}",
+                label(colour, "mail flow (last hour, all recipients):")
+            )?;
             for line in recent_mail {
                 writeln!(w, "  {}", style::paint(&line, Tone::Muted, colour))?;
             }
@@ -3739,12 +3729,8 @@ mod tests {
         );
     }
 
-    /// Issue #100 (2026-08-23): a message addressed to a session that no
-    /// longer exists at all (no live registry record was ever registered for
-    /// it in this test) must be swept out of the unread count, and reported
-    /// separately rather than silently dropped.
     #[test]
-    fn status_reports_undeliverable_mail_as_swept_and_excludes_it_from_unread() {
+    fn status_leaves_unread_mail_unchanged() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         state.ensure().expect("ensure");
@@ -3782,6 +3768,7 @@ mod tests {
         )
         .expect("store undirected");
 
+        let before = mail::list(&state, &slug, None, None).expect("before");
         let env = env_for(state.root());
         let mut out = Vec::new();
         run_with(
@@ -3801,9 +3788,10 @@ mod tests {
         .expect("runs");
         let text = String::from_utf8(out).expect("utf8");
 
-        assert!(
-            text.contains("mail: \u{2709} 1 unread (1 undeliverable, swept)"),
-            "got {text}"
+        assert!(text.contains("mail: \u{2709} 2 unread"), "got {text}");
+        assert_eq!(
+            mail::list(&state, &slug, None, None).expect("after"),
+            before
         );
     }
 

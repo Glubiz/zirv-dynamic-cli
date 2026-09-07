@@ -912,6 +912,7 @@ pub struct Pane {
     /// the whole point is "remind at most once in this pane's life," not
     /// "once per turn."
     report_reminder_sent: bool,
+    pub(crate) settled_mail_sent: bool,
     /// Review F1/F2 (PR #116): the deadline for phase 2 of a deferred
     /// `inject_visible` call -- `Some` from the moment phase 1's write
     /// succeeds until phase 2's lone `\r` is actually written, `None`
@@ -920,6 +921,8 @@ pub struct Pane {
     /// [`INJECTION_SUBMIT_DELAY`]'s own doc comment for why this replaced an
     /// inline sleep.
     pending_submit: Option<Instant>,
+    submit_confirmation: Option<(Instant, bool)>,
+    pub(crate) delivery_sender: Option<String>,
     /// Issue #160 finding 1, review round (2026-08-28): the `LaunchMode`
     /// this pane was ACTUALLY spawned with, derived from `turn_env` itself
     /// (whether it carried the durable interactive-launch pin,
@@ -1212,7 +1215,10 @@ impl Pane {
             deadline: None,
             parent_session: None,
             report_reminder_sent: false,
+            settled_mail_sent: false,
             pending_submit: None,
+            submit_confirmation: None,
+            delivery_sender: None,
             launch_mode,
             writer_permit: None,
             cwd: cwd.to_path_buf(),
@@ -1249,6 +1255,10 @@ impl Pane {
             // `signal_still_stands`' decision, and it needs the timestamp to
             // make it.
             self.last_output_at = Some(Instant::now());
+            if self.submit_confirmation.is_some() {
+                self.submit_confirmation = None;
+                self.delivery_sender = None;
+            }
         }
         // A signal-less pane's `on_turn_signal` never fires (its socket is
         // never written to -- `register_turn_signal` is a no-op for it), so
@@ -1510,6 +1520,10 @@ impl Pane {
         if self.has_pending_submit() {
             let _ = self.submit_pending();
         }
+        // Operator input owns the composer; never submit it on an automatic retry.
+        if let Some((_, retry_spent)) = self.submit_confirmation.as_mut() {
+            *retry_spent = true;
+        }
         self.user_typed_since_turn = true;
         self.last_local_input_at = Some(Instant::now());
         self.scroll_to_live();
@@ -1566,6 +1580,9 @@ impl Pane {
     /// longer enough, because the operator's own mid-thought typing is
     /// deliberately excluded from it.
     pub fn injectable(&self) -> bool {
+        if self.pending_submit.is_some() || self.submit_confirmation.is_some() {
+            return false;
+        }
         injectable_from(
             self.state(),
             self.injected_awaiting_turn,
@@ -1587,6 +1604,9 @@ impl Pane {
         if let Some(server) = &self.server {
             while server.try_recv().is_some() {
                 self.last_signal_at = Some(Instant::now());
+                self.pending_submit = None;
+                self.submit_confirmation = None;
+                self.delivery_sender = None;
                 self.injected_awaiting_turn = false;
                 self.user_typed_since_turn = false;
             }
@@ -1658,6 +1678,7 @@ impl Pane {
     pub fn set_report_to(&mut self, report_to: Option<String>) {
         self.report_to = report_to;
         self.report_reminder_sent = false;
+        self.settled_mail_sent = false;
     }
 
     /// The address `report_back_reminder_sweep` reminds this pane to report
@@ -2008,15 +2029,27 @@ impl Pane {
         self.last_local_input_at = Some(now);
         self.injected_awaiting_turn = true;
         self.pending_submit = Some(now + INJECTION_SUBMIT_DELAY);
+        self.submit_confirmation = None;
+        self.delivery_sender = None;
         Ok(())
     }
 
     /// Whether this pane has a deferred injection submission
-    /// (`Self::pending_submit`) whose deadline has passed as of `now`. The
+    /// (`Self::pending_submit`) whose output has settled, bounded by two seconds. The
     /// dashboard's tick loop calls this for every pane, every tick, and
     /// [`Self::submit_pending`] on the ones that answer `true`.
     pub(crate) fn pending_submit_due(&self, now: Instant) -> bool {
-        submit_is_due(self.pending_submit, now)
+        let Some(deadline) = self.pending_submit else {
+            return false;
+        };
+        let quiet_deadline = self
+            .last_output_at
+            .map(|output| (output + INJECTION_SUBMIT_DELAY).max(deadline))
+            .unwrap_or(deadline);
+        submit_is_due(
+            Some(quiet_deadline.min(deadline + Duration::from_secs(2))),
+            now,
+        )
     }
 
     /// Whether this pane has ANY deferred injection submission outstanding,
@@ -2028,13 +2061,8 @@ impl Pane {
         self.pending_submit.is_some()
     }
 
-    /// Writes the lone `\r` that submits a deferred `inject_visible` call
-    /// ([`write_submit_cr`]) and clears [`Self::pending_submit`] -- but only
-    /// once the write itself succeeds. A failed write leaves
-    /// `pending_submit` set exactly as it was, so the next call (the tick
-    /// loop's next pass, or the operator's next keystroke) simply retries
-    /// it; see `write_submit_cr`'s own doc comment for why a retried `\r` is
-    /// always safe. A no-op, successfully, when nothing is pending.
+    /// Writes one `\r`, clearing the pending submit only after a successful write.
+    /// The caller reports a failed write; success starts the confirmation window.
     pub fn submit_pending(&mut self) -> CtxResult<()> {
         if self.pending_submit.is_none() {
             return Ok(());
@@ -2048,7 +2076,59 @@ impl Pane {
             write_submit_cr(sink)?;
         }
         self.pending_submit = None;
+        self.submit_confirmation = Some((Instant::now(), false));
         Ok(())
+    }
+
+    pub(crate) fn cancel_submission(&mut self) {
+        self.pending_submit = None;
+        self.submit_confirmation = None;
+    }
+
+    pub(crate) fn screen_tail(&mut self) -> String {
+        let offset = self.scrollback();
+        self.parser.screen_mut().set_scrollback(0);
+        let contents = self.screen().contents();
+        self.parser.screen_mut().set_scrollback(offset);
+        let mut lines: Vec<&str> = contents.lines().rev().take(20).collect();
+        lines.reverse();
+        let tail = lines.join("\n");
+        let mut start = tail.len().saturating_sub(2048);
+        while !tail.is_char_boundary(start) {
+            start += 1;
+        }
+        tail[start..].to_string()
+    }
+
+    /// Retries one silent submission, then reports it unconfirmed without typing again.
+    pub(crate) fn check_submission(&mut self, now: Instant) -> CtxResult<bool> {
+        if matches!(self.state(), PaneState::Ended(_))
+            && (self.pending_submit.is_some() || self.submit_confirmation.is_some())
+        {
+            self.cancel_submission();
+            return Ok(true);
+        }
+        let Some((submitted, retry_spent)) = self.submit_confirmation else {
+            return Ok(false);
+        };
+        if self.last_output_at.is_some_and(|at| at > submitted)
+            || self.last_signal_at.is_some_and(|at| at > submitted)
+        {
+            self.submit_confirmation = None;
+            self.delivery_sender = None;
+            return Ok(false);
+        }
+        if now.saturating_duration_since(submitted) < Duration::from_secs(1) {
+            return Ok(false);
+        }
+        self.submit_confirmation = None;
+        if retry_spent || self.user_typed_since_turn {
+            return Ok(true);
+        }
+        self.write_input(b"\r")?;
+        self.last_local_input_at = Some(now);
+        self.submit_confirmation = Some((now, true));
+        Ok(false)
     }
 
     /// Idempotent: sends `quit_sequence` (grace period, then `kill`, exactly
@@ -2408,7 +2488,8 @@ impl Pane {
         // F1/F2: the old child's pty is gone, so any deferred `\r` it was
         // still owed would now write into the successor's composer instead
         // -- drop it rather than carry it across the swap.
-        self.pending_submit = None;
+        self.cancel_submission();
+        self.delivery_sender = None;
         // F5 (review, PR #116): the one-shot report-back reminder is scoped
         // to a child SESSION, not to this pane's own lifetime across a swap.
         // A handover keeps `report_to` (the requester is still owed a
@@ -2417,6 +2498,7 @@ impl Pane {
         // its own reminder -- unlike a restore (F3), which resurrects the
         // SAME logical session and must therefore keep its sent flag.
         self.report_reminder_sent = false;
+        self.settled_mail_sent = false;
         // R6: this pane keeps its session id across the swap, so codex's
         // rollout pin would otherwise keep answering the retired child's file
         // for every later usage/budget read. Dropped here, after the
@@ -4710,6 +4792,123 @@ pub(crate) mod tests {
         pane.finish_shutdown().expect("shutdown");
     }
 
+    #[test]
+    fn screen_tail_keeps_the_latest_output_within_its_caps() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut spec = test_spec("55555555-2222-4333-8444-555555555555");
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            tmp.path(),
+            tmp.path(),
+            (200, 30),
+            &[],
+            false,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.parser
+            .process(format!("{}latest", format!("{}\r\n", "ø".repeat(180)).repeat(40)).as_bytes());
+        pane.parser.screen_mut().set_scrollback(5);
+        let offset = pane.scrollback();
+        let tail = pane.screen_tail();
+        assert!(tail.len() <= 2048);
+        assert!(tail.lines().count() <= 20);
+        assert!(tail.ends_with("latest"));
+        assert_eq!(pane.scrollback(), offset);
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn injection_retries_once_then_stops_on_output_or_operator_input() {
+        for (responds, operator_types) in [(false, false), (true, false), (false, true)] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(tmp.path().join("state"));
+            let mut spec = test_spec("55555555-2222-4333-8444-555555555555");
+            spec.argv = long_lived_argv();
+            let mut pane = Pane::spawn(
+                spec,
+                &state,
+                tmp.path(),
+                tmp.path(),
+                (80, 24),
+                &[],
+                false,
+                DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn");
+            let capture = tmp.path().join("input");
+            pane.writer = Arc::new(Mutex::new(Box::new(
+                std::fs::File::create(&capture).expect("capture"),
+            )));
+            pane.inject_visible("mail", "hello").expect("inject");
+            pane.submit_pending().expect("submit");
+            let submitted = pane.submit_confirmation.expect("confirmation").0;
+            if responds {
+                pane.last_output_at = Some(submitted + Duration::from_millis(10));
+            }
+            if operator_types {
+                pane.write_operator_input(b"x").expect("operator input");
+                pane.user_typed_since_turn = false;
+            }
+            assert_eq!(
+                pane.check_submission(submitted + Duration::from_secs(1))
+                    .expect("first check"),
+                operator_types
+            );
+            assert_eq!(
+                pane.check_submission(submitted + Duration::from_secs(2))
+                    .expect("second check"),
+                !responds && !operator_types
+            );
+            assert!(
+                !pane
+                    .check_submission(submitted + Duration::from_secs(3))
+                    .expect("finished")
+            );
+            let bytes = std::fs::read(capture).expect("input bytes");
+            assert_eq!(
+                bytes.iter().filter(|byte| **byte == b'\r').count(),
+                if responds || operator_types { 1 } else { 2 }
+            );
+            assert_eq!(String::from_utf8_lossy(&bytes).matches("hello").count(), 1);
+            pane.finish_shutdown().expect("shutdown");
+        }
+    }
+
+    #[test]
+    fn injection_submit_waits_for_echo_quiet_with_a_ceiling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut spec = test_spec("55555555-2222-4333-8444-555555555555");
+        spec.argv = long_lived_argv();
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            tmp.path(),
+            tmp.path(),
+            (80, 24),
+            &[],
+            false,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.inject_visible("mail", "hello").expect("inject");
+        let due = pane.pending_submit.expect("pending");
+        pane.last_output_at = Some(due);
+        assert!(!pane.pending_submit_due(due), "echo is still arriving");
+        assert!(pane.pending_submit_due(due + INJECTION_SUBMIT_DELAY));
+        let ceiling = due + Duration::from_secs(2);
+        pane.last_output_at = Some(ceiling);
+        assert!(
+            pane.pending_submit_due(ceiling),
+            "continuous output must not starve Enter"
+        );
+        pane.finish_shutdown().expect("shutdown");
+    }
+
     /// F1/F2, end to end on a real supervised child: `inject_visible` must
     /// not block the caller (no inline sleep), phase 1's stamping is
     /// immediate, `pending_submit_due` only flips true once
@@ -5051,6 +5250,7 @@ pub(crate) mod tests {
         }
 
         pane.inject_visible("test", "one").expect("first injection");
+        pane.submit_pending().expect("submit injected line");
         assert!(
             matches!(pane.state(), PaneState::Working),
             "immediately busy after a successful injection"

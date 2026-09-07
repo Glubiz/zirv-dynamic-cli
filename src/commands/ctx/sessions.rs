@@ -875,6 +875,7 @@ enum SignalProbe {
     CanSignal,
     NoSuchProcess,
     PermissionDenied,
+    Unknown,
 }
 
 #[cfg(unix)]
@@ -884,10 +885,10 @@ fn probe_signal(pid: u32) -> SignalProbe {
     if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
         return SignalProbe::CanSignal;
     }
-    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
-        SignalProbe::PermissionDenied
-    } else {
-        SignalProbe::NoSuchProcess
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => SignalProbe::NoSuchProcess,
+        Some(libc::EPERM) => SignalProbe::PermissionDenied,
+        _ => SignalProbe::Unknown,
     }
 }
 
@@ -932,7 +933,9 @@ pub(crate) fn is_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 pub(crate) fn is_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
+    };
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -941,10 +944,10 @@ pub(crate) fn is_alive(pid: u32) -> bool {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            return false;
+            return GetLastError() != ERROR_INVALID_PARAMETER;
         }
         let mut code: u32 = 0;
-        let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        let alive = GetExitCodeProcess(handle, &mut code) == 0 || code == STILL_ACTIVE as u32;
         CloseHandle(handle);
         alive
     }
@@ -1065,7 +1068,7 @@ pub(crate) fn process_start_secs(pid: u32) -> Option<u64> {
 #[cfg(unix)]
 pub fn record_is_alive(record: &Record) -> bool {
     match probe_signal(record.pid) {
-        SignalProbe::CanSignal => true,
+        SignalProbe::CanSignal | SignalProbe::Unknown => true,
         SignalProbe::NoSuchProcess => false,
         SignalProbe::PermissionDenied => {
             !start_time_disambiguates_dead(record.start_time, process_start_secs(record.pid))
