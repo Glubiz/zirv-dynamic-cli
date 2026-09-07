@@ -3266,15 +3266,19 @@ mod tests {
         let home = tempfile::tempdir().expect("tempdir");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
 
-        // Both known adapters disabled: codex's own `ready()` now only
-        // checks that its program resolves (`CodexAdapter::ready`, mirrors
-        // claude), so disabling claude alone would leave codex as a usable
-        // fallback -- both have to be disabled by the gate to reach
-        // "nothing enabled and ready" at all.
+        // Every registered adapter disabled: each one's own `ready()` only
+        // checks that its program resolves (`CodexAdapter::ready`,
+        // `OpenCodeAdapter::ready`, ..., mirroring claude), so disabling claude
+        // alone would leave another as a usable fallback -- every
+        // registered adapter has to be disabled by the gate to reach "nothing enabled
+        // and ready" at all.
         std::fs::create_dir_all(tmp.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             tmp.path().join(".zirv/.settings.toml"),
-            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n",
+            crate::commands::ctx::adapters::ADAPTERS
+                .iter()
+                .map(|(name, _)| format!("[agents.{name}]\nenabled = false\n"))
+                .collect::<String>(),
         )
         .expect("write");
 
@@ -3300,6 +3304,7 @@ mod tests {
         assert!(chat_line.contains("unavailable"), "got {chat_line}");
         assert!(chat_line.contains("claude"), "got {chat_line}");
         assert!(chat_line.contains("codex"), "got {chat_line}");
+        assert!(chat_line.contains("opencode"), "got {chat_line}");
         assert!(chat_line.contains("disabled"), "got {chat_line}");
         assert!(
             !chat_line.contains('\u{2014}'),

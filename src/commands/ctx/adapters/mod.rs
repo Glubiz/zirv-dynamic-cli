@@ -4,6 +4,7 @@ use std::process::Command;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod opencode;
 pub mod pi;
 
 use super::CtxResult;
@@ -2499,6 +2500,10 @@ fn make_gemini(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(gemini::GeminiAdapter::new(bin))
 }
 
+fn make_opencode(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(opencode::OpenCodeAdapter::new(bin))
+}
+
 fn make_pi(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(pi::PiAdapter::new(bin))
 }
@@ -2512,6 +2517,7 @@ pub const ADAPTERS: &[(&str, AdapterCtor)] = &[
     ("claude", make_claude),
     ("codex", make_codex),
     ("gemini", make_gemini),
+    ("opencode", make_opencode),
     ("pi", make_pi),
 ];
 
@@ -5771,7 +5777,7 @@ mod tests {
     #[test]
     fn registry_exposes_every_registered_adapter() {
         let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["claude", "codex", "gemini", "pi"]);
+        assert_eq!(names, vec!["claude", "codex", "gemini", "opencode", "pi"]);
     }
 
     /// The registry table is the one place a new adapter is wired in: `all`
@@ -5956,9 +5962,7 @@ mod tests {
             repo.path().join(".zirv/.settings.toml"),
             ADAPTERS
                 .iter()
-                .map(|(name, _)| format!("[agents.{name}]
-enabled = false
-"))
+                .map(|(name, _)| format!("[agents.{name}]\nenabled = false\n"))
                 .collect::<String>(),
         )
         .expect("write");
@@ -5975,6 +5979,7 @@ enabled = false
         let msg = err.to_string();
         assert!(msg.contains("claude"), "must name claude: {msg}");
         assert!(msg.contains("codex"), "must name codex: {msg}");
+        assert!(msg.contains("opencode"), "must name opencode: {msg}");
         assert!(
             msg.contains("disabled"),
             "must say why claude lost out: {msg}"
