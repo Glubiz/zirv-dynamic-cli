@@ -30,9 +30,16 @@ impl Script {
     /// both exercised in-process). Pure, so the decision itself stays
     /// testable without spawning anything.
     pub fn has_agent_step(&self) -> bool {
-        self.commands
-            .iter()
-            .any(|step| matches!(step, CommandTypes::Agent(_)))
+        self.commands.iter().any(|step| match step {
+            // Review round 2: a step `run` will skip for this platform
+            // (`Options::skip_for_os`) never spawns a supervisor, so it must
+            // not lower the process either.
+            CommandTypes::Agent(agent) => !agent
+                .options
+                .as_ref()
+                .is_some_and(super::options::Options::skip_for_os),
+            _ => false,
+        })
     }
 
     pub async fn run(
@@ -344,6 +351,30 @@ mod tests {
         assert!(
             with_agent.has_agent_step(),
             "an agent step anywhere in the script counts, not just the first"
+        );
+
+        let other_os = if cfg!(windows) {
+            crate::script_runner::operating_system::OperatingSystem::Linux
+        } else {
+            crate::script_runner::operating_system::OperatingSystem::Windows
+        };
+        let filtered_out = Script {
+            commands: vec![CommandTypes::Agent(AgentCommand {
+                agent: "claude".to_string(),
+                prompt: "do the work".to_string(),
+                flags: None,
+                description: None,
+                options: Some(crate::script_runner::options::Options {
+                    operating_system: Some(other_os),
+                    ..Default::default()
+                }),
+                capture: None,
+            })],
+            ..shell_only.clone()
+        };
+        assert!(
+            !filtered_out.has_agent_step(),
+            "an agent step skipped for this platform never spawns a supervisor"
         );
     }
 
