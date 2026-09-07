@@ -22,7 +22,8 @@ pub mod ui;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -882,6 +883,12 @@ fn mark_first_run_tip_seen(state: &StateDir) {
 /// file back, and nothing behaves differently because it is on.
 const KEYLOG_ENV: &str = "ZIRV_CTX_DASH_KEYLOG";
 
+/// A tick this long or longer is worth a `TICK` line of its own even when
+/// nothing about the loop state changed -- it is a tick the operator felt.
+/// The loop's own input poll is 10ms hot / 50ms idle, so anything at this
+/// scale is maintenance or drawing, not waiting for a keystroke.
+const KEYLOG_SLOW_TICK: Duration = Duration::from_millis(100);
+
 /// The loop state the diagnostic watches for changes between ticks. Small and
 /// `Copy`-ish on purpose: it is compared every iteration, and only a change
 /// writes anything.
@@ -1000,20 +1007,34 @@ impl KeyLog {
     /// is exactly what hypothesis (b) would look like: an `EVENT` arming the
     /// prefix, then a `TICK armed=false` on a later tick with no keystroke
     /// logged in between.
-    fn tick(&mut self, state: LoopState) {
+    /// Issue #330 adds `dur=<n>ms`: how long the PREVIOUS iteration took, wall
+    /// clock. Keystroke latency is exactly that number -- the loop reaches
+    /// `event::poll` only after a tick's maintenance and draw are done -- so it
+    /// is the one measurement that turns "typing feels laggy" into evidence.
+    /// A tick at or over [`KEYLOG_SLOW_TICK`] writes a line even when nothing
+    /// else about the loop state moved; anything faster still only writes on a
+    /// change, so the silence the rest of this log depends on is kept.
+    fn tick(&mut self, state: LoopState, previous_tick: Duration) {
         self.tick = self.tick.saturating_add(1);
-        if self.last == Some(state) {
+        let ms = previous_tick.as_millis();
+        let slow = previous_tick >= KEYLOG_SLOW_TICK;
+        if self.last == Some(state) && !slow {
             return;
         }
         let previous = self.last;
         self.last = Some(state);
         match previous {
             None => self.line(&format!(
-                "TICK armed={} overlay={} panes={} focused={} alt_screen={} (first)",
+                "TICK armed={} overlay={} panes={} focused={} alt_screen={} dur={ms}ms (first)",
+                state.prefix_armed, state.overlay, state.panes, state.focused, state.focused_alt
+            )),
+            Some(prev) if prev == state => self.line(&format!(
+                "TICK armed={} overlay={} panes={} focused={} alt_screen={} dur={ms}ms (slow)",
                 state.prefix_armed, state.overlay, state.panes, state.focused, state.focused_alt
             )),
             Some(prev) => self.line(&format!(
-                "TICK armed={}->{} overlay={}->{} panes={}->{} focused={}->{} alt_screen={}->{}",
+                "TICK armed={}->{} overlay={}->{} panes={}->{} focused={}->{} \
+                 alt_screen={}->{} dur={ms}ms",
                 prev.prefix_armed,
                 state.prefix_armed,
                 prev.overlay,
@@ -1876,6 +1897,89 @@ fn due(last: Instant, now: Instant, interval: Duration) -> bool {
     now.duration_since(last) >= interval
 }
 
+/// How often [`handle_spawn_requests`] actually reads its intake directories.
+/// One `read_dir` for the dashboard's shared channel plus one per live pane,
+/// on a tick rate that reaches 100/s while the operator is typing, is a
+/// per-keystroke directory scan per worker; a queued request is data sitting
+/// on disk (see `handle_spawn_requests`' own doc comment), so a quarter of a
+/// second of latency on picking it up is invisible next to the round trip the
+/// requester is already waiting on.
+const SPAWN_REQUEST_POLL: Duration = Duration::from_millis(250);
+
+/// Pure: whether this tick reads the spawn-request channels.
+///
+/// L17: forced when there are no panes left, whatever the throttle says. The
+/// empty-exit decision runs immediately after the intake, and a request that
+/// arrives on the very tick the last pane ends must still be seen -- otherwise
+/// the dashboard exits first and the requester burns its ack timeout against a
+/// channel nobody will ever poll again.
+fn spawn_intake_due(last: Instant, now: Instant, panes_empty: bool) -> bool {
+    panes_empty || due(last, now, SPAWN_REQUEST_POLL)
+}
+
+/// Pure: the order one tick drains its panes in -- the focused pane first,
+/// then every other pane round-robin from `start`.
+///
+/// Issue #330: the focused pane is the one the operator is looking at and
+/// typing into, so it gets first call on the tick's parsing budget; `start`
+/// rotates each tick so that whichever unfocused pane gets what is left over
+/// changes, and none of them starves behind a noisier neighbour.
+fn drain_order(count: usize, focused: usize, start: usize) -> Vec<usize> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut order = Vec::with_capacity(count);
+    // `focused` can be one past the end for the length of a tick: a pane may
+    // have ended since the last one, and the index is re-clamped further down
+    // the loop, after this.
+    if focused < count {
+        order.push(focused);
+    }
+    let start = start % count;
+    for step in 0..count {
+        let idx = (start + step) % count;
+        if idx != focused {
+            order.push(idx);
+        }
+    }
+    order
+}
+
+/// Spends one tick's shared vt100 budget ([`pane::DRAIN_BUDGET_BYTES`]) over
+/// `count` panes in [`drain_order`], returning the indices that actually
+/// produced output.
+///
+/// `drain_one(index, remaining)` returns `(any, used)`. Every pane is visited
+/// even once the budget is gone -- a visit is also how a pane's child exit is
+/// noticed and how a signal-less pane's turn flags retire -- so the panes at
+/// the back of the order are asked to parse zero bytes rather than skipped.
+/// Nothing is ever dropped: what a pane could not parse this tick stays queued
+/// for the next one.
+///
+/// `drain_one` is a closure so the sharing itself is testable with plain byte
+/// counters, without a pty child or a terminal.
+fn drain_shared_budget<F>(
+    count: usize,
+    focused: usize,
+    start: usize,
+    budget: usize,
+    mut drain_one: F,
+) -> Vec<usize>
+where
+    F: FnMut(usize, usize) -> (bool, usize),
+{
+    let mut produced = Vec::new();
+    let mut remaining = budget;
+    for idx in drain_order(count, focused, start) {
+        let (any, used) = drain_one(idx, remaining);
+        if any {
+            produced.push(idx);
+        }
+        remaining = remaining.saturating_sub(used);
+    }
+    produced
+}
+
 /// The delegation ledger's `(len, mtime_secs)`, or `(0, 0)` when there is no
 /// ledger yet. A1-4: one `stat` standing in for a full read-and-re-price of
 /// every row the ledger holds -- see [`FactsCache::spend_key`].
@@ -1965,9 +2069,10 @@ struct DiskFacts {
     /// load`, keyed by `FactsOwner::session_short`), `None` until a seat is
     /// registered for it.
     pool_seat: Option<String>,
-    /// Issue #354: every live pane's work group, by id, loaded on this same
-    /// throttled tick -- the sidebar's group headers name a scope, and
-    /// `group::load` is a disk read that must never happen per frame.
+    /// Issue #354: every live pane's work group, by id -- the sidebar's group
+    /// headers name a scope, and `group::load` is a disk read that must never
+    /// happen per frame. Read by the background [`FactsRefresher`] and swapped
+    /// in whole (see [`FactsSnapshot`]).
     groups: HashMap<String, super::group::WorkGroup>,
     /// Issue #354: when each pane last changed [`ui::RowState`], for the
     /// `since` disclosure line. Kept here rather than on `Pane` because it is
@@ -2004,6 +2109,187 @@ struct FactsOwner<'a> {
     repo: &'a Path,
     agent_name: &'a str,
     session_short: &'a str,
+}
+
+/// The disk-derived facts that are read OFF the UI thread, published whole by
+/// [`FactsRefresher`] and swapped into [`FactsCache`] by the tick.
+///
+/// Exactly the four reads whose cost is a function of machine-wide history
+/// rather than of this dashboard's own panes -- above all `sessions::list`,
+/// which reads and parses every `sessions/*.json` on the machine and then
+/// sweeps the state directory, probing each orphan socket synchronously
+/// (`signal::probe`, a named-pipe open on Windows). On the UI thread that is
+/// keystroke latency: the tick reaches `event::poll` only after it finishes,
+/// once a second, forever. Everything else `FactsCache::refresh_if_due` reads
+/// is keyed to this dashboard's own panes and stays on the tick.
+#[derive(Default)]
+struct FactsSnapshot {
+    mail: Option<(usize, usize)>,
+    memory_count: usize,
+    registry: Vec<(sessions::Record, sessions::Liveness)>,
+    groups: HashMap<String, super::group::WorkGroup>,
+}
+
+/// Everything [`collect_facts_snapshot`] needs and a background thread cannot
+/// borrow from the event loop. All of it is fixed for a dashboard's whole life
+/// (the same reasoning [`FactsOwner`] documents for its own three fields), so
+/// it is cloned once at spawn; the one input that does move -- the live panes'
+/// work-group ids -- travels through [`FactsRefresher::group_ids`] instead.
+#[derive(Clone)]
+struct FactsInputs {
+    state: StateDir,
+    repo: PathBuf,
+    agent_name: String,
+    session_short: String,
+    mail_enabled: bool,
+}
+
+/// The reads behind one [`FactsSnapshot`], in one place so the background
+/// thread, the inline fallback and the tests all run identical code.
+fn collect_facts_snapshot(inputs: &FactsInputs, group_ids: &[String]) -> FactsSnapshot {
+    let FactsInputs {
+        state,
+        repo,
+        agent_name,
+        session_short,
+        mail_enabled,
+    } = inputs;
+    let mail = mail::unread_counts(state, repo, agent_name, session_short, *mail_enabled);
+    let slug = super::state::repo_slug(repo);
+    let memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
+    let registry = sessions::list(state);
+    // Issue #354: the sidebar's group headers name a scope -- one `group::
+    // load` per distinct live group, never one per frame.
+    let groups = group_ids
+        .iter()
+        .filter_map(|id| {
+            super::group::load(state, id)
+                .ok()
+                .flatten()
+                .map(|g| (id.clone(), g))
+        })
+        .collect();
+    FactsSnapshot {
+        mail,
+        memory_count,
+        registry,
+        groups,
+    }
+}
+
+/// How many slices the refresher's sleep between cycles is cut into, so a quit
+/// is noticed within a fraction of `FACTS_THROTTLE` rather than after a whole
+/// one. The thread is otherwise entirely passive.
+const FACTS_SLEEP_SLICES: u32 = 10;
+
+/// The background half of [`FactsCache`]: one thread that runs
+/// [`collect_facts_snapshot`] on the `FACTS_THROTTLE` cadence and publishes
+/// each result down an `mpsc` channel the tick drains with `try_recv`, so a
+/// slow state directory costs the operator nothing but staleness -- never a
+/// keystroke.
+struct FactsRefresher {
+    /// The live panes' work-group ids, republished by the tick on its own
+    /// cadence. Locked only to clone in or out, never across a disk read, so
+    /// the tick can never wait on a `sessions::list` in progress.
+    group_ids: Arc<Mutex<Vec<String>>>,
+    rx: mpsc::Receiver<FactsSnapshot>,
+    stop: Arc<AtomicBool>,
+    /// `Some` only when the thread could not be spawned at all: the snapshot
+    /// is then computed inline, exactly as it was before this loop had a
+    /// background half. A dashboard that cannot start a thread still shows a
+    /// correct sidebar -- it just pays the old latency for it.
+    inline: Option<FactsInputs>,
+}
+
+impl FactsRefresher {
+    fn spawn(state: &StateDir, owner: FactsOwner<'_>, mail_enabled: bool) -> Self {
+        let inputs = FactsInputs {
+            state: state.clone(),
+            repo: owner.repo.to_path_buf(),
+            agent_name: owner.agent_name.to_string(),
+            session_short: owner.session_short.to_string(),
+            mail_enabled,
+        };
+        let (tx, rx) = mpsc::channel();
+        let group_ids = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_groups = Arc::clone(&group_ids);
+        let thread_stop = Arc::clone(&stop);
+        let thread_inputs = inputs.clone();
+        let spawned = std::thread::Builder::new()
+            .name("zirv-dash-facts".to_string())
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    let ids = lock_group_ids(&thread_groups);
+                    if tx
+                        .send(collect_facts_snapshot(&thread_inputs, &ids))
+                        .is_err()
+                    {
+                        // The dashboard dropped its receiver: nothing will
+                        // ever read another snapshot.
+                        return;
+                    }
+                    for _ in 0..FACTS_SLEEP_SLICES {
+                        if thread_stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(FACTS_THROTTLE / FACTS_SLEEP_SLICES);
+                    }
+                }
+            })
+            .is_ok();
+        Self {
+            group_ids,
+            rx,
+            stop,
+            inline: (!spawned).then_some(inputs),
+        }
+    }
+
+    /// The panes' current work-group ids, for the refresher's next cycle. A
+    /// group that appears on this tick therefore lands in the snapshot after
+    /// next -- the same order-of-a-second staleness every other fact on this
+    /// cadence already carries.
+    fn publish_group_ids(&self, ids: Vec<String>) {
+        match self.group_ids.lock() {
+            Ok(mut guard) => *guard = ids,
+            Err(poisoned) => *poisoned.into_inner() = ids,
+        }
+    }
+
+    /// The newest snapshot the refresher has published, or `None` when it has
+    /// not finished a cycle since the last call. Never blocks: `try_recv` in a
+    /// loop keeping only the last, so a tick costs one channel probe however
+    /// far behind a busy machine has left the thread.
+    fn take_latest(&self) -> Option<FactsSnapshot> {
+        if let Some(inputs) = self.inline.as_ref() {
+            let ids = lock_group_ids(&self.group_ids);
+            return Some(collect_facts_snapshot(inputs, &ids));
+        }
+        let mut latest = None;
+        while let Ok(snapshot) = self.rx.try_recv() {
+            latest = Some(snapshot);
+        }
+        latest
+    }
+}
+
+impl Drop for FactsRefresher {
+    /// The dashboard is leaving: the thread stops at its next slice rather
+    /// than outliving the terminal it was reading for.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A poisoned lock is not worth failing a dashboard over -- the payload is a
+/// list of group ids, and the worst a stale one costs is a missing sidebar
+/// header for one cycle.
+fn lock_group_ids(ids: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    match ids.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
 }
 
 /// Caches every disk read the header and sidebar need -- rot scores, mail,
@@ -2090,23 +2376,56 @@ impl FactsCache {
         };
     }
 
+    /// Pure: swaps in whatever the background [`FactsRefresher`] last
+    /// published, reporting whether anything actually arrived.
+    ///
+    /// Split out from [`FactsCache::refresh_if_due`] so the swap is testable
+    /// with no thread, no state directory and no terminal -- and so the one
+    /// property that matters here is stated in one place: a tick that finds
+    /// nothing waiting keeps the facts it already had, at whatever age they
+    /// are, rather than blanking the sidebar while the refresher catches up.
+    fn apply_snapshot(&mut self, latest: Option<FactsSnapshot>) -> bool {
+        let Some(snapshot) = latest else {
+            return false;
+        };
+        self.disk.mail = snapshot.mail;
+        self.disk.memory_count = snapshot.memory_count;
+        self.disk.groups = snapshot.groups;
+        self.registry = snapshot.registry;
+        true
+    }
+
     /// Every disk read the header and sidebar need, at most once per
     /// `FACTS_THROTTLE`. `panes` is only walked when a refresh is actually
     /// due, so a throttled tick costs the `due` comparison and nothing else.
+    ///
+    /// `take_snapshot` is the non-blocking hand-off from the background
+    /// [`FactsRefresher`] -- the machine-wide reads (mail, memory bank, the
+    /// session registry, the work groups) happen on its thread and are only
+    /// swapped in here. It is a closure rather than a value so it is claimed
+    /// *after* the throttle check: a snapshot that arrives between two due
+    /// ticks stays in the channel instead of being taken and thrown away,
+    /// which would leave the registry a full window staler than it needs
+    /// to be.
     ///
     /// Returns whether it actually re-read. Issue #354 phase 2 hangs
     /// [`FactsCache::refresh_attention`] off that answer rather than off a
     /// second throttle of its own: the attention statuses have to be exactly
     /// as fresh as the registry listing they are keyed against, and a second
-    /// clock could only ever drift them apart.
-    fn refresh_if_due(
+    /// clock could only ever drift them apart. That is why the swap happens
+    /// here, inside the due branch, and never on a tick of its own.
+    fn refresh_if_due<F>(
         &mut self,
         cfg: &CtxConfig,
         state: &StateDir,
         owner: FactsOwner<'_>,
         panes: &[Pane],
         now: Instant,
-    ) -> bool {
+        take_snapshot: F,
+    ) -> bool
+    where
+        F: FnOnce() -> Option<FactsSnapshot>,
+    {
         if !due(self.last_refresh, now, FACTS_THROTTLE) {
             return false;
         }
@@ -2114,30 +2433,16 @@ impl FactsCache {
 
         let FactsOwner {
             repo,
-            agent_name,
+            agent_name: _,
             session_short,
         } = owner;
 
-        self.disk.mail =
-            mail::unread_counts(state, repo, agent_name, session_short, cfg.mail.enabled);
-        let slug = super::state::repo_slug(repo);
-        self.disk.memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
-        self.registry = sessions::list(state);
-        // Issue #354: the sidebar's group headers and its `since` line, on
-        // this same throttled cadence -- one `group::load` per distinct live
-        // group, and a state-change clock that only ever moves when the state
-        // actually changed. Both are pruned to the live panes, so a reaped
-        // pane leaves nothing behind.
-        let group_ids: HashSet<_> = panes.iter().filter_map(|p| p.work_group_id()).collect();
-        self.disk.groups = group_ids
-            .into_iter()
-            .filter_map(|id| {
-                super::group::load(state, id)
-                    .ok()
-                    .flatten()
-                    .map(|g| (id.to_string(), g))
-            })
-            .collect();
+        self.apply_snapshot(take_snapshot());
+        // Issue #354: the sidebar's `since` line, on this same throttled
+        // cadence -- a state-change clock that only ever moves when the state
+        // actually changed, pruned to the live panes so a reaped pane leaves
+        // nothing behind. In-memory and keyed to the panes this tick is
+        // holding, so unlike the group headers it stays on this thread.
         self.disk
             .state_since
             .retain(|short, _| panes.iter().any(|p| p.short() == short));
@@ -9728,6 +10033,20 @@ pub fn run_dashboard(
         ui::Overlay::Restore(build_restore_view(&restore_candidates))
     };
     let mut facts_cache = FactsCache::new(Instant::now());
+    // The machine-wide half of those facts, off this thread entirely: the
+    // registry listing alone is O(every session this machine has ever
+    // registered) plus a synchronous probe per orphan socket, and it used to
+    // run between the operator's keystroke and the `event::poll` that would
+    // have read it. See `FactsSnapshot`.
+    let facts_refresher = FactsRefresher::spawn(
+        state,
+        FactsOwner {
+            repo,
+            agent_name: &agent_name,
+            session_short: &dashboard_short,
+        },
+        cfg.mail.enabled,
+    );
     // L13: transient, auto-expiring header notices (info), kept apart from the
     // sticky `errors` channel (⚠) so a confirmation like "spawned … as …"
     // shows briefly and then clears instead of pinning behind a warning glyph.
@@ -9737,6 +10056,12 @@ pub fn run_dashboard(
     // drawn frame, not on a clock of its own -- the dashboard already
     // redraws every frame, so this is the only "polling" the spinner needs.
     let mut render_tick: usize = 0;
+    // Issue #330: which unfocused pane the shared drain budget starts on,
+    // advanced once per tick -- see `drain_shared_budget`.
+    let mut drain_rotation: usize = 0;
+    // Issue #330: when the current iteration started, so the next one can
+    // report how long it took (`KeyLog::tick`'s `dur=` field).
+    let mut last_tick_started = Instant::now();
     // P4: one line per candidate the liveness check just held back. Pushed
     // here rather than at the partition above only because `notices` does not
     // exist yet up there. It says "kept for next launch" because that is now
@@ -9758,6 +10083,11 @@ pub fn run_dashboard(
     // tick sweeps immediately (same reasoning as `FactsCache::new`).
     let mut last_mail_sweep = Instant::now()
         .checked_sub(FACTS_THROTTLE)
+        .unwrap_or_else(Instant::now);
+    // The spawn-request intake's own (much tighter) cadence, seeded the same
+    // way so the first tick reads immediately -- see `SPAWN_REQUEST_POLL`.
+    let mut last_spawn_intake = Instant::now()
+        .checked_sub(SPAWN_REQUEST_POLL)
         .unwrap_or_else(Instant::now);
     // A1-1: the per-pane budget sweep reads (and parses) every budgeted
     // pane's whole transcript, so it belongs on the same ~1s disk cadence as
@@ -9827,28 +10157,54 @@ pub fn run_dashboard(
         // only when the watched state changed -- so a `prefix_armed` (or
         // `overlay`) that moves with no keystroke in between is visible as a
         // `TICK` with no `EVENT` before it. Inert unless the keylog is on.
+        // Issue #330: how long the last iteration took, for the `dur=` field
+        // below. One monotonic clock read per tick, which this loop already
+        // makes several of; the log itself stays entirely inert with the env
+        // var unset.
+        let tick_started = Instant::now();
+        let previous_tick = tick_started.saturating_duration_since(last_tick_started);
+        last_tick_started = tick_started;
         if let Some(log) = keylog.as_mut() {
-            log.tick(LoopState {
-                prefix_armed,
-                overlay: overlay_name(&overlay),
-                panes: panes.len(),
-                focused,
-                focused_alt: panes.get(focused).is_some_and(Pane::alternate_screen),
-            });
+            log.tick(
+                LoopState {
+                    prefix_armed,
+                    overlay: overlay_name(&overlay),
+                    panes: panes.len(),
+                    focused,
+                    focused_alt: panes.get(focused).is_some_and(Pane::alternate_screen),
+                },
+                previous_tick,
+            );
         }
-        for pane in panes.iter_mut() {
-            let (any_output, _more) = pane.drain();
+        // Issue #330: ONE `DRAIN_BUDGET_BYTES` for the whole tick, focused
+        // pane first and the rest round-robin behind it -- not that much per
+        // pane, which with eight streaming workers put up to 2 MiB of vt100
+        // parsing between a keystroke and the `event::poll` that would have
+        // read it. See `drain_shared_budget`.
+        let produced_output = drain_shared_budget(
+            panes.len(),
+            focused,
+            drain_rotation,
+            pane::DRAIN_BUDGET_BYTES,
+            |idx, remaining| {
+                let (any, _more, used) = panes[idx].drain_with_budget(remaining);
+                (any, used)
+            },
+        );
+        drain_rotation = drain_rotation.wrapping_add(1);
+        for idx in produced_output {
             // HIGH (review): live output rewrites this pane's grid rows in
             // place, under a selection's stale `(row, col)` coordinates --
             // scrollback-offset checks (`scroll_cancels_selection`) never see
             // this, since the offset itself does not move while the pane
             // sits at its live view. See `output_cancels_selection`.
-            if any_output
-                && let Some(sel) = selection.as_ref()
-                && output_cancels_selection(sel, pane.short())
+            if let Some(sel) = selection.as_ref()
+                && output_cancels_selection(sel, panes[idx].short())
             {
                 selection = None;
             }
+        }
+        for pane in panes.iter_mut() {
             pane.on_turn_signal();
         }
         enforce_pane_token_budgets(
@@ -9912,17 +10268,24 @@ pub fn run_dashboard(
         // stranded -- the dashboard exited first, and the requester burned its
         // ack timeout against a channel nobody would ever poll again.
         let panes_before_requests = panes.len();
-        handle_spawn_requests(
-            &requests_dir,
-            &mut panes,
-            &mut nudge_queues,
-            cfg,
-            state,
-            repo,
-            pane_size,
-            &mut errors,
-            &mut kept_requests,
-        );
+        // ...on its own `SPAWN_REQUEST_POLL` cadence rather than every tick:
+        // the directory reads are what cost, and they must not sit between
+        // the operator's keystroke and the `event::poll` below.
+        let intake_now = Instant::now();
+        if spawn_intake_due(last_spawn_intake, intake_now, panes.is_empty()) {
+            last_spawn_intake = intake_now;
+            handle_spawn_requests(
+                &requests_dir,
+                &mut panes,
+                &mut nudge_queues,
+                cfg,
+                state,
+                repo,
+                pane_size,
+                &mut errors,
+                &mut kept_requests,
+            );
+        }
         // M4: a request fulfilled this tick appended panes, shifting every
         // view-only sidebar row (and any selection on one) down.
         selected = insert_fixup(panes_before_requests, panes.len(), selected);
@@ -10034,8 +10397,14 @@ pub fn run_dashboard(
             },
             &panes,
             Instant::now(),
+            || facts_refresher.take_latest(),
         );
         if facts_refreshed {
+            // What the refresher's next cycle should load groups for: this
+            // tick's live panes, deduped. One lock per throttled tick, held
+            // for a `Vec` swap and nothing else.
+            let group_ids: HashSet<&str> = panes.iter().filter_map(Pane::work_group_id).collect();
+            facts_refresher.publish_group_ids(group_ids.into_iter().map(str::to_string).collect());
             // Exactly the rows the sidebar can draw, and only on the tick the
             // rest of the facts were re-read: the glyph column must never put
             // a file read on a frame.
@@ -12774,13 +13143,13 @@ mod tests {
         };
 
         // Tick 1: nothing armed. Tick 2: identical, so it writes nothing.
-        log.tick(live(false));
-        log.tick(live(false));
+        log.tick(live(false), Duration::ZERO);
+        log.tick(live(false), Duration::ZERO);
         // The operator presses Ctrl+A and the loop stores the arming.
         log.dispatch(false, true, &InputVerdict::Pending);
-        log.tick(live(true));
+        log.tick(live(true), Duration::ZERO);
         // ... and then it is gone, with no keystroke to explain it.
-        log.tick(live(false));
+        log.tick(live(false), Duration::ZERO);
 
         let text = std::fs::read_to_string(&path).expect("read back");
         let lines: Vec<&str> = text.lines().collect();
@@ -12807,6 +13176,53 @@ mod tests {
         );
         // Tick numbers make "which iteration" answerable rather than inferred.
         assert!(lines[3].contains("t4"), "{}", lines[3]);
+    }
+
+    /// Issue #330: keystroke latency IS the tick duration -- the loop reaches
+    /// `event::poll` only after a tick's maintenance and draw -- so every
+    /// `TICK` line carries the previous iteration's wall time, and a tick slow
+    /// enough for the operator to feel writes a line even when nothing else
+    /// about the loop state moved.
+    #[test]
+    fn the_keylog_tick_line_carries_the_previous_tick_duration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("keys.log");
+        let mut log = KeyLog {
+            file: std::fs::File::create(&path).expect("create"),
+            start: Instant::now(),
+            tick: 0,
+            last: None,
+        };
+        let state = LoopState {
+            prefix_armed: false,
+            overlay: "none",
+            panes: 3,
+            focused: 0,
+            focused_alt: false,
+        };
+
+        log.tick(state, Duration::from_millis(7));
+        log.tick(state, Duration::from_millis(3));
+        log.tick(state, KEYLOG_SLOW_TICK);
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "an unchanged, fast tick still writes nothing: {text}"
+        );
+        assert!(
+            lines[0].contains("dur=7ms"),
+            "the first line carries the duration too: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(&format!("dur={}ms", KEYLOG_SLOW_TICK.as_millis()))
+                && lines[1].contains("(slow)"),
+            "a slow tick is reported even with the loop state unchanged: {}",
+            lines[1]
+        );
     }
 
     /// Hypothesis (c): the action fires but nothing visible follows. Every
@@ -13187,13 +13603,16 @@ mod tests {
         log.scroll("wheel", true, true, 0, 0, ScrollOutcome::ForwardedMouse);
         log.scroll("top", true, false, 0, 0, ScrollOutcome::FullScreen);
         // And the per-tick state line carries the flag even with no scroll.
-        log.tick(LoopState {
-            prefix_armed: false,
-            overlay: "none",
-            panes: 1,
-            focused: 0,
-            focused_alt: true,
-        });
+        log.tick(
+            LoopState {
+                prefix_armed: false,
+                overlay: "none",
+                panes: 1,
+                focused: 0,
+                focused_alt: true,
+            },
+            Duration::ZERO,
+        );
 
         let text = std::fs::read_to_string(&path).expect("read back");
         let lines: Vec<&str> = text.lines().collect();
@@ -13510,6 +13929,24 @@ mod tests {
             agent_name: "claude",
             session_short: "sess0000",
         }
+    }
+
+    /// Issue #330: the snapshot [`FactsRefresher`] would have published,
+    /// computed synchronously right here. The reads themselves are unchanged
+    /// -- only which thread makes them is -- so a cache test stays a test of
+    /// the cache's own throttle rather than of a background thread's timing.
+    fn snapshot(state: &StateDir, repo: &Path, cfg: &CtxConfig) -> Option<FactsSnapshot> {
+        let owner = owner(repo);
+        Some(collect_facts_snapshot(
+            &FactsInputs {
+                state: state.clone(),
+                repo: repo.to_path_buf(),
+                agent_name: owner.agent_name.to_string(),
+                session_short: owner.session_short.to_string(),
+                mail_enabled: cfg.mail.enabled,
+            },
+            &[],
+        ))
     }
 
     /// This test module's stand-in for "the running dashboard's own pid" --
@@ -14327,7 +14764,9 @@ mod tests {
         // 40 frames inside one throttle window -- the dashboard's own poll is
         // 10-50ms, so this is well under a second of real time.
         for _ in 0..40 {
-            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], start) {
+            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], start, || {
+                snapshot(&state, &repo, &cfg)
+            }) {
                 cache.refresh_attention(&shorts, &counting);
             }
         }
@@ -14340,7 +14779,9 @@ mod tests {
         // The next window reads again, and only once more.
         let later = start + FACTS_THROTTLE + Duration::from_millis(1);
         for _ in 0..40 {
-            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later) {
+            if cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || {
+                snapshot(&state, &repo, &cfg)
+            }) {
                 cache.refresh_attention(&shorts, &counting);
             }
         }
@@ -14571,7 +15012,9 @@ mod tests {
         .expect("store claude's reading");
 
         let mut cache = FactsCache::new(now);
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
+            snapshot(&state, &repo, &cfg)
+        });
 
         let claude = cache
             .disk
@@ -14623,7 +15066,9 @@ mod tests {
         .expect("store an expired reading");
 
         let mut cache = FactsCache::new(now);
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
+            snapshot(&state, &repo, &cfg)
+        });
 
         let claude = cache
             .disk
@@ -14638,6 +15083,127 @@ mod tests {
         assert_eq!(claude.seven_day, None);
     }
 
+    /// Issue #330: the tick's half of the facts refresh never waits on the
+    /// background refresher. A refresher still mid-cycle -- the state
+    /// directory it is listing is exactly what made this expensive -- leaves
+    /// the facts the dashboard already had; whatever it publishes in the
+    /// meantime is swapped in by the next tick that asks, newest only.
+    ///
+    /// `take_latest` returning at all is half the assertion: a hand-off that
+    /// blocked on the refresher would hang this test rather than fail it.
+    #[test]
+    fn a_blocked_facts_refresher_leaves_the_tick_alone_and_lands_on_the_next_one() {
+        let (tx, rx) = mpsc::channel();
+        let refresher = FactsRefresher {
+            group_ids: Arc::new(Mutex::new(Vec::new())),
+            rx,
+            stop: Arc::new(AtomicBool::new(false)),
+            inline: None,
+        };
+        let release = Arc::new(AtomicBool::new(false));
+        let thread_release = Arc::clone(&release);
+        let publisher = std::thread::spawn(move || {
+            while !thread_release.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            for (memory_count, unread) in [(4usize, 1usize), (7, 3)] {
+                let _ = tx.send(FactsSnapshot {
+                    mail: Some((unread, 0)),
+                    memory_count,
+                    registry: Vec::new(),
+                    groups: HashMap::new(),
+                });
+            }
+        });
+
+        let mut cache = FactsCache::new(Instant::now());
+        cache.disk.mail = Some((0, 0));
+        cache.disk.memory_count = 2;
+        assert!(
+            !cache.apply_snapshot(refresher.take_latest()),
+            "a refresher mid-cycle has published nothing to swap in"
+        );
+        assert_eq!(
+            (cache.disk.mail, cache.disk.memory_count),
+            (Some((0, 0)), 2),
+            "the tick keeps the facts it already had rather than blanking them"
+        );
+
+        release.store(true, Ordering::Relaxed);
+        publisher.join().expect("the publisher finishes");
+        assert!(cache.apply_snapshot(refresher.take_latest()));
+        assert_eq!(
+            (cache.disk.mail, cache.disk.memory_count),
+            (Some((3, 0)), 7),
+            "the newest snapshot wins; a tick never replays a stale backlog"
+        );
+    }
+
+    /// Issue #330: the spawn-request channels are read on their own cadence,
+    /// not once per (up to 100/s) tick -- except with no panes left, where
+    /// L17's empty-exit decision has to see a request that arrived on the very
+    /// tick the last pane ended.
+    #[test]
+    fn the_spawn_request_intake_is_throttled_but_forced_once_the_panes_are_gone() {
+        let start = Instant::now();
+        assert!(
+            spawn_intake_due(
+                start.checked_sub(SPAWN_REQUEST_POLL).unwrap_or(start),
+                start,
+                false
+            ),
+            "seeded an interval in the past, the first tick reads"
+        );
+        assert!(
+            !spawn_intake_due(start, start + SPAWN_REQUEST_POLL / 2, false),
+            "a tick inside the window does no directory reads at all"
+        );
+        assert!(spawn_intake_due(start, start + SPAWN_REQUEST_POLL, false));
+        assert!(
+            spawn_intake_due(start, start + Duration::from_millis(1), true),
+            "L17: with no panes left the intake runs whatever the throttle says"
+        );
+    }
+
+    /// Issue #330: one vt100 budget for the tick, not one per pane. The
+    /// focused pane -- the one the operator is watching and typing into --
+    /// spends it first; the rest take what is left in a rotation, and whatever
+    /// nobody could parse stays queued for the next tick rather than being
+    /// dropped.
+    #[test]
+    fn the_shared_drain_budget_feeds_the_focused_pane_first_and_loses_nothing() {
+        assert_eq!(drain_order(3, 1, 0), vec![1, 0, 2]);
+        assert_eq!(
+            drain_order(3, 1, 1),
+            vec![1, 2, 0],
+            "the rotation moves the start index, so no unfocused pane starves"
+        );
+
+        let mut queued = [100usize, 100, 100];
+        let tick = |focused: usize, start: usize, queued: &mut [usize; 3]| {
+            drain_shared_budget(3, focused, start, 150, |idx, remaining| {
+                let used = queued[idx].min(remaining);
+                queued[idx] -= used;
+                (used > 0, used)
+            })
+        };
+
+        assert_eq!(tick(1, 0, &mut queued), vec![1, 0]);
+        assert_eq!(
+            queued,
+            [50, 0, 100],
+            "the focused pane drains in full, the next in the rotation takes \
+             the remainder, and the last one waits"
+        );
+
+        assert_eq!(tick(1, 1, &mut queued), vec![2, 0]);
+        assert_eq!(
+            queued,
+            [0, 0, 0],
+            "two ticks parse every byte that was queued: nothing is ever dropped"
+        );
+    }
+
     #[test]
     fn facts_cache_refreshes_immediately_then_honors_the_throttle() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -14647,7 +15213,9 @@ mod tests {
         let now = Instant::now();
 
         let mut cache = FactsCache::new(now);
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
+            snapshot(&state, &repo, &cfg)
+        });
         assert_eq!(
             cache.disk.mail,
             Some((0, 0)),
@@ -14672,7 +15240,9 @@ mod tests {
         )
         .expect("store");
 
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
+            snapshot(&state, &repo, &cfg)
+        });
         assert_eq!(
             cache.disk.mail,
             Some((0, 0)),
@@ -14680,7 +15250,9 @@ mod tests {
         );
 
         let later = now + FACTS_THROTTLE;
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || {
+            snapshot(&state, &repo, &cfg)
+        });
         assert_eq!(
             cache.disk.mail,
             Some((1, 0)),
@@ -14702,7 +15274,9 @@ mod tests {
         let now = Instant::now();
 
         let mut cache = FactsCache::new(now);
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
+            snapshot(&state, &repo, &cfg)
+        });
         assert!(cache.registry.is_empty(), "nothing is registered yet");
         assert!(
             cache.disk.scores.is_empty(),
@@ -14714,14 +15288,18 @@ mod tests {
             registry_record("aaa11111", "claude", Some(DASHBOARD_PID)),
         );
 
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], now, || {
+            snapshot(&state, &repo, &cfg)
+        });
         assert!(
             cache.registry.is_empty(),
             "within the throttle window nothing re-reads the registry"
         );
 
         let later = now + FACTS_THROTTLE;
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later);
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], later, || {
+            snapshot(&state, &repo, &cfg)
+        });
         assert_eq!(
             cache.registry.len(),
             1,
@@ -14774,7 +15352,9 @@ mod tests {
         let _foreign_guard = sessions::SessionGuard::register(&state, foreign);
 
         let mut cache = FactsCache::new(Instant::now());
-        cache.refresh_if_due(&cfg, &state, owner(repo), &[], Instant::now());
+        cache.refresh_if_due(&cfg, &state, owner(repo), &[], Instant::now(), || {
+            snapshot(&state, repo, &cfg)
+        });
 
         assert_eq!(cache.registry.len(), 2, "both records are on disk");
         assert!(
@@ -14827,7 +15407,9 @@ mod tests {
         .expect("store");
 
         let mut cache = FactsCache::new(Instant::now());
-        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], Instant::now());
+        cache.refresh_if_due(&cfg, &state, owner(&repo), &[], Instant::now(), || {
+            snapshot(&state, &repo, &cfg)
+        });
 
         assert_eq!(
             cache.disk.mail_by_session.get(&short).copied(),
