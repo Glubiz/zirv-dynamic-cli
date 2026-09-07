@@ -821,6 +821,9 @@ pub struct Pane {
     /// anything, but gates injection only, not the pane's displayed state.
     user_typed_since_turn: bool,
     exit_code: Option<i32>,
+    /// Monotonic launch age captured when the real child exit is observed.
+    launched_at: Instant,
+    exited_after: Option<Duration>,
     /// Idempotency guard for `shutdown` -- the release profile is
     /// `panic = "abort"`, so `Drop` is not guaranteed and every exit arm
     /// that leaves a pane's owner must call `shutdown` explicitly (mirrors
@@ -1077,6 +1080,7 @@ impl Pane {
         wrap::answer_inherit_cursor_probe(&mut *first_writer);
         let writer = Arc::new(Mutex::new(first_writer));
 
+        let launched_at = Instant::now();
         let child = pair.slave.spawn_command(command)?;
         // P2/P3: adopted on the very next statement after the spawn, ahead of
         // every `?` below. Two reasons for that placement: it narrows the
@@ -1203,6 +1207,8 @@ impl Pane {
             injected_awaiting_turn: false,
             user_typed_since_turn: false,
             exit_code: None,
+            launched_at,
+            exited_after: None,
             done: false,
             report_to: None,
             intake_dir: None,
@@ -1982,6 +1988,11 @@ impl Pane {
         last_line_of(self.screen())
     }
 
+    /// The child's age at its observed exit, before teardown adds any delay.
+    pub fn exited_after(&self) -> Option<Duration> {
+        self.exited_after
+    }
+
     /// Writes a visible, clearly-labelled line into the child's own pty --
     /// `"[zirv ▸ {label}] {body}"` -- and schedules the lone `\r` that
     /// submits it for at least [`INJECTION_SUBMIT_DELAY`] later (issue #114
@@ -2383,6 +2394,7 @@ impl Pane {
         wrap::answer_inherit_cursor_probe(&mut *first_writer);
         let writer = Arc::new(Mutex::new(first_writer));
 
+        let launched_at = Instant::now();
         let child = pair.slave.spawn_command(command)?;
         let lifecycle = supervise::ChildGuard::adopt(child.process_id());
         drop(pair.slave);
@@ -2491,6 +2503,8 @@ impl Pane {
         self.injected_awaiting_turn = false;
         self.user_typed_since_turn = false;
         self.exit_code = None;
+        self.launched_at = launched_at;
+        self.exited_after = None;
         // F1/F2: the old child's pty is gone, so any deferred `\r` it was
         // still owed would now write into the successor's composer instead
         // -- drop it rather than carry it across the swap.
@@ -2532,6 +2546,7 @@ impl Pane {
         }
         if let Ok(Some(status)) = self.child.try_wait() {
             self.exit_code = Some(status.exit_code() as i32);
+            self.exited_after = Some(self.launched_at.elapsed());
         }
     }
 }

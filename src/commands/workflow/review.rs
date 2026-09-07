@@ -4029,6 +4029,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reviewer_argv_codex_has_one_read_only_sandbox_through_headless_launch() {
+        use crate::commands::ctx::{CtxCli, CtxVerb, adapters, agent, config::CtxConfig};
+        use clap::Parser;
+        let repo = tempdir().unwrap();
+        let argv = reviewer_argv("codex", repo.path(), false, None, None).unwrap();
+        let parsed =
+            CtxCli::try_parse_from(std::iter::once("ctx".to_string()).chain(argv.clone())).unwrap();
+        let CtxVerb::Agent(args) = parsed.verb else {
+            panic!("reviewer must delegate an agent")
+        };
+        let adapter = adapters::codex::CodexAdapter::new(None).with_ignore_flags_forced(true);
+        let flags = agent::headless_worker_flags(&CtxConfig::default(), &args, &adapter);
+        for composed in [&argv, &flags] {
+            let sandbox: Vec<_> = composed
+                .windows(2)
+                .filter(|w| w[0] == "--sandbox")
+                .map(|w| w[1].as_str())
+                .collect();
+            assert_eq!(sandbox, ["read-only"], "{composed:?}");
+        }
+    }
+
     /// Budget flags must land before the `--` separator, and only when set.
     #[test]
     fn reviewer_argv_appends_worker_budget_flags_before_the_separator_only_when_set() {

@@ -1449,6 +1449,24 @@ fn worker_launch_flags(
     out
 }
 
+/// Compose the headless worker's model, policy and requested seat flags.
+pub(crate) fn headless_worker_flags(
+    cfg: &CtxConfig,
+    args: &AgentArgs,
+    adapter: &dyn AgentAdapter,
+) -> Vec<String> {
+    let mut flags = worker_launch_flags(
+        cfg,
+        &args.name,
+        adapter,
+        &flags_with_system_prompt(args, adapter),
+    );
+    if args.mode == WorkerMode::ReadOnly {
+        adapters::extend_read_only_args(adapter, &mut flags, adapters::LaunchMode::Headless);
+    }
+    flags
+}
+
 /// Issue #252 (2026-09-01): appends the same extra writable-root argv
 /// `dash::worker_pane_extra_args` has always added unconditionally for a
 /// dashboard-spawned worker pane, to a headless `zirv agent` delegation's own
@@ -2929,15 +2947,7 @@ pub fn run_with<W: Write>(
         },
         &mut refresh_flags,
     );
-    let requested_command = worker_launch_flags(
-        &cfg,
-        &args.name,
-        requested_adapter.as_ref(),
-        // R1-4: the seat instructions are part of what this delegation
-        // launches with, so the routing read sees the same argv the launch
-        // below will build.
-        &flags_with_system_prompt(args, requested_adapter.as_ref()),
-    );
+    let requested_command = headless_worker_flags(&cfg, args, requested_adapter.as_ref());
     let requested_model = adapters::last_model_flag(&requested_command);
     let source_model_explicit = flags_pin_model(&args.flags);
     let bounds = super::fallback::TaskBounds {
@@ -3226,15 +3236,7 @@ pub fn run_with<W: Write>(
     // both reads are the same pure function over the same inputs.
     let launch_repo = effective_launch_repo(args.workdir.as_deref(), repo);
     let command = with_headless_extra_writable_roots(
-        worker_launch_flags(
-            &cfg,
-            &args.name,
-            adapter.as_ref(),
-            // R1-4: `--system-prompt` reaches an inline supervised child
-            // through the adapter's own injection form here; the pane fork
-            // carries the same text on `SpawnRequest::system_prompt`.
-            &flags_with_system_prompt(args, adapter.as_ref()),
-        ),
+        headless_worker_flags(&cfg, args, adapter.as_ref()),
         adapter.as_ref(),
         &launch_repo,
         &state.mail(),
@@ -5831,18 +5833,10 @@ mod tests {
         );
     }
 
-    /// A `[policy] shell_exec = "deny"` must reach a delegated headless
-    /// worker's real launch argv on both adapters *on top of* the shipped
-    /// sandbox baseline, from the same `cfg.policy` -- claude's tool-deny
-    /// pin, and codex's `policy_args` restating (more strictly) the same
-    /// `--sandbox`/`--ask-for-approval` flags `default_sandbox_args` already
-    /// emitted. The duplication is intentional and harmless: both CLIs take
-    /// the last occurrence of a single-value flag, and the later, explicit
-    /// `Deny`-driven values (`read-only`) are strictly stricter than the
-    /// baseline (`workspace-write`), so they are the ones that end up
-    /// governing the launch.
+    /// A configured deny keeps claude's tool restriction and replaces
+    /// codex's default sandbox. Codex rejects repeated single-value flags.
     #[test]
-    fn worker_launch_flags_layers_an_explicit_policy_deny_on_top_of_the_sandbox_baseline() {
+    fn worker_launch_flags_applies_an_explicit_policy_deny_without_duplicate_sandbox_flags() {
         use crate::commands::ctx::policy::{EffectivePolicy, Stance};
         let cfg = CtxConfig {
             policy: EffectivePolicy {
@@ -5871,22 +5865,16 @@ mod tests {
             codex_flags,
             vec![
                 "--sandbox".to_string(),
-                "workspace-write".to_string(),
-                "--ask-for-approval".to_string(),
-                "never".to_string(),
-                "--sandbox".to_string(),
                 "read-only".to_string(),
                 "--ask-for-approval".to_string(),
                 "never".to_string(),
             ],
-            "the later, stricter --sandbox read-only is the one that wins (last occurrence)"
+            "the restrictive sandbox replaces the default without repeating either CLI option"
         );
     }
 
-    /// The operator's own trailing flags still reach argv unchanged (and
-    /// still win, since both CLIs take the last occurrence of a single-value
-    /// flag) even under the sandbox baseline plus a configured `[policy]`
-    /// restriction.
+    /// The operator's trailing flags still reach argv unchanged after a
+    /// configured policy restriction.
     #[test]
     fn worker_launch_flags_keeps_the_operators_own_flags_after_a_configured_policy() {
         use crate::commands::ctx::policy::{EffectivePolicy, Stance};
@@ -5905,10 +5893,6 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                "--sandbox".to_string(),
-                "workspace-write".to_string(),
-                "--ask-for-approval".to_string(),
-                "never".to_string(),
                 "--sandbox".to_string(),
                 "read-only".to_string(),
                 "--ask-for-approval".to_string(),
@@ -5980,6 +5964,29 @@ mod tests {
             ),
         ]
         .into()
+    }
+
+    #[test]
+    fn headless_read_only_codex_worker_has_one_sandbox() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let adapter = adapters::codex::CodexAdapter::new(None)
+            .with_ignore_flags_forced(true)
+            .with_exec_ask_for_approval_forced(true);
+        let mut args = args_for("codex", "go");
+        args.mode = WorkerMode::ReadOnly;
+        let flags = with_headless_extra_writable_roots(
+            headless_worker_flags(&cfg, &args, &adapter),
+            &adapter,
+            tmp.path(),
+            &tmp.path().join("mail"),
+        );
+        let sandbox: Vec<_> = flags
+            .windows(2)
+            .filter(|w| w[0] == "--sandbox")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(sandbox, ["read-only"], "{flags:?}");
     }
 
     fn args_for(name: &str, prompt: &str) -> AgentArgs {

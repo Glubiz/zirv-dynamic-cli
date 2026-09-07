@@ -1140,7 +1140,7 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// Build a provider-neutral workflow-seat launch. Agent manifests describe
     /// required capabilities and methodology but never grant authority: this
     /// default re-loads the effective canonical policy, applies the normal
-    /// headless sandbox/policy projection, and finally appends the adapter's
+    /// headless sandbox/policy projection, and finally applies the adapter's
     /// read-only floor when the seat requires it. Provider-specific model ids
     /// are accepted only when an operator/caller explicitly supplies one;
     /// `model_tier` remains a routing hint rather than a guessed model name.
@@ -1167,12 +1167,7 @@ pub trait AgentAdapter: std::fmt::Debug {
             }
         }
 
-        let mut extra = if cfg.sandbox.enabled {
-            self.default_sandbox_args(&cfg.sandbox, &cfg.safety, LaunchMode::Headless)
-        } else {
-            Vec::new()
-        };
-        extra.extend(self.policy_args(&cfg.policy, LaunchMode::Headless));
+        let mut extra = policy_launch_args(&cfg, self, &[], LaunchMode::Headless);
         if let Some(model) = task.model.as_deref() {
             extra.extend(self.model_args(model));
         }
@@ -1185,10 +1180,7 @@ pub trait AgentAdapter: std::fmt::Debug {
         );
         extra.extend(self.system_prompt_args(&system_prompt));
         if manifest.read_only {
-            // Last writer wins for both current adapters' restriction flags.
-            // Keeping this last makes the read-only floor impossible for a
-            // weaker sandbox/model argument to undo.
-            extra.extend(self.read_only_args());
+            extend_read_only_args(self, &mut extra, LaunchMode::Headless);
         }
         let session = SessionId::new_v4();
         let mut command = self.headless_cmd(&task.prompt, &session, &extra);
@@ -2535,6 +2527,57 @@ pub fn read_only_args_for_agent_name(name: &str, mode: LaunchMode) -> Option<Vec
         })
 }
 
+/// Apply a worker's read-only floor at the launch composition seam.
+/// Codex's sandbox option is single-use: replace the earlier choice instead
+/// of appending a second pair. Other adapters retain their own floor argv.
+pub fn extend_read_only_args(
+    adapter: &(impl AgentAdapter + ?Sized),
+    args: &mut Vec<String>,
+    mode: LaunchMode,
+) {
+    let mut floor = if mode.is_interactive() {
+        adapter.interactive_read_only_args()
+    } else {
+        adapter.read_only_args()
+    };
+    if adapter.name() == "codex" {
+        let mut replaced = false;
+        let mut index = 0;
+        while index < args.len() {
+            let arg = &args[index];
+            if arg == "--sandbox" || arg == "-s" {
+                args[index] = "--sandbox".to_string();
+                if index + 1 == args.len() {
+                    args.push("read-only".to_string());
+                } else {
+                    args[index + 1] = "read-only".to_string();
+                }
+                replaced = true;
+                index += 1;
+            } else if arg.starts_with("--sandbox=") || (arg.starts_with("-s") && arg.len() > 2) {
+                args.splice(
+                    index..=index,
+                    ["--sandbox".to_string(), "read-only".to_string()],
+                );
+                replaced = true;
+                index += 1;
+            }
+            index += 1;
+        }
+        if replaced {
+            floor.drain(..2);
+        }
+        // A workflow reviewer can already carry the exec-only floor.
+        floor.retain(|arg| {
+            !matches!(arg.as_str(), "--ignore-rules" | "--ignore-user-config")
+                || !args.contains(arg)
+        });
+    } else {
+        floor.retain(|arg| !args.contains(arg));
+    }
+    args.extend(floor);
+}
+
 /// Issue #89: a one-time `zirv ▸` announcement naming a resolved distiller/
 /// reviewer adapter's own recorded sandbox residual
 /// ([`AgentAdapter::sandbox_residual_note`]), fired at most once per
@@ -2978,12 +3021,11 @@ pub fn worker_model_args(cfg: &CtxConfig, name: &str, adapter: &dyn AgentAdapter
 /// default -- see that method's own doc comment for the exact posture),
 /// followed by `adapter.policy_args(&cfg.policy, mode)` for any *additional*
 /// restriction an explicit `[policy]` `Deny` stance asks for on top of the
-/// baseline. The more specific choice comes last, so it wins if it overlaps
-/// with the baseline (both adapters' relevant flags are single-value; the
-/// underlying CLI takes the last occurrence).
+/// baseline. Codex's restrictive policy replaces the baseline because its
+/// sandbox and approval options reject duplicate occurrences.
 pub fn policy_launch_args(
     cfg: &CtxConfig,
-    adapter: &dyn AgentAdapter,
+    adapter: &(impl AgentAdapter + ?Sized),
     flags: &[String],
     mode: LaunchMode,
 ) -> Vec<String> {
@@ -3029,7 +3071,7 @@ pub fn policy_launch_args(
 /// `Deny` stance instead of `--mode read-only`'s own floor.
 pub fn policy_launch_args_for_surface(
     cfg: &CtxConfig,
-    adapter: &dyn AgentAdapter,
+    adapter: &(impl AgentAdapter + ?Sized),
     flags: &[String],
     approval_mode: LaunchMode,
     surface_mode: LaunchMode,
@@ -3037,12 +3079,16 @@ pub fn policy_launch_args_for_surface(
     if flags_pin_policy(flags) {
         return Vec::new();
     }
-    let mut out = if cfg.sandbox.enabled {
+    let policy = adapter.policy_args(&cfg.policy, surface_mode);
+    // Codex's restrictive policy already supplies sandbox and approval.
+    // Neither CLI option accepts a second occurrence from the baseline.
+    let policy_supplies_sandbox = adapter.name() == "codex" && flags_pin_policy(&policy);
+    let mut out = if cfg.sandbox.enabled && !policy_supplies_sandbox {
         adapter.default_sandbox_args(&cfg.sandbox, &cfg.safety, approval_mode)
     } else {
         Vec::new()
     };
-    out.extend(adapter.policy_args(&cfg.policy, surface_mode));
+    out.extend(policy);
     out
 }
 
@@ -3496,6 +3542,72 @@ pub(crate) fn git_dirs(path: &Path) -> Option<(PathBuf, PathBuf)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn restrictive_codex_policy_has_one_sandbox_and_approval_option() {
+        let mut cfg = CtxConfig::default();
+        cfg.policy.repo_fs_write = super::super::policy::Stance::Deny;
+        let adapter = codex::CodexAdapter::new(None)
+            .with_ignore_flags_forced(true)
+            .with_exec_ask_for_approval_forced(true);
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            let flags = policy_launch_args(&cfg, &adapter, &[], mode);
+            let sandbox: Vec<_> = flags
+                .windows(2)
+                .filter(|w| w[0] == "--sandbox")
+                .map(|w| w[1].as_str())
+                .collect();
+            assert_eq!(sandbox, ["read-only"], "{flags:?}");
+            assert_eq!(
+                flags
+                    .iter()
+                    .filter(|arg| *arg == "--ask-for-approval")
+                    .count(),
+                1,
+                "{flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_floor_replaces_an_explicit_codex_sandbox_and_is_idempotent() {
+        let adapter = codex::CodexAdapter::new(None).with_ignore_flags_forced(true);
+        for sandbox in [
+            vec!["--sandbox", "workspace-write"],
+            vec!["-s", "workspace-write"],
+            vec!["--sandbox=workspace-write"],
+            vec!["-sworkspace-write"],
+            vec!["--sandbox"],
+            vec!["-s"],
+        ] {
+            let mut flags: Vec<String> = sandbox.into_iter().map(str::to_string).collect();
+            extend_read_only_args(&adapter, &mut flags, LaunchMode::Headless);
+            let once = flags.clone();
+            extend_read_only_args(&adapter, &mut flags, LaunchMode::Headless);
+            assert_eq!(flags, once);
+            assert_eq!(flags.iter().filter(|arg| *arg == "--sandbox").count(), 1);
+            assert!(
+                flags
+                    .windows(2)
+                    .any(|pair| pair == ["--sandbox", "read-only"])
+            );
+            assert!(
+                !flags.iter().any(|arg| arg.contains("workspace-write")),
+                "{flags:?}"
+            );
+            assert_eq!(
+                flags.iter().filter(|arg| *arg == "--ignore-rules").count(),
+                1
+            );
+            assert_eq!(
+                flags
+                    .iter()
+                    .filter(|arg| *arg == "--ignore-user-config")
+                    .count(),
+                1
+            );
+        }
+    }
+
     /// Issue #224 review round 2: the bare "drop every guardrail" toggles
     /// pin the loosest posture just as decisively as a dedicated
     /// `--permission-mode`/`--sandbox` value, so `flags_pin_policy` must
@@ -3698,14 +3810,62 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
+    /// Built-in read-only seats must launch with one restrictive sandbox,
+    /// including when the repository policy already denies writes.
+    #[test]
+    fn dispatch_agent_codex_read_only_seats_have_one_sandbox() {
+        use crate::commands::workflow::agents::{AgentRegistry, AgentTask};
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let registry = AgentRegistry::load(repo.path(), None, false, false).expect("registry");
+        let adapter = codex::CodexAdapter::new(None)
+            .with_ignore_flags_forced(true)
+            .with_exec_ask_for_approval_forced(true);
+        let task = AgentTask {
+            prompt: "inspect the change".to_string(),
+            repo: repo.path().to_path_buf(),
+            model: None,
+        };
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        for policy in ["", "[policy]\nrepo_fs_write = \"deny\"\n"] {
+            std::fs::write(repo.path().join(".zirv/ctx.toml"), policy).expect("config");
+            for id in ["reviewer", "security-scanner", "explorer"] {
+                let seat = registry
+                    .list()
+                    .find(|seat| seat.manifest.id == id)
+                    .expect("built-in seat");
+                let argv = flatten_command(
+                    adapter
+                        .dispatch_agent(&seat.manifest, &task)
+                        .expect("dispatch"),
+                );
+                let sandbox: Vec<_> = argv
+                    .windows(2)
+                    .filter(|w| w[0] == "--sandbox")
+                    .map(|w| w[1].as_str())
+                    .collect();
+                assert_eq!(sandbox, ["read-only"], "{id}: {argv:?}");
+                assert_eq!(
+                    argv.iter()
+                        .filter(|arg| *arg == "--ask-for-approval")
+                        .count(),
+                    1,
+                    "{id}: {argv:?}"
+                );
+            }
+        }
+    }
+
     /// Spec Risks section (issue #187, `2026-08-28-ai-native-sdlc-design.md`)
     /// calls for a cross-adapter conformance test on `AgentAdapter::
     /// dispatch_agent`'s own documented contract, so a future third adapter
     /// -- or a change to either existing one -- cannot silently drop an
     /// invariant for just one harness. Composed entirely from each adapter's
     /// own methods (`policy_args`, `default_sandbox_args`, `read_only_args`),
-    /// never a hardcoded vendor flag, so this holds regardless of which real
-    /// binaries happen to be installed on the machine running it.
+    /// with an additional single-use check for codex's sandbox and approval
+    /// options. No real harness is launched.
     #[test]
     fn dispatch_agent_invariants_hold_for_claude_and_codex() {
         use crate::commands::workflow::agents::{
@@ -3775,9 +3935,8 @@ mod tests {
             );
 
             // Invariant 2: a satisfied seat dispatches, carrying the same
-            // building blocks `dispatch_agent`'s own doc comment promises,
-            // in order -- sandbox args, then the policy narrowing fold, and
-            // the read-only floor appended LAST, after everything else.
+            // restrictions promised by `dispatch_agent`. A codex sandbox
+            // is replaced in place; claude retains its baseline plus deny.
             let command = adapter
                 .dispatch_agent(&manifest, &task)
                 .unwrap_or_else(|e| panic!("{name}: a satisfied capability must dispatch: {e}"));
@@ -3789,31 +3948,45 @@ mod tests {
                 "{name}: a read-only seat's floor must not be empty, or this invariant is vacuous"
             );
             assert!(
-                argv.ends_with(read_only_args.as_slice()),
-                "{name}: the read-only floor must be appended LAST -- got {argv:?}"
+                find_subsequence(&argv, &read_only_args).is_some(),
+                "{name}: the read-only floor must reach the command -- got {argv:?}"
             );
-            let before_floor = &argv[..argv.len() - read_only_args.len()];
 
             let policy_args = adapter.policy_args(&resolved_cfg.policy, LaunchMode::Headless);
             assert!(
                 !policy_args.is_empty(),
                 "{name}: the forced repo_fs_write=deny narrowing must actually produce args"
             );
-            let policy_pos = find_subsequence(before_floor, &policy_args).unwrap_or_else(|| {
+            let policy_pos = find_subsequence(&argv, &policy_args).unwrap_or_else(|| {
                 panic!("{name}: the narrowing fold (policy_args) is missing from {argv:?}")
             });
 
-            if resolved_cfg.sandbox.enabled {
+            if name == "codex" {
+                let sandbox: Vec<_> = argv
+                    .windows(2)
+                    .filter(|w| w[0] == "--sandbox")
+                    .map(|w| w[1].as_str())
+                    .collect();
+                assert_eq!(sandbox, ["read-only"], "{argv:?}");
+                assert_eq!(
+                    argv.iter()
+                        .filter(|arg| {
+                            matches!(arg.as_str(), "--ask-for-approval" | "approval_policy=never")
+                        })
+                        .count(),
+                    1,
+                    "{argv:?}"
+                );
+            } else if resolved_cfg.sandbox.enabled {
                 let sandbox_args = adapter.default_sandbox_args(
                     &resolved_cfg.sandbox,
                     &resolved_cfg.safety,
                     LaunchMode::Headless,
                 );
                 if !sandbox_args.is_empty() {
-                    let sandbox_pos =
-                        find_subsequence(before_floor, &sandbox_args).unwrap_or_else(|| {
-                            panic!("{name}: sandbox args are missing from {argv:?}")
-                        });
+                    let sandbox_pos = find_subsequence(&argv, &sandbox_args).unwrap_or_else(|| {
+                        panic!("{name}: sandbox args are missing from {argv:?}")
+                    });
                     assert!(
                         sandbox_pos <= policy_pos,
                         "{name}: sandbox args must precede the narrowing fold -- got {argv:?}"

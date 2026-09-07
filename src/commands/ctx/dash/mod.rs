@@ -2583,6 +2583,25 @@ fn reap_fixup(removed: usize, focused: usize, selected: usize) -> (usize, usize)
     (focused, selected)
 }
 
+/// A failed worker launch includes the last visible output line. Reaping
+/// removes the pane, so the header receives this message only once.
+fn early_pane_failure(
+    agent: &str,
+    short: &str,
+    code: i32,
+    elapsed: Duration,
+    tail: &str,
+) -> Option<String> {
+    if code == 0 || elapsed > Duration::from_secs(10) {
+        return None;
+    }
+    let tail: String = tail.trim().chars().take(160).collect();
+    Some(format!(
+        "{agent} pane {short} exited with code {code} {}s after launch: {tail}",
+        elapsed.as_secs()
+    ))
+}
+
 /// Review round 1 (R5): resolved against the PANE's own cwd, not the
 /// dashboard's `repo`. Both adapters key a transcript on the directory the
 /// session runs in -- claude by project slug, codex by the `cwd` its rollout's
@@ -2924,6 +2943,18 @@ fn reap_ended_panes(
             panes[index].budget_tokens(),
         );
         let retained_writer = writer_text(panes[index].holds_writer_permit(), panes[index].cwd());
+        let early_failure = (panes[index].role() != prompt::PromptRole::Orchestrator)
+            .then(|| panes[index].exited_after())
+            .flatten()
+            .and_then(|elapsed| {
+                early_pane_failure(
+                    panes[index].agent(),
+                    panes[index].short(),
+                    code,
+                    elapsed,
+                    &panes[index].last_line(),
+                )
+            });
         let quit_sequence = adapters::select(Some(panes[index].agent()), &[], cfg)
             .map(|adapter| adapter.quit_sequence())
             .unwrap_or("");
@@ -2995,7 +3026,7 @@ fn reap_ended_panes(
         if code == 0 {
             confirmations.push(ended_line);
         } else {
-            push_error(errors, ended_line);
+            push_error(errors, early_failure.unwrap_or(ended_line));
         }
         if panes.is_empty() {
             *last_exited = Some(LastExited {
@@ -4826,14 +4857,10 @@ fn worker_pane_extra_args(
     // while the actual read-only argv travelled in the requester's trailing
     // flags -- which a pane cannot carry across an untrusted channel, so a
     // read-only delegation that landed on a pane silently ran writable.
-    // Appended last, after any operator flag, exactly as `workflow::review::
-    // reviewer_argv` appends its own floor: no argument may weaken it.
-    // `surface_mode`, not `approval_mode`, for the same reason as above.
-    if req.mode == super::permit::WorkerMode::ReadOnly
-        && let Some(read_only) =
-            adapters::read_only_args_for_agent_name(adapter.name(), surface_mode)
-    {
-        extra.extend(read_only);
+    // Replace codex's earlier sandbox selection; appending it twice makes
+    // the child reject argv before it can create a session.
+    if req.mode == super::permit::WorkerMode::ReadOnly {
+        adapters::extend_read_only_args(adapter, &mut extra, surface_mode);
     }
     extra.extend(adapter.extra_writable_root_args(&req.cwd, &state.mail()));
     extra.extend(pane_launch_extra(adapter, prompt_args, session_id));
@@ -15564,7 +15591,7 @@ mod tests {
             "a clean exit is a confirmation, not a sticky failure: {errors:?}"
         );
         assert!(
-            errors.iter().any(|e| e.contains("(exit 1)")),
+            errors.iter().any(|e| e.contains("exited with code 1")),
             "a failing exit is still an error: {errors:?}"
         );
         assert!(
@@ -15575,6 +15602,105 @@ mod tests {
             !confirmations.iter().any(|c| c.contains("(exit 1)")),
             "a failure never becomes a confirmation: {confirmations:?}"
         );
+    }
+
+    #[test]
+    fn early_pane_failure_bounds_age_and_unicode_tail() {
+        let tail = "é".repeat(180);
+        let error =
+            early_pane_failure("codex", "12345678", 2, Duration::from_secs(10), &tail).unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "codex pane 12345678 exited with code 2 10s after launch: {}",
+                "é".repeat(160)
+            )
+        );
+        assert!(
+            early_pane_failure(
+                "codex",
+                "12345678",
+                2,
+                Duration::from_millis(10_001),
+                "late"
+            )
+            .is_none()
+        );
+        assert!(early_pane_failure("codex", "12345678", 0, Duration::ZERO, "done").is_none());
+        assert_eq!(
+            early_pane_failure("codex", "12345678", 2, Duration::ZERO, "  ").unwrap(),
+            "codex pane 12345678 exited with code 2 0s after launch: "
+        );
+    }
+
+    /// A failed launch reports its output once, even if the reap runs again.
+    #[cfg(unix)]
+    #[test]
+    fn early_worker_pane_failure_reports_the_output_tail_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut pane = Pane::spawn(
+            PaneSpec {
+                agent_name: "test-agent".to_string(),
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'first\nlaunch failed\n\n'; exit 2".to_string(),
+                ],
+                role: prompt::PromptRole::Worker,
+                verb: sessions::Verb::Dash,
+                session_id: "77774444-2222-4333-8444-555555555555".to_string(),
+                title: "failed launch".to_string(),
+            },
+            &state,
+            tmp.path(),
+            tmp.path(),
+            (200, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            pane.drain();
+            if matches!(pane.state(), PaneState::Ended(2)) && pane.last_line() == "launch failed" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pane.state(), PaneState::Ended(2));
+        assert_eq!(pane.last_line(), "launch failed");
+        let short = pane.short().to_string();
+        let mut panes = vec![pane];
+        let mut queues = vec![VecDeque::new()];
+        let mut errors = ErrorLog::default();
+        for _ in 0..2 {
+            reap_ended_panes(
+                &mut panes,
+                &mut queues,
+                &cfg,
+                &state,
+                tmp.path(),
+                &mut 0,
+                &mut 0,
+                &mut errors,
+                &mut Vec::new(),
+                &mut HashSet::new(),
+                &mut None,
+                &mut VecDeque::new(),
+                &mut HashMap::new(),
+            );
+        }
+        assert!(panes.is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let error = errors.iter().next().expect("one error");
+        assert!(
+            error.starts_with(&format!("test-agent pane {short} exited with code 2 ")),
+            "{error}"
+        );
+        assert!(error.ends_with("s after launch: launch failed"), "{error}");
     }
 
     /// A1-1: the budget sweep reads (and parses) every budgeted pane's whole
@@ -18775,6 +18901,36 @@ mod tests {
             pane::deadline_for(Instant::now(), req.timeout_secs.expect("clamped")).is_some(),
             "and what survives is representable as a real deadline"
         );
+    }
+
+    #[test]
+    fn read_only_codex_worker_pane_has_one_sandbox() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let adapter = adapters::codex::CodexAdapter::new(None)
+            .with_ignore_flags_forced(true)
+            .with_on_request_approval_forced(false)
+            .with_exec_ask_for_approval_forced(true);
+        let mut req = spawn_request("go", tmp.path());
+        req.agent = "codex".to_string();
+        for interactive in [false, true] {
+            req.interactive = interactive;
+            for (mode, expected) in [
+                (super::super::permit::WorkerMode::ReadOnly, "read-only"),
+                (super::super::permit::WorkerMode::Writing, "workspace-write"),
+            ] {
+                req.mode = mode;
+                let flags =
+                    worker_pane_extra_args(&req, &cfg, &adapter, Vec::new(), "sess", &state);
+                let sandbox: Vec<_> = flags
+                    .windows(2)
+                    .filter(|w| w[0] == "--sandbox")
+                    .map(|w| w[1].as_str())
+                    .collect();
+                assert_eq!(sandbox, [expected], "{flags:?}");
+            }
+        }
     }
 
     /// 2026-09-06: `--mode read-only` used to reach a pane as a label while
