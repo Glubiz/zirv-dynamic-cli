@@ -8,6 +8,7 @@ pub mod droid;
 pub mod gemini;
 pub mod opencode;
 pub mod pi;
+pub mod qwen;
 
 use super::CtxResult;
 use super::config::{CtxConfig, OrchestratorWrites};
@@ -2518,6 +2519,10 @@ fn make_pi(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(pi::PiAdapter::new(bin))
 }
 
+fn make_qwen(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(qwen::QwenAdapter::new(bin))
+}
+
 /// The single source of truth for which adapters exist: a name paired with a
 /// constructor. Adding an adapter is one entry here (plus its own module) --
 /// `all`, `select`'s fallback, `describe_known_adapters`, `resolve_default`
@@ -2531,6 +2536,7 @@ pub const ADAPTERS: &[(&str, AdapterCtor)] = &[
     ("gemini", make_gemini),
     ("opencode", make_opencode),
     ("pi", make_pi),
+    ("qwen", make_qwen),
 ];
 
 pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
@@ -5791,7 +5797,9 @@ mod tests {
         let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
-            vec!["claude", "codex", "copilot", "droid", "gemini", "opencode", "pi"]
+            vec![
+                "claude", "codex", "copilot", "droid", "gemini", "opencode", "pi", "qwen"
+            ]
         );
     }
 
