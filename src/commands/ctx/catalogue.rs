@@ -34,8 +34,9 @@ use super::price::ModelPrice;
 /// BUILT_IN_AS_OF`], which stays pinned to when the pre-existing prices were
 /// last verified. Approximate on purpose: see this module's own doc comment
 /// and `price.rs`'s for why a dated-but-approximate number beats an
-/// undated-but-precise one.
-#[allow(dead_code)] // first non-test reader lands with the survey vendors' own price-table exposure (#381 follow-up)
+/// undated-but-precise one. Carried on each survey [`Vendor`]'s own `as_of`
+/// field, not just here, so a reader of one vendor never has to cross-check
+/// a module constant to know how fresh its prices are.
 pub const CATALOGUE_AS_OF: &str = "2026-09-07";
 
 /// The three generic cost/capability tiers `handover::TIERS` resolves
@@ -55,12 +56,20 @@ pub enum Tier {
 /// orchestrator-tier aliases are two separate `Rung`s at the same
 /// `strength` -- see [`rung_below`] for why that is enough to keep both
 /// resolving identically.
+///
+/// `context_window` is `None` when this specific rung has no verified
+/// capacity -- the same "never guess" rule `AgentAdapter::context_window_
+/// tokens` documents applies per rung, not just per vendor: every codex rung
+/// is `None` today because no capacity is verified for any of them, even
+/// though the vendor itself might one day state a fallback. [`context_
+/// window`] only falls back to the vendor's own default when the rung says
+/// nothing at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rung {
     pub alias: &'static str,
     pub id: &'static str,
     pub strength: u8,
-    pub context_window: u64,
+    pub context_window: Option<u64>,
     pub price: Option<ModelPrice>,
     pub tier: Option<Tier>,
 }
@@ -69,13 +78,17 @@ pub struct Rung {
 /// vendor-wide fallback context window used when a model is unstated or not
 /// on the ladder at all, and any priced ids that are not ladder rungs in
 /// their own right (a long-context variant, a product model priced at an
-/// existing rung's rate).
+/// existing rung's rate). `as_of` is `Some(catalogue_date)` for a survey
+/// vendor priced on a specific day (see [`CATALOGUE_AS_OF`]) and `None` for
+/// `anthropic`/`openai`, whose prices are governed by `price::
+/// BUILT_IN_AS_OF` instead -- one table-wide stamp, not a per-vendor one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vendor {
     pub slug: &'static str,
     pub rungs: &'static [Rung],
     pub default_context_window: Option<u64>,
     pub extra_prices: &'static [(&'static str, ModelPrice)],
+    pub as_of: Option<&'static str>,
 }
 
 // Anthropic's own tier ladder (issue #155/#84's own verified names), copied
@@ -116,7 +129,7 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         alias: "fable",
         id: "claude-fable-5-1",
         strength: 4,
-        context_window: 200_000,
+        context_window: Some(200_000),
         price: Some(FABLE),
         tier: None,
     },
@@ -124,7 +137,7 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         alias: "mythos",
         id: "claude-mythos-5",
         strength: 4,
-        context_window: 200_000,
+        context_window: Some(200_000),
         price: Some(FABLE),
         tier: None,
     },
@@ -132,7 +145,7 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         alias: "opus",
         id: "claude-opus-5",
         strength: 3,
-        context_window: 200_000,
+        context_window: Some(200_000),
         price: Some(OPUS),
         tier: Some(Tier::Deep),
     },
@@ -140,7 +153,7 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         alias: "sonnet",
         id: "claude-sonnet-5",
         strength: 2,
-        context_window: 200_000,
+        context_window: Some(200_000),
         price: Some(SONNET),
         tier: Some(Tier::Standard),
     },
@@ -148,7 +161,7 @@ const ANTHROPIC_RUNGS: &[Rung] = &[
         alias: "haiku",
         id: "claude-haiku-5",
         strength: 1,
-        context_window: 200_000,
+        context_window: Some(200_000),
         price: Some(HAIKU),
         tier: Some(Tier::Cheap),
     },
@@ -182,19 +195,17 @@ const MINI: ModelPrice = ModelPrice {
     output_micros: 1_000_000,
 };
 
-// Codex's context window is not verified for any rung (`adapters::codex`
-// keeps the trait default `None` rather than reading this), so this number
-// is a documented placeholder only: it exists so `Rung::context_window` has
-// a concrete value, never consulted by `codex.rs`'s own
-// `context_window_tokens`, which stays on the trait default.
-const CODEX_UNVERIFIED_WINDOW: u64 = 400_000;
-
+// Codex's context window is not verified for any rung -- `adapters::codex`
+// keeps the trait default `None` for `context_window_tokens`, and every
+// rung here matches that with its own `None` rather than an invented number
+// (see `Rung`'s own doc comment for why that is a per-rung answer, not just
+// a per-vendor one).
 const OPENAI_RUNGS: &[Rung] = &[
     Rung {
         alias: "gpt-5.6-sol",
         id: "gpt-5.6-sol",
         strength: 4,
-        context_window: CODEX_UNVERIFIED_WINDOW,
+        context_window: None,
         price: Some(SOL),
         tier: Some(Tier::Deep),
     },
@@ -202,7 +213,7 @@ const OPENAI_RUNGS: &[Rung] = &[
         alias: "gpt-5.6-terra",
         id: "gpt-5.6-terra",
         strength: 3,
-        context_window: CODEX_UNVERIFIED_WINDOW,
+        context_window: None,
         price: Some(TERRA),
         tier: Some(Tier::Standard),
     },
@@ -210,7 +221,7 @@ const OPENAI_RUNGS: &[Rung] = &[
         alias: "gpt-5.6-luna",
         id: "gpt-5.6-luna",
         strength: 2,
-        context_window: CODEX_UNVERIFIED_WINDOW,
+        context_window: None,
         price: Some(LUNA),
         tier: None,
     },
@@ -218,7 +229,7 @@ const OPENAI_RUNGS: &[Rung] = &[
         alias: "gpt-5.4-mini",
         id: "gpt-5.4-mini",
         strength: 1,
-        context_window: CODEX_UNVERIFIED_WINDOW,
+        context_window: None,
         price: Some(MINI),
         tier: Some(Tier::Cheap),
     },
@@ -233,7 +244,7 @@ const GOOGLE_RUNGS: &[Rung] = &[
         alias: "gemini-3.1-pro-preview",
         id: "gemini-3.1-pro-preview",
         strength: 3,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 2_000_000,
             cache_write_micros: 2_000_000,
@@ -246,7 +257,7 @@ const GOOGLE_RUNGS: &[Rung] = &[
         alias: "gemini-3.7-flash",
         id: "gemini-3.7-flash",
         strength: 2,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 750_000,
             cache_write_micros: 750_000,
@@ -259,7 +270,7 @@ const GOOGLE_RUNGS: &[Rung] = &[
         alias: "gemini-3.5-flash-lite",
         id: "gemini-3.5-flash-lite",
         strength: 1,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 300_000,
             cache_write_micros: 300_000,
@@ -275,7 +286,7 @@ const XAI_RUNGS: &[Rung] = &[
         alias: "grok-4.6",
         id: "grok-4.6",
         strength: 3,
-        context_window: 500_000,
+        context_window: Some(500_000),
         price: Some(ModelPrice {
             input_micros: 2_000_000,
             cache_write_micros: 2_000_000,
@@ -288,7 +299,7 @@ const XAI_RUNGS: &[Rung] = &[
         alias: "grok-4.3",
         id: "grok-4.3",
         strength: 2,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 1_250_000,
             cache_write_micros: 1_250_000,
@@ -301,7 +312,7 @@ const XAI_RUNGS: &[Rung] = &[
         alias: "grok-build-0.1",
         id: "grok-build-0.1",
         strength: 1,
-        context_window: 256_000,
+        context_window: Some(256_000),
         price: Some(ModelPrice {
             input_micros: 1_000_000,
             cache_write_micros: 1_000_000,
@@ -317,7 +328,7 @@ const QWEN_RUNGS: &[Rung] = &[
         alias: "qwen3.8-max",
         id: "qwen3.8-max",
         strength: 3,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 2_000_000,
             cache_write_micros: 2_000_000,
@@ -330,7 +341,7 @@ const QWEN_RUNGS: &[Rung] = &[
         alias: "qwen3-coder-plus",
         id: "qwen3-coder-plus",
         strength: 2,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 1_000_000,
             cache_write_micros: 1_000_000,
@@ -343,7 +354,7 @@ const QWEN_RUNGS: &[Rung] = &[
         alias: "qwen3.8-flash",
         id: "qwen3.8-flash",
         strength: 1,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: None,
         tier: Some(Tier::Cheap),
     },
@@ -361,7 +372,7 @@ const MOONSHOT_RUNGS: &[Rung] = &[
         alias: "kimi-k3",
         id: "kimi-k3",
         strength: 3,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: None,
         tier: Some(Tier::Deep),
     },
@@ -369,7 +380,7 @@ const MOONSHOT_RUNGS: &[Rung] = &[
         alias: "kimi-k2.7-code",
         id: "kimi-k2.7-code",
         strength: 2,
-        context_window: 256_000,
+        context_window: Some(256_000),
         price: Some(MOONSHOT_KIMI_STANDARD),
         tier: Some(Tier::Standard),
     },
@@ -377,7 +388,7 @@ const MOONSHOT_RUNGS: &[Rung] = &[
         alias: "kimi-k2.6",
         id: "kimi-k2.6",
         strength: 1,
-        context_window: 262_144,
+        context_window: Some(262_144),
         price: Some(MOONSHOT_KIMI_STANDARD),
         tier: Some(Tier::Cheap),
     },
@@ -388,7 +399,7 @@ const MISTRAL_RUNGS: &[Rung] = &[
         alias: "devstral-2",
         id: "devstral-2",
         strength: 3,
-        context_window: 256_000,
+        context_window: Some(256_000),
         price: Some(ModelPrice {
             input_micros: 400_000,
             cache_write_micros: 400_000,
@@ -401,7 +412,7 @@ const MISTRAL_RUNGS: &[Rung] = &[
         alias: "mistral-medium-3.5",
         id: "mistral-medium-3.5",
         strength: 2,
-        context_window: 256_000,
+        context_window: Some(256_000),
         price: None,
         tier: Some(Tier::Standard),
     },
@@ -409,7 +420,7 @@ const MISTRAL_RUNGS: &[Rung] = &[
         alias: "devstral-small-2",
         id: "devstral-small-2",
         strength: 1,
-        context_window: 256_000,
+        context_window: Some(256_000),
         price: Some(ModelPrice {
             input_micros: 100_000,
             cache_write_micros: 100_000,
@@ -427,7 +438,7 @@ const DEEPSEEK_RUNGS: &[Rung] = &[
         alias: "deepseek-v4-pro",
         id: "deepseek-v4-pro",
         strength: 2,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 660_000,
             cache_write_micros: 660_000,
@@ -440,7 +451,7 @@ const DEEPSEEK_RUNGS: &[Rung] = &[
         alias: "deepseek-v4-flash",
         id: "deepseek-v4-flash",
         strength: 1,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 220_000,
             cache_write_micros: 220_000,
@@ -456,7 +467,7 @@ const ZHIPU_RUNGS: &[Rung] = &[
         alias: "glm-5.3",
         id: "glm-5.3",
         strength: 3,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 1_400_000,
             cache_write_micros: 1_400_000,
@@ -469,7 +480,7 @@ const ZHIPU_RUNGS: &[Rung] = &[
         alias: "glm-4.6",
         id: "glm-4.6",
         strength: 2,
-        context_window: 205_000,
+        context_window: Some(205_000),
         price: Some(ModelPrice {
             input_micros: 430_000,
             cache_write_micros: 430_000,
@@ -485,7 +496,7 @@ const ZHIPU_RUNGS: &[Rung] = &[
         alias: "glm-4.7-flash",
         id: "glm-4.7-flash",
         strength: 1,
-        context_window: 200_000,
+        context_window: Some(200_000),
         price: Some(ModelPrice {
             input_micros: 0,
             cache_write_micros: 0,
@@ -501,7 +512,7 @@ const MINIMAX_RUNGS: &[Rung] = &[Rung {
     alias: "minimax-m2.7",
     id: "minimax-m2.7",
     strength: 1,
-    context_window: 204_800,
+    context_window: Some(204_800),
     price: Some(ModelPrice {
         input_micros: 240_000,
         cache_write_micros: 240_000,
@@ -516,7 +527,7 @@ const META_RUNGS: &[Rung] = &[
         alias: "muse-spark-1.2",
         id: "muse-spark-1.2",
         strength: 2,
-        context_window: 200_000,
+        context_window: Some(200_000),
         price: Some(ModelPrice {
             input_micros: 1_250_000,
             cache_write_micros: 1_250_000,
@@ -529,7 +540,7 @@ const META_RUNGS: &[Rung] = &[
         alias: "llama-4-maverick",
         id: "llama-4-maverick",
         strength: 1,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 200_000,
             cache_write_micros: 200_000,
@@ -545,7 +556,7 @@ const AMAZON_RUNGS: &[Rung] = &[
         alias: "nova-premier",
         id: "nova-premier",
         strength: 3,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: None,
         tier: Some(Tier::Deep),
     },
@@ -553,7 +564,7 @@ const AMAZON_RUNGS: &[Rung] = &[
         alias: "nova-pro",
         id: "nova-pro",
         strength: 2,
-        context_window: 300_000,
+        context_window: Some(300_000),
         price: Some(ModelPrice {
             input_micros: 800_000,
             cache_write_micros: 800_000,
@@ -566,7 +577,7 @@ const AMAZON_RUNGS: &[Rung] = &[
         alias: "nova-lite",
         id: "nova-lite",
         strength: 1,
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         price: Some(ModelPrice {
             input_micros: 60_000,
             cache_write_micros: 60_000,
@@ -589,72 +600,84 @@ const VENDORS: &[Vendor] = &[
             ("claude-mythos-5[1m]", FABLE_1M),
             ("claude-opus-5[1m]", OPUS_1M),
         ],
+        as_of: None,
     },
     Vendor {
         slug: "openai",
         rungs: OPENAI_RUNGS,
         default_context_window: None,
         extra_prices: &[("gpt-5-codex", TERRA), ("gpt-6-astra", SOL)],
+        as_of: None,
     },
     Vendor {
         slug: "google",
         rungs: GOOGLE_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
     Vendor {
         slug: "xai",
         rungs: XAI_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
     Vendor {
         slug: "qwen",
         rungs: QWEN_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
     Vendor {
         slug: "moonshot",
         rungs: MOONSHOT_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
     Vendor {
         slug: "mistral",
         rungs: MISTRAL_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
     Vendor {
         slug: "deepseek",
         rungs: DEEPSEEK_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
     Vendor {
         slug: "zhipu",
         rungs: ZHIPU_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
     Vendor {
         slug: "minimax",
         rungs: MINIMAX_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
     Vendor {
         slug: "meta",
         rungs: META_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
     Vendor {
         slug: "amazon",
         rungs: AMAZON_RUNGS,
         default_context_window: None,
         extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
     },
 ];
 
@@ -717,14 +740,16 @@ pub fn strength(vendor: &Vendor, model: &str) -> Option<u8> {
 }
 
 /// The usable context window for `model` on `vendor`: the matched rung's own
-/// window when `model` is recognised, else the vendor's fallback -- which
-/// also covers an unstated (`None`) model. `None` overall means this vendor
-/// states no fallback and `model` did not resolve to a rung either (codex's
-/// case today: no verified capacity to report).
+/// window when `model` is recognised AND that rung states one, else the
+/// vendor's fallback -- which also covers an unstated (`None`) model and a
+/// recognised rung with no verified figure of its own (every codex rung
+/// today). `None` overall means this vendor states no fallback either and
+/// `model` did not resolve to a rung with one (codex's case today: no
+/// verified capacity to report at any level).
 pub fn context_window(vendor: &Vendor, model: Option<&str>) -> Option<u64> {
     model
         .and_then(|m| rung_of(vendor, m))
-        .map(|r| r.context_window)
+        .and_then(|r| r.context_window)
         .or(vendor.default_context_window)
 }
 
@@ -891,6 +916,29 @@ mod tests {
 
         let o = openai();
         assert_eq!(context_window(o, None), None, "openai states no fallback");
+        assert_eq!(
+            context_window(o, Some("gpt-5.6-sol")),
+            None,
+            "a recognised rung with no verified figure falls to the vendor \
+             default too, not to a guess"
+        );
+    }
+
+    #[test]
+    fn as_of_is_set_only_on_survey_vendors() {
+        assert_eq!(anthropic().as_of, None);
+        assert_eq!(openai().as_of, None);
+        for v in vendors() {
+            if v.slug == "anthropic" || v.slug == "openai" {
+                continue;
+            }
+            assert_eq!(
+                v.as_of,
+                Some(CATALOGUE_AS_OF),
+                "{}: survey vendors carry CATALOGUE_AS_OF on the vendor itself",
+                v.slug
+            );
+        }
     }
 
     #[test]
