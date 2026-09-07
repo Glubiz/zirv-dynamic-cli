@@ -44,6 +44,7 @@ pub mod policy;
 pub mod poll;
 pub mod pool;
 pub mod price;
+pub mod priority;
 pub mod prompt;
 pub mod reservation;
 pub mod result_schema;

@@ -1101,6 +1101,16 @@ impl Pane {
         // report one; there the guard is inert and behaviour is exactly
         // today's.
         let lifecycle = supervise::ChildGuard::adopt(child.process_id());
+        // Issue #330: a pane's child is spawned BY the dashboard, so it would
+        // otherwise inherit the operator UI's own priority class and hand it
+        // straight on to every cargo process it runs. The posture is stamped
+        // onto this one child instead (`apply_to_child`, a no-op for the
+        // Orchestrator pane the operator types into), and its own children
+        // inherit it from there. `process_id` returning `None` -- a backend
+        // that cannot report one -- degrades to today's behaviour.
+        if let Some(pid) = child.process_id() {
+            super::super::priority::apply_to_child(pid, super::super::priority::posture_for(role));
+        }
         // The slave side is not needed past the spawn; dropping it here
         // (rather than keeping the whole `PtyPair` alive) mirrors the
         // explicit `drop(pair.slave)` this codebase's own pty tests already
@@ -1111,6 +1121,11 @@ impl Pane {
         let mut reader = master.try_clone_reader()?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
+            // Issue #330: everything the operator sees of this pane arrives on
+            // this thread, so it is raised for the same reason `wrap`'s own
+            // output thread is -- and here too, because thread priority never
+            // crosses a `spawn`.
+            super::super::priority::raise_current_thread();
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
@@ -2426,12 +2441,21 @@ impl Pane {
         let launched_at = Instant::now();
         let child = pair.slave.spawn_command(command)?;
         let lifecycle = supervise::ChildGuard::adopt(child.process_id());
+        // Issue #330: the successor gets the posture its predecessor had --
+        // see `Pane::spawn`'s matching call. A handover that skipped this
+        // would silently promote a worker pane back to the dashboard's own
+        // class the first time it changed harness.
+        if let Some(pid) = child.process_id() {
+            super::super::priority::apply_to_child(pid, super::super::priority::posture_for(role));
+        }
         drop(pair.slave);
         let master = pair.master;
 
         let mut reader = master.try_clone_reader()?;
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         std::thread::spawn(move || {
+            // Issue #330: see `Pane::spawn`'s own reader thread.
+            super::super::priority::raise_current_thread();
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {

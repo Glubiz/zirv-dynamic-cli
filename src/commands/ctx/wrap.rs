@@ -1520,6 +1520,11 @@ fn spawn_output_thread(
     stdout_lock: std::sync::Arc<std::sync::Mutex<()>>,
 ) {
     std::thread::spawn(move || {
+        // Issue #330: this thread carries every byte the operator SEES. On a
+        // machine saturated by below-normal worker builds it must be picked
+        // the moment the pty has output, so it is raised here rather than
+        // inherited -- thread priority never crosses a `spawn`.
+        super::priority::raise_current_thread();
         let still_current =
             || generation.load(std::sync::atomic::Ordering::SeqCst) == my_generation;
         let mut buf = [0u8; 8192];
@@ -2280,6 +2285,16 @@ pub fn run_with(
     answer_inherit_cursor_probe(&mut *first_writer);
     let writer = std::sync::Arc::new(std::sync::Mutex::new(first_writer));
 
+    // Issue #330, and the last statement before the child exists: a Windows
+    // priority class is inherited AT CREATION, so this is the only point at
+    // which one call can still reach the whole tree this launch is about to
+    // become. `role` is the same one that picked this session's prompt layers
+    // -- both `wrap` and `chat` are Orchestrators, so in practice this raises
+    // this supervisor's own threads and deliberately leaves the process class
+    // (which the child, and any build the operator starts from this seat,
+    // would inherit) exactly where it was. See `priority::Posture`.
+    super::priority::apply_process(super::priority::posture_for(role));
+
     let mut child = pair.slave.spawn_command(command)?;
     // P2/P3: adopted the instant the child exists -- registered for the
     // console-close sweep and put in a kill-on-close job, so neither closing
@@ -2343,6 +2358,10 @@ pub fn run_with(
     let input_writer = std::sync::Arc::clone(&writer);
     let input_filter = std::sync::Arc::clone(&cpr_filter);
     std::thread::spawn(move || {
+        // Issue #330: the operator's own keystrokes travel on this thread and
+        // nothing else does. Raised for the same reason (and with the same
+        // per-thread caveat) as the output thread's own raise.
+        super::priority::raise_current_thread();
         let mut buf = [0u8; 4096];
         let mut stdin = std::io::stdin();
         // #206. Owned by this thread rather than shared: a relaunch swaps the

@@ -1582,6 +1582,13 @@ fn handle_cycle_outcome<W: Write>(
 }
 
 pub fn run<W: Write>(args: &LoopArgs, w: &mut W) -> CtxResult<i32> {
+    // Issue #330: see `exec::run`'s matching call -- `loop` supervises the
+    // same delegated worker sessions (`PromptRole::Worker` throughout this
+    // module) and takes the same worker posture, at the same CLI-entry
+    // placement and for the same reasons.
+    super::priority::apply_process(super::priority::posture_for(
+        super::prompt::PromptRole::Worker,
+    ));
     let repo = std::env::current_dir()?;
     let ambient = env_from_process();
     // Issue #249/#250 review: see `exec::run`'s matching comment -- a direct
