@@ -1199,6 +1199,27 @@ fn directed_paths_for(
         .collect()
 }
 
+/// A worker's directed report remains evidence after the recipient reads it.
+pub(super) fn sent_since(
+    state: &StateDir,
+    repo_slug: &str,
+    from_session: &str,
+    to_session: &str,
+    since: u64,
+) -> bool {
+    let mailbox = state.mail().join(repo_slug);
+    [mailbox.clone(), mailbox.join("read")]
+        .iter()
+        .flat_map(|dir| scan_md_files(dir).unwrap_or_default())
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .map(|text| parse_markdown(&text))
+        .any(|msg| {
+            msg.from_session == from_session
+                && msg.to_session.as_deref() == Some(to_session)
+                && msg.sent >= since
+        })
+}
+
 pub fn list(
     state: &StateDir,
     repo_slug: &str,
@@ -2372,6 +2393,31 @@ impl AdvisedIds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sent_report_is_found_before_and_after_consumption_only_for_its_dispatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let message = Message {
+            from_session: "dddddddd".to_string(),
+            from_agent: "codex".to_string(),
+            to: "any".to_string(),
+            to_session: Some("aaaa1111".to_string()),
+            sent: 100,
+            body: "report sent".to_string(),
+        };
+        let path = store(&state, "repo", &message, &cfg).expect("store");
+        for read in [false, true] {
+            if read {
+                consume(&state, "repo", &path).expect("consume");
+            }
+            assert!(sent_since(&state, "repo", "dddddddd", "aaaa1111", 100));
+            assert!(!sent_since(&state, "repo", "dddddddd", "aaaa1111", 101));
+            assert!(!sent_since(&state, "repo", "eeeeeeee", "aaaa1111", 100));
+            assert!(!sent_since(&state, "repo", "dddddddd", "bbbb2222", 100));
+        }
+    }
 
     // N2: the header block ends at the first blank line. Before this, a
     // blank line only `continue`d, so the parser stayed in header mode and a

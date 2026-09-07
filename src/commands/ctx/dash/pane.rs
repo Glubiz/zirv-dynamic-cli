@@ -945,9 +945,9 @@ pub struct Pane {
     /// once, right after `Pane::spawn`, by [`Pane::set_writer_permit`] --
     /// the same "computed once, stored once" pattern `set_report_to`/`set_
     /// work_group_id` already establish. Held as a plain field so it releases
-    /// automatically (`permit::HeavyPermit::drop`) the moment this `Pane` is
+    /// during shutdown, or automatically (`permit::HeavyPermit::drop`) when it is
     /// dropped, exactly when the pane's own child tree stops being able to
-    /// write to its checkout -- no explicit release call needed on any exit
+    /// write to its checkout -- the fallback release covers every exit
     /// path (reap, shutdown, or the dashboard process itself exiting).
     writer_permit: Option<super::super::permit::HeavyPermit>,
     /// Review finding (2026-09), finding 2a: the actual directory this
@@ -1669,6 +1669,10 @@ impl Pane {
         self.server.is_some()
     }
 
+    pub(crate) fn started_at(&self) -> u64 {
+        self.guard.record().started_at
+    }
+
     /// This pane's own zirv session id (the uuid `PaneSpec::session_id`
     /// carried in) -- the roster's own `RosterPane::session_id`, and what a
     /// verified adapter's `resume_args` is asked to resume.
@@ -1935,8 +1939,7 @@ impl Pane {
         self.writer_permit = Some(permit);
     }
 
-    /// Whether `report_back_reminder_sweep`'s one-shot reminder has already
-    /// been injected into this pane.
+    /// Whether the one-shot reminder was injected or suppressed by a sent report.
     pub fn report_reminder_sent(&self) -> bool {
         self.report_reminder_sent
     }
@@ -2184,6 +2187,7 @@ impl Pane {
             super::super::rollover::forget(&self.state_dir, self.guard.short());
         }
         self.guard.release();
+        self.writer_permit.take();
         Ok(())
     }
 
@@ -2249,6 +2253,7 @@ impl Pane {
             super::super::rollover::forget(&self.state_dir, self.guard.short());
         }
         self.guard.release();
+        self.writer_permit.take();
         Ok(())
     }
 
@@ -5418,8 +5423,15 @@ pub(crate) mod tests {
         )
         .expect("spawn");
 
+        pane.set_writer_permit(
+            super::super::super::permit::acquire_writer(&state, 1, "first", &repo)
+                .expect("first permit"),
+        );
         pane.shutdown("")
             .expect("first shutdown releases the guard");
+        assert!(!pane.holds_writer_permit());
+        let _successor = super::super::super::permit::acquire_writer(&state, 1, "successor", &repo)
+            .expect("shutdown releases the permit before the pane is dropped");
         let short = pane.short().to_string();
         let record_path = state.sessions().join(format!("{short}.json"));
         assert!(
@@ -5431,6 +5443,13 @@ pub(crate) mod tests {
         // already gone.
         pane.shutdown("")
             .expect("second shutdown is a no-op, not an error");
+        pane.finish_shutdown()
+            .expect("second cleanup path is also idempotent");
+        drop(pane);
+        assert!(
+            super::super::super::permit::acquire_writer(&state, 1, "third", &repo).is_err(),
+            "old pane cleanup must not release its successor's permit"
+        );
         assert!(!record_path.exists());
     }
 
