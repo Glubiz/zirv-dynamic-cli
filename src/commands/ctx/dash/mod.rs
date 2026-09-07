@@ -1281,6 +1281,7 @@ fn reap_observations(
     prior: super::attention::Lifecycle,
     code: i32,
     at: u64,
+    tail: &str,
 ) -> Vec<super::attention::Observation> {
     let mut observations = Vec::new();
     if code == 0 && prior != super::attention::Lifecycle::Settled {
@@ -1297,7 +1298,11 @@ fn reap_observations(
     observations.push(
         super::attention::Observation::new(
             super::attention::Authority::Supervisor,
-            format!("pane exited with code {code}"),
+            if code == 0 {
+                format!("pane exited with code {code}")
+            } else {
+                format!("pane exited with code {code}: {tail}")
+            },
             90,
             at,
         )
@@ -2745,9 +2750,7 @@ fn enforce_pane_deadlines(
 /// `$0.00`. One row per completed pane delegation, attributed to the
 /// requester, carrying the same fields the inline supervised path writes.
 fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, exit_code: i32) {
-    let Some(usage) = pane_transcript_usage(pane, cfg) else {
-        return;
-    };
+    let usage = pane_transcript_usage(pane, cfg).unwrap_or_default();
     if let Some(facts) = pane.delegation() {
         let _ = super::log::append_delegation(
             state,
@@ -2857,9 +2860,8 @@ struct LastExited {
 }
 
 /// Removes every pane whose child has exited, in place: each one is shut down
-/// first (`Pane::shutdown` -- idempotent, and with the child already gone the
-/// quit ladder is a no-op, so this is really "release the registry record and
-/// unpublish the socket"), announced into the header's notice channel, then
+/// first (`Pane::finish_shutdown` releases the registry record, writer permit
+/// and socket), announced into the header's notice channel, then
 /// dropped along with its nudge queue, with `focused`/`selected` fixed up by
 /// [`reap_fixup`].
 ///
@@ -2919,7 +2921,7 @@ fn reap_ended_panes(
             confirmations.extend(notices.into_iter().map(|notice| notice.text));
         }
         // Issue #354 phase 2: the row survives the pane, so everything it will
-        // ever need is captured HERE -- before `shutdown` below releases the
+        // ever need is captured HERE -- before `finish_shutdown` below releases the
         // registry record the age comes from, and before the `Pane` itself is
         // dropped. Nothing about a finished worker can be re-derived a tick
         // later.
@@ -2955,10 +2957,7 @@ fn reap_ended_panes(
                     &panes[index].last_line(),
                 )
             });
-        let quit_sequence = adapters::select(Some(panes[index].agent()), &[], cfg)
-            .map(|adapter| adapter.quit_sequence())
-            .unwrap_or("");
-        if let Err(e) = panes[index].shutdown(quit_sequence) {
+        if let Err(e) = panes[index].finish_shutdown() {
             push_error(errors, format!("reap {}: {e}", panes[index].short()));
         }
         let short = panes[index].short().to_string();
@@ -2989,7 +2988,8 @@ fn reap_ended_panes(
         // preceded by the `Settled` observation that latches `Unseen` -- see
         // [`reap_observations`].
         let prior_lifecycle = super::attention::load(state, &retained_row.short).lifecycle;
-        for observation in reap_observations(prior_lifecycle, code, ended_meta.exited_at) {
+        let tail = panes[index].screen_tail();
+        for observation in reap_observations(prior_lifecycle, code, ended_meta.exited_at, &tail) {
             let _ = super::attention::record(
                 state,
                 &retained_row.short,
@@ -3011,7 +3011,7 @@ fn reap_ended_panes(
         if index < queues.len() {
             queues.remove(index);
         }
-        // L19: `shutdown` above released the registry record immediately, but
+        // L19: `finish_shutdown` above released the registry record immediately, but
         // `facts_cache.registry` is up to ~1s stale, so the dead session would
         // re-list as a view-only (nudge-targetable) row until the next refresh.
         // Remember its short and exclude it from the view-only rows until the
@@ -8682,13 +8682,8 @@ fn report_to_for(req: &spawnreq::SpawnRequest, cfg: &CtxConfig) -> Option<String
 }
 
 /// Issue #115: the exact reminder body `report_back_reminder_sweep` injects.
-/// Names the same command `prompt::report_back_command` already told this
-/// worker at launch (so a worker that never actually saw that instruction --
-/// a Windows shim launch where even the fallback channel was unsafe -- still
-/// learns the right command from the reminder alone), and is deliberately
-/// phrased so firing when the report was already sent is harmless: see
-/// `report_back_reminder_sweep`'s own doc comment for why no durable
-/// "already sent" signal gates this.
+/// Names the same command the worker received at launch. The mail ledger gates
+/// reminders even after the requester has consumed the worker's report.
 fn report_back_reminder_body(report_to: &str) -> String {
     format!(
         "If you have already sent your report, ignore this. Otherwise, your task session appears \
@@ -8708,20 +8703,6 @@ fn report_back_reminder_body(report_to: &str) -> String {
 /// that injection succeeds, so a pane can never be reminded twice -- a
 /// failed injection is left unmarked and simply retried on a later tick,
 /// the same as every other `inject_visible` caller in this module.
-///
-/// No gating on whether the worker's report has actually already gone out:
-/// the only place mail delivery is logged today is the RECIPIENT's own
-/// consume (`mail::consume_and_log`'s `"mail-consumed"` decision-log entry,
-/// written when the report is *read*, not when it is *sent*), so there is no
-/// durable, cheap "this session already sent mail to `report_to`" signal to
-/// gate on. The reminder therefore fires unconditionally, once, and is
-/// worded to be a harmless no-op for a worker that already reported --
-/// checking `mail::list` for a still-unread, matching outbound message was
-/// considered, but that only proves the report has not yet been *read*, not
-/// that it was never *sent* (a message this reminder would still be right to
-/// suppress), so it would trade a rare harmless duplicate reminder for a
-/// silent gap whenever the requester's own session had already consumed the
-/// report before this sweep ever ran.
 fn report_back_reminder_sweep(panes: &mut [Pane], state: &StateDir, errors: &mut ErrorLog) {
     for pane in panes.iter_mut() {
         if pane.verb() != sessions::Verb::Dash || pane.report_reminder_sent() {
@@ -8731,6 +8712,16 @@ fn report_back_reminder_sweep(panes: &mut [Pane], state: &StateDir, errors: &mut
             continue;
         };
         if !pane.has_produced_output() || !pane.injectable() {
+            continue;
+        }
+        let recipient = sessions::short_id(&report_to);
+        let slug = sessions::load_record(state, &recipient)
+            .map(|record| record.repo_slug)
+            .unwrap_or_else(|| super::state::repo_slug(pane.cwd()));
+        if pane.settled_mail_sent
+            || mail::sent_since(state, &slug, pane.short(), &recipient, pane.started_at())
+        {
+            pane.mark_report_reminder_sent();
             continue;
         }
         let body = report_back_reminder_body(&report_to);
@@ -8907,7 +8898,10 @@ fn report_settled_pane(pane: &mut Pane, state: &StateDir, cfg: &CtxConfig, error
         return;
     }
     let tail = pane.screen_tail();
-    let outcome = if ended { "ended" } else { "settled" };
+    let outcome = match pane.state() {
+        PaneState::Ended(code) => format!("ended with exit code {code}"),
+        _ => "settled".to_string(),
+    };
     let body = format!(
         "pane {} ({}, {}) {outcome} with unread output\n\n{tail}",
         pane.short(),
@@ -13919,7 +13913,7 @@ mod tests {
         assert_eq!(working.lifecycle, Lifecycle::Working);
 
         let mut status = working.clone();
-        for observation in reap_observations(status.lifecycle, 0, 200) {
+        for observation in reap_observations(status.lifecycle, 0, 200, "") {
             status = compose(Some(&status), std::slice::from_ref(&observation), 200);
         }
         assert_eq!(status.lifecycle, Lifecycle::Exited);
@@ -13971,7 +13965,7 @@ mod tests {
     #[test]
     fn a_reap_only_settles_a_clean_exit_that_nothing_settled_already() {
         use super::super::attention::Lifecycle;
-        let clean = reap_observations(Lifecycle::Working, 0, 5);
+        let clean = reap_observations(Lifecycle::Working, 0, 5, "");
         assert_eq!(
             clean.iter().map(|o| o.lifecycle).collect::<Vec<_>>(),
             vec![Some(Lifecycle::Settled), Some(Lifecycle::Exited)]
@@ -13981,7 +13975,14 @@ mod tests {
             (Lifecycle::Settled, 0),
             (Lifecycle::Settled, 3),
         ] {
-            let observations = reap_observations(prior, code, 5);
+            let observations = reap_observations(prior, code, 5, "fatal: terminal disconnected");
+            if code != 0 {
+                assert!(
+                    observations[0]
+                        .evidence
+                        .contains("fatal: terminal disconnected")
+                );
+            }
             assert_eq!(
                 observations.iter().map(|o| o.lifecycle).collect::<Vec<_>>(),
                 vec![Some(Lifecycle::Exited)],
@@ -18935,6 +18936,10 @@ mod tests {
                     .map(|w| w[1].as_str())
                     .collect();
                 assert_eq!(sandbox, [expected], "{flags:?}");
+                assert!(
+                    !flags.iter().any(|arg| arg.starts_with("--ignore-")),
+                    "{flags:?}"
+                );
             }
         }
     }
@@ -22944,7 +22949,102 @@ mod tests {
         )
         .expect("list");
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].1.body.contains("ended with unread output"));
+        assert!(
+            messages[0]
+                .1
+                .body
+                .contains("ended with exit code 0 with unread output")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn early_failed_worker_mails_exit_tail_and_ledgers_without_a_transcript() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let spec = PaneSpec {
+            agent_name: "codex".to_string(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo 'error: unexpected argument' >&2; exit 2".into(),
+            ],
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: uuid::Uuid::new_v4().to_string(),
+            title: "worker".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            tmp.path(),
+            tmp.path(),
+            (80, 24),
+            &[],
+            false,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+        pane.set_report_to(Some("aaaa1111".into()));
+        pane.set_delegation(pane::DelegationFacts {
+            requester: "aaaa1111".into(),
+            mode: super::super::permit::WorkerMode::ReadOnly,
+            principal: "root/aaaa1111".into(),
+            envelope_sha256: None,
+            started_at: Instant::now(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            pane.drain();
+            if matches!(pane.state(), PaneState::Ended(2))
+                && pane.last_line().contains("unexpected argument")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(pane.state(), PaneState::Ended(2)));
+        let short = pane.short().to_string();
+        let mut panes = vec![pane];
+        let mut errors = ErrorLog::default();
+        reap_ended_panes(
+            &mut panes,
+            &mut vec![VecDeque::new()],
+            &cfg,
+            &state,
+            tmp.path(),
+            &mut 0,
+            &mut 0,
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashSet::new(),
+            &mut None,
+            &mut VecDeque::new(),
+            &mut HashMap::new(),
+        );
+        assert!(panes.is_empty());
+        let messages = mail::list(
+            &state,
+            &super::super::state::repo_slug(tmp.path()),
+            None,
+            Some("aaaa1111"),
+        )
+        .expect("list");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].1.body.contains("exit code 2"));
+        assert!(messages[0].1.body.contains("error: unexpected argument"));
+        let rows = super::super::log::read_delegations(&state, usize::MAX);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].exit_code, 2);
+        assert_eq!(rows[0].outcome, "failed");
+        assert_eq!(rows[0].input_tokens, 0);
+        assert!(
+            super::super::attention::load(&state, &short)
+                .evidence
+                .contains("error: unexpected argument")
+        );
+        assert!(sessions::load_record(&state, &short).is_none());
     }
 
     #[test]
@@ -23051,6 +23151,46 @@ mod tests {
         for pane in panes.iter_mut() {
             let _ = pane.finish_shutdown();
         }
+    }
+
+    #[test]
+    fn report_back_reminder_sweep_skips_a_workers_consumed_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        pane.set_report_to(Some("aaaa1111".into()));
+        let slug = super::super::state::repo_slug(tmp.path());
+        let path = mail::store(
+            &state,
+            &slug,
+            &mail::Message {
+                from_session: pane.short().into(),
+                from_agent: "codex".into(),
+                to: "any".into(),
+                to_session: Some("aaaa1111".into()),
+                sent: pane.started_at(),
+                body: "finished".into(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store");
+        mail::consume(&state, &slug, &path).expect("consume");
+        assert!(
+            !pane.settled_mail_sent,
+            "the worker's own send does not set the dashboard latch"
+        );
+        let mut panes = vec![pane];
+        report_back_reminder_sweep(&mut panes, &state, &mut ErrorLog::default());
+        assert!(
+            panes[0].report_reminder_sent(),
+            "the report suppresses future reminders"
+        );
+        assert!(panes[0].injectable(), "no reminder was injected");
+        panes[0].finish_shutdown().expect("shutdown");
     }
 
     #[test]
