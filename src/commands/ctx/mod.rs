@@ -11,6 +11,7 @@ pub mod chat;
 pub mod chrome;
 pub mod compile;
 pub mod config;
+pub mod config_cmd;
 pub mod context;
 pub mod context_cli;
 pub mod context_lint;
@@ -401,6 +402,8 @@ pub struct CtxCli {
 
 #[derive(Debug, Subcommand)]
 pub enum CtxVerb {
+    /// Show or edit operator ~/.zirv/ctx.toml; set/add ask for approval in wrapped sessions.
+    Config(config_cmd::ConfigArgs),
     /// Rot-score a session transcript and print JSON.
     Score(score::ScoreArgs),
     /// Distill a handoff from a transcript.
@@ -564,6 +567,7 @@ pub fn dispatch(args: &[String]) -> i32 {
 
     let mut out = std::io::stdout();
     let result = match &cli.verb {
+        CtxVerb::Config(a) => config_cmd::run(a, &mut out),
         CtxVerb::Score(a) => score::run(a, &mut out),
         CtxVerb::Handoff(a) => handoff::run(a, &mut out),
         CtxVerb::Resume(a) => resume::run(a, &mut out),

@@ -4701,14 +4701,15 @@ fn workdir_within_roots(candidate: &Path, roots: &[PathBuf]) -> bool {
 /// the directory reachable knows exactly which key to set and where.
 fn workdir_outside_roots_reason(dir: &Path, roots: &[PathBuf]) -> String {
     format!(
-        "workdir {} is outside the dashboard's workdir roots ({}); add it to [dash] \
-         workdir_roots in ~/.zirv/ctx.toml",
+        "workdir {} is outside the dashboard's workdir roots ({}); run \
+         `zirv ctx config add dash.workdir_roots '{}'` (asks the operator for approval)",
         dir.display(),
         roots
             .iter()
             .map(|r| r.display().to_string())
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        dir.display().to_string().replace('\'', "'\"'\"'")
     )
 }
 
@@ -18099,7 +18100,7 @@ mod tests {
             "got {msg}"
         );
         assert!(
-            msg.contains("add it to [dash] workdir_roots in ~/.zirv/ctx.toml"),
+            msg.contains("zirv ctx config add dash.workdir_roots"),
             "got {msg}"
         );
     }
@@ -18293,7 +18294,7 @@ mod tests {
             "got {reason}"
         );
         assert!(
-            reason.contains("add it to [dash] workdir_roots in ~/.zirv/ctx.toml"),
+            reason.contains("zirv ctx config add dash.workdir_roots"),
             "got {reason}"
         );
     }

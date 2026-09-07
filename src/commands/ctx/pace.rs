@@ -992,7 +992,9 @@ impl Seat {
     pub fn override_hint(self) -> &'static str {
         match self {
             Self::Cli => "pass --force",
-            Self::Pane => "raise pace.spawn_hard_pct in ~/.zirv/ctx.toml",
+            Self::Pane => {
+                "run `zirv ctx config set pace.spawn_hard_pct <percent>` (asks the operator for approval)"
+            }
         }
     }
 }
