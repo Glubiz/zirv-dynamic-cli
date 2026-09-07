@@ -452,6 +452,25 @@ impl StateDir {
         self.0.join("groups")
     }
 
+    /// `<state>/shadow` -- one `<short>.jsonl` plus `<short>.cursor` pair per
+    /// session (issue #382), a sibling of [`Self::rollouts`] with the same
+    /// short-id derivation (`sessions::short_id`). A harness whose own
+    /// transcript is a JSON snapshot or a SQLite database has no line-local
+    /// JSONL for the unchanged rot engine to read; `super::transcript_source`
+    /// materializes the rows that engine needs into a shadow file here. See
+    /// that module for the sync/pruning behaviour -- this method only names
+    /// the path, exactly like every other subdirectory accessor on this
+    /// type.
+    ///
+    /// `#[allow(dead_code)]` for the same reason `write_shared` above carries
+    /// one: `transcript_source` is dormant until a wave-1 adapter (issues
+    /// #384-#386) exists to call it, so nothing outside that module's own
+    /// tests names this method yet.
+    #[allow(dead_code)]
+    pub fn shadow(&self) -> PathBuf {
+        self.0.join("shadow")
+    }
+
     /// `<state>/reservations/<provider-slug>.json` -- one ledger per provider
     /// of expected token spend for admitted-but-unsettled delegated work
     /// (issue #358, task T3). A sibling of `groups()`, not inside it: a work
@@ -1032,5 +1051,26 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert_eq!(state.reservations(), tmp.path().join("reservations"));
+    }
+
+    #[test]
+    fn the_shadow_dir_hangs_off_the_state_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(state.shadow(), tmp.path().join("shadow"));
+    }
+
+    /// `shadow()` itself is a pure path accessor, exactly like every sibling
+    /// above -- the actual mkdir-plus-prune sweep happens in
+    /// `transcript_source::ShadowTranscript::for_session` the first time a
+    /// session touches it (see that module's own pruning test for the
+    /// behaviour); this only pins down that the path stays a direct child of
+    /// the state root and is not created just by asking for it.
+    #[test]
+    fn the_shadow_dir_is_not_created_merely_by_naming_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let dir = state.shadow();
+        assert!(!dir.exists(), "naming the path must not be a side effect");
     }
 }

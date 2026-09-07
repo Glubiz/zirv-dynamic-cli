@@ -33,6 +33,7 @@ ratatui = "0.30"
 vt100 = "0.16"
 ureq = "3"
 unicode-width = "0.2.2"
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

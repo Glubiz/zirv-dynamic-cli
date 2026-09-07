@@ -1,0 +1,17 @@
+[
+  {
+    "role": "user",
+    "text": "What does the shadow transcript sync do?",
+    "timestamp": "2026-09-07T09:00:00Z"
+  },
+  {
+    "role": "assistant",
+    "text": "It materializes newly seen rows from a JSON snapshot or SQLite database into a JSONL file the rot engine can read incrementally.",
+    "timestamp": "2026-09-07T09:00:05Z"
+  },
+  {
+    "role": "user",
+    "text": "Does it ever error out the session?",
+    "timestamp": "2026-09-07T09:00:12Z"
+  }
+]
