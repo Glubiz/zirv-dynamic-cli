@@ -778,7 +778,6 @@ pub fn session_delivery_metrics(
     session_short: &str,
     now: u64,
 ) -> SessionDeliveryMetrics {
-    let _ = expire_deliveries(state, now);
     let mut metrics = SessionDeliveryMetrics::default();
     for envelope in read_envelopes(state) {
         let recent = now.saturating_sub(envelope.created_at) <= RECENT_FLOW_SECONDS;
@@ -804,7 +803,7 @@ pub fn session_delivery_metrics(
                 metrics.queued += 1;
                 metrics.unread += 1;
             }
-            Some(ReceiptState::Delivered) => metrics.unread += 1,
+            Some(ReceiptState::Delivered) if envelope.expires_at > now => metrics.unread += 1,
             _ => {}
         }
     }
@@ -1185,11 +1184,15 @@ fn scan_md_files(dir: &Path) -> CtxResult<Vec<PathBuf>> {
 /// at all, and a fan-out target is excluded because its per-reader `.read`
 /// marker (and so its whole read-tracking contract) belongs to `list`'s own
 /// `fanout/` scan below, which stays repo-scoped exactly as `--all` fans out.
-fn directed_paths_for(state: &StateDir, short: &str) -> Vec<PathBuf> {
-    read_envelopes(state)
-        .into_iter()
+fn directed_paths_for(
+    state: &StateDir,
+    short: &str,
+    envelopes: &[DeliveryEnvelope],
+) -> Vec<PathBuf> {
+    envelopes
+        .iter()
         .filter(|envelope| matches!(envelope.to.kind.as_str(), "session" | "role"))
-        .flat_map(|envelope| envelope.targets)
+        .flat_map(|envelope| &envelope.targets)
         .filter(|target| target.session.as_deref() == Some(short))
         .map(|target| state.mail().join(&target.mail_path))
         .filter(|path| path.is_file())
@@ -1202,7 +1205,14 @@ pub fn list(
     for_agent: Option<&str>,
     for_session: Option<&str>,
 ) -> CtxResult<Vec<(PathBuf, Message)>> {
-    let _ = expire_deliveries(state, now_secs());
+    let envelopes = read_envelopes(state);
+    let now = now_secs();
+    let expired: std::collections::BTreeSet<PathBuf> = envelopes
+        .iter()
+        .filter(|envelope| envelope.expires_at <= now)
+        .flat_map(|envelope| &envelope.targets)
+        .map(|target| state.mail().join(&target.mail_path))
+        .collect();
     let dir = state.mail().join(repo_slug);
     let mut out = Vec::new();
 
@@ -1212,7 +1222,7 @@ pub fn list(
         Vec::new()
     };
     if let Some(short) = for_session {
-        paths.extend(directed_paths_for(state, short));
+        paths.extend(directed_paths_for(state, short, &envelopes));
         // Still oldest first across mailboxes: what sorts chronologically is
         // the zero-padded seconds prefix `store_into` names a file with, not
         // the slug directory above it. The full path breaks a tie so the
@@ -1221,7 +1231,7 @@ pub fn list(
         paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b)));
         paths.dedup();
     }
-    for path in paths {
+    for path in paths.into_iter().filter(|path| !expired.contains(path)) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -1251,7 +1261,10 @@ pub fn list(
     // on `--all`.
     let fanout_dir = dir.join("fanout");
     if fanout_dir.is_dir() {
-        for path in scan_md_files(&fanout_dir)? {
+        for path in scan_md_files(&fanout_dir)?
+            .into_iter()
+            .filter(|path| !expired.contains(path))
+        {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -1275,34 +1288,28 @@ pub fn list(
     Ok(out)
 }
 
-/// Issue #100 (2026-08-23): a message whose `To-session` names a session
-/// that no longer exists. Every broad, no-session-filter caller of `list`
-/// (`zirv ctx status`, `zirv context status`) counted such a message as
-/// pending mail forever -- only the `keep` count cap (`store_into`'s own
-/// `prune_to_newest`) ever removed it, which could take days of unrelated
-/// mail traffic.
-///
-/// Reuses `sessions::list`'s own pid-liveness sweep (rather than duplicating
-/// its platform-specific process probing here) to build the set of
-/// currently live short ids, then moves any ordinary (non-fan-out) message
-/// whose `to_session` names a short outside that set into `read/` via the
-/// same `consume` every other single-shot read uses -- so it stops being
-/// counted by every caller of `list` without a second on-disk marker to
-/// track. Undirected mail (`to_session = None`, which includes every
-/// fan-out message: `--all` never sets it) and mail to a session still in
-/// the registry are both left exactly where they are.
-///
-/// `to_session` is matched by exact equality against a live short id, the
-/// same rule `list`'s own `session_visible` filter uses just below -- never
-/// a prefix match, which could otherwise sweep (or spare) the wrong session
-/// on a short-id collision.
-///
-/// Best-effort, like every other piece of state-dir housekeeping in this
-/// module: a message that fails to move is simply left in place and counted
-/// again on the next call. Returns how many messages it swept, so a caller
-/// (`zirv ctx status`, `zirv context status`) can report that count
-/// alongside the remaining unread total.
+/// Moves mail for confirmed dead recipients into read/, preserving the current
+/// session's mail and any recipient whose liveness cannot be determined.
 pub fn sweep_undeliverable(state: &StateDir, repo_slug: &str) -> usize {
+    let live: std::collections::BTreeSet<String> = sessions::list(state)
+        .into_iter()
+        .filter(|(_, liveness)| *liveness == sessions::Liveness::Live)
+        .map(|(record, _)| record.short)
+        .collect();
+
+    let current = session_identity(&env_from_process());
+    sweep_undeliverable_with(state, repo_slug, current.as_deref(), &|short| {
+        Some(live.contains(short))
+    })
+}
+
+/// `None` is the test seam's unknown case; production probes already fold uncertain liveness into `sessions::Liveness::Live`.
+fn sweep_undeliverable_with(
+    state: &StateDir,
+    repo_slug: &str,
+    current: Option<&str>,
+    recipient_live: &dyn Fn(&str) -> Option<bool>,
+) -> usize {
     let dir = state.mail().join(repo_slug);
     let Ok(paths) = scan_md_files(&dir) else {
         return 0;
@@ -1310,11 +1317,6 @@ pub fn sweep_undeliverable(state: &StateDir, repo_slug: &str) -> usize {
     if paths.is_empty() {
         return 0;
     }
-    let live: std::collections::BTreeSet<String> = sessions::list(state)
-        .into_iter()
-        .filter(|(_, liveness)| *liveness == sessions::Liveness::Live)
-        .map(|(record, _)| record.short)
-        .collect();
 
     let mut swept = 0;
     for path in paths {
@@ -1325,7 +1327,7 @@ pub fn sweep_undeliverable(state: &StateDir, repo_slug: &str) -> usize {
         let Some(to_session) = &msg.to_session else {
             continue;
         };
-        if live.contains(to_session) {
+        if current == Some(to_session.as_str()) || recipient_live(to_session) != Some(false) {
             continue;
         }
         if consume(state, repo_slug, &path).is_ok() {
@@ -2148,6 +2150,9 @@ pub fn run_inbox_with<W: Write>(
     }
 
     let state = StateDir::resolve(env)?;
+    if !args.peek {
+        let _ = expire_deliveries(&state, now_secs());
+    }
     let slug = repo_slug(repo);
     let for_agent = env(AGENT_ENV);
     let thread_id = args
@@ -3762,6 +3767,43 @@ This is part of the body too.\n";
     // exists.
 
     #[test]
+    fn sweep_undeliverable_preserves_an_unprobeable_recipient() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let path = store(
+            &state,
+            "-work-repo",
+            &session_addressed("sender", "aaaa1111", "any"),
+            &CtxConfig::default(),
+        )
+        .expect("store");
+        assert_eq!(
+            sweep_undeliverable_with(&state, "-work-repo", None, &|_| None),
+            0
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn sweep_undeliverable_never_sweeps_own_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let _env = super::super::testenv::VarGuard::set(&[(
+            SESSION_ENV,
+            Some("aaaa1111-2222-4333-8444-555555555555"),
+        )]);
+        let path = store(
+            &state,
+            "-work-repo",
+            &session_addressed("sender", "aaaa1111", "any"),
+            &CtxConfig::default(),
+        )
+        .expect("store");
+        assert_eq!(sweep_undeliverable(&state, "-work-repo"), 0);
+        assert!(path.exists());
+    }
+
+    #[test]
     fn sweep_undeliverable_moves_mail_addressed_to_a_dead_session_into_read() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -5352,6 +5394,13 @@ This is part of the body too.\n";
                 .is_empty(),
             "expired payload must not still be deliverable"
         );
+        let _ = session_delivery_metrics(&state, &short, now_secs());
+        for target in &envelope.targets {
+            assert!(
+                state.mail().join(&target.mail_path).exists(),
+                "listing and metrics must not move expired mail"
+            );
+        }
         let mut dead = Vec::new();
         run_dead_letters(&state, &mut dead, false).expect("dead letters");
         let text = String::from_utf8(dead).expect("utf8");

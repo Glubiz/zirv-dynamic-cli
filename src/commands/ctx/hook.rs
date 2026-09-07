@@ -1537,13 +1537,36 @@ pub fn per_turn_context_text(marker: &str) -> String {
     )
 }
 
-pub fn prompt_output(marker: &str, adoption_nudge: Option<&str>) -> String {
+pub fn prompt_output(
+    marker: &str,
+    adoption_nudge: Option<&str>,
+    repo: &Path,
+    env: EnvLookup<'_>,
+) -> String {
     let mut lines = Vec::new();
     if !marker.is_empty() {
         lines.push(per_turn_context_text(marker));
     }
     if let Some(nudge) = adoption_nudge {
         lines.push(nudge.to_string());
+    }
+    if let Some(short) = super::mail::session_identity(env)
+        && let Ok(state) = StateDir::resolve(env)
+        && let Ok(messages) = super::mail::list(
+            &state,
+            &super::state::repo_slug(repo),
+            env(adapters::AGENT_ENV).as_deref(),
+            Some(&short),
+        )
+        && !messages.is_empty()
+    {
+        lines.push(format!(
+            "[zirv ▸ mail] {} unread -- run zirv ctx inbox",
+            messages.len()
+        ));
+    }
+    if lines.is_empty() {
+        return String::new();
     }
     let context = lines.join("\n");
     serde_json::json!({
@@ -2589,8 +2612,9 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
             let adoption_nudge = cfg
                 .as_ref()
                 .and_then(|cfg| prompt_adoption_nudge(&repo, cfg, &env));
-            if !marker.is_empty() || adoption_nudge.is_some() {
-                let _ = writeln!(w, "{}", prompt_output(&marker, adoption_nudge.as_deref()));
+            let output = prompt_output(&marker, adoption_nudge.as_deref(), &repo, &env);
+            if !output.is_empty() {
+                let _ = writeln!(w, "{output}");
             }
             // Issue #349: a fresh user prompt is the clearest possible
             // `Working` signal -- the operator just handed the agent
@@ -4268,8 +4292,53 @@ mod tests {
     /// `prompt_output` keeps the marker line intact and adds the nudge as a
     /// second line.
     #[test]
+    fn prompt_output_is_empty_when_no_context_is_available() {
+        assert!(prompt_output("", None, Path::new("."), &|_| None).is_empty());
+    }
+
+    #[test]
+    fn prompt_output_signals_session_mail_without_consuming() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let env = |key: &str| match key {
+            super::super::state::STATE_ENV => Some(state.root().display().to_string()),
+            SESSION_ENV => Some("aaaa1111-2222-4333-8444-555555555555".to_string()),
+            adapters::AGENT_ENV => Some("claude".to_string()),
+            _ => None,
+        };
+        assert!(!prompt_output("[zirv]", None, tmp.path(), &env).contains("[zirv ▸ mail]"));
+        let path = super::super::mail::store(
+            &state,
+            &super::super::state::repo_slug(tmp.path()),
+            &super::super::mail::Message {
+                from_session: "bbbb2222".to_string(),
+                from_agent: "codex".to_string(),
+                to: "claude".to_string(),
+                to_session: Some("aaaa1111".to_string()),
+                sent: now_secs(),
+                body: "done".to_string(),
+            },
+            &CtxConfig::default(),
+        )
+        .expect("store");
+        for marker in ["", "[zirv]"] {
+            let out = prompt_output(marker, None, tmp.path(), &env);
+            assert!(
+                out.contains("[zirv ▸ mail] 1 unread -- run zirv ctx inbox"),
+                "{out}"
+            );
+            assert!(path.exists());
+        }
+    }
+
+    #[test]
     fn prompt_output_keeps_the_marker_line_and_appends_the_nudge() {
-        let out = prompt_output("[zirv]", Some("[zirv workflow] substantial work detected"));
+        let out = prompt_output(
+            "[zirv]",
+            Some("[zirv workflow] substantial work detected"),
+            Path::new("."),
+            &|_| None,
+        );
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         let context = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -4722,7 +4791,7 @@ mod tests {
 
     #[test]
     fn prompt_hook_emits_the_documented_injection_shape() {
-        let out = prompt_output("[zirv]", None);
+        let out = prompt_output("[zirv]", None, Path::new("."), &|_| None);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
         assert_eq!(
             parsed["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit",
@@ -4745,7 +4814,7 @@ mod tests {
 
     #[test]
     fn prompt_hook_uses_the_configured_marker() {
-        let out = prompt_output("[acme]", None);
+        let out = prompt_output("[acme]", None, Path::new("."), &|_| None);
         assert!(out.contains("[acme]"));
         assert!(
             !out.contains("[zirv]"),
@@ -4762,7 +4831,8 @@ mod tests {
     #[test]
     fn prompt_hook_context_stays_under_the_ninety_byte_steady_state_budget() {
         let parsed: serde_json::Value =
-            serde_json::from_str(&prompt_output("[zirv]", None)).expect("valid json");
+            serde_json::from_str(&prompt_output("[zirv]", None, Path::new("."), &|_| None))
+                .expect("valid json");
         let context = parsed["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .expect("additionalContext")
