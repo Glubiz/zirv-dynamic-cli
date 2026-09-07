@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-06
+last-verified: 2026-09-07
 ---
 
 # Decision Log
@@ -24,6 +24,20 @@ last-verified: 2026-09-06
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-09-07 -- Seat/worker scheduling posture: raise the seat's threads, lower a worker's process class -- never the other way round
+**Context:** Typing into a wrapped session lagged whenever the machine was busy with the worker sessions zirv itself had spawned (`cargo build`/`cargo test` across every core) -- the seat's own supervisor threads, the dashboard UI thread, and a worker's cargo grandchildren all ran at the same normal OS priority (release 3.30.0). A scheduling fix needed a posture, decided per role, applied at the right process boundary.
+**Decision:** `ctx::priority::posture_for(role)` is pure: only `PromptRole::Orchestrator` (the seat) gets `Posture::Interactive`, which raises its own THREADS (`THREAD_PRIORITY_ABOVE_NORMAL` on Windows) and never touches the process class. Every delegated role (`SubOrchestrator`, `Worker`) gets `Posture::Worker`, which lowers the whole PROCESS one notch (`BELOW_NORMAL_PRIORITY_CLASS` on Windows, nice `+5` on unix) before it spawns anything, so its harness child and every cargo process under it inherit the lower class for free. A dashboard pane's child gets the same worker lowering stamped onto it by pid (`apply_to_child`) rather than by inheritance, since it is spawned BY the dashboard's own (normal-class) UI process.
+**Rejected:** Raising the seat's own PROCESS class instead of just its threads -- a `cargo build` the operator launches from that same seat is a child of the seat's own shell and would inherit the raised class, recreating the exact starvation this fixes one level down. Lowering a worker's THREADS instead of its process class -- thread priority is not inherited across `std::thread::spawn`, so it would need to be reapplied to every thread the harness and every cargo process under it ever spawns, an unbounded and easily-missed surface; a process class is inherited once, at creation, for free.
+**Consequences:** No config knob or environment variable exists for this by design -- a posture that can be turned off gets turned off in exactly the situation it exists for. `apply_process`/`raise_current_thread`/`apply_to_child` are all infallible and best-effort: a refused OS hint leaves a session exactly as fast as it was, matching `wrap`'s own "never worsen a session" contract.
+**Spec / link:** [[Ctx Supervisors]]'s "Scheduling posture: seat vs. worker" section; `src/commands/ctx/priority.rs`.
+
+### 2026-09-07 -- Self-update fails closed without a published checksum
+**Context:** `zirv update` downloads and replaces the running binary over the network with no prior integrity check -- one contributing shape to Windows Defender repeatedly quarantining released `zirv.exe` builds as a trojan (issue #326). A checksum mechanism needed a policy for the releases that predate it: verify when possible, or refuse to proceed at all.
+**Decision:** After downloading a release asset, `zirv update` also downloads `<asset>.sha256` from the same release and refuses to `sanity_check`/`replace_binary` on a digest mismatch. A release published before this change carries no `.sha256` sidecar at all -- `zirv update` fails closed on that case too, naming the release and pointing the operator at `--version` to pick a newer one that does publish one, rather than silently skipping verification because the artifact simply predates it.
+**Rejected:** Skipping verification and proceeding whenever no `.sha256` is found -- indistinguishable, from the download's own bytes, between "this release predates checksums" and "something stripped the sidecar off a tampered download," and defeats the whole point of adding verification in the first place. Requiring an operator opt-in flag to accept an unverified download -- adds a footgun exactly where the goal is to make an unsigned self-updating downloader look and behave LESS like one.
+**Consequences:** An operator stuck on a pre-3.30.0 release with no checksum sidecar cannot self-update past it with `zirv update` at all and must fetch a newer release manually once, after which every subsequent `zirv update` verifies normally. `install.sh` applies the identical policy when `sha256sum`/`shasum` is on `PATH` (warn-and-skip only when neither tool exists).
+**Spec / link:** [[Known Issues]]'s "Windows Defender false positive on zirv.exe" entry; [[Built-in Commands]]'s `update` entry; `src/commands/update.rs`'s `verify_checksum`.
 
 ### 2026-09-06 -- Verbose tool output is compacted via claude's `PostToolUse` hook, not a `PreToolUse` command rewrite or an API-level proxy
 **Context:** A `cargo test`/`cargo build` run's output is often tens of thousands of tokens of progress noise around a few hundred tokens that matter (issue #326). Three places in the pipeline could intercept it: before the command runs (rewrite the Bash tool's own input to route it through a wrapper), after it runs but before the result reaches the model (replace the tool's own result), or outside the harness entirely (a local proxy between the harness and the vendor API, rewriting tool-result content in the wire protocol).
