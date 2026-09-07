@@ -185,13 +185,17 @@ impl ShadowTranscript {
     /// Syncs rows past the cursor from a harness's SQLite transcript into
     /// the shadow JSONL.
     ///
-    /// Opens the database read-only, as a URI (`SQLITE_OPEN_URI`) with
-    /// `?immutable=1`: SQLite takes this as a promise that the file will not
-    /// change while the handle is open and skips locking entirely, so a live
-    /// writer is never blocked by this read and this read never waits on it
-    /// either -- at the cost of a possibly slightly stale snapshot (a commit
-    /// mid-poll may not be visible yet), which the next poll picks up like
-    /// any other incremental read.
+    /// Opens the database with a plain `SQLITE_OPEN_READ_ONLY` connection
+    /// (see [`open_for_sync`] for the fallback this prefers over). In WAL
+    /// mode -- what a live harness transcript actually uses -- readers never
+    /// block a writer and a writer never blocks them, which is the entire
+    /// point of WAL, so this needs no `?immutable=1` promise to stay
+    /// non-blocking. Unlike `?immutable=1`, a plain read-only open DOES
+    /// attach the `-wal` file, so a row a writer has committed but not yet
+    /// checkpointed into the main database file is visible immediately
+    /// rather than lagging by up to a full checkpoint interval -- the
+    /// staleness an `immutable=1`-only open would otherwise impose on every
+    /// WAL-writing harness (OpenCode among them).
     ///
     /// `query` must select `rowid` as its first column, then the named
     /// columns to carry into the shadow line, and must contain exactly one
@@ -226,11 +230,7 @@ impl ShadowTranscript {
         let needs_reset = stored.is_none();
         let cursor = stored.unwrap_or(0);
 
-        let uri = sqlite_uri(db);
-        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let Ok(conn) = rusqlite::Connection::open_with_flags(&uri, flags) else {
+        let Some(conn) = open_for_sync(db) else {
             return Ok(self.jsonl.clone());
         };
         let Ok(mut stmt) = conn.prepare(query) else {
@@ -270,6 +270,46 @@ impl ShadowTranscript {
         }
         Ok(self.jsonl.clone())
     }
+}
+
+/// Opens `db` for [`ShadowTranscript::sync_sqlite`], preferring a plain
+/// read-only connection over `?immutable=1`.
+///
+/// A plain `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX` open (no URI, no
+/// `immutable`) is an ordinary WAL reader: in WAL mode readers never block a
+/// writer and a writer never blocks them, so nothing here needs the
+/// `immutable` promise to stay non-blocking, and this form DOES attach the
+/// `-wal` file, so a row committed but not yet checkpointed into the main
+/// database is visible right away.
+///
+/// `?immutable=1` is kept only as a fallback for the one thing a plain
+/// read-only open cannot itself do: even a read-only WAL connection still
+/// needs to create/open the `-shm` (shared-memory wal-index) file next to
+/// the database on first access, and that fails with `SQLITE_READONLY` or
+/// `SQLITE_CANTOPEN` when the containing directory itself is not writable
+/// (e.g. a transcript database shipped on read-only media). `immutable=1`
+/// tells SQLite the file will never change and skips the `-shm`/`-wal`
+/// machinery entirely, trading a possibly-stale read (a commit made after
+/// this handle opened may not be visible until the next poll) for the
+/// ability to read at all -- acceptable only as a last resort, never
+/// attempted first.
+fn open_for_sync(db: &Path) -> Option<rusqlite::Connection> {
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    match rusqlite::Connection::open_with_flags(db, flags) {
+        Ok(conn) => return Some(conn),
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if matches!(
+                err.code,
+                rusqlite::ffi::ErrorCode::ReadOnly | rusqlite::ffi::ErrorCode::CannotOpen
+            ) => {}
+        Err(_) => return None,
+    }
+    let uri = sqlite_uri(db);
+    let immutable_flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    rusqlite::Connection::open_with_flags(&uri, immutable_flags).ok()
 }
 
 /// One column's value as JSON, or `None` for a blob (skipped -- see
@@ -595,10 +635,6 @@ mod tests {
         let conn = new_message_db(&db_path);
         insert_message(&conn, "user", "a");
         insert_message(&conn, "assistant", "b");
-        // Checkpoint so the immutable reader below (which does not attach
-        // the WAL) sees these committed rows in the main database file.
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .expect("checkpoint");
 
         let shadow = shadow_for(dir.path(), "88888888-8888-4888-8888-888888888888");
         shadow
@@ -607,8 +643,6 @@ mod tests {
         assert_eq!(read_lines(shadow.path()).len(), 2);
 
         insert_message(&conn, "user", "c");
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .expect("checkpoint");
         shadow
             .sync_sqlite(&db_path, MESSAGE_QUERY)
             .expect("second sync");
@@ -616,6 +650,32 @@ mod tests {
         assert_eq!(lines.len(), 3, "only the new row was appended: {lines:?}");
         assert!(lines[2].contains("\"c\""));
         assert!(lines[2].contains("\"rowid\""));
+    }
+
+    /// The whole point of preferring a plain read-only open over
+    /// `?immutable=1` (see `open_for_sync`'s doc comment): `immutable=1`
+    /// never attaches the `-wal` file, so a row a writer committed but has
+    /// not yet checkpointed into the main database would stay invisible for
+    /// up to a full checkpoint interval. A plain `SQLITE_OPEN_READ_ONLY`
+    /// connection reads through the WAL like any ordinary reader, so it
+    /// must see this row immediately -- no `PRAGMA wal_checkpoint` anywhere
+    /// in this test.
+    #[test]
+    fn a_committed_uncheckpointed_wal_row_is_visible_to_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("session.db");
+        let conn = new_message_db(&db_path);
+        insert_message(&conn, "user", "a");
+
+        let shadow = shadow_for(dir.path(), "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+        shadow.sync_sqlite(&db_path, MESSAGE_QUERY).expect("sync");
+        let lines = read_lines(shadow.path());
+        assert_eq!(
+            lines.len(),
+            1,
+            "a committed but uncheckpointed WAL row must be visible: {lines:?}"
+        );
+        assert!(lines[0].contains("\"a\""));
     }
 
     #[test]
@@ -630,19 +690,16 @@ mod tests {
         assert!(!path.exists());
     }
 
-    /// `?immutable=1` promises SQLite the file will not change while this
-    /// handle is open and skips locking entirely -- proven here by holding a
-    /// write transaction open on a second, ordinary connection at the same
-    /// time as the immutable sync, with the sync required to complete
-    /// rather than block on that writer's lock.
+    /// In WAL mode a reader never blocks a writer and a writer never blocks
+    /// a reader -- proven here by holding a write transaction open on a
+    /// second, ordinary connection at the same time as the sync, with the
+    /// sync required to complete rather than block on that writer's lock.
     #[test]
-    fn an_open_write_transaction_elsewhere_never_blocks_the_immutable_read() {
+    fn an_open_write_transaction_elsewhere_never_blocks_the_sync() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("session.db");
         let conn = new_message_db(&db_path);
         insert_message(&conn, "user", "a");
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .expect("checkpoint");
 
         let writer = rusqlite::Connection::open(&db_path).expect("second connection");
         writer
@@ -676,7 +733,7 @@ mod tests {
         assert_eq!(
             finished,
             Ok(true),
-            "the immutable read must complete without waiting on the open write transaction"
+            "the sync must complete without waiting on the open write transaction"
         );
         assert_eq!(
             read_lines(shadow.path()).len(),
