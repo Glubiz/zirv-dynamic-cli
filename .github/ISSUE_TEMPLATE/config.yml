@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Glubiz/zirv-cli/security/advisories/new
+    about: Report vulnerabilities privately.
+  - name: Documentation
+    url: https://cli.zirv.io
+    about: Read the zirv documentation.
