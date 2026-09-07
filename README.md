@@ -1,5 +1,5 @@
 # Zirv CLI
-[![Release](https://img.shields.io/github/v/release/Glubiz/zirv-dynamic-cli)](https://github.com/Glubiz/zirv-dynamic-cli/releases)
+[![Release](https://img.shields.io/github/v/release/Glubiz/zirv-cli)](https://github.com/Glubiz/zirv-cli/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 > **Zirv CLI** is a cross-platform command-line interface for developers to automate and streamline workflows with YAML, JSON, or TOML scripts.
@@ -428,13 +428,13 @@ The published binary is universal (Intel and Apple Silicon), so this works on ei
 Recommended — install script:
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh
 ```
 
 To install a specific version:
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh -s -- <version>
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh -s -- <version>
 ```
 
 Alternative — Homebrew on Linux, via the same tap:
@@ -451,14 +451,14 @@ The prebuilt Linux release is x86_64-only. On other architectures (aarch64, armv
 ### From source (any platform/arch)
 
 ```bash
-cargo install --git https://github.com/Glubiz/zirv-dynamic-cli
+cargo install --git https://github.com/Glubiz/zirv-cli
 ```
 
 Works today without a crates.io publish, and is the only supported path on architectures the release pipeline doesn't build for (e.g. Linux aarch64).
 
 ### Precompiled Binaries
 Download the latest release from the [GitHub Releases]:
-https://github.com/Glubiz/zirv-dynamic-cli/releases
+https://github.com/Glubiz/zirv-cli/releases
 
 Assets per version: `zirv-<version>-linux.tar.gz` (x86_64), `zirv-<version>-macos.tar.gz` (universal x86_64+arm64), `zirv-<version>-windows.exe`.
 
@@ -481,13 +481,13 @@ choco upgrade zirv
 Re-run the install script to get the latest version:
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-dynamic-cli/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/Glubiz/zirv-cli/main/install.sh | sh
 ```
 
 ### From source
 
 ```bash
-cargo install --git https://github.com/Glubiz/zirv-dynamic-cli --force
+cargo install --git https://github.com/Glubiz/zirv-cli --force
 ```
 
 ## Usage
@@ -1080,7 +1080,7 @@ Shell-shim launches retain the task-prompt fallback for mail and worker
 instructions but intentionally withhold repository-authored system layers.
 
 Full event support is tracked in
-[issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
+[issue #11](https://github.com/Glubiz/zirv-cli/issues/11).
 
 **Platform support.** Supervision is unix only. `wrap` and `exec` need unix
 domain sockets for turn signals, and `wrap` additionally needs raw terminal
@@ -1486,7 +1486,7 @@ Current Codex versions support lifecycle hooks with the same JSON event shape.
 and trust new definitions with `/hooks` in Codex. The older
 `zirv ctx hook notify` compatibility entry point remains available for Codex
 versions configured with the external `notify` program. Rollout event parsing
-is still tracked in [issue #11](https://github.com/Glubiz/zirv-dynamic-cli/issues/11).
+is still tracked in [issue #11](https://github.com/Glubiz/zirv-cli/issues/11).
 
 ### Interactive use
 

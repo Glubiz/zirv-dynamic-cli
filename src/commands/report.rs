@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) type ReportResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-const GITHUB_REPOSITORY: &str = "Glubiz/zirv-dynamic-cli";
+const GITHUB_REPOSITORY: &str = "Glubiz/zirv-cli";
 const HTTP_TIMEOUT_SECS: u64 = 15;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
 
@@ -592,7 +592,7 @@ mod tests {
             &|token, request| {
                 assert_eq!(token, "token");
                 captured.replace(Some(request.clone()));
-                Ok("https://github.com/Glubiz/zirv-dynamic-cli/issues/999".to_string())
+                Ok("https://github.com/Glubiz/zirv-cli/issues/999".to_string())
             },
         )
         .expect("run");
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(
             String::from_utf8(output).expect("utf8"),
-            "https://github.com/Glubiz/zirv-dynamic-cli/issues/999\n"
+            "https://github.com/Glubiz/zirv-cli/issues/999\n"
         );
         assert_eq!(captured.borrow().as_ref().expect("request").title, "Broken");
     }
@@ -621,10 +621,10 @@ mod tests {
 
     #[test]
     fn fixed_destination_is_the_zirv_repository() {
-        assert_eq!(GITHUB_REPOSITORY, "Glubiz/zirv-dynamic-cli");
+        assert_eq!(GITHUB_REPOSITORY, "Glubiz/zirv-cli");
         assert_eq!(
             issues_url(GITHUB_REPOSITORY).unwrap(),
-            "https://api.github.com/repos/Glubiz/zirv-dynamic-cli/issues"
+            "https://api.github.com/repos/Glubiz/zirv-cli/issues"
         );
         assert!(validate_repository("../owner/repo").is_err());
         assert_eq!(validate_repository("owner/repo").unwrap(), "owner/repo");
