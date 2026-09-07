@@ -1162,9 +1162,14 @@ fn parse_cargo_test_failure_names(output: &str) -> std::collections::BTreeSet<St
 /// that doubly-capped text let a real pass or failure misreport as
 /// `Inconclusive`; `classify_gate_status` now uses `summary_seen`/
 /// `summary_total` from this full-stream scan instead.
+/// Serial libtest starts are also tracked until their verdict arrives:
+/// child-process output can separate `test <name> ... ` from `FAILED`.
+/// Tracking requires a `running N test(s)` header and ends at the summary.
 #[derive(Default)]
 struct FailureNameScanner {
     names: std::collections::BTreeSet<String>,
+    active_test: Option<String>,
+    in_test_run: bool,
     pending: Vec<String>,
     partial: Vec<u8>,
     partial_overflowed: bool,
@@ -1216,6 +1221,41 @@ impl FailureNameScanner {
             self.summary_total = self.summary_total.saturating_add(count);
         }
         let trimmed = line.trim();
+        if trimmed
+            .strip_prefix("running ")
+            .and_then(|rest| {
+                rest.strip_suffix(" tests")
+                    .or_else(|| rest.strip_suffix(" test"))
+            })
+            .is_some_and(|count| count.parse::<u64>().is_ok())
+        {
+            self.in_test_run = true;
+            self.active_test = None;
+        } else if trimmed.starts_with("test result:") || trimmed == "failures:" {
+            self.in_test_run = false;
+            self.active_test = None;
+        }
+        let verdict = if self.in_test_run
+            && let Some((name, verdict)) = line
+                .strip_prefix("test ")
+                .and_then(|rest| rest.split_once(" ... "))
+        {
+            self.active_test = Some(name.to_string());
+            let verdict = verdict.trim();
+            ["ok", "FAILED", "ignored", "bench:"]
+                .iter()
+                .any(|prefix| verdict.starts_with(prefix))
+                .then_some(verdict)
+        } else {
+            (trimmed == "FAILED" || trimmed == "ok" || trimmed.starts_with("ignored"))
+                .then_some(trimmed)
+        };
+        if let Some(verdict) = verdict
+            && let Some(name) = self.active_test.take()
+            && verdict.starts_with("FAILED")
+        {
+            self.names.insert(name);
+        }
         if trimmed == "failures:" {
             self.pending.clear();
             self.saw_failures_header = true;
@@ -1516,6 +1556,97 @@ fn command_for_shell(command: &str) -> Command {
     }
 }
 
+/// Compacts consecutive identical Git line-ending warnings before capping
+/// the display tail. Long or unterminated lines pass through in bounded
+/// pieces, so display buffering cannot grow with a newline-less stream.
+struct FailureOutputTail {
+    kept: Vec<u8>,
+    cap: usize,
+    partial: Vec<u8>,
+    long_line: bool,
+    warning: Vec<u8>,
+    repeats: usize,
+}
+
+impl FailureOutputTail {
+    fn new(cap: usize) -> Self {
+        Self {
+            kept: Vec::with_capacity(cap),
+            cap,
+            partial: Vec::new(),
+            long_line: false,
+            warning: Vec::new(),
+            repeats: 0,
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        if bytes.len() >= self.cap {
+            self.kept.clear();
+            self.kept
+                .extend_from_slice(&bytes[bytes.len() - self.cap..]);
+        } else {
+            let overflow = self
+                .kept
+                .len()
+                .saturating_add(bytes.len())
+                .saturating_sub(self.cap);
+            self.kept.drain(..overflow);
+            self.kept.extend_from_slice(bytes);
+        }
+    }
+
+    fn flush_warning(&mut self) {
+        let warning = std::mem::take(&mut self.warning);
+        self.append(&warning);
+        if self.repeats > 0 {
+            self.append(
+                format!(
+                    "[previous Git line-ending warning repeated {} more times]\n",
+                    self.repeats
+                )
+                .as_bytes(),
+            );
+        }
+        self.repeats = 0;
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        for part in chunk.split_inclusive(|&byte| byte == b'\n') {
+            self.partial.extend_from_slice(part);
+            let ended = part.ends_with(b"\n");
+            if !ended && self.partial.len() <= FailureNameScanner::MAX_PARTIAL_LINE_BYTES {
+                continue;
+            }
+            let line = std::mem::take(&mut self.partial);
+            let text = String::from_utf8_lossy(&line);
+            let is_warning = !self.long_line
+                && text.starts_with("warning: in the working copy of ")
+                && (text.contains("LF will be replaced by CRLF")
+                    || text.contains("CRLF will be replaced by LF"));
+            if ended && is_warning {
+                if self.warning == line {
+                    self.repeats = self.repeats.saturating_add(1);
+                } else {
+                    self.flush_warning();
+                    self.warning = line;
+                }
+            } else {
+                self.flush_warning();
+                self.append(&line);
+            }
+            self.long_line = !ended;
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.flush_warning();
+        let partial = std::mem::take(&mut self.partial);
+        self.append(&partial);
+        self.kept
+    }
+}
+
 /// The retained tail (whether the stream ended in a read error rather than
 /// at EOF is the second element -- an error read as a clean end silently
 /// turned a truncated failure log into a complete-looking one), plus what a
@@ -1534,7 +1665,7 @@ pub(crate) fn read_capped_tail_and_scan(
     mut reader: impl Read,
     cap: usize,
 ) -> (Vec<u8>, bool, std::collections::BTreeSet<String>, bool, u64) {
-    let mut kept = Vec::with_capacity(cap);
+    let mut tail = FailureOutputTail::new(cap);
     let mut chunk = [0u8; 8192];
     let mut errored = false;
     let mut scanner = FailureNameScanner::default();
@@ -1548,19 +1679,10 @@ pub(crate) fn read_capped_tail_and_scan(
             Ok(count) => count,
         };
         scanner.feed(&chunk[..count]);
-        if count >= cap {
-            kept.clear();
-            kept.extend_from_slice(&chunk[count - cap..count]);
-            continue;
-        }
-        let overflow = kept.len().saturating_add(count).saturating_sub(cap);
-        if overflow > 0 {
-            kept.drain(..overflow);
-        }
-        kept.extend_from_slice(&chunk[..count]);
+        tail.feed(&chunk[..count]);
     }
     let (names, summary_seen, summary_total) = scanner.finish();
-    (kept, errored, names, summary_seen, summary_total)
+    (tail.finish(), errored, names, summary_seen, summary_total)
 }
 
 /// The last `cap` bytes as text, on a char boundary. `utils::truncate_bytes`
@@ -4574,6 +4696,155 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             failure_names_for(&check).contains(real_name),
             "evaluate_against_baseline/run_baseline must prefer the recovered name"
         );
+    }
+
+    /// #361: serial libtest verdicts arrive after child-process CRLF noise,
+    /// while a later warning flood can evict the entire failure summary.
+    #[test]
+    fn interleaved_git_warnings_cannot_hide_serial_test_failures() {
+        let expected: std::collections::BTreeSet<String> = (0..6)
+            .map(|index| format!("tests::failure_{index}"))
+            .collect();
+        let warning = "warning: in the working copy of 'tracked.txt', LF will be replaced by CRLF the next time Git touches it\r\n";
+        let mut input = String::from("running 8 tests\r\n");
+        for index in 0..8 {
+            let (name, verdict) = if index < 6 {
+                (format!("tests::failure_{index}"), "FAILED")
+            } else {
+                (format!("tests::pass_{index}"), "ok")
+            };
+            input.push_str(&format!("test {name} ... "));
+            input.push_str(&warning.repeat(60));
+            input.push_str(&format!("{verdict}\r\n"));
+        }
+        let (_, errored, before_summary, _, _) = read_capped_tail_and_scan(
+            std::io::Cursor::new(input.as_bytes()),
+            MAX_FAILURE_OUTPUT_BYTES,
+        );
+        assert!(!errored);
+        let summary_start = input.len();
+        input.push_str("\r\nfailures:\r\n\r\n");
+        for name in &expected {
+            input.push_str(&format!(
+                "---- {name} stdout ----\r\nthread panicked at test.rs:1\r\n\r\n"
+            ));
+        }
+        input.push_str("failures:\r\n");
+        for name in &expected {
+            input.push_str(&format!("    {name}\r\n"));
+        }
+        input.push_str("\r\ntest result: FAILED. 2 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\r\n");
+        let flood = warning.repeat(300);
+        assert!(flood.len() > MAX_FAILURE_OUTPUT_BYTES);
+        input.push_str(&flood);
+        input.push_str(
+            "error: unexpected argument '--this-flag-does-not-exist'\r\nerror: test failed\r\n",
+        );
+        for text in [&input[..], &input[summary_start..]] {
+            let (_, errored, names, seen, total) = read_capped_tail_and_scan(
+                std::io::Cursor::new(text.as_bytes()),
+                MAX_FAILURE_OUTPUT_BYTES,
+            );
+            assert!(!errored);
+            assert_eq!(names, expected);
+            assert!(seen);
+            assert_eq!(total, 8);
+        }
+        assert_eq!(
+            before_summary, expected,
+            "delayed verdicts must be recognized before the failures list arrives"
+        );
+    }
+
+    /// Repeated line-ending warnings must consume display space only once
+    /// per consecutive run, leaving the failure list and summary visible.
+    #[test]
+    fn repeated_git_warnings_are_compacted_before_the_display_tail_cap() {
+        let summary =
+            "failures:\r\n    tests::broken\r\n\r\ntest result: FAILED. 0 passed; 1 failed\r\n";
+        let forward = "warning: in the working copy of 'tracked.txt', LF will be replaced by CRLF the next time Git touches it\r\n";
+        let reverse = "warning: in the working copy of 'tracked.txt', CRLF will be replaced by LF the next time Git touches it\r\n";
+        let mut input = summary.to_string();
+        input.push_str(&forward.repeat(300));
+        input.push_str("error: unexpected argument '--this-flag-does-not-exist'\r\n");
+        input.push_str(&forward.repeat(60));
+        input.push_str(&reverse.repeat(70));
+        let (retained, errored, _, _, _) = read_capped_tail_and_scan(
+            std::io::Cursor::new(input.as_bytes()),
+            MAX_FAILURE_OUTPUT_BYTES,
+        );
+        assert!(!errored);
+        assert!(input.len() > MAX_FAILURE_OUTPUT_BYTES);
+        assert!(retained.len() <= MAX_FAILURE_OUTPUT_BYTES);
+        assert_eq!(
+            String::from_utf8(retained).unwrap(),
+            format!(
+                "{summary}{forward}[previous Git line-ending warning repeated 299 more times]\n\
+             error: unexpected argument '--this-flag-does-not-exist'\r\n\
+             {forward}[previous Git line-ending warning repeated 59 more times]\n\
+             {reverse}[previous Git line-ending warning repeated 69 more times]\n"
+            )
+        );
+    }
+
+    #[test]
+    fn serial_test_verdicts_clear_active_names_across_chunks_and_binaries() {
+        let mut scanner = FailureNameScanner::default();
+        let input = "test tests::passed ... output\r\nok\r\nFAILED\r\n\
+            test tests::ignored ... ignored, reason\r\nFAILED\r\n\
+            test tests::unfinished ... output\r\nrunning 1 test\r\nFAILED\r\n\
+            test tests::broken ... FAILED\r\n\
+            test tests::delayed ... output\r\nFAILED";
+        for chunk in input.as_bytes().chunks(7) {
+            scanner.feed(chunk);
+        }
+        let (names, _, _) = scanner.finish();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "tests::broken".to_string(),
+                "tests::delayed".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn serial_verdicts_require_a_running_header_and_do_not_reuse_terminal_names() {
+        for input in [
+            "test tests::unrelated ... \r\nFAILED\r\n",
+            "test tests::unrelated ... FAILED <0.50s>\r\n",
+            "running 1 test\r\ntest tests::passed ... ok <0.001s>\r\nFAILED\r\n",
+            "running 1 test\r\ntest tests::ignored ... ignored, reason\r\nFAILED\r\n",
+            "running 1 test\r\ntest tests::benchmark ... bench: 10 ns/iter\r\nFAILED\r\n",
+        ] {
+            let mut scanner = FailureNameScanner::default();
+            scanner.feed(input.as_bytes());
+            let (names, _, _) = scanner.finish();
+            assert!(
+                names.is_empty(),
+                "unexpected names for {input:?}: {names:?}"
+            );
+        }
+        let mut scanner = FailureNameScanner::default();
+        scanner.feed(b"running 1 test\r\ntest tests::timed_failure ... FAILED <0.50s>\r\n");
+        let (names, _, _) = scanner.finish();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["tests::timed_failure".to_string()])
+        );
+    }
+
+    #[test]
+    fn display_tail_preserves_long_and_unterminated_lines_with_bounded_buffering() {
+        let mut tail = FailureOutputTail::new(100);
+        for _ in 0..128 {
+            tail.feed(&[b'x'; 4096]);
+            assert!(tail.partial.len() <= FailureNameScanner::MAX_PARTIAL_LINE_BYTES);
+        }
+        tail.feed(b"\nlast unterminated line");
+        let retained = tail.finish();
+        assert_eq!(retained.len(), 100);
+        assert!(retained.ends_with(b"\nlast unterminated line"));
     }
 
     /// #215 follow-up (security): a check whose command text was written in
