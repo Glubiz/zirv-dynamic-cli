@@ -772,7 +772,7 @@ pub fn tier_model(vendor: &Vendor, tier: Tier) -> Option<&'static str> {
 /// naming a vendor this catalogue actually knows about is stripped, so a
 /// model id that legitimately contains `/` or `.` without meaning "vendor
 /// namespace" passes through untouched.
-#[allow(dead_code)] // first caller lands with the per-launch provider track (#383) in the same wave
+#[allow(dead_code)] // first callers are the multi-provider wave-1 adapters (#385 OpenCode, #386 Pi), which resolve the billed vendor from a `provider/model` pin
 pub fn normalize_id(model: &str) -> Cow<'_, str> {
     let mut s = model;
     match s.split_once('/') {
@@ -803,7 +803,7 @@ pub fn normalize_id(model: &str) -> Cow<'_, str> {
 /// nothing recognises it -- the vendor named by an explicit OpenRouter
 /// `vendor/` prefix even though the id itself is unrecognised (a model this
 /// catalogue has not caught up to yet, on a vendor it has).
-#[allow(dead_code)] // first caller lands with the per-launch provider track (#383) in the same wave
+#[allow(dead_code)] // first callers are the multi-provider wave-1 adapters (#385 OpenCode, #386 Pi), which resolve the billed vendor from a `provider/model` pin
 pub fn vendor_of(model: &str) -> Option<&'static str> {
     let normalized = normalize_id(model).to_lowercase();
     for v in vendors() {
