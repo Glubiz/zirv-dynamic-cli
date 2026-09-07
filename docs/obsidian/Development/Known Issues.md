@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-07 (feat/adapters-wave-1-catalogue, issues #381/#382): recorded that catalogue.rs's OpenAI rungs carry no verified context window (matching the pre-catalogue answer) and that normalize_id/vendor_of have no production caller yet -- both wait on the wave-1 adapter tracks (issues #384-#386) -->
 <!-- Updated 2026-09-07 (fix/3.30.0-input-latency-defender, v3.30.0): recorded a third Windows dev-machine test baseline name, commands::ctx::dash::pane::tests::a_signal_less_pane_stays_uninjectable_for_a_full_window_after_its_own_injection, failing on unmodified main at 09f913a -->
 <!-- Updated 2026-09-07 (track/330-c, v3.30.0): added a Windows Defender false-positive entry -- VERSIONINFO, published .sha256 checksums, and a verified `zirv update` shipped as this release's mitigation; code signing remains the real fix, tracked but out of scope -->
 <!-- Updated 2026-09-06 (feat/326-track-d, issue #326 fix): closed the interactive-pane codex ignore-flags crash (AgentAdapter::interactive_read_only_args); recorded a codex hook-trust finding instead -- `zirv ctx hook prompt`/`zirv ctx hook stop` run clean by hand and a live `codex exec` round-trip completed both hooks successfully against this machine's currently-persisted hooks.json/config.toml trust state, so the reported "hook: X Failed" is not reproducible here and now, and no zirv-side cause was found -->
@@ -121,6 +122,10 @@ Recorded 2026-09-07 (`track/330-c`, v3.30.0). Windows Defender has twice quarant
 - Add a Defender exclusion for the install directory as a stopgap while a submission is pending.
 
 **What's still missing.** None of the above is code signing, which is what would actually change Defender's (and SmartScreen's) reputation scoring rather than just narrowing the heuristic match and letting an operator recover a corrupted/tampered download before it runs. Code signing needs an operator-owned signing account (Azure Trusted Signing or SignPath.io for OSS projects are the two realistic options) and was explicitly out of scope for this round. See the CD pipeline (`.github/workflows/cd.yaml`) for where a signing step would need to land, on the Windows build job's artifact before it is checksummed and uploaded.
+
+## The model catalogue's OpenAI rungs carry no verified context window; two new lookups have no production caller yet
+
+Recorded 2026-09-07 (`feat/adapters-wave-1-catalogue`, issues #381/#382). Two narrow gaps, both deliberate rather than oversights: (1) every rung on `catalogue::OPENAI_RUNGS` has `context_window: None`, and the vendor's own `default_context_window` is also `None` -- no static per-model capacity is verified for codex's lineup, matching `CodexAdapter::context_window_tokens`'s pre-catalogue answer exactly (codex's *live* per-session window still comes from `context_window_hint` reading the rollout JSON's own `info.model_context_window`, unaffected by this). (2) `catalogue::normalize_id`/`vendor_of` (OpenRouter/Bedrock/Vertex model-string decoration stripping) are `#[allow(dead_code)]`: nothing in the binary calls them yet, since their first caller is the per-launch provider-resolution work the wave-1 adapter tracks (issues #384-#386) will add. Neither is a bug to fix here -- watch for either resolving on its own once a wave-1 adapter lands (a verified OpenAI context window, or `vendor_of` gaining a real caller), and remove this entry then.
 
 ## Codex's own hook-trust gate may fail `zirv`'s registered hooks in a way this repo cannot fix
 
