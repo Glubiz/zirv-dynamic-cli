@@ -1712,7 +1712,10 @@ mod tests {
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
             repo.path().join(".zirv/.settings.toml"),
-            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n",
+            crate::commands::ctx::adapters::ADAPTERS
+                .iter()
+                .map(|(name, _)| format!("[agents.{name}]\nenabled = false\n"))
+                .collect::<String>(),
         )
         .expect("write");
         let home = tempfile::tempdir().expect("tempdir");
@@ -1740,6 +1743,7 @@ mod tests {
         let msg = String::from_utf8(err_out).expect("utf8");
         assert!(msg.contains("claude"), "must name claude: {msg}");
         assert!(msg.contains("codex"), "must name codex: {msg}");
+        assert!(msg.contains("opencode"), "must name opencode: {msg}");
         assert!(msg.contains("disabled"), "must say why: {msg}");
     }
 
