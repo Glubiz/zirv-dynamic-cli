@@ -3,6 +3,7 @@ use std::process::Command;
 
 pub mod claude;
 pub mod codex;
+pub mod gemini;
 pub mod pi;
 
 use super::CtxResult;
@@ -2494,6 +2495,10 @@ fn make_codex(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(codex::CodexAdapter::new(bin))
 }
 
+fn make_gemini(bin: Option<&str>) -> Box<dyn AgentAdapter> {
+    Box::new(gemini::GeminiAdapter::new(bin))
+}
+
 fn make_pi(bin: Option<&str>) -> Box<dyn AgentAdapter> {
     Box::new(pi::PiAdapter::new(bin))
 }
@@ -2506,6 +2511,7 @@ fn make_pi(bin: Option<&str>) -> Box<dyn AgentAdapter> {
 pub const ADAPTERS: &[(&str, AdapterCtor)] = &[
     ("claude", make_claude),
     ("codex", make_codex),
+    ("gemini", make_gemini),
     ("pi", make_pi),
 ];
 
@@ -4119,7 +4125,16 @@ mod tests {
         );
         assert!(note.contains("usage"), "got {note}");
         assert!(note.contains("turn signal"), "got {note}");
-        assert!(!note.contains("injected prompt"), "got {note}");
+        // Codex's OWN clause must not claim the "injected prompt" gap --
+        // `system_prompt_args` is real for codex (`-c
+        // developer_instructions=...`). Gemini (added #384) legitimately
+        // carries that gap (`GEMINI_SYSTEM_MD` is env-var-only, no per-run
+        // argv mechanism), so this checks codex's own exact clause rather
+        // than asserting the whole note never mentions the phrase at all.
+        assert!(
+            note.contains("codex (launch-level: no usage or turn signal)"),
+            "got {note}"
+        );
         assert!(note.contains("issue #11"), "got {note}");
         assert!(
             !note.contains("claude (launch-level"),
@@ -5681,9 +5696,13 @@ mod tests {
 
     #[test]
     fn unknown_name_is_an_error_that_lists_the_options() {
-        let err = select(Some("gemini"), &[], &permissive_cfg()).expect_err("unknown agent");
+        // "gemini" was this test's own unknown-name example before issue
+        // #384 registered it for real; "not-a-real-agent" keeps testing the
+        // same unknown-agent path without colliding with a now-real adapter.
+        let err =
+            select(Some("not-a-real-agent"), &[], &permissive_cfg()).expect_err("unknown agent");
         let msg = err.to_string();
-        assert!(msg.contains("gemini"), "got {msg}");
+        assert!(msg.contains("not-a-real-agent"), "got {msg}");
         assert!(
             msg.contains("claude"),
             "error should list known adapters: {msg}"
@@ -5752,7 +5771,7 @@ mod tests {
     #[test]
     fn registry_exposes_every_registered_adapter() {
         let names: Vec<&str> = ADAPTERS.iter().map(|(name, _)| *name).collect();
-        assert_eq!(names, vec!["claude", "codex", "pi"]);
+        assert_eq!(names, vec!["claude", "codex", "gemini", "pi"]);
     }
 
     /// The registry table is the one place a new adapter is wired in: `all`
@@ -5927,10 +5946,20 @@ mod tests {
     fn when_no_adapter_is_both_enabled_and_ready_the_error_names_each_one_and_why() {
         let repo = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        // Every registered adapter must be disabled, not just claude/codex --
+        // issue #384 registered a THIRD adapter (gemini) whose own `ready()`
+        // fails open on a missing binary (`resolve_program`'s own contract),
+        // so leaving it enabled would let `resolve_default` silently pick it
+        // instead of refusing, defeating this test's own "nothing qualifies"
+        // premise.
         std::fs::write(
             repo.path().join(".zirv/.settings.toml"),
-            "[agents.claude]\nenabled = false\n[agents.codex]\nenabled = false\n\
-             [agents.pi]\nenabled = false\n",
+            ADAPTERS
+                .iter()
+                .map(|(name, _)| format!("[agents.{name}]
+enabled = false
+"))
+                .collect::<String>(),
         )
         .expect("write");
         let home = tempfile::tempdir().expect("tempdir");
@@ -5942,7 +5971,7 @@ mod tests {
             ..CtxConfig::default()
         };
 
-        let err = resolve_default(&cfg).expect_err("both disabled");
+        let err = resolve_default(&cfg).expect_err("all disabled");
         let msg = err.to_string();
         assert!(msg.contains("claude"), "must name claude: {msg}");
         assert!(msg.contains("codex"), "must name codex: {msg}");
