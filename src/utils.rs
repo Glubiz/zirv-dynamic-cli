@@ -26,7 +26,7 @@ pub const COMMANDS_DIR_NAME: &str = "commands";
 pub const RESERVED_COMMANDS: &[&str] = &[
     "help", "h", "version", "v", "init", "i", "create", "c", "ctx", "chat", "agent", "memory",
     "context", "setup", "report", "skill", "workflow", "test", "verify", "artifact", "frontend",
-    "commands",
+    "commands", "update",
 ];
 
 /// Compared case-insensitively, the same way `is_reserved_zirv_file` compares
@@ -452,6 +452,7 @@ mod tests {
         assert!(is_reserved_command("c"));
         assert!(is_reserved_command("frontend"));
         assert!(is_reserved_command("setup"));
+        assert!(is_reserved_command("update"));
         assert!(!is_reserved_command("build"));
     }
 
@@ -467,6 +468,7 @@ mod tests {
         assert!(is_reserved_command("CtX"));
         assert!(is_reserved_command("FRONTEND"));
         assert!(is_reserved_command("SeTuP"));
+        assert!(is_reserved_command("UpDaTe"));
         assert!(!is_reserved_command("Build"));
     }
 

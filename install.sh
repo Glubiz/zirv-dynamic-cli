@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="Glubiz/zirv-dynamic-cli"
+REPO="Glubiz/zirv-cli"
 INSTALL_DIR="${ZIRV_INSTALL_DIR:-/usr/local/bin}"
 BINARY_NAME="zirv"
 
@@ -22,7 +22,7 @@ detect_platform() {
                 *)
                     echo "Error: Unsupported architecture for Linux: ${ARCH}." >&2
                     echo "The prebuilt Linux release is x86_64-only. Build from source instead:" >&2
-                    echo "  cargo install --git https://github.com/Glubiz/zirv-dynamic-cli" >&2
+                    echo "  cargo install --git https://github.com/Glubiz/zirv-cli" >&2
                     exit 1
                     ;;
             esac

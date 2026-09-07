@@ -464,6 +464,17 @@ Assets per version: `zirv-<version>-linux.tar.gz` (x86_64), `zirv-<version>-maco
 
 ## Upgrading
 
+### Built-in (any platform)
+
+```bash
+zirv update
+zirv update --version <x.y.z>
+```
+
+A Homebrew or Chocolatey installation keeps working after a built-in update,
+but the package manager's recorded version lags until its own upgrade command
+runs.
+
 ### Homebrew (macOS & Linux)
 
 ```bash

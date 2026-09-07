@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) type ReportResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-const GITHUB_REPOSITORY: &str = "Glubiz/zirv-cli";
+pub(crate) const GITHUB_REPOSITORY: &str = "Glubiz/zirv-cli";
 const HTTP_TIMEOUT_SECS: u64 = 15;
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 5;
 
