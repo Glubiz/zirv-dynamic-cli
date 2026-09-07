@@ -110,6 +110,7 @@ jobs:
     needs: build
     outputs:
       version: ${{ needs.build.outputs.version }}
+      published: ${{ steps.release.outputs.published }}
 
     steps:
       - name: Checkout
@@ -153,22 +154,39 @@ jobs:
           path: artifacts
 
       - name: Create Release with Assets
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ needs.build.outputs.version }}
-          name: Release v${{ needs.build.outputs.version }}
-          body: "Release of zirv v${{ needs.build.outputs.version }}"
-          files: |
-            artifacts/zirv-${{ needs.build.outputs.version }}-windows.exe
-            artifacts/zirv-${{ needs.build.outputs.version }}-linux.tar.gz
-            artifacts/zirv-${{ needs.build.outputs.version }}-macos.tar.gz
+        id: release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ needs.build.outputs.version }}"
+
+          # Immutable releases need assets uploaded while still a draft.
+          # Skip published releases so re-runs succeed without changing them.
+          if IS_DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft); then
+            if [[ "$IS_DRAFT" == "false" ]]; then
+              echo "::notice::release $TAG is already published; nothing to do"
+              echo "published=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            gh release create "$TAG" --draft --title "Release $TAG" --notes "Release of zirv $TAG"
+          fi
+
+          gh release upload "$TAG" \
+            "artifacts/zirv-${{ needs.build.outputs.version }}-windows.exe" \
+            "artifacts/zirv-${{ needs.build.outputs.version }}-linux.tar.gz" \
+            "artifacts/zirv-${{ needs.build.outputs.version }}-macos.tar.gz" \
+            --clobber
+          gh release edit "$TAG" --draft=false --latest
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
   update-homebrew:
     name: Update Homebrew Tap
     runs-on: ubuntu-latest
     needs: release
+    if: needs.release.outputs.published == 'true'
     environment:
       name: homebrew-release
     steps:
@@ -212,6 +230,7 @@ jobs:
     name: Update Chocolatey Package
     runs-on: windows-latest
     needs: release
+    if: needs.release.outputs.published == 'true'
     environment:
       name: chocolatey-release
     steps:
