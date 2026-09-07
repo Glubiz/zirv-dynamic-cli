@@ -2598,6 +2598,9 @@ impl FactsCache {
             .iter()
             .filter(|(name, _)| cfg.agents.is_enabled(name))
             .map(|(name, _)| {
+                // No model in hand, and none applies: this is one row per
+                // registered HARNESS name, not a specific launch, so there is
+                // no pinned model to resolve `provider_for_model` against.
                 let provider = adapters::provider_for_agent_name(Some(name));
                 let windows = window::load_for(state, provider)
                     .map(|w| window::available(&w, now_secs))
@@ -3175,6 +3178,8 @@ fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, exi
     // to a work group -- settled with the same actual spend just computed
     // above, mirroring `agent::run_with`'s own headless completion path.
     if let Some(reservation_id) = pane.reservation_id() {
+        // Must match `fulfill_spawn_request`'s own reserve exactly -- see
+        // that function's Track C (#383) note for why this stays name-only.
         let provider = adapters::provider_for_agent_name(Some(pane.agent()));
         let _ = super::reservation::settle(state, provider, reservation_id, actual);
     }
@@ -3962,7 +3967,14 @@ fn rollover_sweep(
         return;
     };
     let short = panes[idx].short().to_string();
-    let provider = adapters::provider_for_agent_name(Some(panes[idx].agent())).to_string();
+    // The seat's own currently-registered model (`Seat::model`, stamped by
+    // the same `seat::register` call `Pane::spawn`/`Pane::handover` make),
+    // not `Pane`'s own state -- this is a point-in-time rollover-eligibility
+    // read, not a reserve/settle pairing, so it can resolve per-model freely.
+    let seat_model = super::seat::load(state, &short).and_then(|seat| seat.model);
+    let provider =
+        adapters::provider_for_agent_and_model(Some(panes[idx].agent()), seat_model.as_deref())
+            .to_string();
     let idle = panes[idx].state() == PaneState::Idle;
     let now = super::state::now_secs();
 
@@ -4088,7 +4100,10 @@ fn settle_pending_rollover(
                 pane.session_id(),
                 pane.agent(),
                 successor_model.as_deref(),
-                adapters::provider_for_agent_name(Some(pane.agent())),
+                adapters::provider_for_agent_and_model(
+                    Some(pane.agent()),
+                    successor_model.as_deref(),
+                ),
                 pane.role().label(),
                 false,
                 now,
@@ -6299,6 +6314,16 @@ fn fulfill_spawn_request(
     // check consulted (a live-dashboard fallback, a request that sat claimed
     // for a while) is held to an equally fresh reading rather than trusting
     // a decision that may now be stale.
+    //
+    // Track C (#383) note: this whole function -- the gate read here, the
+    // token reservation below, and its settle counterpart in
+    // `account_reaped_pane_spend` -- stays on the static, name-only
+    // `adapter.provider()`/`provider_for_agent_name` rather than
+    // `provider_for_model`, deliberately: `Pane` does not retain the model a
+    // pane actually launched with (see `Pane::handover`'s matching note in
+    // `pane.rs`), so a model-aware gate/reserve here would have no way to
+    // settle against the same provider once the child reaps. All three stay
+    // symmetric until `Pane` carries its own resolved model.
     let (collector, estimator) =
         super::pace::current_windows(state, &cfg.pace, now, adapter.provider());
     let gate = super::pace::spawn_gate(&collector, estimator.as_ref(), now, &cfg.pace);
@@ -9845,7 +9870,15 @@ pub fn run_dashboard(
     // spawned *during* the live loop) cannot reuse this same blocking
     // treatment and uses the advisory spawn gate instead.
     {
-        let provider = super::adapters::provider_for_agent_name(Some(&agent_name));
+        // The `SEAT_MODEL_ENV` `seat_model_env` just pushed onto `turn_env`
+        // above -- this pane's own resolved model, for the same reason
+        // `wrap::run_with`'s matching gate call resolves one.
+        let first_pane_model = turn_env
+            .iter()
+            .find(|(key, _)| key == super::adapters::SEAT_MODEL_ENV)
+            .map(|(_, value)| value.as_str());
+        let provider =
+            super::adapters::provider_for_agent_and_model(Some(&agent_name), first_pane_model);
         // Before raw mode / the dashboard's own event loop starts (see the
         // comment above), so a blocking keypress read here cannot collide
         // with anything -- this is the one dashboard spawn point that may

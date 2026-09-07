@@ -1180,6 +1180,9 @@ fn render_report<W: Write>(
             if cfg.fallback.enabled && !args.brief {
                 let now = crate::commands::ctx::state::now_secs();
                 for name in &cfg.fallback.order {
+                    // No model in hand: one row per configured fallback
+                    // harness NAME, not a specific pinned launch -- matches
+                    // `fallback::capacity_snapshot`'s own name-only choice.
                     let provider = adapters::provider_for_agent_name(Some(name));
                     let (collector, estimator) =
                         super::pace::current_windows(&state, &cfg.pace, now, provider);

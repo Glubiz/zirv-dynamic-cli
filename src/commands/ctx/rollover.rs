@@ -324,6 +324,12 @@ pub fn evaluate(
         Some(current.agent.as_str()),
     );
 
+    // Track C (#383) note: stays name-only, matching `capacity_snapshot`'s
+    // own `harness.provider` field above it -- `snapshot` was built through
+    // the static, per-name lookup (see that function's doc comment), so this
+    // fallback (only reached when `current.agent` is missing from the
+    // snapshot entirely) must resolve the identical way or the two branches
+    // could disagree about which provider a bare miss reports.
     let source_provider = snapshot
         .harness(&current.agent)
         .map(|harness| harness.provider.clone())

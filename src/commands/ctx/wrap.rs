@@ -1216,6 +1216,18 @@ fn interactive_from_turn_env(turn_env: &[(String, String)]) -> bool {
     })
 }
 
+/// This launch's own pinned model, read back out of `turn_env` -- the same
+/// `SEAT_MODEL_ENV` lookup `seat::register`'s call sites already duplicate
+/// inline in a few places in this file. Used to resolve
+/// `AgentAdapter::provider_for_model` wherever a call site has `turn_env` in
+/// hand but no separately-resolved model variable of its own.
+fn seat_model_from_turn_env(turn_env: &[(String, String)]) -> Option<&str> {
+    turn_env
+        .iter()
+        .find(|(key, _)| key == adapters::SEAT_MODEL_ENV)
+        .map(|(_, value)| value.as_str())
+}
+
 /// One open automatic rollover: the seat generation `rollover::evaluate`
 /// reserved, the signal count at the moment the successor was launched, and
 /// when that happened -- everything [`rollover::successor_readiness`] needs
@@ -1815,6 +1827,16 @@ pub fn run_with(
     // auto-derefs through `&mut Box<dyn AgentAdapter>` exactly as it does
     // through `&dyn AgentAdapter`.
     let mut adapter = adapters::select(agent_name, &args.command, &cfg)?;
+    // The pinned model this wrapped launch actually spawns with, if the
+    // wrapped command names one -- the same `last_model_flag` scan `exec`'s
+    // own `execution_model` and `seat_model_env` use, read directly off
+    // `args.command` rather than `cfg.chat.model`: unlike the seat-model env
+    // guard (see `seat_cfg_model` below), a launch's provider bucketing may
+    // honestly use the operator's configured chat model too, but here the
+    // wrapped argv is already in hand and is the more direct source. Recomputed
+    // wherever the pinned model can change (a harness handover) rather than
+    // reused across the whole session.
+    let launch_model = adapters::last_model_flag(&args.command);
 
     // `select` defaults to claude when detection finds nothing to back it,
     // which is fine for a caller (like `exec`) that already gates every
@@ -1885,7 +1907,12 @@ pub fn run_with(
     // of failing closed to `Headless`.
     let interactive_launch = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if !args.no_supervise && interactive_launch {
-        let gate = pace::interactive_gate(&state_dir, &cfg, adapter.provider(), true);
+        let gate = pace::interactive_gate(
+            &state_dir,
+            &cfg,
+            adapter.provider_for_model(launch_model),
+            true,
+        );
         apply_interactive_gate(gate, args.force_pace)?;
     }
 
@@ -2223,7 +2250,7 @@ pub fn run_with(
             session.as_str(),
             adapter.name(),
             seat_model.as_deref(),
-            adapter.provider(),
+            adapter.provider_for_model(seat_model.as_deref()),
             role.label(),
             super::seat::pin_from_env(env),
             super::state::now_secs(),
@@ -2412,7 +2439,9 @@ pub fn run_with(
     let mut bar = BarRuntime::new(
         chrome,
         adapter.name().to_string(),
-        adapter.provider().to_string(),
+        adapter
+            .provider_for_model(seat_model_from_turn_env(&turn_env))
+            .to_string(),
         super::sessions::short_id(session.as_str()),
         cfg.mail.enabled,
         stdout_lock.clone(),
@@ -3094,7 +3123,9 @@ fn perform_handover_swap(
         handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter.as_ref());
     *turn_env = new_turn_env;
     bar.harness = adapter.name().to_string();
-    bar.provider = adapter.provider().to_string();
+    bar.provider = adapter
+        .provider_for_model(req.target_model.as_deref())
+        .to_string();
 
     Ok(HandoverOutcome {
         from_agent,
@@ -3357,7 +3388,7 @@ fn pump(
                     cfg,
                     session.as_str(),
                     &seat_short,
-                    adapter.provider(),
+                    adapter.provider_for_model(seat_model_from_turn_env(turn_env)),
                     supervision,
                     debounce,
                     interactive_from_turn_env(turn_env),
@@ -3632,7 +3663,7 @@ fn pump(
                         session.as_str(),
                         adapter.name(),
                         model.as_deref(),
-                        adapter.provider(),
+                        adapter.provider_for_model(model.as_deref()),
                         role.label(),
                         false,
                         now_secs,

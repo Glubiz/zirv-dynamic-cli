@@ -1463,9 +1463,12 @@ fn run_with_clock_inner<W: Write>(
             now_fn,
             sleep_fn,
             Some(&announcer),
-            adapter.provider(),
+            adapter.provider_for_model(execution_model.as_deref()),
             pace::PaceGate {
-                use_credits: cfg.pace.use_credits.for_provider(adapter.provider()),
+                use_credits: cfg
+                    .pace
+                    .use_credits
+                    .for_provider(adapter.provider_for_model(execution_model.as_deref())),
                 poller: cfg
                     .pace
                     .poll_enabled
@@ -1656,7 +1659,12 @@ fn run_with_clock_inner<W: Write>(
             );
             if limit_text_seen {
                 let now = now_fn();
-                match pace::confirm_limit_hit(&state, &cfg.pace, now, adapter.provider()) {
+                match pace::confirm_limit_hit(
+                    &state,
+                    &cfg.pace,
+                    now,
+                    adapter.provider_for_model(execution_model.as_deref()),
+                ) {
                     pace::LimitConfirmation::Confirmed { detail } => {
                         limit_hit = true;
                         limit_confirmation_detail = Some(detail);
@@ -2349,10 +2357,15 @@ fn run_with_clock_inner<W: Write>(
                 // legitimate harness handover.
                 let mut reservation_id = None;
                 if let Some(old_id) = args.reservation_id.as_deref() {
-                    let _ = super::reservation::release(&state, adapter.provider(), old_id);
+                    let _ = super::reservation::release(
+                        &state,
+                        adapter.provider_for_model(execution_model.as_deref()),
+                        old_id,
+                    );
+                    let target_provider = target.provider_for_model(Some(selected_model.as_str()));
                     reservation_id = match super::reservation::reserve(
                         &state,
-                        target.provider(),
+                        target_provider,
                         session.as_str(),
                         remaining_tokens.unwrap_or(0),
                         now_fn(),
@@ -2361,8 +2374,7 @@ fn run_with_clock_inner<W: Write>(
                         Err(e) => {
                             eprintln!(
                                 "zirv ctx exec: failed to record a token reservation for \
-                                 provider '{}': {e}",
-                                target.provider()
+                                 provider '{target_provider}': {e}"
                             );
                             None
                         }
@@ -2373,7 +2385,7 @@ fn run_with_clock_inner<W: Write>(
                     // handover chain returns settles the right one -- not
                     // the provider (and id) it started this run on.
                     report.final_reservation =
-                        reservation_id.clone().map(|id| (id, target.provider()));
+                        reservation_id.clone().map(|id| (id, target_provider));
                 }
                 let nested_args = ExecArgs {
                     agent: Some(selected_agent.clone()),
@@ -2465,7 +2477,7 @@ fn run_with_clock_inner<W: Write>(
                 now_fn,
                 sleep_fn,
                 Some(&announcer),
-                adapter.provider(),
+                adapter.provider_for_model(execution_model.as_deref()),
                 pace::PaceGate {
                     // A vendor-reported limit hit parks even with use_credits
                     // enabled: the vendor limiting us means credits are
@@ -3202,6 +3214,12 @@ fn supervise_run(
         }
         if pace::scan_for_limit(&lines, state, session, "exec", &mut std::io::stderr()) {
             let now = now_secs();
+            // Left on the static `provider()`: `supervise_run` has no pinned-
+            // model parameter of its own, and this deep, already-huge
+            // argument list (`#[allow(clippy::too_many_arguments)]`) is not
+            // the place to add one for this foundation track -- the caller
+            // (`run_with_clock_inner`) already resolves `execution_model` for
+            // every OTHER pacing call in this file.
             match pace::confirm_limit_hit(state, pace_cfg, now, adapter.provider()) {
                 pace::LimitConfirmation::Confirmed { detail } => {
                     *limit_hit = true;

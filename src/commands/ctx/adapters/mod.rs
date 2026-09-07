@@ -1071,6 +1071,25 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// existing adapter's slug orphans that adapter's stored readings.
     fn provider(&self) -> &'static str;
 
+    /// The ACCOUNT a LAUNCH actually spends, given the `model` it pins --
+    /// the per-launch sibling of [`provider`](Self::provider) above.
+    ///
+    /// Default: this adapter's own static `provider()`, ignoring `model`
+    /// entirely -- correct for claude and codex, whose account never
+    /// depends on which model argv names. A multi-provider adapter (one CLI
+    /// whose `provider/model` argument can pin different vendors -- an
+    /// OpenCode/Pi/Goose/Droid-shaped front end) overrides this to read the
+    /// vendor prefix out of `model` instead, so `StateDir::usage_for`/
+    /// `poll_marker_for`, pacing, and the token-reservation ledger all file
+    /// this launch under the account it is actually billed to rather than
+    /// under one static slug shared by every model the adapter can launch.
+    /// `model: None` (no pinned/resolved model in hand at the call site)
+    /// always falls back to `provider()`.
+    fn provider_for_model(&self, model: Option<&str>) -> &'static str {
+        let _ = model;
+        self.provider()
+    }
+
     /// `Err` when the adapter exists but is not safe to use yet, so callers
     /// fail loudly instead of scoring garbage.
     fn ready(&self) -> CtxResult<()>;
@@ -2499,8 +2518,22 @@ pub fn all(bin: Option<&str>) -> Vec<Box<dyn AgentAdapter>> {
 /// or absent configuration, where there truly is nothing more specific to
 /// say than the legacy default).
 pub fn provider_for_agent_name(name: Option<&str>) -> &'static str {
+    provider_for_agent_and_model(name, None)
+}
+
+/// The model-aware sibling of [`provider_for_agent_name`] above: resolves
+/// through [`AgentAdapter::provider_for_model`] rather than the adapter's
+/// own static `provider()`, for a caller that already has a pinned/
+/// resolved model in hand at the point it needs a provider slug for usage/
+/// pacing/reservation state -- see that method's own doc comment for why a
+/// multi-provider adapter needs this instead of one static slug per
+/// registered name. `model: None` reproduces `provider_for_agent_name`
+/// exactly, so every existing caller of that function is unaffected by this
+/// one's addition. Same registry-only, no-readiness-required lookup, and
+/// the same `LEGACY_USAGE_PROVIDER` fallback for an unknown or absent name.
+pub fn provider_for_agent_and_model(name: Option<&str>, model: Option<&str>) -> &'static str {
     name.and_then(|n| ADAPTERS.iter().find(|(adapter_name, _)| *adapter_name == n))
-        .map(|(_, ctor)| ctor(None).provider())
+        .map(|(_, ctor)| ctor(None).provider_for_model(model))
         .unwrap_or(super::window::LEGACY_USAGE_PROVIDER)
 }
 
@@ -2676,10 +2709,18 @@ pub fn native_artifact_presentation_for_agent_name(
 /// explicitly configured, repo-disabled agent (`resolve_default`'s
 /// configured arm hard-refuses there) still needs a provider, and only
 /// `provider_for_agent_name` can name one without requiring readiness.
+///
+/// Resolves through `provider_for_model(cfg.chat.model)`, not the static
+/// `provider()`: this readout describes the interactive orchestrator seat
+/// (`zirv chat`/bare `wrap`), whose own model is `cfg.chat.model` when the
+/// operator configured one -- the same field `seat_model_env` and
+/// `wrap::run_with`'s `seat_cfg_model` already read for that seat.
 pub fn provider_for_usage_readout(cfg: &CtxConfig) -> &'static str {
     resolve_default(cfg)
-        .map(|(adapter, _origin)| adapter.provider())
-        .unwrap_or_else(|_| provider_for_agent_name(cfg.agent.as_deref()))
+        .map(|(adapter, _origin)| adapter.provider_for_model(cfg.chat.model.as_deref()))
+        .unwrap_or_else(|_| {
+            provider_for_agent_and_model(cfg.agent.as_deref(), cfg.chat.model.as_deref())
+        })
 }
 
 /// `cfg.agent_bin` is one global override applied to *whichever* adapter is
@@ -5307,6 +5348,152 @@ mod tests {
     fn an_adapter_with_no_override_reports_no_shim_for_a_direct_program() {
         let adapter = NoOverrideAdapter("/tmp/fake-agent".to_string());
         assert!(!adapter.launches_through_cmd_shim());
+    }
+
+    /// Track C (#383): a stand-in for an upcoming multi-provider adapter
+    /// (OpenCode/Pi/Goose/Droid-shaped) whose pinned `provider/model` argv
+    /// can name a DIFFERENT vendor per launch. `provider()` answers this
+    /// adapter's own fallback default; `provider_for_model` reads the vendor
+    /// prefix out of a `"<vendor>/<model>"` string when one is given, the
+    /// same shape those front ends use.
+    #[derive(Debug)]
+    struct MultiProviderStubAdapter;
+
+    impl AgentAdapter for MultiProviderStubAdapter {
+        fn name(&self) -> &'static str {
+            "multi-provider-stub"
+        }
+
+        fn program(&self) -> &str {
+            "multi-provider-stub"
+        }
+
+        fn provider(&self) -> &'static str {
+            "anthropic"
+        }
+
+        fn provider_for_model(&self, model: Option<&str>) -> &'static str {
+            match model.and_then(|m| m.split('/').next()) {
+                Some("google") => "google",
+                Some("openai") => "openai",
+                _ => self.provider(),
+            }
+        }
+
+        fn ready(&self) -> CtxResult<()> {
+            Ok(())
+        }
+
+        fn detect(&self, _command: &[String]) -> bool {
+            false
+        }
+
+        fn headless_cmd(&self, _prompt: &str, _session: &SessionId, _extra: &[String]) -> Command {
+            Command::new("true")
+        }
+
+        fn interactive_cmd(&self, _initial_prompt: Option<&str>, _extra: &[String]) -> Command {
+            Command::new("true")
+        }
+
+        fn distiller_cmd(&self, _model: &str) -> Command {
+            Command::new("true")
+        }
+
+        fn read_only_args(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn system_prompt_args(&self, _prompt: &str) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn transcript_path(&self, _session: &SessionRef) -> PathBuf {
+            PathBuf::new()
+        }
+
+        fn parse_events(&self, _jsonl: &str) -> Vec<NormalizedEvent> {
+            Vec::new()
+        }
+
+        fn structural_context(&self, _jsonl: &str, _last_n: usize) -> StructuralContext {
+            StructuralContext::default()
+        }
+
+        fn compact_command(&self) -> Option<&'static str> {
+            None
+        }
+
+        fn quit_sequence(&self) -> &'static str {
+            ""
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn register_turn_signal(&self, _session: &SessionRef, _socket: &Path) -> TurnSignalSetup {
+            TurnSignalSetup {
+                env: Vec::new(),
+                instructions: String::new(),
+            }
+        }
+    }
+
+    /// The default `provider_for_model` (claude/codex; every adapter this
+    /// track ships) ignores `model` entirely and always answers the static
+    /// `provider()` -- the whole point of a default that is a no-op until an
+    /// adapter opts in.
+    #[test]
+    fn the_default_provider_for_model_ignores_the_model_and_returns_provider() {
+        let claude = claude::ClaudeAdapter::new(None);
+        assert_eq!(claude.provider_for_model(None), claude.provider());
+        assert_eq!(claude.provider_for_model(Some("opus")), claude.provider());
+        let codex = codex::CodexAdapter::new(None);
+        assert_eq!(
+            codex.provider_for_model(Some("gpt-5.6-terra")),
+            codex.provider()
+        );
+    }
+
+    /// A multi-provider adapter's override changes which account a launch
+    /// bills depending on the model it pins -- the mechanism the whole
+    /// `provider_for_model` addition exists for.
+    #[test]
+    fn a_multi_provider_adapter_resolves_the_account_from_the_pinned_model() {
+        let adapter = MultiProviderStubAdapter;
+        assert_eq!(adapter.provider(), "anthropic");
+        assert_eq!(
+            adapter.provider_for_model(Some("google/gemini-3-pro")),
+            "google"
+        );
+        assert_eq!(adapter.provider_for_model(Some("openai/gpt-5")), "openai");
+        // No pinned model, and a model naming no known vendor prefix, both
+        // fall back to this adapter's own static default.
+        assert_eq!(adapter.provider_for_model(None), "anthropic");
+        assert_eq!(adapter.provider_for_model(Some("unqualified")), "anthropic");
+    }
+
+    /// This is the exact seam `StateDir::usage_for`/`poll_marker_for` file
+    /// names off of (see their own doc comments): a launch pinning a
+    /// `"google/..."` model must file its usage/pacing state under
+    /// `usage-google.json`, separate from this adapter's own default
+    /// `usage-anthropic.json` -- not silently sharing the default account's
+    /// window the way the static `provider()` alone would.
+    #[test]
+    fn usage_for_names_a_different_file_per_pinned_model_provider() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(tmp.path().to_path_buf());
+        let adapter = MultiProviderStubAdapter;
+        assert_eq!(
+            state.usage_for(adapter.provider_for_model(Some("google/gemini-3-pro"))),
+            tmp.path().join("usage-google.json")
+        );
+        assert_eq!(
+            state.usage_for(adapter.provider()),
+            tmp.path().join("usage-anthropic.json"),
+            "the static provider() still names the adapter's own default file"
+        );
     }
 
     /// The core of issue #92: an adapter that implements nothing beyond the
