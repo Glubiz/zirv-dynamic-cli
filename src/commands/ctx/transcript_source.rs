@@ -37,28 +37,47 @@ use super::state::{self, StateDir};
 /// resumed/handed-over session without growing forever on a machine that has
 /// run zirv for months. Unlike that log's day-bucketed files (one file per
 /// UTC day, prunable by parsing the filename), a shadow directory holds one
-/// `<short>.jsonl`/`<short>.cursor` pair per SESSION -- there is no day to
-/// parse out of a short session id -- so pruning here reads each file's own
-/// mtime instead, the same signal [`state::prune_to_newest`] reads, just
-/// compared against an age cutoff rather than a keep-count.
+/// file per SESSION -- there is no day to parse out of a short session id --
+/// so pruning here reads each file's own mtime instead, the same signal
+/// [`state::prune_to_newest`] reads, just compared against an age cutoff
+/// rather than a keep-count.
 const SHADOW_RETENTION_DAYS: u64 = 30;
 
-/// One session's materialized shadow transcript: `<state>/shadow/<short>.jsonl`
-/// holds the JSONL rows the rot engine reads, and `<short>.cursor` holds how
-/// many source rows (JSON array) or the highest `rowid` (SQLite) are already
-/// reflected in it. A sibling of [`StateDir::rollouts`], with the same
-/// short-id derivation ([`sessions::short_id`]).
+/// Bytes comfortably larger than any single realistic JSONL row (one chat
+/// message, or one row of a handful of SQLite columns) that [`tail_window`]
+/// reads from a shadow's tail before falling back to a full read. Bounds how
+/// much of a long-lived shadow gets read just to find its last line or two,
+/// which is all [`ShadowTranscript::shadow_row_count`] and
+/// [`ShadowTranscript::shadow_last_rowid`] ever need.
+///
+/// [`tail_window`]: ShadowTranscript::tail_window
+const TAIL_READ_BYTES: u64 = 64 * 1024;
+
+/// One session's materialized shadow transcript:
+/// `<state>/shadow/<short>.jsonl` holds the JSONL rows the rot engine reads.
+/// A sibling of [`StateDir::rollouts`], with the same short-id derivation
+/// ([`sessions::short_id`]).
+///
+/// There is deliberately no separate cursor file recording how much of a
+/// source has already been synced: an earlier revision kept one, and a
+/// crash between appending rows to the shadow and writing the cursor's new
+/// value left the cursor behind what the shadow already held, so the next
+/// sync trusted the stale cursor and replayed rows the shadow already had,
+/// duplicating them. The shadow file is now the only record of its own
+/// position -- [`Self::shadow_row_count`] (for [`Self::sync_json_array`])
+/// and [`Self::shadow_last_rowid`] (for [`Self::sync_sqlite`]) read it
+/// directly off the shadow's own bytes, so there is nothing left that can
+/// fall out of sync with it.
 pub struct ShadowTranscript {
     jsonl: PathBuf,
-    cursor: PathBuf,
 }
 
 impl ShadowTranscript {
     /// Ensures `<state>/shadow` exists with the same private-directory
     /// discipline every other state-dir subdirectory gets
     /// ([`state::create_private_dir_all`]), prunes shadow files idle for
-    /// more than [`SHADOW_RETENTION_DAYS`], then names this session's pair of
-    /// files inside it. Both steps are best-effort, matching every other
+    /// more than [`SHADOW_RETENTION_DAYS`], then names this session's file
+    /// inside it. Both steps are best-effort, matching every other
     /// lazy-create call site in this module (e.g.
     /// `adapters::codex::CodexAdapter::pinned_rollout`): a directory that
     /// cannot be created or pruned is not a reason a session should fail to
@@ -74,7 +93,6 @@ impl ShadowTranscript {
         let short = sessions::short_id(session.id.as_str());
         Self {
             jsonl: dir.join(format!("{short}.jsonl")),
-            cursor: dir.join(format!("{short}.cursor")),
         }
     }
 
@@ -82,18 +100,6 @@ impl ShadowTranscript {
     /// after syncing.
     pub fn path(&self) -> &Path {
         &self.jsonl
-    }
-
-    /// Reads `self.cursor` as a single decimal number of type `T`. `None`
-    /// covers both a missing file (the ordinary first-sync case) and one
-    /// that fails to parse (a corrupted or foreign file) -- both read as "no
-    /// cursor on record", which both `sync_json_array` and `sync_sqlite`
-    /// treat identically: rewrite the shadow from scratch rather than trust
-    /// a shadow file whose cursor cannot be reconciled with it.
-    fn read_cursor<T: std::str::FromStr>(&self) -> Option<T> {
-        std::fs::read_to_string(&self.cursor)
-            .ok()
-            .and_then(|text| text.trim().parse::<T>().ok())
     }
 
     /// Atomically empties the shadow JSONL. `state::write_private`'s
@@ -108,9 +114,118 @@ impl ShadowTranscript {
     }
 
     fn dir(&self) -> &Path {
-        // `for_session` always names both files as direct children of the
-        // same shadow directory, so either one's parent is that directory.
+        // `for_session` always names the file as a direct child of the
+        // shadow directory.
         self.jsonl.parent().unwrap_or(Path::new("."))
+    }
+
+    /// Reads `self.jsonl` from `start` to EOF.
+    fn read_tail(&self, start: u64) -> CtxResult<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(&self.jsonl)?;
+        let len = file.metadata()?.len();
+        let start = start.min(len);
+        file.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; (len - start) as usize];
+        file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// A tail window of the shadow guaranteed to hold at least its last two
+    /// complete lines, or the whole file, whichever is shorter -- the shared
+    /// read behind both [`Self::repair_trailing_partial_line`] and
+    /// [`Self::shadow_last_rowid`]. Starts with [`TAIL_READ_BYTES`] and only
+    /// re-reads the whole file when that window holds fewer than two
+    /// newlines while stopping short of the file's start, which only a
+    /// pathologically large single line ever triggers. Returns the absolute
+    /// file offset the window starts at, alongside its bytes; `(0, [])` for
+    /// a missing or empty shadow.
+    fn tail_window(&self) -> CtxResult<(u64, Vec<u8>)> {
+        let len = match std::fs::metadata(&self.jsonl) {
+            Ok(meta) => meta.len(),
+            Err(_) => return Ok((0, Vec::new())),
+        };
+        if len == 0 {
+            return Ok((0, Vec::new()));
+        }
+        let start = len.saturating_sub(TAIL_READ_BYTES);
+        let window = self.read_tail(start)?;
+        if start > 0 && window.iter().filter(|&&b| b == b'\n').count() < 2 {
+            return Ok((0, self.read_tail(0)?));
+        }
+        Ok((start, window))
+    }
+
+    /// Drops a trailing partial line -- a write that stopped mid-row, e.g. a
+    /// crash between two [`Self::append_rows`] calls -- and persists the
+    /// truncation immediately. Both [`Self::shadow_row_count`] and
+    /// [`Self::shadow_last_rowid`] call this first: with no cursor file to
+    /// consult any more, the shadow's own bytes are the only record of a
+    /// resume position, and a half-written line must never be read as if it
+    /// had landed. A no-op when the shadow is missing, empty, or already
+    /// ends in a complete line.
+    fn repair_trailing_partial_line(&self) -> CtxResult<()> {
+        let (start, window) = self.tail_window()?;
+        if window.is_empty() || window.last() == Some(&b'\n') {
+            return Ok(());
+        }
+        match window.iter().rposition(|&b| b == b'\n') {
+            Some(pos) => {
+                let keep_len = start + pos as u64 + 1;
+                let file = std::fs::OpenOptions::new().write(true).open(&self.jsonl)?;
+                file.set_len(keep_len)?;
+            }
+            None => {
+                // `tail_window` only ever returns fewer than two newlines
+                // while `start == 0` (see its own doc comment), so an empty
+                // `rposition` here means the whole file is one partial
+                // line/blob -- nothing complete survives.
+                state::create_private_dir_all(self.dir())?;
+                state::write_private(&self.jsonl, "")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The shadow's own row count, once [`Self::repair_trailing_partial_line`]
+    /// has dropped any trailing partial line -- the cursor
+    /// [`Self::sync_json_array`] resumes from, read directly off the file
+    /// instead of a separate record. Reads the whole shadow: unlike
+    /// [`Self::shadow_last_rowid`], a total count cannot be answered from a
+    /// tail window alone, and a JSON-array-sourced shadow is bounded by the
+    /// harness's own snapshot size rather than growing without limit.
+    fn shadow_row_count(&self) -> CtxResult<usize> {
+        self.repair_trailing_partial_line()?;
+        let Ok(bytes) = std::fs::read(&self.jsonl) else {
+            return Ok(0);
+        };
+        Ok(bytes.iter().filter(|&&b| b == b'\n').count())
+    }
+
+    /// The `rowid` of the shadow's last complete line, once
+    /// [`Self::repair_trailing_partial_line`] has dropped any trailing
+    /// partial one -- the cursor [`Self::sync_sqlite`] resumes from, read
+    /// directly off the file instead of a separate record. `0` when the
+    /// shadow is empty or its last complete line is not a JSON object with
+    /// an integer `rowid` field -- both read as "nothing to resume from",
+    /// the same safe-restart posture [`Self::shadow_row_count`] gives an
+    /// unreadable shadow.
+    fn shadow_last_rowid(&self) -> CtxResult<i64> {
+        self.repair_trailing_partial_line()?;
+        let (_, window) = self.tail_window()?;
+        if window.is_empty() {
+            return Ok(0);
+        }
+        let end = window.len() - 1; // drop the trailing '\n'
+        let line_start = window[..end]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |p| p + 1);
+        let last_line = &window[line_start..end];
+        Ok(serde_json::from_slice::<serde_json::Value>(last_line)
+            .ok()
+            .and_then(|value| value.get("rowid").and_then(serde_json::Value::as_i64))
+            .unwrap_or(0))
     }
 
     /// Appends `rows` to the shadow JSONL, one compact JSON line per row,
@@ -138,17 +253,13 @@ impl ShadowTranscript {
     ///
     /// `extract` receives the parsed snapshot and returns its message rows,
     /// in the harness's own order; each row becomes one shadow line. The
-    /// cursor file holds how many of those rows are already written. A
-    /// snapshot that now has FEWER rows than the cursor remembers -- a new
-    /// session reusing the same file, or a genuine truncation -- rewrites
-    /// the shadow from zero, which `Watcher::read_appended` already reads as
-    /// a restart (see its own doc comment: same-or-shorter length is never
-    /// treated as an append). A missing cursor file, or one that fails to
-    /// parse, reads the same way: [`Self::read_cursor`] cannot tell "never
-    /// synced" apart from "cursor lost its meaning", so both take the safe
-    /// path and rewrite from scratch rather than risk silently duplicating
-    /// or skipping rows against a shadow file the cursor can no longer
-    /// account for.
+    /// resume position is [`Self::shadow_row_count`] -- how many complete
+    /// rows the shadow itself already holds, not a separate cursor record
+    /// (see [`ShadowTranscript`]'s own doc comment for why). A snapshot that
+    /// now has FEWER rows than that count -- a new session reusing the same
+    /// file, or a genuine truncation -- rewrites the shadow from zero, which
+    /// `Watcher::read_appended` already reads as a restart (see its own doc
+    /// comment: same-or-shorter length is never treated as an append).
     ///
     /// A missing or unparseable source file leaves the shadow untouched and
     /// simply returns its path: a harness's snapshot being absent or
@@ -168,16 +279,12 @@ impl ShadowTranscript {
         };
         let rows = extract(&value);
 
-        let stored = self.read_cursor::<usize>();
-        let needs_reset = stored.is_none() || rows.len() < stored.unwrap_or(0);
-        let cursor = if needs_reset { 0 } else { stored.unwrap_or(0) };
-
-        if needs_reset || rows.len() > cursor {
-            if needs_reset {
-                self.reset()?;
-            }
-            self.append_rows(&rows[cursor..])?;
-            state::write_private(&self.cursor, &rows.len().to_string())?;
+        let written = self.shadow_row_count()?;
+        if rows.len() < written {
+            self.reset()?;
+            self.append_rows(&rows)?;
+        } else if rows.len() > written {
+            self.append_rows(&rows[written..])?;
         }
         Ok(self.jsonl.clone())
     }
@@ -208,11 +315,10 @@ impl ShadowTranscript {
     /// written) rather than base64-encoded: a transcript database's blob
     /// columns are not verified to hold anything the rot engine's line-local
     /// text parsing would ever read, and skipping avoids pulling in a
-    /// base64 dependency for bytes nothing downstream consumes. The cursor
-    /// file stores the highest rowid seen, exactly like `sync_json_array`'s
-    /// cursor stores a row count (see [`Self::read_cursor`]'s doc comment
-    /// for how a missing/unparseable cursor is handled identically here:
-    /// treated as zero and the shadow rewritten from scratch).
+    /// base64 dependency for bytes nothing downstream consumes. The resume
+    /// position is [`Self::shadow_last_rowid`] -- the `rowid` field of the
+    /// shadow's own last complete line, not a separate cursor record (see
+    /// [`ShadowTranscript`]'s own doc comment for why).
     ///
     /// A missing database file, a database that fails to open under those
     /// flags, or a query that fails to prepare or execute, all leave the
@@ -226,9 +332,7 @@ impl ShadowTranscript {
             return Ok(self.jsonl.clone());
         }
 
-        let stored = self.read_cursor::<i64>();
-        let needs_reset = stored.is_none();
-        let cursor = stored.unwrap_or(0);
+        let cursor = self.shadow_last_rowid()?;
 
         let Some(conn) = open_for_sync(db) else {
             return Ok(self.jsonl.clone());
@@ -242,15 +346,15 @@ impl ShadowTranscript {
         };
 
         let mut new_rows = Vec::new();
-        let mut max_rowid = cursor;
         // A fault partway through iteration (e.g. a concurrent checkpoint)
         // simply stops the scan here -- whatever was already read is kept,
-        // never discarded, and the next poll picks up past `max_rowid`.
+        // never discarded, and the next poll picks up past the last row
+        // actually appended (`shadow_last_rowid` re-derives the cursor from
+        // it on the next call).
         while let Some(row) = rows.next().ok().flatten() {
             let Ok(rowid) = row.get::<_, i64>(0) else {
                 continue;
             };
-            max_rowid = max_rowid.max(rowid);
             let mut obj = serde_json::Map::new();
             obj.insert("rowid".to_string(), serde_json::Value::from(rowid));
             for (index, name) in column_names.iter().enumerate().skip(1) {
@@ -261,13 +365,7 @@ impl ShadowTranscript {
             new_rows.push(serde_json::Value::Object(obj));
         }
 
-        if needs_reset || !new_rows.is_empty() {
-            if needs_reset {
-                self.reset()?;
-            }
-            self.append_rows(&new_rows)?;
-            state::write_private(&self.cursor, &max_rowid.to_string())?;
-        }
+        self.append_rows(&new_rows)?;
         Ok(self.jsonl.clone())
     }
 }
@@ -538,7 +636,7 @@ mod tests {
         assert_eq!(read_lines(shadow.path()).len(), 3);
 
         // A new session reusing the same snapshot file, or a genuine
-        // truncation -- either way fewer rows than the cursor remembers.
+        // truncation -- either way fewer rows than the shadow already holds.
         std::fs::write(
             &source,
             serde_json::json!([{"role": "user", "text": "z"}]).to_string(),
@@ -553,6 +651,112 @@ mod tests {
             lines,
             vec![serde_json::json!({"role": "user", "text": "z"}).to_string()]
         );
+    }
+
+    /// The bug this redesign fixes (see `ShadowTranscript`'s own doc
+    /// comment): a separate cursor file used to record how many rows were
+    /// already written, and a crash between appending rows to the shadow
+    /// and updating that cursor left it behind what the shadow already
+    /// held, so the next sync trusted the stale cursor and replayed rows
+    /// the shadow already had. There is no cursor file any more --
+    /// `append_rows` is called directly here to put the shadow in exactly
+    /// that "rows already landed, nothing else to update" state a crash
+    /// would have left, then a normal sync of a source describing those
+    /// same rows must find nothing new, because the shadow's own row count
+    /// IS the position now.
+    #[test]
+    fn a_crash_that_left_rows_appended_never_replays_them_on_the_next_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shadow = shadow_for(dir.path(), "ffffffff-ffff-4fff-8fff-ffffffffffff");
+        let rows = serde_json::json!([
+            {"role": "user", "text": "a"},
+            {"role": "assistant", "text": "b"},
+        ]);
+        shadow
+            .append_rows(&extract_array(&rows))
+            .expect("simulate a completed append with no cursor to record it");
+        assert_eq!(read_lines(shadow.path()).len(), 2, "sanity: rows landed");
+
+        let source = dir.path().join("snapshot.json");
+        std::fs::write(&source, rows.to_string()).expect("write source");
+        shadow
+            .sync_json_array(&source, &extract_array)
+            .expect("sync after the simulated crash");
+
+        let lines = read_lines(shadow.path());
+        assert_eq!(
+            lines.len(),
+            2,
+            "the already-written rows must not be replayed: {lines:?}"
+        );
+    }
+
+    /// The other half of the crash this redesign survives: a write that
+    /// stopped mid-row (a crash inside `append_rows`'s own loop, between two
+    /// `write_all` calls) leaves a trailing line with no final newline.
+    /// `shadow_row_count` must not count it, and must drop it before the
+    /// next row is appended, so the row it represents is re-synced whole
+    /// rather than left as a permanently broken half-line.
+    #[test]
+    fn a_partial_trailing_line_is_dropped_and_the_row_is_re_synced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shadow = shadow_for(dir.path(), "12121212-1212-4121-8121-121212121212");
+        let source = dir.path().join("snapshot.json");
+        std::fs::write(
+            &source,
+            serde_json::json!([{"role": "user", "text": "a"}]).to_string(),
+        )
+        .expect("write source");
+        shadow
+            .sync_json_array(&source, &extract_array)
+            .expect("first sync");
+        assert_eq!(read_lines(shadow.path()).len(), 1);
+
+        // Simulate a crash mid-append: a second row's line was started but
+        // never terminated with a newline.
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(shadow.path())
+                .expect("open for corruption");
+            file.write_all(br#"{"role":"assistant"#)
+                .expect("write partial line");
+        }
+        assert!(
+            std::fs::read(shadow.path())
+                .expect("read")
+                .last()
+                .is_some_and(|&b| b != b'\n'),
+            "sanity: the shadow now ends in a partial line"
+        );
+
+        std::fs::write(
+            &source,
+            serde_json::json!([
+                {"role": "user", "text": "a"},
+                {"role": "assistant", "text": "b"},
+            ])
+            .to_string(),
+        )
+        .expect("extend source");
+        shadow
+            .sync_json_array(&source, &extract_array)
+            .expect("second sync");
+
+        let lines = read_lines(shadow.path());
+        assert_eq!(
+            lines.len(),
+            2,
+            "the partial line must be dropped and the row re-synced whole: {lines:?}"
+        );
+        for line in &lines {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "every line must be valid JSON, proving the partial fragment is gone: {line}"
+            );
+        }
+        assert!(lines[1].contains("\"b\""));
     }
 
     #[test]
@@ -650,6 +854,88 @@ mod tests {
         assert_eq!(lines.len(), 3, "only the new row was appended: {lines:?}");
         assert!(lines[2].contains("\"c\""));
         assert!(lines[2].contains("\"rowid\""));
+    }
+
+    /// The SQLite half of the crash this redesign fixes (see
+    /// `ShadowTranscript`'s own doc comment): `append_rows` here simulates
+    /// rows a crashed sync already landed in the shadow, with no separate
+    /// cursor file left behind to fall out of sync with it. A normal sync
+    /// against a database whose rows are the same ones already in the
+    /// shadow must find nothing past `shadow_last_rowid` and append
+    /// nothing.
+    #[test]
+    fn a_crash_that_left_sqlite_rows_appended_never_replays_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("session.db");
+        let conn = new_message_db(&db_path);
+        insert_message(&conn, "user", "a");
+        insert_message(&conn, "assistant", "b");
+
+        let shadow = shadow_for(dir.path(), "13131313-1313-4131-8131-131313131313");
+        shadow
+            .append_rows(&[
+                serde_json::json!({"rowid": 1, "role": "user", "data": "a"}),
+                serde_json::json!({"rowid": 2, "role": "assistant", "data": "b"}),
+            ])
+            .expect("simulate a completed append with no cursor to record it");
+        assert_eq!(read_lines(shadow.path()).len(), 2, "sanity: rows landed");
+
+        shadow
+            .sync_sqlite(&db_path, MESSAGE_QUERY)
+            .expect("sync after the simulated crash");
+        assert_eq!(
+            read_lines(shadow.path()).len(),
+            2,
+            "the already-written rows must not be replayed"
+        );
+    }
+
+    /// The same partial-line hazard `sync_json_array` repairs, exercised
+    /// through `sync_sqlite`: a trailing line with no final newline must be
+    /// dropped and `shadow_last_rowid` must read `0`, not the broken line's
+    /// (absent) rowid, so the row it represents is re-fetched from the
+    /// database rather than left as a permanently broken half-line.
+    #[test]
+    fn a_partial_trailing_sqlite_line_is_dropped_and_the_row_is_re_synced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("session.db");
+        let conn = new_message_db(&db_path);
+        insert_message(&conn, "user", "a");
+
+        let shadow = shadow_for(dir.path(), "14141414-1414-4141-8141-141414141414");
+        shadow
+            .sync_sqlite(&db_path, MESSAGE_QUERY)
+            .expect("first sync");
+        assert_eq!(read_lines(shadow.path()).len(), 1);
+
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(shadow.path())
+                .expect("open for corruption");
+            file.write_all(br#"{"rowid":2,"role":"assistant"#)
+                .expect("write partial line");
+        }
+
+        insert_message(&conn, "assistant", "b");
+        shadow
+            .sync_sqlite(&db_path, MESSAGE_QUERY)
+            .expect("second sync");
+
+        let lines = read_lines(shadow.path());
+        assert_eq!(
+            lines.len(),
+            2,
+            "the partial line must be dropped and the row re-synced whole: {lines:?}"
+        );
+        for line in &lines {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "every line must be valid JSON, proving the partial fragment is gone: {line}"
+            );
+        }
+        assert!(lines[1].contains("\"b\""));
     }
 
     /// The whole point of preferring a plain read-only open over

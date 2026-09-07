@@ -452,9 +452,9 @@ impl StateDir {
         self.0.join("groups")
     }
 
-    /// `<state>/shadow` -- one `<short>.jsonl` plus `<short>.cursor` pair per
-    /// session (issue #382), a sibling of [`Self::rollouts`] with the same
-    /// short-id derivation (`sessions::short_id`). A harness whose own
+    /// `<state>/shadow` -- one `<short>.jsonl` file per session (issue #382),
+    /// a sibling of [`Self::rollouts`] with the same short-id derivation
+    /// (`sessions::short_id`). A harness whose own
     /// transcript is a JSON snapshot or a SQLite database has no line-local
     /// JSONL for the unchanged rot engine to read; `super::transcript_source`
     /// materializes the rows that engine needs into a shadow file here. See
