@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a reproducible problem with zirv.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        From a terminal, `zirv report bug "<title>" --body "<details>"` files the same issue and can attach a redacted `zirv ctx snapshot`.
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour or output
+      render: shell
+  - type: input
+    id: version
+    attributes:
+      label: zirv version
+      placeholder: Paste the output of zirv --version
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+    validations:
+      required: true
+  - type: dropdown
+    id: harness
+    attributes:
+      label: AI harness involved
+      options:
+        - None
+        - Claude Code
+        - Codex
+        - Both
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
