@@ -24,6 +24,14 @@ fn main() {
     embed_version_resource();
 }
 
+// The `winresource` build-dependency is declared for a Windows HOST (Cargo
+// evaluates `[target.'cfg(windows)'.build-dependencies]` against the machine
+// running the build script), so on any other host there is nothing to call:
+// a cross-compile to Windows from Linux/macOS ships without the resource
+// rather than failing on a missing `windres`.
+#[cfg(not(windows))]
+fn embed_version_resource() {}
+
 #[cfg(windows)]
 fn embed_version_resource() {
     let version = env!("CARGO_PKG_VERSION");
