@@ -357,9 +357,9 @@ fn codex_token() -> Option<String> {
         .map(str::to_owned)
 }
 
-/// A human-readable reason `provider` currently has no usage reading at all,
-/// plus the concrete next step -- consulted only by `zirv ctx status`'s "no
-/// usage source" line (T7 follow-up 2). Deliberately a pure, filesystem-only
+/// A human-readable reason `provider` currently has no fresh usage reading,
+/// plus the concrete next step for status and launch-time pacing messages.
+/// Deliberately a pure, filesystem-only
 /// check (an `exists()` stat, nothing more): `status` must stay fast and
 /// side-effect-free, so this never spawns `security`, never makes an HTTP
 /// request, and never mutates anything -- it explains what the *next* `zirv
@@ -399,11 +399,21 @@ pub fn usage_source_hint(provider: &str) -> String {
                 )
             }
         }
-        super::window::CODEX_USAGE_PROVIDER => format!(
-            "no ~/.codex/auth.json and no codex rollout snapshot found yet; {tee_hint} for a \
-             claude session, or run a codex session so its own passive rollout scan can pick up \
-             a reading"
-        ),
+        super::window::CODEX_USAGE_PROVIDER => {
+            let file_exists = crate::utils::home_dir()
+                .map(|h| h.join(".codex").join("auth.json").exists())
+                .unwrap_or(false);
+            let reason = if file_exists {
+                "a codex credentials file exists but no fresh reading has landed yet"
+            } else {
+                "no ~/.codex/auth.json (a keyring-based codex login has no file) and no fresh \
+                 codex rollout reading yet"
+            };
+            format!(
+                "{reason}; run a codex session so its passive rollout scan picks one up, or \
+                 `zirv ctx usage`"
+            )
+        }
         _ => tee_hint.to_string(),
     }
 }
@@ -677,11 +687,40 @@ mod tests {
         assert!(hint.contains("no reading has landed yet"), "got {hint}");
 
         let codex_hint = usage_source_hint(window::CODEX_USAGE_PROVIDER);
-        assert!(codex_hint.contains("codex"), "got {codex_hint}");
         assert!(
-            codex_hint.contains("zirv ctx usage tee"),
+            codex_hint.contains("no ~/.codex/auth.json (a keyring-based codex login has no file)"),
             "got {codex_hint}"
         );
+        assert!(
+            codex_hint.contains("no fresh codex rollout reading yet"),
+            "got {codex_hint}"
+        );
+        assert!(
+            codex_hint.contains("passive rollout scan"),
+            "got {codex_hint}"
+        );
+        assert!(codex_hint.contains("`zirv ctx usage`"), "got {codex_hint}");
+        assert!(!codex_hint.contains("tee"), "got {codex_hint}");
+
+        let codex_dir = home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("mkdir");
+        std::fs::write(codex_dir.join("auth.json"), "{}").expect("write credentials file");
+        let codex_hint = usage_source_hint(window::CODEX_USAGE_PROVIDER);
+        assert!(
+            codex_hint
+                .contains("a codex credentials file exists but no fresh reading has landed yet"),
+            "got {codex_hint}"
+        );
+        assert!(
+            codex_hint.contains("passive rollout scan"),
+            "got {codex_hint}"
+        );
+        assert!(codex_hint.contains("`zirv ctx usage`"), "got {codex_hint}");
+        assert!(
+            !codex_hint.contains("no ~/.codex/auth.json"),
+            "got {codex_hint}"
+        );
+        assert!(!codex_hint.contains("tee"), "got {codex_hint}");
 
         let other = usage_source_hint("unknown-provider");
         assert!(other.contains("zirv ctx usage tee"), "got {other}");
