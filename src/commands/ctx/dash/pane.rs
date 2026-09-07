@@ -923,6 +923,7 @@ pub struct Pane {
     pending_submit: Option<Instant>,
     submit_confirmation: Option<(Instant, bool)>,
     pub(crate) delivery_sender: Option<String>,
+    pub(crate) last_injection_at: Instant,
     /// Issue #160 finding 1, review round (2026-08-28): the `LaunchMode`
     /// this pane was ACTUALLY spawned with, derived from `turn_env` itself
     /// (whether it carried the durable interactive-launch pin,
@@ -1219,6 +1220,7 @@ impl Pane {
             pending_submit: None,
             submit_confirmation: None,
             delivery_sender: None,
+            last_injection_at: Instant::now(),
             launch_mode,
             writer_permit: None,
             cwd: cwd.to_path_buf(),
@@ -1255,9 +1257,9 @@ impl Pane {
             // `signal_still_stands`' decision, and it needs the timestamp to
             // make it.
             self.last_output_at = Some(Instant::now());
-            if self.submit_confirmation.is_some() {
+            // Mail error output is not proof the child survived the confirmation window.
+            if self.delivery_sender.is_none() {
                 self.submit_confirmation = None;
-                self.delivery_sender = None;
             }
         }
         // A signal-less pane's `on_turn_signal` never fires (its socket is
@@ -2029,6 +2031,7 @@ impl Pane {
         self.last_local_input_at = Some(now);
         self.injected_awaiting_turn = true;
         self.pending_submit = Some(now + INJECTION_SUBMIT_DELAY);
+        self.last_injection_at = now;
         self.submit_confirmation = None;
         self.delivery_sender = None;
         Ok(())
@@ -2102,8 +2105,11 @@ impl Pane {
 
     /// Retries one silent submission, then reports it unconfirmed without typing again.
     pub(crate) fn check_submission(&mut self, now: Instant) -> CtxResult<bool> {
+        self.poll_exit();
         if matches!(self.state(), PaneState::Ended(_))
-            && (self.pending_submit.is_some() || self.submit_confirmation.is_some())
+            && (self.pending_submit.is_some()
+                || self.submit_confirmation.is_some()
+                || self.delivery_sender.is_some())
         {
             self.cancel_submission();
             return Ok(true);
@@ -2111,14 +2117,14 @@ impl Pane {
         let Some((submitted, retry_spent)) = self.submit_confirmation else {
             return Ok(false);
         };
+        if now.saturating_duration_since(submitted) < Duration::from_secs(1) {
+            return Ok(false);
+        }
         if self.last_output_at.is_some_and(|at| at > submitted)
             || self.last_signal_at.is_some_and(|at| at > submitted)
         {
             self.submit_confirmation = None;
             self.delivery_sender = None;
-            return Ok(false);
-        }
-        if now.saturating_duration_since(submitted) < Duration::from_secs(1) {
             return Ok(false);
         }
         self.submit_confirmation = None;

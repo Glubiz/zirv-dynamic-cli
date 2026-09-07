@@ -2887,6 +2887,18 @@ fn reap_ended_panes(
             index += 1;
             continue;
         };
+        if panes[index].delivery_sender.is_some() {
+            let mut notices = Vec::new();
+            report_unconfirmed_submission(
+                &mut panes[index],
+                state,
+                cfg,
+                errors,
+                &mut notices,
+                Instant::now(),
+            );
+            confirmations.extend(notices.into_iter().map(|notice| notice.text));
+        }
         // Issue #354 phase 2: the row survives the pane, so everything it will
         // ever need is captured HERE -- before `shutdown` below releases the
         // registry record the age comes from, and before the `Pane` itself is
@@ -3164,6 +3176,7 @@ fn on_quit(
             // `report_back_reminder_sweep` could never remind it again.
             report_to: pane.report_to().map(str::to_string),
             report_reminder_sent: pane.report_reminder_sent(),
+            settled_mail_sent: pane.settled_mail_sent,
             // Finding 6: and the group it belongs to, so the restore can put
             // it back inside the same one.
             work_group_id: pane.work_group_id().map(str::to_string),
@@ -8223,6 +8236,7 @@ fn spawn_restored_pane(
             if candidate.report_reminder_sent {
                 pane.mark_report_reminder_sent();
             }
+            pane.settled_mail_sent = candidate.settled_mail_sent;
             pane.set_intake_dir(pane_channel);
             pane.set_work_group_id(candidate.work_group_id.clone());
             pane.set_budget_tokens(candidate.budget_tokens);
@@ -8824,11 +8838,19 @@ fn report_unconfirmed_submission(
     notices: &mut Vec<Notice>,
     now: Instant,
 ) {
-    let body = format!(
+    let mut body = format!(
         "text was typed into pane {} ({}) but submission is unconfirmed: it may not have been submitted and may need Enter or a resend",
         pane.short(),
         pane.agent()
     );
+    if let PaneState::Ended(code) = pane.state() {
+        let elapsed = now
+            .saturating_duration_since(pane.last_injection_at)
+            .as_secs();
+        body.push_str(&format!(
+            "; the pane exited {elapsed}s after the message was injected (exit code {code})"
+        ));
+    }
     if let Some(sender) = pane.delivery_sender.take()
         && let Err(error) = store_pane_system_mail(pane, &sender, body.clone(), state, cfg)
     {
@@ -22469,6 +22491,170 @@ mod tests {
     }
 
     #[test]
+    fn mail_sender_is_notified_if_the_child_exits_during_confirmation() {
+        for exits in [true, false] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(tmp.path().join("state"));
+            let cfg = CtxConfig::default();
+            #[cfg(unix)]
+            let argv = vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "printf 'ready\n'; IFS= read -r line; printf 'delivery error\n'; {}",
+                    if exits { "exit 7" } else { "sleep 60" }
+                ),
+            ];
+            #[cfg(windows)]
+            let argv = vec![
+                "cmd".to_string(),
+                "/c".to_string(),
+                format!(
+                    "echo ready & set /p injected= & echo delivery error & {}",
+                    if exits {
+                        "exit /b 7"
+                    } else {
+                        "ping -n 60 127.0.0.1 >nul"
+                    }
+                ),
+            ];
+            let spec = PaneSpec {
+                agent_name: "test-agent".to_string(),
+                argv,
+                role: prompt::PromptRole::Worker,
+                verb: sessions::Verb::Dash,
+                session_id: "dddddddd-2222-4333-8444-555555555555".to_string(),
+                title: "worker".to_string(),
+            };
+            let mut pane = Pane::spawn(
+                spec,
+                &state,
+                tmp.path(),
+                tmp.path(),
+                (80, 24),
+                &[],
+                false,
+                Duration::from_millis(100),
+            )
+            .expect("spawn");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                pane.drain();
+                if pane.screen().contents().contains("ready") && pane.injectable() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                pane.injectable(),
+                "the child is ready for its injected input"
+            );
+            let slug = super::super::state::repo_slug(tmp.path());
+            let source = mail::store_to(
+                &state,
+                &slug,
+                &slug,
+                &mail::Message {
+                    from_session: "aaaa1111".to_string(),
+                    from_agent: "claude".to_string(),
+                    to: "any".to_string(),
+                    to_session: Some(pane.short().to_string()),
+                    sent: super::super::state::now_secs(),
+                    body: "please continue".to_string(),
+                },
+                &cfg,
+            )
+            .expect("store");
+            let mut panes = vec![pane];
+            let mut errors = ErrorLog::default();
+            let mut notices = Vec::new();
+            mail_sweep(
+                &mut panes,
+                &cfg,
+                &state,
+                tmp.path(),
+                &mut HashMap::new(),
+                &mut errors,
+            );
+            assert!(!source.exists(), "the source mail has been consumed");
+            panes[0].submit_pending().expect("submit");
+            let submitted = Instant::now();
+            let deadline = submitted + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                panes[0].drain();
+                confirm_pane_submissions(
+                    &mut panes,
+                    &state,
+                    &cfg,
+                    &mut errors,
+                    &mut notices,
+                    Instant::now(),
+                );
+                let output = panes[0].screen().contents().contains("delivery error");
+                if output && (matches!(panes[0].state(), PaneState::Ended(_)) || !exits) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(panes[0].screen().contents().contains("delivery error"));
+            if !exits {
+                while submitted.elapsed() < Duration::from_millis(1100) {
+                    panes[0].drain();
+                    confirm_pane_submissions(
+                        &mut panes,
+                        &state,
+                        &cfg,
+                        &mut errors,
+                        &mut notices,
+                        Instant::now(),
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                assert!(!matches!(panes[0].state(), PaneState::Ended(_)));
+            } else {
+                assert!(matches!(panes[0].state(), PaneState::Ended(7)));
+            }
+            confirm_pane_submissions(
+                &mut panes,
+                &state,
+                &cfg,
+                &mut errors,
+                &mut notices,
+                Instant::now(),
+            );
+            let replies = mail::list(&state, &slug, None, Some("aaaa1111")).expect("list");
+            assert_eq!(replies.len(), usize::from(exits));
+            if exits {
+                assert!(
+                    replies[0]
+                        .1
+                        .body
+                        .contains("s after the message was injected")
+                );
+                assert!(replies[0].1.body.contains("exit code 7"));
+            }
+            panes[0].finish_shutdown().expect("shutdown");
+            panes[0].drain();
+            confirm_pane_submissions(
+                &mut panes,
+                &state,
+                &cfg,
+                &mut errors,
+                &mut notices,
+                Instant::now(),
+            );
+            assert_eq!(
+                mail::list(&state, &slug, None, Some("aaaa1111"))
+                    .expect("list again")
+                    .len(),
+                usize::from(exits)
+            );
+            assert_eq!(notices.len(), usize::from(exits));
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+    }
+
+    #[test]
     fn unconfirmed_mail_submission_notifies_sender_once() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
@@ -25113,6 +25299,7 @@ mod tests {
         let mut candidate = restore_pane("cccc3333", "33333333-2222-4333-8444-555555555555");
         candidate.report_to = Some("aaaa1111".to_string());
         candidate.report_reminder_sent = true;
+        candidate.settled_mail_sent = true;
         let cfg = CtxConfig {
             #[cfg(windows)]
             agent_bin: Some("ping -n 3 127.0.0.1".to_string()),
@@ -25154,6 +25341,22 @@ mod tests {
             "a restore resurrects the SAME logical session, so an \
              already-reminded worker must not be reminded again"
         );
+
+        assert!(
+            panes[0].settled_mail_sent,
+            "the restored session must not send a second settled report"
+        );
+
+        on_quit(&panes, &[], &[], &requests_dir, &state, &repo);
+        let saved = roster::take_roster(
+            &state,
+            &super::super::state::repo_slug(&repo),
+            super::super::state::now_secs(),
+            999_999,
+        )
+        .expect("saved roster");
+        assert!(saved.panes[0].report_reminder_sent);
+        assert!(saved.panes[0].settled_mail_sent);
 
         panes[0].finish_shutdown().expect("shutdown");
     }
