@@ -645,6 +645,10 @@ pub(crate) fn reserved_zirv_command_patterns() -> Vec<String> {
             if *name == "ctx" {
                 ctx_base_allow_verbs()
                     .map(|verb| format!("zirv ctx {verb} *"))
+                    .chain([
+                        "zirv ctx config show".into(),
+                        "zirv ctx config show *".into(),
+                    ])
                     .collect::<Vec<_>>()
             } else if BASE_GATED_RESERVED_BUILTINS.contains(name) {
                 Vec::new()
@@ -909,6 +913,12 @@ fn reserved_zirv_auto_allow_rule(command: &str) -> Option<Rule> {
         });
     }
     let verb = tokens.get(2)?.to_ascii_lowercase();
+    if verb == "config" && tokens.get(3).is_some_and(|s| s == "show") {
+        return Some(Rule {
+            pattern: "zirv ctx config show *".to_string(),
+            origin: Origin::BuiltIn,
+        });
+    }
     if is_permissions_compile_write(&tokens) {
         return None;
     }
@@ -1291,8 +1301,21 @@ fn apply_credential_outcome(command: &str, base: Outcome) -> Outcome {
 /// it. Reads stay silent, and a repository's own `.zirv/` is a different
 /// directory entirely.
 fn apply_operator_config_outcome(command: &str, base: Outcome) -> Outcome {
-    if base.verdict == Verdict::Deny || !writes_into_operator_zirv_config(command) {
+    if base.verdict == Verdict::Deny {
         return base;
+    }
+    if !writes_into_operator_zirv_config(command) {
+        return if is_operator_config_edit(command) {
+            Outcome {
+                verdict: Verdict::Ask,
+                matched: Some(Rule {
+                    pattern: OPERATOR_CONFIG_EDIT_RULE.to_string(),
+                    origin: Origin::BuiltIn,
+                }),
+            }
+        } else {
+            base
+        };
     }
     Outcome {
         verdict: Verdict::Deny,
@@ -1301,6 +1324,29 @@ fn apply_operator_config_outcome(command: &str, base: Outcome) -> Outcome {
             origin: Origin::BuiltIn,
         }),
     }
+}
+
+const OPERATOR_CONFIG_EDIT_RULE: &str = "<config: operator ctx.toml edit via zirv ctx config>";
+
+fn is_operator_config_edit(command: &str) -> bool {
+    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
+        return false;
+    };
+    tokens
+        .first()
+        .is_some_and(|s| sql_program_name(s) == "zirv")
+        && tokens.get(1).is_some_and(|s| s.eq_ignore_ascii_case("ctx"))
+        && tokens.get(2).is_some_and(|s| s == "config")
+        && tokens
+            .get(3)
+            .is_some_and(|s| matches!(s.as_str(), "set" | "add"))
+}
+
+fn operator_config_approval(outcome: &Outcome) -> bool {
+    outcome.verdict == Verdict::Ask
+        && outcome.matched.as_ref().is_some_and(|rule| {
+            rule.origin == Origin::BuiltIn && rule.pattern == OPERATOR_CONFIG_EDIT_RULE
+        })
 }
 
 fn apply_network_outcome(command: &str, base: Outcome) -> Outcome {
@@ -7702,8 +7748,9 @@ fn hook_output_with_extras(
         Verdict::Deny => "deny",
         // Under `dontAsk` an "ask" is an unsatisfiable prompt claude turns
         // into a denial that strips the operator's own `permissions.allow`
-        // (issue #102) -- unchanged.
-        Verdict::Ask if dont_ask => return None,
+        // (issue #102). Operator config edits must retain the approval gate
+        // even here, so a standing native allow cannot silently edit policy.
+        Verdict::Ask if dont_ask && !operator_config_approval(outcome) => return None,
         Verdict::Ask => "ask",
         // Under `dontAsk`, silence is ordinarily right: the mode already
         // resolves anything pre-approved, and issue #102's finding was that
@@ -8174,7 +8221,10 @@ fn run_check_hook_mode_with_env<W: Write>(
     //   own entries) AND clears the credential/root-scan screen
     //   ([`escape_allow_matches`]) -- an operator-attested retry the
     //   sandbox would otherwise force a fresh prompt for on every repeat.
-    if payload.tool_input.dangerously_disable_sandbox && outcome.verdict != Verdict::Deny {
+    if payload.tool_input.dangerously_disable_sandbox
+        && outcome.verdict != Verdict::Deny
+        && !operator_config_approval(&outcome)
+    {
         let already_scratchpad_confined = outcome
             .matched
             .as_ref()
@@ -12241,6 +12291,111 @@ mod tests {
             .verdict,
             evaluate(&policy, "cargo test", LaunchMode::Headless).verdict
         );
+    }
+
+    #[test]
+    fn operator_config_show_is_allowed_in_both_modes() {
+        let policy = SafetyPolicy::default();
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            for command in ["zirv ctx config show", "zirv ctx config show worker.codex"] {
+                assert_eq!(evaluate(&policy, command, mode).verdict, Verdict::Allow);
+            }
+        }
+    }
+
+    #[test]
+    fn operator_config_writes_require_approval_even_with_broad_allow() {
+        let mut policy = SafetyPolicy::default();
+        policy.allow.push(Rule {
+            pattern: "*".into(),
+            origin: Origin::Operator,
+        });
+        for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
+            for command in [
+                "zirv ctx config set worker.codex gpt-5",
+                "zirv ctx config add dash.workdir_roots /tmp/x",
+                "env X=1 zirv ctx config add dash.workdir_roots /tmp/x",
+                "/usr/local/bin/zirv ctx config set worker.codex gpt-5",
+                "sh -c 'zirv ctx config set worker.codex gpt-5'",
+            ] {
+                let outcome = evaluate(&policy, command, mode);
+                assert!(operator_config_approval(&outcome), "{command}: {outcome:?}");
+                assert!(
+                    orchestrator_repo_write_target(
+                        command,
+                        "/repo",
+                        &|_| Some("/repo".into()),
+                        &|_| None
+                    )
+                    .is_none()
+                );
+            }
+            assert_eq!(
+                evaluate(
+                    &policy,
+                    "zirv ctx config add dash.workdir_roots /tmp/x > ~/.zirv/ctx.toml",
+                    mode
+                )
+                .verdict,
+                Verdict::Deny
+            );
+        }
+        let patterns = reserved_zirv_command_patterns();
+        for command in [
+            "zirv ctx config set worker.codex gpt-5",
+            "zirv ctx config add dash.workdir_roots /tmp/x",
+        ] {
+            assert!(!patterns.iter().any(|pattern| glob_match(pattern, command)));
+        }
+    }
+
+    #[test]
+    fn operator_config_hook_asks_from_orchestrator_even_on_sandbox_retry() {
+        let state = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        let mut cfg = CtxConfig::default();
+        cfg.supervise.orchestrator_writes = super::super::config::OrchestratorWrites::Deny;
+        let env = env_from(&[
+            (super::super::adapters::SEAT_ROLE_ENV, "orchestrator"),
+            (
+                super::super::state::STATE_ENV,
+                state.path().to_str().unwrap(),
+            ),
+        ]);
+        for permission_mode in ["default", "dontAsk"] {
+            for retry in [false, true] {
+                for command in [
+                    "zirv ctx config set worker.codex gpt-5",
+                    "zirv ctx config add dash.workdir_roots /tmp/x",
+                ] {
+                    let stdin = serde_json::json!({
+                        "tool_name": "Bash", "cwd": repo.path(),
+                        "permission_mode": permission_mode,
+                        "tool_input": {"command": command, "dangerouslyDisableSandbox": retry}
+                    })
+                    .to_string();
+                    let mut out = Vec::new();
+                    run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|key| {
+                        env.get(key).cloned()
+                    })
+                    .unwrap();
+                    let result: serde_json::Value = serde_json::from_slice(&out).unwrap();
+                    assert_eq!(
+                        result["hookSpecificOutput"]["permissionDecision"], "ask",
+                        "{result}"
+                    );
+                    assert!(
+                        result["hookSpecificOutput"]["permissionDecisionReason"]
+                            .as_str()
+                            .unwrap()
+                            .contains(OPERATOR_CONFIG_EDIT_RULE)
+                    );
+                }
+            }
+        }
     }
 
     /// A3 (2026-09-06 audit): `zirv ctx permissions compile` was the only

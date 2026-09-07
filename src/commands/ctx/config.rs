@@ -3747,6 +3747,23 @@ fn read_layer(
     }
 }
 
+pub(super) fn operator_path() -> CtxResult<std::path::PathBuf> {
+    Ok(crate::utils::home_dir()?
+        .join(crate::utils::SCRIPT_DIR_NAME)
+        .join(CTX_CONFIG_FILE))
+}
+
+/// Validate just the operator document, without repo or environment overrides.
+pub(super) fn validate_operator_document(text: &str) -> CtxResult<()> {
+    let mut table: toml::Table = toml::from_str(text)?;
+    super::policy::resolve(table.remove(POLICY_SECTION), None, &|_| None)?;
+    super::safety::resolve(table.remove(SAFETY_SECTION), None, &|_| None)?;
+    let _: CtxConfig = toml::Value::Table(table)
+        .try_into()
+        .map_err(|e| format!("invalid ctx config: {e}"))?;
+    Ok(())
+}
+
 impl CtxConfig {
     /// Whether the orchestrator seat may roll over automatically, resolving
     /// `fallback.auto_orchestrator_rollover`'s "decide from the roster"
@@ -3787,14 +3804,8 @@ impl CtxConfig {
         let mut merged = toml::Table::new();
         let mut unparsable_layers: Vec<UnparsableLayer> = Vec::new();
 
-        if let Ok(home) = crate::utils::home_dir()
-            && let Some(bad) = read_layer(
-                &home
-                    .join(crate::utils::SCRIPT_DIR_NAME)
-                    .join(CTX_CONFIG_FILE),
-                &mut merged,
-                true,
-            )?
+        if let Ok(path) = operator_path()
+            && let Some(bad) = read_layer(&path, &mut merged, true)?
         {
             unparsable_layers.push(bad);
         }

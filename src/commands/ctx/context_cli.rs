@@ -792,8 +792,8 @@ fn render_lint_text<W: Write>(w: &mut W, report: &context_lint::LintReport) -> C
         writeln!(
             w,
             "\ndegraded: context.lint_max_pairs was exhausted before every sentence pair was \
-             compared -- duplicate/contradiction detection is partial. Raise context.lint_max_pairs \
-             in ~/.zirv/ctx.toml to compare more."
+             compared -- duplicate/contradiction detection is partial. Run `zirv ctx config set \
+             context.lint_max_pairs <count>` to compare more (asks the operator for approval)."
         )?;
     }
     Ok(())
