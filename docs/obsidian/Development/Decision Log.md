@@ -25,6 +25,34 @@ last-verified: 2026-09-07
 
 ## Decisions
 
+### 2026-09-07 -- Copilot's provider stays a static `"github"`, no per-model override
+**Context:** Wave-1/2 introduced `provider_for_model` for genuinely multi-vendor CLIs (opencode, pi, droid, qwen each resolve a per-launch vendor via `catalogue::vendor_of`); copilot needed the same call made explicitly rather than left implicit.
+**Decision:** `CopilotAdapter` does not override `provider_for_model` -- every copilot launch bills the operator's own GitHub Copilot subscription regardless of which underlying model answers, so the static `provider() == "github"` is already the correct billed account for every model copilot can select.
+**Rejected:** Resolving a per-model vendor via `catalogue::vendor_of` anyway, for consistency with the other four wave-1/2 adapters -- copilot exposes no `provider/model`-shaped argument the way opencode/pi/droid do, and the account actually billed is GitHub's subscription either way, never the underlying model vendor's own API account.
+**Consequences:** Usage/pacing/reservations for a copilot session always key off `"github"`, never split per underlying model the way an opencode/pi/droid/qwen launch's spend can be.
+**Spec / link:** [[Ctx Adapters]]'s copilot section; `src/commands/ctx/adapters/copilot.rs`.
+
+### 2026-09-07 -- Droid's real flags are verified against the live binary, not `docs.factory.ai`
+**Context:** Droid (`@factory/cli`) is closed-source with no bundled JS to read the way gemini/pi/qwen's could be, and its published reference docs disagree with the shipped 0.213.0 binary on multiple flags and paths.
+**Decision:** Every droid fact in `adapters/droid.rs` is verified by running the real compiled Windows binary directly (`--help`, `exec --help`, `--list-tools`, plus one live end-to-end agentic turn against a local BYOK mock model server) rather than trusting the published docs. Concretely: the real flags are `--only-tools`/`--add-tools`/`--remove-tools` (the docs' own `--restrict-tools`/`--disabled-tools` do not exist at all), and transcripts live at `~/.factory/sessions/<cwd-slug>/<id>.jsonl` (the docs' `~/.factory/projects/...` describes a hook's own field, not the real on-disk layout).
+**Rejected:** Shipping the published reference's flags unverified -- would have produced an adapter whose read-only floor silently no-ops on a real install (an unrecognised flag rejected outright rather than restricting anything).
+**Consequences:** droid is the only wave-1/2 adapter verified against a real live agentic run rather than source/docs alone; a built-in (non-BYOK) model's own `modelId` reporting is presumed symmetric with the BYOK run that was actually observed, not independently confirmed (no real `FACTORY_API_KEY` exists here).
+**Spec / link:** [[Ctx Adapters]]'s droid section; `tests/fixtures/droid/README.md`; `src/commands/ctx/adapters/droid.rs`.
+
+### 2026-09-07 -- Gemini's read-only floor is `--admin-policy`, not `--approval-mode=plan`
+**Context:** gemini-cli has no per-tool deny flag the way codex's `--sandbox read-only`/claude's `--disallowedTools` do; `--approval-mode=plan` looked like the obvious analogue for a read-only launch.
+**Decision:** `GeminiAdapter::read_only_args` writes a zirv-owned Admin-tier policy file and passes `--admin-policy <path>` (a real, verified yargs option) denying `run_shell_command`/`write_file`/`replace` -- an Admin-tier rule outranks every Default/Extension/User-tier rule regardless of approval mode.
+**Rejected:** `--approval-mode=plan` -- gemini-cli's own docs state a headless plan-mode run auto-escalates to YOLO (auto-approving shell/write tools) the moment its plan is approved, the exact opposite of read-only. `tools.exclude`/`tools.core` -- `settings.json`-only keys with no per-run CLI equivalent, explicitly deprecated upstream in favour of the policy engine.
+**Consequences:** A documented residual: an operator-managed machine carrying its own system-tier `.toml` policy ignores this supplemental admin policy entirely (gemini-cli's own stated behaviour) -- the intended outcome of that guard, not a hole this adapter opens.
+**Spec / link:** [[Ctx Adapters]]'s gemini section; `src/commands/ctx/adapters/gemini.rs`.
+
+### 2026-09-07 -- Gemini's own transcript is read directly, never through the shadow-JSONL materializer
+**Context:** issue #382's `transcript_source::ShadowTranscript` was built anticipating a JSON-array-snapshot or SQLite transcript for the wave-1 adapters; this wave's own survey had assumed gemini-cli rewrites one JSON array whole per turn.
+**Decision:** Reading gemini-cli's bundled JS directly (`ChatRecordingService`) showed its session file is already append-only JSONL (one `fs.appendFileSync` per record) -- genuinely line-local already, so `GeminiAdapter::transcript_path` reads it the same way `CodexAdapter` does, with no shadow file involved at all.
+**Rejected:** Materializing through `ShadowTranscript::sync_json_array` anyway for mechanism consistency -- that helper parses its whole source as one `serde_json::Value`, which cannot parse a multi-line JSONL blob as valid JSON at all; it would simply fail on every poll.
+**Consequences:** `qwen` (also a gemini-cli fork, also append-only JSONL) follows the identical direct-read shape. `transcript_source.rs` stays dormant for a JSON-array snapshot; opencode's SQLite database is its first real caller.
+**Spec / link:** [[Ctx Adapters]]'s gemini/qwen/opencode sections; `src/commands/ctx/adapters/gemini.rs`'s own doc comment.
+
 ### 2026-09-07 -- Seat/worker scheduling posture: raise the seat's threads, lower a worker's process class -- never the other way round
 **Context:** Typing into a wrapped session lagged whenever the machine was busy with the worker sessions zirv itself had spawned (`cargo build`/`cargo test` across every core) -- the seat's own supervisor threads, the dashboard UI thread, and a worker's cargo grandchildren all ran at the same normal OS priority (release 3.30.0). A scheduling fix needed a posture, decided per role, applied at the right process boundary.
 **Decision:** `ctx::priority::posture_for(role)` is pure: only `PromptRole::Orchestrator` (the seat) gets `Posture::Interactive`, which raises its own THREADS (`THREAD_PRIORITY_ABOVE_NORMAL` on Windows) and never touches the process class. Every delegated role (`SubOrchestrator`, `Worker`) gets `Posture::Worker`, which lowers the whole PROCESS one notch (`BELOW_NORMAL_PRIORITY_CLASS` on Windows, nice `+5` on unix) before it spawns anything, so its harness child and every cargo process under it inherit the lower class for free. A dashboard pane's child gets the same worker lowering stamped onto it by pid (`apply_to_child`) rather than by inheritance, since it is spawned BY the dashboard's own (normal-class) UI process.
