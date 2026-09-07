@@ -65,15 +65,15 @@ if [ ! -f "$FORMULA" ]; then
     exit 1
 fi
 
-MACOS_URL="https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v${VERSION}/${MACOS_BASENAME}"
-LINUX_URL="https://github.com/Glubiz/zirv-dynamic-cli/releases/download/v${VERSION}/${LINUX_BASENAME}"
+MACOS_URL="https://github.com/Glubiz/zirv-cli/releases/download/v${VERSION}/${MACOS_BASENAME}"
+LINUX_URL="https://github.com/Glubiz/zirv-cli/releases/download/v${VERSION}/${LINUX_BASENAME}"
 
 echo "Writing updated formula"
 
 cat > "$FORMULA" << RUBY
 class Zirv < Formula
   desc "Dynamic CLI tool to streamline tasks and boost productivity"
-  homepage "https://github.com/Glubiz/zirv-dynamic-cli"
+  homepage "https://github.com/Glubiz/zirv-cli"
   license "MIT"
   version "${VERSION}"
 

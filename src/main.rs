@@ -9,7 +9,7 @@ use commands::{
     create::{CreateOptions, create_script},
     help::show_help,
     init::init_zirv,
-    report,
+    report, update,
     version::get_version,
 };
 
@@ -79,6 +79,11 @@ fn is_top_level_setup(argv: &[String]) -> bool {
 fn is_top_level_report(argv: &[String]) -> bool {
     argv.get(1)
         .is_some_and(|name| name.eq_ignore_ascii_case("report"))
+}
+
+fn is_top_level_update(argv: &[String]) -> bool {
+    argv.get(1)
+        .is_some_and(|name| name.eq_ignore_ascii_case("update"))
 }
 
 /// True when argv[1] names the `context` built-in (issue #45, "Context
@@ -328,6 +333,10 @@ async fn main() {
         std::process::exit(report::dispatch(&argv[1..]));
     }
 
+    if is_top_level_update(&argv) {
+        std::process::exit(update::dispatch(&argv[1..]));
+    }
+
     if let Some(verb) = top_level_ctx_alias(&argv) {
         // Only `chat` gets the first-run gate, not `agent`: `agent` delegates
         // one bounded task to another harness rather than opening the kind of
@@ -540,6 +549,18 @@ mod tests {
         assert!(!is_top_level_report(&argv(&["zirv", "reports"])));
     }
 
+    #[test]
+    fn update_is_intercepted_case_insensitively() {
+        assert!(is_top_level_update(&argv(&["zirv", "update"])));
+        assert!(is_top_level_update(&argv(&[
+            "zirv",
+            "UPDATE",
+            "--version",
+            "3.20.0"
+        ])));
+        assert!(!is_top_level_update(&argv(&["zirv", "updates"])));
+    }
+
     /// FINDING 2: every reserved command name -- whatever its casing -- is
     /// recognised by the guard that gates script dispatch, so `zirv Help`,
     /// `zirv CREATE`, `zirv Chat` are all refused as scripts rather than run a
@@ -548,6 +569,7 @@ mod tests {
     fn mis_cased_reserved_command_names_are_recognised_by_the_guard() {
         for name in [
             "Help", "HELP", "Version", "CREATE", "Init", "Ctx", "Chat", "Agent", "Setup", "Report",
+            "Update",
         ] {
             assert!(
                 utils::is_reserved_command(name),

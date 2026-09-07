@@ -5,5 +5,6 @@ pub mod help;
 pub mod init;
 pub mod report;
 pub mod setup;
+pub mod update;
 pub mod version;
 pub mod workflow;

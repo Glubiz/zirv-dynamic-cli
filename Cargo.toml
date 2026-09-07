@@ -1,6 +1,6 @@
 [package]
 name = "zirv"
-version = "3.28.0"
+version = "3.29.0"
 edition = "2024"
 authors = ["Jonathan Solskov <josj@zirv.io>"]
 description = "A CLI tool for executing developer-defined YAML scripts with support for interactive commands and OS-specific execution."
@@ -38,7 +38,9 @@ unicode-width = "0.2.2"
 tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dependencies]
+flate2 = "1.1.9"
 libc = "0.2.183"
+tar = "0.4.44"
 
 # Already in the tree transitively (console, dirs-sys, mio, tempfile all pull
 # it); named here so `ctx wrap` can call the console-mode and named-pipe APIs

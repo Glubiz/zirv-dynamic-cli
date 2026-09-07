@@ -153,6 +153,7 @@ const MUTATING: &[&str] = &[
     "zirv create",
     "zirv report bug",
     "zirv report feature",
+    "zirv update",
     "zirv ctx chat",
     "zirv ctx config set",
     "zirv ctx config add",
@@ -368,13 +369,14 @@ pub fn command_entries() -> CtxResult<Vec<CommandEntry>> {
     let mut entries = Vec::new();
     let mut unclassified = Vec::new();
 
-    let roots: [Command; 6] = [
+    let roots: [Command; 7] = [
         super::ctx::CtxCli::command(),
         super::ctx::memory_cli::MemoryCli::command(),
         super::ctx::context_cli::ContextCli::command(),
         super::workflow::command(),
         super::report::ReportCli::command(),
         super::setup::SetupCli::command(),
+        super::update::UpdateCli::command(),
     ];
     for root in &roots {
         let prefix = root.get_name().to_string();
@@ -584,16 +586,16 @@ mod tests {
     }
 
     #[test]
-    fn report_bug_and_feature_are_mutating_they_file_a_real_github_issue() {
+    fn github_writes_and_self_update_are_mutating() {
         let entries = command_entries().expect("classified");
-        for path in ["zirv report bug", "zirv report feature"] {
+        for path in ["zirv report bug", "zirv report feature", "zirv update"] {
             let entry = entries
                 .iter()
                 .find(|entry| entry.path == path)
                 .unwrap_or_else(|| panic!("{path} must be discovered"));
             assert!(
                 entry.mutating,
-                "{path} files a real GitHub issue over HTTP: it mutates"
+                "{path} performs a network or filesystem write: it mutates"
             );
         }
     }

@@ -242,6 +242,10 @@ fn write_builtins<W: Write>(
                 desc: &["Configure AI context, memory, hooks, migration, and safe resets"],
             },
             Row {
+                name: "update [--version <x.y.z>]",
+                desc: &["Install the latest or a specified zirv release"],
+            },
+            Row {
                 name: "skill [--json]",
                 desc: &[
                     "Print the bundled operator orientation skill for this binary (also `zirv",
@@ -459,6 +463,7 @@ mod tests {
             "version",
             "init",
             "report",
+            "update",
             "ctx",
             "--dry-run",
             "--name",
