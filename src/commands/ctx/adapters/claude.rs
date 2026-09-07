@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::super::CtxResult;
+use super::super::catalogue;
 use super::super::event::input_hash;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, ToolInvocation,
@@ -814,6 +815,11 @@ pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 /// A long-window Claude seat (1M tokens) is spelled with a `[1m]` or `-1m`
 /// marker in the model id in this environment.
 const LONG_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
+
+/// This adapter's own vendor slug in `catalogue`'s registry (issue #381):
+/// claude's ladder, strengths, windows and prices all now live there rather
+/// than as literals in this file.
+const CATALOGUE_VENDOR: &str = "anthropic";
 
 pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     let mut out = StructuralContext::default();
@@ -1987,11 +1993,14 @@ impl AgentAdapter for ClaudeAdapter {
 
     /// A real, verified cheap-model name for claude's own lineup -- the
     /// value `handoff.model`/`optimize.model` defaulted to before it became
-    /// per-adapter (see `resolve_distiller_model` in `handoff.rs`). Specific
-    /// to claude by construction: a hardcoded model name from one agent's
-    /// lineup has no business leaking into another adapter's default.
+    /// per-adapter (see `resolve_distiller_model` in `handoff.rs`). Now the
+    /// catalogue's `Cheap` tier (`"haiku"`) rather than a literal here, but
+    /// still specific to claude by construction: a hardcoded model name from
+    /// one agent's lineup has no business leaking into another adapter's
+    /// default.
     fn default_distiller_model(&self) -> Option<&'static str> {
-        Some("haiku")
+        catalogue::vendor(CATALOGUE_VENDOR)
+            .and_then(|v| catalogue::tier_model(v, catalogue::Tier::Cheap))
     }
 
     /// Claude's one verified per-run enforcement mechanism is the same
@@ -2340,54 +2349,40 @@ impl AgentAdapter for ClaudeAdapter {
     /// A delegated headless worker (`zirv ctx agent`, and the dashboard's
     /// own spawn-request pane variant) used to silently inherit whatever the
     /// operator's own interactive default model happened to be -- often a
-    /// far pricier model than the delegated task actually needs. `"sonnet"`
-    /// is the user-approved hard default that stops that, used only when
-    /// the operator has not set `worker.claude` explicitly (see
-    /// `adapters::resolve_worker_model`).
+    /// far pricier model than the delegated task actually needs. The
+    /// catalogue's `Standard` tier (`"sonnet"`) is the user-approved hard
+    /// default that stops that, used only when the operator has not set
+    /// `worker.claude` explicitly (see `adapters::resolve_worker_model`).
     fn default_worker_model(&self) -> Option<&'static str> {
-        Some("sonnet")
+        catalogue::vendor(CATALOGUE_VENDOR)
+            .and_then(|v| catalogue::tier_model(v, catalogue::Tier::Standard))
     }
 
     /// Claude's own model ladder, top to bottom: `fable`/`mythos` (the
-    /// orchestrator-tier aliases), `opus`, `sonnet`, `haiku`. Matched by
-    /// substring on `seat`, lowercased first so `"claude-Opus-4-5"` and a
-    /// bare `"opus"` both hit the same rung regardless of case (so
-    /// `"claude-fable-5"` and a bare `"fable"` both hit the fable rung)
-    /// rather than exact equality, since a seat string can carry a full id
-    /// (`claude-opus-4-1`) or a bare alias. `haiku` is already the floor, so
-    /// it maps to itself instead of falling off the ladder; an absent or
-    /// unrecognised seat assumes the top tier, same as
+    /// orchestrator-tier aliases), `opus`, `sonnet`, `haiku` -- now data in
+    /// `catalogue` (issue #381) rather than a hand-written ladder here.
+    /// Matched by substring on `seat`, lowercased first so
+    /// `"claude-Opus-4-5"` and a bare `"opus"` both hit the same rung
+    /// regardless of case (so `"claude-fable-5"` and a bare `"fable"` both
+    /// hit the fable rung) rather than exact equality, since a seat string
+    /// can carry a full id (`claude-opus-4-1`) or a bare alias. `haiku` is
+    /// already the floor, so it maps to itself instead of falling off the
+    /// ladder; an absent or unrecognised seat assumes the top tier, same as
     /// `AgentAdapter::review_model_below`'s own doc comment requires -- the
     /// deliberate consequence is that the computed default can then resolve
     /// to a model *more expensive* than the seat actually in use (an
     /// accepted spend-up default; the operator can override it with
-    /// `[review]` or by setting `chat.model`).
+    /// `[review]` or by setting `chat.model`). See `catalogue::rung_below`'s
+    /// own doc comment for why that "assume the top tier" answer is `opus`,
+    /// not `fable`.
     fn review_model_below(&self, seat: Option<&str>) -> &'static str {
-        let seat = seat.map(str::to_lowercase);
-        match seat.as_deref() {
-            Some(s) if s.contains("fable") || s.contains("mythos") => "opus",
-            Some(s) if s.contains("opus") => "sonnet",
-            Some(s) if s.contains("sonnet") => "haiku",
-            Some(s) if s.contains("haiku") => "haiku",
-            _ => "opus",
-        }
+        catalogue::vendor(CATALOGUE_VENDOR)
+            .map(|v| catalogue::rung_below(v, seat))
+            .unwrap_or("opus")
     }
 
     fn model_strength(&self, model: &str) -> Option<u8> {
-        let model = model.to_lowercase();
-        if model.contains("fable") || model.contains("mythos") {
-            return Some(4);
-        }
-        if model.contains("opus") {
-            return Some(3);
-        }
-        if model.contains("sonnet") {
-            return Some(2);
-        }
-        if model.contains("haiku") {
-            return Some(1);
-        }
-        None
+        catalogue::vendor(CATALOGUE_VENDOR).and_then(|v| catalogue::strength(v, model))
     }
 
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
@@ -2454,14 +2449,26 @@ impl AgentAdapter for ClaudeAdapter {
     /// Claude reports a per-model capacity (issue #155): the long-window
     /// `[1m]` / `-1m` marker reports `LONG_CONTEXT_WINDOW_TOKENS`, and every
     /// other id -- including an unstated model -- gets the conservative
-    /// `DEFAULT_CONTEXT_WINDOW_TOKENS`. See that constant's own doc comment
-    /// for why an overstated capacity is the worse failure mode.
+    /// `DEFAULT_CONTEXT_WINDOW_TOKENS` (the catalogue's own `anthropic`
+    /// vendor default, which is the same number). The `[1m]`/`-1m` check
+    /// stays here rather than in `catalogue` (issue #381): it is a claude-
+    /// specific marker convention layered on top of the catalogue's window,
+    /// not part of the ladder itself. See `DEFAULT_CONTEXT_WINDOW_TOKENS`'s
+    /// own doc comment for why an overstated capacity is the worse failure
+    /// mode.
     fn context_window_tokens(&self, model: Option<&str>) -> Option<u64> {
-        let model = model.map(str::to_lowercase);
-        match model.as_deref() {
-            Some(m) if m.contains("[1m]") || m.contains("-1m") => Some(LONG_CONTEXT_WINDOW_TOKENS),
-            _ => Some(DEFAULT_CONTEXT_WINDOW_TOKENS),
+        let lower = model.map(str::to_lowercase);
+        if lower
+            .as_deref()
+            .is_some_and(|m| m.contains("[1m]") || m.contains("-1m"))
+        {
+            return Some(LONG_CONTEXT_WINDOW_TOKENS);
         }
+        Some(
+            catalogue::vendor(CATALOGUE_VENDOR)
+                .and_then(|v| catalogue::context_window(v, model))
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS),
+        )
     }
 
     /// Verified against the real CLI (`claude --help`, v2.1.220): `--model
@@ -5054,6 +5061,55 @@ mod tests {
         assert_eq!(adapter.review_model_below(Some("Haiku")), "haiku");
         assert_eq!(adapter.review_model_below(Some("Fable")), "opus");
         assert_eq!(adapter.review_model_below(Some("MYTHOS")), "opus");
+    }
+
+    /// Issue #381: `review_model_below`/`model_strength`/
+    /// `default_worker_model`/`default_distiller_model`/
+    /// `context_window_tokens` now delegate to `catalogue`. This pins every
+    /// answer the pre-catalogue hand-written ladder gave, so the migration
+    /// cannot silently change one.
+    #[test]
+    fn catalogue_backed_answers_match_the_pre_catalogue_ladder() {
+        let adapter = ClaudeAdapter::new(None);
+        for (seat, expected) in [
+            (Some("claude-fable-5"), "opus"),
+            (Some("mythos"), "opus"),
+            (Some("opus"), "sonnet"),
+            (Some("sonnet"), "haiku"),
+            (Some("haiku"), "haiku"),
+            (None, "opus"),
+            (Some("some-unreleased-model"), "opus"),
+        ] {
+            assert_eq!(adapter.review_model_below(seat), expected, "seat={seat:?}");
+        }
+        for (model, expected) in [
+            ("fable", Some(4)),
+            ("mythos", Some(4)),
+            ("opus", Some(3)),
+            ("sonnet", Some(2)),
+            ("haiku", Some(1)),
+            ("unknown-model", None),
+        ] {
+            assert_eq!(adapter.model_strength(model), expected, "model={model}");
+        }
+        assert_eq!(adapter.default_worker_model(), Some("sonnet"));
+        assert_eq!(adapter.default_distiller_model(), Some("haiku"));
+        assert_eq!(
+            adapter.context_window_tokens(None),
+            Some(DEFAULT_CONTEXT_WINDOW_TOKENS)
+        );
+        assert_eq!(
+            adapter.context_window_tokens(Some("claude-opus-5[1m]")),
+            Some(LONG_CONTEXT_WINDOW_TOKENS)
+        );
+        assert_eq!(
+            adapter.context_window_tokens(Some("claude-opus-5-1m")),
+            Some(LONG_CONTEXT_WINDOW_TOKENS)
+        );
+        assert_eq!(
+            adapter.context_window_tokens(Some("claude-opus-5")),
+            Some(DEFAULT_CONTEXT_WINDOW_TOKENS)
+        );
     }
 
     #[test]
