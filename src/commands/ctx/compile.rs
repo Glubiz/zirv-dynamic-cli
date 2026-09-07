@@ -968,7 +968,8 @@ fn with_canonical_context_layer(
             eprintln!(
                 "zirv: canonical context layer {display_path} was truncated -- \
                  {delivered_bytes} of {raw_bytes} bytes delivered, {} bytes LOST to \
-                 {budget_key}. Shorten the file or raise the key in ~/.zirv/ctx.toml.",
+                 {budget_key}. Shorten the file or run `zirv ctx config set {budget_key} <bytes>` \
+                 (asks the operator for approval).",
                 raw_bytes.saturating_sub(delivered_bytes),
             );
         }

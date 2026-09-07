@@ -96,7 +96,7 @@ pub fn resolve_model(agent: &str, requested: &str, cfg: &CtxConfig) -> CtxResult
         }
         return Err(format!(
             "zirv ctx handover: no tier ladder for adapter '{agent}'; pass a literal model id \
-             instead of '{tier}', or configure one under [handover.{agent}] in ~/.zirv/ctx.toml"
+             instead of '{tier}', or run `zirv ctx config set handover.{agent}.{tier} <model>` (asks the operator for approval)"
         )
         .into());
     }
