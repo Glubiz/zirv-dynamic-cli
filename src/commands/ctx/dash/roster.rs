@@ -60,6 +60,9 @@ pub struct RosterPane {
     /// again. `#[serde(default)]`, same reasoning as `report_to`.
     #[serde(default)]
     pub report_reminder_sent: bool,
+    /// Whether this session already sent its one-shot settled report before quit.
+    #[serde(default)]
+    pub settled_mail_sent: bool,
     /// Security review Finding 6 (2026-08-28): the `group::WorkGroup` this
     /// pane was spawned into, so a restore puts it back inside the same
     /// group -- `dash::mod::spawn_restored_pane` re-exports it as
@@ -253,6 +256,7 @@ mod tests {
                     title: "orch".to_string(),
                     report_to: None,
                     report_reminder_sent: false,
+                    settled_mail_sent: false,
                     work_group_id: None,
                     budget_tokens: None,
                     interactive: true,
@@ -266,6 +270,7 @@ mod tests {
                     title: "wrk codex".to_string(),
                     report_to: Some("aaaa1111".to_string()),
                     report_reminder_sent: true,
+                    settled_mail_sent: true,
                     work_group_id: Some("wg-1".to_string()),
                     budget_tokens: Some(200_000),
                     interactive: false,
@@ -283,6 +288,24 @@ mod tests {
             roster_path(&state, "-repo"),
             tmp.path().join("dash").join("roster--repo.json")
         );
+    }
+
+    #[test]
+    fn roster_round_trip_preserves_report_latches_and_defaults_old_entries() {
+        let mut value = serde_json::to_value(sample_roster()).expect("serialize roster");
+        value["panes"][1]["settled_mail_sent"] = true.into();
+        let restored: Roster = serde_json::from_value(value.clone()).expect("deserialize roster");
+        let saved = serde_json::to_value(restored).expect("serialize restored roster");
+        assert_eq!(saved["panes"][1]["settled_mail_sent"], true);
+        assert_eq!(saved["panes"][1]["report_reminder_sent"], true);
+        value["panes"][1]
+            .as_object_mut()
+            .expect("pane")
+            .remove("settled_mail_sent");
+        let old: Roster = serde_json::from_value(value).expect("old roster");
+        let saved = serde_json::to_value(old).expect("serialize old roster");
+        assert_eq!(saved["panes"][1]["settled_mail_sent"], false);
+        assert_eq!(saved["panes"][1]["report_reminder_sent"], true);
     }
 
     #[test]
