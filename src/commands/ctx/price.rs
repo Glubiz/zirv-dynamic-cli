@@ -29,6 +29,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::catalogue;
 use super::config::CtxConfig;
 use super::event::TranscriptUsage;
 
@@ -156,114 +157,21 @@ fn expand_home(path: &str) -> PathBuf {
 
 /// The built-in price table zirv ships, covering the models `handover.rs`
 /// already names (`equivalent_model`'s own tier aliases, plus the canonical
-/// ids those tiers and the harness transcripts themselves surface). See this
-/// module's own doc comment for why the numbers are deliberately
-/// approximate.
+/// ids those tiers and the harness transcripts themselves surface), plus
+/// every other vendor `catalogue` now carries. See this module's own doc
+/// comment for why the numbers are deliberately approximate.
+///
+/// Issue #381: built by collecting `catalogue::built_in_prices()` rather
+/// than a hand-written map -- the equivalence test below pins every price
+/// the old hand-written map gave, so the migration cannot silently change
+/// one. `as_of` stays `BUILT_IN_AS_OF` even though the survey vendors were
+/// priced later (`catalogue::CATALOGUE_AS_OF`): `PriceTable` carries one
+/// stamp for the whole table, and the pre-existing rows are what that stamp
+/// has always described.
 pub fn built_in_table() -> PriceTable {
-    const OPUS: ModelPrice = ModelPrice {
-        input_micros: 15_000_000,
-        cache_write_micros: 18_750_000,
-        cache_read_micros: 1_500_000,
-        output_micros: 75_000_000,
-    };
-    // The long-context ("[1m]") variant `claude.rs`'s own capability probe
-    // names: priced at the vendor's usual long-context surcharge, roughly
-    // double the ordinary-context rate.
-    const OPUS_1M: ModelPrice = ModelPrice {
-        input_micros: 30_000_000,
-        cache_write_micros: 37_500_000,
-        cache_read_micros: 3_000_000,
-        output_micros: 150_000_000,
-    };
-    // The orchestrator tier above opus (`claude.rs::review_model_below`'s own
-    // top rung, and the model `tests/fixtures/claude-real-session.jsonl`
-    // itself records). No public per-token rate is verifiable for it here, so
-    // it is priced AT the opus rate rather than left out of the table
-    // entirely: an unpriced model reads as `None` and silently omits the most
-    // expensive seat in the fleet from every cost line, which understates the
-    // ledger far worse than a known-approximate figure does. See this
-    // module's own doc comment -- an operator who needs exact numbers
-    // overrides via `~/.zirv/prices.toml`.
-    const FABLE: ModelPrice = OPUS;
-    const FABLE_1M: ModelPrice = OPUS_1M;
-    const SONNET: ModelPrice = ModelPrice {
-        input_micros: 3_000_000,
-        cache_write_micros: 3_750_000,
-        cache_read_micros: 300_000,
-        output_micros: 15_000_000,
-    };
-    const HAIKU: ModelPrice = ModelPrice {
-        input_micros: 800_000,
-        cache_write_micros: 1_000_000,
-        cache_read_micros: 80_000,
-        output_micros: 4_000_000,
-    };
-    // codex's own tier ladder (`adapters::codex::review_model_below`'s own
-    // rungs) -- OpenAI's public pricing carries no separate cache-WRITE
-    // class, so each rung reuses its own input rate there rather than
-    // guessing a number this table cannot verify.
-    const SOL: ModelPrice = ModelPrice {
-        input_micros: 15_000_000,
-        cache_write_micros: 15_000_000,
-        cache_read_micros: 1_500_000,
-        output_micros: 60_000_000,
-    };
-    const TERRA: ModelPrice = ModelPrice {
-        input_micros: 2_500_000,
-        cache_write_micros: 2_500_000,
-        cache_read_micros: 250_000,
-        output_micros: 10_000_000,
-    };
-    const LUNA: ModelPrice = ModelPrice {
-        input_micros: 1_000_000,
-        cache_write_micros: 1_000_000,
-        cache_read_micros: 100_000,
-        output_micros: 4_000_000,
-    };
-    const MINI: ModelPrice = ModelPrice {
-        input_micros: 250_000,
-        cache_write_micros: 250_000,
-        cache_read_micros: 25_000,
-        output_micros: 1_000_000,
-    };
-
-    let models = BTreeMap::from([
-        // Tier aliases (`handover::equivalent_model`'s own vocabulary).
-        ("fable".to_string(), FABLE),
-        ("mythos".to_string(), FABLE),
-        ("opus".to_string(), OPUS),
-        ("sonnet".to_string(), SONNET),
-        ("haiku".to_string(), HAIKU),
-        // Canonical claude model ids a real transcript/`--model` flag names.
-        ("claude-fable-5".to_string(), FABLE),
-        ("claude-fable-5[1m]".to_string(), FABLE_1M),
-        ("claude-fable-5-1".to_string(), FABLE),
-        ("claude-fable-5-1[1m]".to_string(), FABLE_1M),
-        ("claude-mythos-5".to_string(), FABLE),
-        ("claude-mythos-5[1m]".to_string(), FABLE_1M),
-        ("claude-opus-5".to_string(), OPUS),
-        ("claude-opus-5[1m]".to_string(), OPUS_1M),
-        ("claude-sonnet-5".to_string(), SONNET),
-        ("claude-haiku-5".to_string(), HAIKU),
-        // codex's own tier ladder.
-        ("gpt-5.6-sol".to_string(), SOL),
-        ("gpt-5.6-terra".to_string(), TERRA),
-        ("gpt-5.6-luna".to_string(), LUNA),
-        ("gpt-5.4-mini".to_string(), MINI),
-        // codex's coding-specific product model, named directly by workers
-        // that pin it rather than going through the tier ladder.
-        ("gpt-5-codex".to_string(), TERRA),
-        // The generation above the ladder above, named directly by a worker
-        // that pins it. Priced AT the `sol` rung -- the top codex rate this
-        // table can actually verify -- for exactly the reason `FABLE` is
-        // priced at the opus rate above: unpriced reads as `None`, which
-        // silently omits the most expensive codex seat from every cost line.
-        ("gpt-6-astra".to_string(), SOL),
-    ]);
-
     PriceTable {
         as_of: BUILT_IN_AS_OF.to_string(),
-        models,
+        models: catalogue::built_in_prices().collect(),
     }
 }
 
@@ -465,6 +373,102 @@ mod tests {
                 .unwrap_or_else(|| panic!("the built-in table must price `{name}`"));
             assert!(rate.input_micros > 0, "{name}: input must not be free");
             assert!(rate.output_micros > 0, "{name}: output must not be free");
+        }
+        assert_eq!(table.as_of, BUILT_IN_AS_OF);
+    }
+
+    /// Issue #381: `built_in_table` is now built from `catalogue::
+    /// built_in_prices()` instead of a hand-written map. `old` is a literal
+    /// copy of that pre-catalogue map (the exact `ModelPrice` values that
+    /// used to live in this function); every one of its 21 entries must
+    /// survive the migration unchanged. The new table may carry additional
+    /// keys (the survey vendors `catalogue` adds) -- this only asserts the
+    /// pre-existing subset never moved.
+    #[test]
+    fn built_in_table_preserves_every_pre_catalogue_price_verbatim() {
+        const OPUS: ModelPrice = ModelPrice {
+            input_micros: 15_000_000,
+            cache_write_micros: 18_750_000,
+            cache_read_micros: 1_500_000,
+            output_micros: 75_000_000,
+        };
+        const OPUS_1M: ModelPrice = ModelPrice {
+            input_micros: 30_000_000,
+            cache_write_micros: 37_500_000,
+            cache_read_micros: 3_000_000,
+            output_micros: 150_000_000,
+        };
+        const FABLE: ModelPrice = OPUS;
+        const FABLE_1M: ModelPrice = OPUS_1M;
+        const SONNET: ModelPrice = ModelPrice {
+            input_micros: 3_000_000,
+            cache_write_micros: 3_750_000,
+            cache_read_micros: 300_000,
+            output_micros: 15_000_000,
+        };
+        const HAIKU: ModelPrice = ModelPrice {
+            input_micros: 800_000,
+            cache_write_micros: 1_000_000,
+            cache_read_micros: 80_000,
+            output_micros: 4_000_000,
+        };
+        const SOL: ModelPrice = ModelPrice {
+            input_micros: 15_000_000,
+            cache_write_micros: 15_000_000,
+            cache_read_micros: 1_500_000,
+            output_micros: 60_000_000,
+        };
+        const TERRA: ModelPrice = ModelPrice {
+            input_micros: 2_500_000,
+            cache_write_micros: 2_500_000,
+            cache_read_micros: 250_000,
+            output_micros: 10_000_000,
+        };
+        const LUNA: ModelPrice = ModelPrice {
+            input_micros: 1_000_000,
+            cache_write_micros: 1_000_000,
+            cache_read_micros: 100_000,
+            output_micros: 4_000_000,
+        };
+        const MINI: ModelPrice = ModelPrice {
+            input_micros: 250_000,
+            cache_write_micros: 250_000,
+            cache_read_micros: 25_000,
+            output_micros: 1_000_000,
+        };
+
+        let old: BTreeMap<String, ModelPrice> = BTreeMap::from([
+            ("fable".to_string(), FABLE),
+            ("mythos".to_string(), FABLE),
+            ("opus".to_string(), OPUS),
+            ("sonnet".to_string(), SONNET),
+            ("haiku".to_string(), HAIKU),
+            ("claude-fable-5".to_string(), FABLE),
+            ("claude-fable-5[1m]".to_string(), FABLE_1M),
+            ("claude-fable-5-1".to_string(), FABLE),
+            ("claude-fable-5-1[1m]".to_string(), FABLE_1M),
+            ("claude-mythos-5".to_string(), FABLE),
+            ("claude-mythos-5[1m]".to_string(), FABLE_1M),
+            ("claude-opus-5".to_string(), OPUS),
+            ("claude-opus-5[1m]".to_string(), OPUS_1M),
+            ("claude-sonnet-5".to_string(), SONNET),
+            ("claude-haiku-5".to_string(), HAIKU),
+            ("gpt-5.6-sol".to_string(), SOL),
+            ("gpt-5.6-terra".to_string(), TERRA),
+            ("gpt-5.6-luna".to_string(), LUNA),
+            ("gpt-5.4-mini".to_string(), MINI),
+            ("gpt-5-codex".to_string(), TERRA),
+            ("gpt-6-astra".to_string(), SOL),
+        ]);
+        assert_eq!(old.len(), 21, "the pre-catalogue map had exactly 21 keys");
+
+        let table = built_in_table();
+        for (model, expected) in &old {
+            assert_eq!(
+                table.models.get(model),
+                Some(expected),
+                "{model}: price must survive the catalogue migration unchanged"
+            );
         }
         assert_eq!(table.as_of, BUILT_IN_AS_OF);
     }

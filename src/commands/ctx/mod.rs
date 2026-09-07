@@ -6,6 +6,7 @@ pub mod allocator;
 pub mod announce;
 pub mod attention;
 pub mod breakdown;
+pub mod catalogue;
 pub mod chain;
 pub mod chat;
 pub mod chrome;

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::super::CtxResult;
+use super::super::catalogue;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
 };
@@ -641,6 +642,14 @@ pub fn codex_approval_advisory(posture: CodexApprovalPosture) -> Option<String> 
 /// a distiller/reviewer spawn. Mirrors `claude.rs`'s own
 /// `HELP_PROBE_TIMEOUT`.
 const IGNORE_FLAGS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// This adapter's own vendor slug in `catalogue`'s registry (issue #381):
+/// codex's ladder, strengths and prices all now live there rather than as
+/// literals in this file. `default_worker_model`/`default_distiller_model`/
+/// `context_window_tokens` stay on the trait default (`None`) -- codex has
+/// no verified default of its own to guess, same as before this module
+/// existed.
+const CATALOGUE_VENDOR: &str = "openai";
 
 /// Process-wide cache of `detect_ignore_flags`'s answer, keyed by the exact
 /// program invocation -- mirrors `claude.rs`'s own `ProbeKey`/
@@ -1292,43 +1301,26 @@ impl AgentAdapter for CodexAdapter {
     /// used when no `-m` is given), `gpt-5.6-terra`, `gpt-5.6-luna`, and the
     /// older, hidden `gpt-5.4-mini` -- verified via `codex debug models` in
     /// docs/superpowers/notes/2026-07-31-codex-cli-facts.md's "Cheap model
-    /// alias for distillation" section (codex-cli 0.146.0). Matched by
-    /// substring on `seat`, lowercased first (same as claude's own ladder)
-    /// so a mixed-case seat still lands on the right rung instead of
-    /// falling through to the unknown arm. `gpt-5.4-mini` is already the
-    /// floor, so it maps to itself; an absent or unrecognised seat
-    /// (including one naming another adapter's model, e.g. a claude
+    /// alias for distillation" section (codex-cli 0.146.0), now data in
+    /// `catalogue` (issue #381) rather than a hand-written ladder here.
+    /// Matched by substring on `seat`, lowercased first (same as claude's
+    /// own ladder) so a mixed-case seat still lands on the right rung
+    /// instead of falling through to the unknown arm. `gpt-5.4-mini` is
+    /// already the floor, so it maps to itself; an absent or unrecognised
+    /// seat (including one naming another adapter's model, e.g. a claude
     /// orchestrator's own `chat.model`) assumes the top tier -- the
     /// deliberate consequence is that the computed default can then resolve
     /// to a model *more expensive* than the seat actually in use (an
     /// accepted spend-up default; the operator can override it with
     /// `[review]` or by setting `chat.model`).
     fn review_model_below(&self, seat: Option<&str>) -> &'static str {
-        let seat = seat.map(str::to_lowercase);
-        match seat.as_deref() {
-            Some(s) if s.contains("gpt-5.6-sol") => "gpt-5.6-terra",
-            Some(s) if s.contains("gpt-5.6-terra") => "gpt-5.6-luna",
-            Some(s) if s.contains("gpt-5.6-luna") => "gpt-5.4-mini",
-            Some(s) if s.contains("gpt-5.4-mini") => "gpt-5.4-mini",
-            _ => "gpt-5.6-terra",
-        }
+        catalogue::vendor(CATALOGUE_VENDOR)
+            .map(|v| catalogue::rung_below(v, seat))
+            .unwrap_or("gpt-5.6-terra")
     }
 
     fn model_strength(&self, model: &str) -> Option<u8> {
-        let model = model.to_lowercase();
-        if model.contains("gpt-5.6-sol") {
-            return Some(4);
-        }
-        if model.contains("gpt-5.6-terra") {
-            return Some(3);
-        }
-        if model.contains("gpt-5.6-luna") {
-            return Some(2);
-        }
-        if model.contains("gpt-5.4-mini") {
-            return Some(1);
-        }
-        None
+        catalogue::vendor(CATALOGUE_VENDOR).and_then(|v| catalogue::strength(v, model))
     }
 
     /// Codex's descriptors come from the repo's **recorded** facts
@@ -2840,6 +2832,35 @@ mod tests {
             adapter.review_model_below(Some("GPT-5.4-Mini")),
             "gpt-5.4-mini"
         );
+    }
+
+    /// Issue #381: `review_model_below`/`model_strength` now delegate to
+    /// `catalogue`. This pins every answer the pre-catalogue hand-written
+    /// ladder gave, so the migration cannot silently change one.
+    #[test]
+    fn catalogue_backed_answers_match_the_pre_catalogue_ladder() {
+        let adapter = CodexAdapter::new(None);
+        for (seat, expected) in [
+            (Some("gpt-5.6-sol"), "gpt-5.6-terra"),
+            (Some("gpt-5.6-terra"), "gpt-5.6-luna"),
+            (Some("gpt-5.6-luna"), "gpt-5.4-mini"),
+            (Some("gpt-5.4-mini"), "gpt-5.4-mini"),
+            (None, "gpt-5.6-terra"),
+            (Some("claude-fable-5"), "gpt-5.6-terra"),
+        ] {
+            assert_eq!(adapter.review_model_below(seat), expected, "seat={seat:?}");
+        }
+        for (model, expected) in [
+            ("gpt-5.6-sol", Some(4)),
+            ("gpt-5.6-terra", Some(3)),
+            ("gpt-5.6-luna", Some(2)),
+            ("gpt-5.4-mini", Some(1)),
+        ] {
+            assert_eq!(adapter.model_strength(model), expected, "model={model}");
+        }
+        assert_eq!(adapter.default_worker_model(), None);
+        assert_eq!(adapter.default_distiller_model(), None);
+        assert_eq!(adapter.context_window_tokens(None), None);
     }
 
     /// The rollout `TokenCount` fixture both cumulative-snapshot tests below

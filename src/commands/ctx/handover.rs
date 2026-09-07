@@ -33,6 +33,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use super::catalogue;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::state::StateDir;
 use super::{CtxResult, adapters, handoff, sessions};
@@ -41,16 +42,23 @@ use super::{CtxResult, adapters, handoff, sessions};
 /// per harness. Anything else is treated as a literal model id.
 pub const TIERS: [&str; 3] = ["cheap", "standard", "deep"];
 
+/// Issue #381: resolves through `catalogue::tier_model` rather than a
+/// hand-written per-agent match -- `catalogue::vendor` returning `None` for
+/// any agent other than `claude`/`codex` already reproduces the old `_ =>
+/// None` arm without a separate catch-all here.
 fn tier_default(agent: &str, tier: &str) -> Option<&'static str> {
-    match (agent, tier) {
-        ("claude", "cheap") => Some("haiku"),
-        ("claude", "standard") => Some("sonnet"),
-        ("claude", "deep") => Some("opus"),
-        ("codex", "cheap") => Some("gpt-5.4-mini"),
-        ("codex", "standard") => Some("gpt-5.6-terra"),
-        ("codex", "deep") => Some("gpt-5.6-sol"),
-        _ => None,
-    }
+    let vendor_slug = match agent {
+        "claude" => "anthropic",
+        "codex" => "openai",
+        _ => return None,
+    };
+    let tier = match tier {
+        "cheap" => catalogue::Tier::Cheap,
+        "standard" => catalogue::Tier::Standard,
+        "deep" => catalogue::Tier::Deep,
+        _ => return None,
+    };
+    catalogue::vendor(vendor_slug).and_then(|v| catalogue::tier_model(v, tier))
 }
 
 /// The operator's own `[handover.<agent>]` override for `tier`, if any --
