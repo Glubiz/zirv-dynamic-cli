@@ -1398,6 +1398,20 @@ pub trait AgentAdapter: std::fmt::Debug {
         1
     }
 
+    /// Issue #382: an adapter whose harness keeps its transcript as a JSON
+    /// snapshot file or a SQLite database -- not naturally line-local JSONL
+    /// -- materializes newly seen rows into a
+    /// `super::transcript_source::ShadowTranscript` from inside this call
+    /// (`sync_json_array`/`sync_sqlite`) and returns the resulting shadow
+    /// path instead of the harness's own file. This is existing precedent,
+    /// not a new rule: `CodexAdapter::transcript_path` already performs I/O
+    /// inside this call (it scans `~/.codex/sessions` and reads/writes a pin
+    /// under `StateDir::rollouts()`). When no `StateDir` resolves, the
+    /// native path is returned instead (degraded, the same fallback shape
+    /// codex's own pin lookup uses) -- there is no trait method for this, an
+    /// adapter simply calls `StateDir::resolve` itself. Whichever path is
+    /// returned is always line-local JSONL, so [`parse_events`](Self::parse_events)
+    /// below stays line-local for every adapter, shadowed or not.
     fn transcript_path(&self, session: &SessionRef) -> PathBuf;
 
     /// Must be line-local: every line's events depend on that line alone, so

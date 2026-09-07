@@ -70,6 +70,7 @@ pub mod supervise;
 pub mod surface;
 pub mod task;
 pub mod term;
+pub mod transcript_source;
 pub mod usage;
 pub mod window;
 pub mod worktree;
