@@ -471,6 +471,19 @@ async fn main() {
         }
     };
 
+    // Issue #330: a script `agent:` step drives a supervised worker session in
+    // THIS process (see `script_runner::agent_command::run_supervised`), so
+    // the harness it spawns -- and every cargo run under that harness --
+    // inherits this process's scheduling class. Take the worker posture
+    // before the script runs, and only for a script that actually delegates:
+    // an ordinary shell script is the operator's own foreground work. A dry
+    // run spawns nothing at all, so it is left alone. This is the one seam on
+    // the script path no unit test drives; `run_supervised` itself is
+    // exercised in-process by the step's own tests.
+    if !input.dry_run && script.has_agent_step() {
+        ctx::priority::apply_process(ctx::priority::posture_for(ctx::prompt::PromptRole::Worker));
+    }
+
     if let Err(e) = execute(&script, &input.params, input.dry_run).await {
         output::error(&e);
         std::process::exit(1);

@@ -3999,16 +3999,6 @@ fn append_execution_segments(
 }
 
 pub fn run<W: Write>(args: &AgentArgs, w: &mut W) -> CtxResult<i32> {
-    // Issue #330: a delegation is always a worker session (see this module's
-    // own doc comment), and when it runs inline it is THIS process that
-    // supervises the harness -- and therefore this process whose class the
-    // harness, and the cargo runs under it, inherit. Applied at the CLI
-    // entry, before `run_with` reaches `exec::run_with_report`; harmless on
-    // the branch that hands the spawn to a live dashboard instead, since
-    // this process then only files the request and exits.
-    super::priority::apply_process(super::priority::posture_for(
-        super::prompt::PromptRole::Worker,
-    ));
     let repo = std::env::current_dir()?;
     let env = env_from_process();
     run_with(args, w, &repo, &env)
