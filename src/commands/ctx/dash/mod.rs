@@ -5979,7 +5979,7 @@ fn fulfill_spawn_request(
     // (if any) has genuinely been admitted -- every remaining fallible step
     // between here and the pane actually spawning must roll that admission
     // back on its way out, or a post-admission failure (prompt composition,
-    // the interactive pace gate, the pty spawn itself) permanently burns a
+    // the pty spawn itself) permanently burns a
     // `child_limit` slot for a child that never ran, and (issue #301) leaks
     // its reservation forever. Best-effort, like `rollback_admission`
     // itself: never shadows the real refusal being returned. `budget_tokens`
@@ -6234,36 +6234,6 @@ fn fulfill_spawn_request(
         super::agent::PRINCIPAL_ENV.to_string(),
         child_envelope.principal.clone(),
     ));
-
-    // T10, reworked for issue #358 (T9): the same launch-time pacing gate
-    // `wrap::run_with`/this dashboard's own first pane apply, but
-    // *non-interactively* here: this spawn happens during the dashboard's
-    // own live event loop (raw mode and the alternate screen already
-    // active), so a blocking `crossterm` keypress read -- the orchestrator
-    // pane's own gate uses one, see `run_dashboard` -- would collide with
-    // the dashboard's own input loop reading the same stream. Usage headroom
-    // never blocks a spawn any more: `Launch` spawns normally, and both
-    // `Pause` and `Refuse` are advisory now -- the pane spawns anyway, with
-    // a visible notice through the same `errors`/notice channel a
-    // withheld-mail advisory already uses a few lines up.
-    {
-        // Finding 1 (review): `poll: false` -- this call happens on the
-        // dashboard's single UI thread, during its own live event loop, so
-        // a live `HttpPoller` (a synchronous ureq request, or a macOS
-        // Keychain shell-out) would freeze every pane and all input. Passive
-        // collector reading only; see `pace::build_gate`.
-        let gate = super::pace::interactive_gate(state, cfg, adapter.provider(), false);
-        match gate {
-            super::pace::InteractiveGate::Launch => {}
-            super::pace::InteractiveGate::Pause { message, .. }
-            | super::pace::InteractiveGate::Refuse { message } => {
-                push_error(
-                    errors,
-                    format!("{} pane for {}: {message}", req.agent, req.requested_by),
-                );
-            }
-        }
-    }
 
     // O2: retryable. A pty that could not be opened is an environment
     // failure, not a policy one -- the headless path has no pty to open.
@@ -9314,8 +9284,7 @@ pub fn run_dashboard(
     // there is no live dashboard input loop yet for a blocking `crossterm`
     // keypress read to collide with. `fulfill_spawn_request` (worker panes
     // spawned *during* the live loop) cannot reuse this same blocking
-    // treatment -- see its own call site's comment -- and gates
-    // non-interactively instead.
+    // treatment and uses the advisory spawn gate instead.
     {
         let provider = super::adapters::provider_for_agent_name(Some(&agent_name));
         // Before raw mode / the dashboard's own event loop starts (see the
@@ -19788,25 +19757,78 @@ mod tests {
         assert!(refusal.reason.contains("depth"), "got {}", refusal.reason);
     }
 
-    /// T10: the coverage gap this closes -- a worker pane spawn request
-    /// arriving while the account is genuinely at the pacing ceiling must be
-    /// refused, the same way `wrap`'s own launch-time gate now refuses (see
-    /// `wrap::apply_interactive_gate`). This spawn point cannot block on a
-    /// confirmation keypress (the dashboard's own live input loop already
-    /// owns the terminal -- see `fulfill_spawn_request`'s own comment), so
-    /// the ceiling is a plain, non-overridable refusal here, checked before
-    /// `Pane::spawn` is ever reached (no real agent binary needed to prove
-    /// it, mirroring `refusal_for`'s own "every assertion is on a refusal
-    /// before any spawn" contract).
-    ///
-    /// Issue #155, Phase 6(c) update: at the default config, 99.9% now trips
-    /// Renamed for issue #358 (T9): `pace::spawn_gate`'s own `spawn_hard_pct`
-    /// (95%) used to refuse a worker pane outright before this function ever
-    /// reached the older `pace::interactive_gate` check below (`max_percent`
-    /// 99%). Now usage headroom never refuses a spawn -- both gates are
-    /// informational -- so this pins the spawn-specific gate's own wording
-    /// (and the actual usage it names) landing in `errors` while the pane
-    /// still spawns.
+    #[test]
+    fn fulfill_spawn_request_unknown_codex_usage_has_no_header_error() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.fallback.enabled = false;
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "codex".to_string();
+
+        for stale in [false, true] {
+            if stale {
+                let now = crate::commands::ctx::state::now_secs();
+                window::store_for(
+                    &state,
+                    window::CODEX_USAGE_PROVIDER,
+                    &window::UsageWindows {
+                        five_hour: Some(window::Window {
+                            used_percentage: 20.0,
+                            resets_at: now - 600,
+                            observed_at: now - 2 * 24 * 60 * 60,
+                            overage_covered: false,
+                            limit_reached: false,
+                        }),
+                        seven_day: None,
+                    },
+                )
+                .expect("store stale codex reading");
+            }
+            let mut panes = Vec::new();
+            let mut queues = Vec::new();
+            let mut errors = ErrorLog::default();
+            let result = fulfill_spawn_request(
+                &req,
+                false,
+                None,
+                &mut panes,
+                &mut queues,
+                &cfg,
+                &state,
+                &repo,
+                (80, 24),
+                &tmp.path().join("requests"),
+                &mut errors,
+            );
+            for pane in &mut panes {
+                let _ = pane.shutdown("");
+            }
+            assert!(result.is_ok(), "unknown usage must launch: {result:?}");
+            assert_eq!(panes.len(), 1, "the pane still spawns");
+            assert!(
+                !errors.iter().any(|e| {
+                    e.contains("press any key")
+                        || e.contains("--force-pace")
+                        || e.contains("codex pane for")
+                }),
+                "unknown usage must not produce a header error (stale={stale}): {errors:?}"
+            );
+        }
+    }
+
+    /// Usage headroom never refuses a spawn: the spawn gate reports the
+    /// ceiling and actual usage while the worker pane still launches.
     #[test]
     fn fulfill_spawn_request_spawns_a_worker_pane_with_a_quota_note_at_the_ceiling() {
         let repo = std::env::current_dir().expect("cwd");
@@ -19878,12 +19900,8 @@ mod tests {
         }
     }
 
-    /// Renamed for issue #358 (T9): isolates `spawn_gate`'s own `spawn_hard_
-    /// pct` (95%) from the older `pace::interactive_gate`'s `max_percent`
-    /// (99%) -- 96% trips ONLY the new gate. Usage headroom never blocks a
-    /// spawn any more, so this now proves that gate is what actually
-    /// produces the note in the band between the two thresholds, not the
-    /// pre-existing one, while the pane spawns regardless.
+    /// The spawn gate reports its ceiling even below the terminal pacing
+    /// ceiling (`max_percent`), while the worker pane still launches.
     #[test]
     fn fulfill_spawn_request_spawns_a_worker_pane_with_a_quota_note_between_spawn_hard_pct_and_max_percent()
      {

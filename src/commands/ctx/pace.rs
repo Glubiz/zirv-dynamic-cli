@@ -1441,9 +1441,7 @@ pub fn resolve_interactive_gate(
 /// call. `http_poller` is always constructed by the caller (cheap: it only
 /// stores a bool, see `HttpPoller::new`); `poll` and `cfg.poll_enabled`
 /// together decide whether it is actually handed to the gate as a live
-/// `UsagePoller` or left out entirely. This is where finding 1 (the
-/// dashboard's mid-session spawn gate must never carry a live poller onto
-/// the UI thread) is enforced, in one place rather than at each call site.
+/// `UsagePoller` or left out entirely.
 fn build_gate<'a>(
     cfg: &PaceConfig,
     provider: &str,
@@ -1462,16 +1460,10 @@ fn build_gate<'a>(
 }
 
 /// Builds the `HttpPoller`/`PaceGate`/fresh `PaceGateFlags` and resolves the
-/// interactive gate in one call. Introduced so the three call sites that
-/// used to hand-assemble this block individually (`wrap::run_with`, and
-/// `dash/mod.rs`'s two spawn points -- `fulfill_spawn_request` and
-/// `run_dashboard`'s own first-pane spawn) cannot drift out of sync with
-/// each other again. `poll` is the one difference between call sites: pass
-/// `false` on a call site that must never block on a synchronous HTTP/
-/// keychain round trip (the dashboard's mid-session spawn path, which runs
-/// on its single UI thread) and `true` everywhere a blocking wait is
-/// already the point (`wrap`'s own pre-spawn gate, the dashboard's first
-/// pane before raw mode is entered).
+/// interactive gate in one call for terminal launches and the dashboard's
+/// first pane, before raw mode is entered. `poll` controls whether a
+/// synchronous HTTP/keychain round trip is allowed. Dashboard worker panes
+/// use the advisory spawn gate instead.
 pub fn interactive_gate(
     state: &StateDir,
     cfg: &super::config::CtxConfig,
