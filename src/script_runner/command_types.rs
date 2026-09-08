@@ -453,7 +453,12 @@ commands:
                 "interactive",
             ),
             (
-                "name: t\ncommands:\n  - agent: gemini\n    prompt: go\n",
+                // Not `gemini`: that name is a registered adapter now
+                // (issue #384), so it would no longer trip this branch.
+                // `mystery` reads the same validation dynamically off
+                // `adapters::all()` (`agent_command.rs::AgentCommand::
+                // validate`), so any name absent from that registry works.
+                "name: t\ncommands:\n  - agent: mystery\n    prompt: go\n",
                 "unknown agent",
             ),
             (

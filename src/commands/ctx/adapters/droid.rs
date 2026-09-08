@@ -534,6 +534,28 @@ impl AgentAdapter for DroidAdapter {
         vec!["--only-tools".to_string(), READ_ONLY_TOOLS.to_string()]
     }
 
+    /// Empty, NOT [`Self::read_only_args`] unchanged: `--only-tools` was
+    /// verified only against `droid exec --help` (this module's own doc
+    /// comment, "Tool ids and read-only enforcement") -- every citation for
+    /// it names the `exec` subcommand's own help text, never the top-level
+    /// `droid [options] [command] [prompt...]` parser's. `AgentAdapter::
+    /// interactive_read_only_args`'s own doc comment records the exact same
+    /// mistake for codex's `--ignore-rules`/`--ignore-user-config` (verified
+    /// `exec`-only, applied to `codex`'s top-level interactive launch,
+    /// instant clap exit code 2 on a `--mode read-only` dashboard pane): the
+    /// trait default (falling back to `read_only_args()` unchanged) would
+    /// repeat that bug here, since `dash`'s own spawn-request pane variant
+    /// and `read_only_args_for_agent_name`/`extend_read_only_args`
+    /// (`mod.rs`) both apply this to an interactive launch too. Unlike
+    /// codex, no verified interactive-safe restriction exists to substitute
+    /// -- `--auto`'s own default posture is explicitly documented as NOT a
+    /// structural deny (this module's own doc comment) -- so empty (never
+    /// refuse the launch, degrade the guarantee honestly) is the correct
+    /// answer, not a guessed flag.
+    fn interactive_read_only_args(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Verified: `exec --help`, `--append-system-prompt <text>`.
     fn system_prompt_args(&self, prompt: &str) -> Vec<String> {
         if prompt.trim().is_empty() {
@@ -807,7 +829,13 @@ impl AgentAdapter for DroidAdapter {
         1 + self.bin_args.len()
     }
 
-    /// Verified: `exec --help`, `-m, --model <id>`.
+    /// Verified: `exec --help`, `-m, --model <id>`. Same unverified-on-
+    /// interactive gap as [`Self::read_only_args`] documents for
+    /// `--only-tools` -- `-m` is cited only against `exec --help` here too --
+    /// but `AgentAdapter` has no `interactive_model_args` split to override
+    /// (`model_args` is the one method every launch surface shares), so
+    /// closing it is out of scope for this fix; `worker_model_args`/
+    /// `dispatch_agent` (`mod.rs`) are the call sites that would need one.
     fn model_args(&self, model: &str) -> Vec<String> {
         vec!["-m".to_string(), model.to_string()]
     }
@@ -904,6 +932,16 @@ mod tests {
                 "{mutating} must never appear in the read-only allow-list"
             );
         }
+    }
+
+    #[test]
+    fn interactive_read_only_args_never_carries_the_exec_only_only_tools_flag() {
+        // `--only-tools` is verified only against `exec --help`; applying it
+        // to the top-level interactive launch a dashboard pane uses is the
+        // same bug codex's `--ignore-rules`/`--ignore-user-config` had.
+        let args = adapter().interactive_read_only_args();
+        assert!(args.is_empty());
+        assert_ne!(args, adapter().read_only_args());
     }
 
     #[test]

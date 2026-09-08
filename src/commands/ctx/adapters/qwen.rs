@@ -630,17 +630,36 @@ impl AgentAdapter for QwenAdapter {
     /// identically-motivated but substring-scanned resolution 1. Resolutions
     /// 2 and 3 ([`QwenAdapter::pinned_chat_file`]) cover the one case that
     /// never pins the id at all: a plain `wrap` relaunch, whose child mints
-    /// its own conversation id qwen never told zirv about.
+    /// its own conversation id qwen never told zirv about. `session.id` can
+    /// also come straight from an operator-supplied `--session-id`/resume
+    /// value, so [`SessionId::is_safe_path_segment`] gates resolution 1: a
+    /// hostile id (`../..`, an embedded separator) never gets joined
+    /// verbatim into `chats_dir` at all, and this falls straight through to
+    /// resolutions 2/3 as if no direct file existed. If those also come up
+    /// empty, the final fallback is the safe id's own (still never-existing)
+    /// direct path, or, for a hostile id, a
+    /// [`sessions::short_id`](super::super::sessions::short_id)-keyed
+    /// "unresolved" name -- never the raw id.
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
         let chats_dir = self.chats_dir(&session.cwd);
-        let direct = chats_dir.join(format!("{}.jsonl", session.id.as_str()));
-        if direct.is_file() {
-            return direct;
+        let safe_direct = session
+            .id
+            .is_safe_path_segment()
+            .then(|| chats_dir.join(format!("{}.jsonl", session.id.as_str())));
+        if let Some(direct) = &safe_direct
+            && direct.is_file()
+        {
+            return direct.clone();
         }
         if let Some(pinned) = self.pinned_chat_file(&chats_dir, session) {
             return pinned;
         }
-        direct
+        safe_direct.unwrap_or_else(|| {
+            chats_dir.join(format!(
+                "unresolved-{}.jsonl",
+                super::super::sessions::short_id(session.id.as_str())
+            ))
+        })
     }
 
     /// Fully line-local, with no cross-line folding needed at all (this
@@ -1136,6 +1155,27 @@ mod tests {
         )
         .expect("write chat file");
         assert_eq!(a.transcript_path(&session), resolved);
+    }
+
+    #[test]
+    fn transcript_path_never_joins_a_traversal_session_id_verbatim() {
+        let home = tempfile::tempdir().expect("home");
+        let state = tempfile::tempdir().expect("state");
+        let repo = tempfile::tempdir().expect("repo");
+        let a = adapter()
+            .with_home(home.path().to_path_buf())
+            .with_state_root(state.path().to_path_buf());
+        let session = session_for(repo.path(), "../../evil");
+
+        let chats_dir = a.chats_dir(repo.path());
+        std::fs::create_dir_all(&chats_dir).expect("mkdir chats");
+
+        let resolved = a.transcript_path(&session);
+        assert!(
+            resolved.starts_with(&chats_dir),
+            "a hostile session id must never escape the chats dir: {resolved:?}"
+        );
+        assert!(!resolved.to_string_lossy().contains(".."));
     }
 
     // -- parse_events -----------------------------------------------------
