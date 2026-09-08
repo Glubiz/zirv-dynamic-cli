@@ -955,6 +955,15 @@ pub struct OutputConfig {
     /// `narrow_diff_max_bytes`). Generous default `65536` (64 KiB): most
     /// diffs a supervised session produces never reach it.
     pub diff_max_bytes: usize,
+    /// Issue #414: whether `rg`/`grep`/`find`/`fd`/`ls`/`dir`/`tree` (all
+    /// `output::VERBATIM_PROGRAMS` members) get a shape-aware pass
+    /// (`output_search`) instead of staying verbatim at any size. Forbidden
+    /// in BOTH directions like `compact`/`compact_min_bytes`/
+    /// `compact_generic_min_bytes` above, never narrow-only: turning it on
+    /// WIDENS what a repository checkout's own commands get compacted into,
+    /// which is exactly the choice those two keys' own doc comment says is
+    /// never the checkout's to make. Default `false`.
+    pub compact_search: bool,
 }
 
 /// The smallest `[output] max_summary_bytes` that can hold a header, a
@@ -973,6 +982,7 @@ impl Default for OutputConfig {
             verbatim: Vec::new(),
             max_summary_bytes: 4096,
             diff_max_bytes: 65536,
+            compact_search: false,
         }
     }
 }
@@ -2449,6 +2459,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_OUTPUT_COMPACT_SEARCH",
+        &["output", "compact_search"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
         &["workflow", "telemetry_enabled"],
         EnvKind::Bool,
@@ -3701,6 +3716,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["output", "max_summary_bytes"],
         "ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES",
+    ),
+    // Issue #414: widens what a repository checkout's own `rg`/`grep`/
+    // `find`/`fd`/`ls`/`dir`/`tree` invocations get compacted into (from
+    // never, at any size, to a shape-aware summary) -- the same forbidden-
+    // both-directions asymmetry as `compact`/`compact_min_bytes`/
+    // `compact_generic_min_bytes` above, never the checkout's call.
+    (
+        &["output", "compact_search"],
+        "ZIRV_CTX_OUTPUT_COMPACT_SEARCH",
     ),
     // Issue #358: rolling the orchestrator seat itself onto another harness
     // is the same class of decision `handoff.model`/`optimize.model` already
@@ -9128,6 +9152,7 @@ mod tests {
         assert!(cfg.output.verbatim.is_empty());
         assert_eq!(cfg.output.max_summary_bytes, 4096);
         assert_eq!(cfg.output.diff_max_bytes, 65536);
+        assert!(!cfg.output.compact_search);
 
         let env = env_map(&[
             ("ZIRV_CTX_OUTPUT_COMPACT", "false"),
@@ -9136,6 +9161,7 @@ mod tests {
             ("ZIRV_CTX_OUTPUT_VERBATIM", "mydump,other-tool"),
             ("ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES", "2048"),
             ("ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES", "8192"),
+            ("ZIRV_CTX_OUTPUT_COMPACT_SEARCH", "true"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load");
         assert!(!cfg.output.compact);
@@ -9144,6 +9170,7 @@ mod tests {
         assert_eq!(cfg.output.verbatim, vec!["mydump", "other-tool"]);
         assert_eq!(cfg.output.max_summary_bytes, 2048);
         assert_eq!(cfg.output.diff_max_bytes, 8192);
+        assert!(cfg.output.compact_search);
 
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         for line in [
@@ -9152,6 +9179,7 @@ mod tests {
             "compact_min_bytes = 999999",
             "compact_generic_min_bytes = 999999",
             "verbatim = [\"cargo\"]",
+            "compact_search = true",
         ] {
             std::fs::write(
                 repo.path().join(".zirv/ctx.toml"),
@@ -9356,6 +9384,7 @@ mod tests {
         ("output", "verbatim"),
         ("output", "max_summary_bytes"),
         ("output", "diff_max_bytes"),
+        ("output", "compact_search"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),

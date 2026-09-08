@@ -2731,8 +2731,11 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // a model reads that output verbatim before editing against it, so a
     // head/tail summary would silently corrupt the edit rather than merely
     // cost tokens.
-    let scope =
-        super::output::classify_compaction(&payload.tool_input.command, &cfg.output.verbatim);
+    let scope = super::output::classify_compaction(
+        &payload.tool_input.command,
+        &cfg.output.verbatim,
+        cfg.output.compact_search,
+    );
     let threshold = match scope {
         super::output::CompactionScope::Verbatim => {
             record(super::ledger::Outcome::Verbatim, bytes_in, None);
@@ -2745,6 +2748,10 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         // since above it the replacement is a bounded per-file listing, not
         // the generic head/tail scan.
         super::output::CompactionScope::Diff => cfg.output.diff_max_bytes,
+        // Issue #414: reuses the generic threshold -- the same reasoning as
+        // `Generic` itself, an unrecognised-by-default shape only worth
+        // compacting once it is genuinely large.
+        super::output::CompactionScope::Shape => cfg.output.compact_generic_min_bytes,
     };
     if combined.len() < threshold {
         record(super::ledger::Outcome::BelowThreshold, bytes_in, None);
@@ -8305,5 +8312,99 @@ mod tests {
             2,
             "the checker runs each qualifying turn; only the render output dedupes"
         );
+    }
+
+    // -- Issue #416: gh/glab template boilerplate stripping ----------------
+
+    /// A small `gh pr view` body stays below `compact_generic_min_bytes` (gh
+    /// is not a `KNOWN_PROGRAMS` member) and must reach the model untouched,
+    /// exactly like any other below-threshold `Generic` result.
+    #[test]
+    fn posttool_leaves_a_small_gh_pr_view_body_untouched() {
+        let rig = posttool_rig(&[]);
+        let small = "## Description\n\nA short PR body.\n";
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "gh pr view 123",
+                serde_json::json!({
+                    "stdout": small,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(
+            out.is_empty(),
+            "a below-threshold body must be left alone: {out}"
+        );
+    }
+
+    // -- Issue #414: opt-in shape-aware search/listing compaction ----------
+
+    /// `[output] compact_search` end to end: off (the default), a large `rg`
+    /// result reaches the model untouched, same as any other reader; on
+    /// (via `ZIRV_CTX_OUTPUT_COMPACT_SEARCH`, the operator's own override),
+    /// the identical result is replaced with a grouped, bounded summary.
+    #[test]
+    fn posttool_compacts_rg_results_only_when_compact_search_is_enabled() {
+        let mut big = String::new();
+        for f in 0..20 {
+            for m in 0..30 {
+                big.push_str(&format!(
+                    "src/file{f}.rs:{}:    let todo_{m} = 1; // TODO fix this\n",
+                    m + 1
+                ));
+            }
+        }
+        assert!(big.len() > 16384, "{}", big.len());
+
+        let off_rig = posttool_rig(&[]);
+        let out = run_post(
+            &off_rig,
+            &posttool_stdin(
+                &off_rig.repo,
+                "Bash",
+                "rg TODO src",
+                serde_json::json!({
+                    "stdout": big.clone(),
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(
+            out.is_empty(),
+            "compact_search off must leave rg untouched: {out}"
+        );
+
+        let on_rig = posttool_rig(&[("ZIRV_CTX_OUTPUT_COMPACT_SEARCH", "true")]);
+        let out = run_post(
+            &on_rig,
+            &posttool_stdin(
+                &on_rig.repo,
+                "Bash",
+                "rg TODO src",
+                serde_json::json!({
+                    "stdout": big,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(
+            !out.is_empty(),
+            "compact_search on must compact the same rg result"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let summary = parsed["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .expect("a summary");
+        assert!(summary.contains("matches in"), "{summary}");
     }
 }
