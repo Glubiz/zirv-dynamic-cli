@@ -7,6 +7,7 @@ use super::adapters::{self, SESSION_ENV, SOCKET_ENV};
 use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::diagnostics;
 use super::event::{NormalizedEvent, input_hash};
+use super::pathutil::canonicalize_with_missing_tail;
 use super::rot::{Score, Verdict};
 use super::state::{StateDir, now_secs};
 use super::supervise::Watcher;
@@ -1944,16 +1945,6 @@ fn harness_home(env: EnvLookup<'_>) -> Option<PathBuf> {
                 .filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".claude"))
         })
-}
-
-/// Canonicalizes the longest existing prefix of `path`, then restores any
-/// missing tail. Write targets and their parent directories need not exist.
-fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
-    let existing = path.ancestors().find(|ancestor| ancestor.exists())?;
-    let tail = path.strip_prefix(existing).ok()?;
-    std::fs::canonicalize(existing)
-        .ok()
-        .map(|root| root.join(tail))
 }
 
 /// Whether a write target belongs to Claude Code's own configuration tree.

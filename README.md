@@ -2050,6 +2050,8 @@ provably read-only `SELECT`/`EXPLAIN`/`SHOW` through a recognized client runs
 silently; write-shaped, multi-statement, stdin/script-fed, malformed, or CTE
 input asks conservatively.
 
+With the default `interactive_default = "allow"`, the hook answers "allow" for commands no rule matches and suppresses the harness's own permission prompt, so enabling the hook widens what runs without a prompt; set `[safety] interactive_default = "ask"` in `~/.zirv/ctx.toml` to keep the harness's prompt for unmatched commands.
+
 The analyzer evaluates the most restrictive result across quote-aware compound
 segments (`;`, `&`, `&&`, `||`, pipes and newlines), nested
 `sh`/`bash`/`zsh`/`cmd`/PowerShell inline wrappers, `$()` and backtick command

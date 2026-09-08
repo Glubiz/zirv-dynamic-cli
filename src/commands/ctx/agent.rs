@@ -296,6 +296,22 @@ impl From<ArtifactStageArg> for crate::commands::workflow::engine::ArtifactStage
 pub(crate) fn validate_workdir(dir: &Path) -> CtxResult<PathBuf> {
     let canon = std::fs::canonicalize(dir)
         .map_err(|e| format!("--workdir {} does not exist: {e}", dir.display()))?;
+    let home = crate::utils::home_dir()?;
+    let state = StateDir::resolve(&super::config::env_from_process())?;
+    let mut homes = WorkdirHomes::new(&home, state.root(), &|key| std::env::var(key).ok());
+    homes.home = std::fs::canonicalize(&homes.home).unwrap_or(homes.home);
+    for (_, root) in &mut homes.roots {
+        if let Some(canonical) = super::pathutil::canonicalize_with_missing_tail(root) {
+            *root = canonical;
+        }
+    }
+    if let Some(root) = refused_workdir_root(&canon, &homes) {
+        return Err(format!(
+            "--workdir {} is refused: protected root {root}",
+            canon.display()
+        )
+        .into());
+    }
     if !canon.is_dir() {
         return Err(format!("--workdir {} is not a directory", dir.display()).into());
     }
@@ -308,6 +324,78 @@ pub(crate) fn validate_workdir(dir: &Path) -> CtxResult<PathBuf> {
         .into());
     }
     Ok(canon)
+}
+
+struct WorkdirHomes {
+    home: PathBuf,
+    roots: Vec<(&'static str, PathBuf)>,
+}
+
+impl WorkdirHomes {
+    fn new(home: &Path, state: &Path, env: super::config::EnvLookup<'_>) -> Self {
+        let configured = |key, fallback: PathBuf| {
+            env(key)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or(fallback)
+        };
+        Self {
+            home: home.to_path_buf(),
+            roots: vec![
+                ("~/.zirv", home.join(".zirv")),
+                ("zirv state directory", state.to_path_buf()),
+                (
+                    "CLAUDE_CONFIG_DIR or ~/.claude",
+                    configured("CLAUDE_CONFIG_DIR", home.join(".claude")),
+                ),
+                (
+                    "CODEX_HOME or ~/.codex",
+                    configured("CODEX_HOME", home.join(".codex")),
+                ),
+                (
+                    "COPILOT_HOME or ~/.copilot",
+                    configured("COPILOT_HOME", home.join(".copilot")),
+                ),
+                ("~/.factory", home.join(".factory")),
+                ("~/.gemini", home.join(".gemini")),
+                (
+                    "XDG_DATA_HOME/opencode or ~/.local/share/opencode",
+                    configured("XDG_DATA_HOME", home.join(".local/share")).join("opencode"),
+                ),
+                (
+                    "PI_CODING_AGENT_DIR or ~/.pi/agent",
+                    configured("PI_CODING_AGENT_DIR", home.join(".pi/agent")),
+                ),
+                (
+                    "QWEN_HOME or ~/.qwen",
+                    configured("QWEN_HOME", home.join(".qwen")),
+                ),
+                (
+                    "QWEN_RUNTIME_DIR or ~/.qwen",
+                    configured(
+                        "QWEN_RUNTIME_DIR",
+                        configured("QWEN_HOME", home.join(".qwen")),
+                    ),
+                ),
+                ("~/.ssh", home.join(".ssh")),
+            ],
+        }
+    }
+}
+
+/// Filesystem roots and the user's home are equality-only refusals; the
+/// configuration/state roots also refuse descendants. No flag overrides this.
+fn refused_workdir_root(canonical: &Path, homes: &WorkdirHomes) -> Option<&'static str> {
+    if canonical.has_root() && canonical.parent().is_none() {
+        return Some("filesystem root");
+    }
+    if canonical == homes.home {
+        return Some("$HOME");
+    }
+    homes
+        .roots
+        .iter()
+        .find_map(|(name, root)| canonical.starts_with(root).then_some(*name))
 }
 
 /// Issue #267/#319: `--worktree`'s own allocation -- a fresh linked `git
@@ -6166,6 +6254,63 @@ mod tests {
         let s = p.display().to_string();
         let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
         stripped.replace('\\', "/").to_lowercase()
+    }
+
+    #[test]
+    fn refused_workdir_roots_cover_operator_state_and_harness_homes() {
+        let home = if cfg!(windows) {
+            Path::new(r"C:\Users\operator")
+        } else {
+            Path::new("/home/operator")
+        };
+        let homes = WorkdirHomes::new(home, &home.join("state/zirv/ctx"), &|_| None);
+        let root = home.ancestors().last().unwrap();
+        assert_eq!(refused_workdir_root(root, &homes), Some("filesystem root"));
+        assert_eq!(refused_workdir_root(home, &homes), Some("$HOME"));
+        for (name, path) in &homes.roots {
+            for target in [path.clone(), path.join("projects/session")] {
+                assert!(
+                    refused_workdir_root(&target, &homes).is_some(),
+                    "{name}: {}",
+                    target.display()
+                );
+            }
+        }
+        for target in [
+            home.join("checkout"),
+            home.join(".claude-sibling"),
+            home.join(".ssh-sibling"),
+        ] {
+            assert_eq!(
+                refused_workdir_root(&target, &homes),
+                None,
+                "{}",
+                target.display()
+            );
+        }
+        for key in [
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "COPILOT_HOME",
+            "XDG_DATA_HOME",
+            "PI_CODING_AGENT_DIR",
+            "QWEN_HOME",
+            "QWEN_RUNTIME_DIR",
+        ] {
+            let custom = home.join("custom");
+            let homes = WorkdirHomes::new(home, &home.join("state"), &|name| {
+                (name == key).then(|| custom.to_string_lossy().into_owned())
+            });
+            let target = if key == "XDG_DATA_HOME" {
+                custom.join("opencode")
+            } else {
+                custom
+            };
+            assert!(
+                refused_workdir_root(&target.join("sessions"), &homes).is_some(),
+                "{key}"
+            );
+        }
     }
 
     #[test]
