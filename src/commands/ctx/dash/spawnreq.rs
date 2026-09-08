@@ -90,10 +90,20 @@ pub struct SpawnRequest {
     /// `Child` and its writer permit is released by that dashboard's own
     /// reap, so an outside signal against the bare pid cannot free the slot
     /// even when it lands -- and from a sandboxed harness shell it may not
-    /// land at all (`EPERM`). Honoured from an untrusted file drop, unlike
+    /// land at all (`EPERM`).
+    ///
+    /// SECURITY (review round 2, 2026-09-08): honoured only on the
+    /// DASHBOARD'S OWN shared channel, never on a pane's attributed intake
+    /// channel (`dash::drain_one_channel`). The earlier justification here
+    /// -- that any process able to write into this directory can already
+    /// signal the same-uid pane itself -- is exactly what #403 disproves: a
+    /// sandboxed pane's own child tree can write into that pane's channel
+    /// and cannot signal anything. Left unguarded, that would let one worker
+    /// stop an unrelated pane through the unsandboxed dashboard, since the
+    /// request names nothing but a short id. On the dashboard's own channel
+    /// it is still safe to honour from an untrusted file drop, unlike
     /// `flags`/`force`: it only ever NARROWS (it stops work, never starts
-    /// any), and any process that can write into this directory can already
-    /// signal the same-uid pane process directly.
+    /// any).
     #[serde(default)]
     pub kill: Option<String>,
     pub agent: String,

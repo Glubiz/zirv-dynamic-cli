@@ -201,6 +201,73 @@ fn kind_word(captured: Option<&str>) -> Option<&'static str> {
     })
 }
 
+/// The multi-line quotings [`BlockState`] tracks, as `(opener, closer)`.
+/// Ordered longest-first only for readability -- the earliest opener on a
+/// line wins regardless.
+const BLOCK_DELIMITERS: [(&str, &str); 3] = [("/*", "*/"), ("\"\"\"", "\"\"\""), ("'''", "'''")];
+
+/// Review round 2, finding 3: whether the scan is currently inside a
+/// `/* ... */` block or a `"""`/`'''` string, carried line to line across
+/// ONE file (or one payload). [`DEF_PATTERNS`] anchor at column 0 and know
+/// nothing of context, so a `def foo():` in a Python module docstring, or a
+/// `pub fn example()` in a Rust block comment, was extracted as a real
+/// definition on the payload side and on the repository side alike, and
+/// advised on.
+///
+/// Deliberately a delimiter counter rather than a lexer: it only has to be
+/// right about text that would otherwise LOOK like a top-level definition,
+/// and both of its error directions cost at most one advisory this probe
+/// never owed anyone.
+#[derive(Debug, Default)]
+struct BlockState {
+    /// The closer being looked for, when a block is open.
+    open: Option<&'static str>,
+}
+
+impl BlockState {
+    /// Advances the state over `line` and answers whether that line's own
+    /// text may be read for definitions -- true only when the line BEGAN
+    /// outside every block, because a column-0 definition inside one is
+    /// prose, not code.
+    fn admits(&mut self, line: &str) -> bool {
+        let outside = self.open.is_none();
+        // A line comment that merely mentions a delimiter (`/// see the
+        // `/* ... */` above`) opens nothing: it ends at the newline. Only
+        // checked outside a block, so a closer on such a line still closes.
+        if outside && line.trim_start().starts_with("//") {
+            return true;
+        }
+        let mut rest = line;
+        loop {
+            match self.open {
+                Some(closer) => match rest.find(closer) {
+                    Some(at) => {
+                        self.open = None;
+                        rest = &rest[at + closer.len()..];
+                    }
+                    None => break,
+                },
+                None => {
+                    let next = BLOCK_DELIMITERS
+                        .iter()
+                        .filter_map(|(opener, closer)| {
+                            rest.find(opener).map(|at| (at, *opener, *closer))
+                        })
+                        .min_by_key(|(at, _, _)| *at);
+                    match next {
+                        Some((at, opener, closer)) => {
+                            self.open = Some(closer);
+                            rest = &rest[at + opener.len()..];
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        outside
+    }
+}
+
 /// Every `(kind, name)` declared on one line, in pattern order, filtered by
 /// [`is_probeworthy`] so a name too short or too generic to prove anything
 /// is dropped on BOTH sides of a comparison rather than only on the
@@ -244,7 +311,11 @@ fn is_probeworthy(name: &str) -> bool {
 pub fn added_definitions(added_text: &str) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
+    let mut blocks = BlockState::default();
     for line in added_text.lines() {
+        if !blocks.admits(line) {
+            continue;
+        }
         for (_, name) in definitions_on_line(line) {
             if seen.insert(name.clone()) {
                 out.push(name);
@@ -476,22 +547,29 @@ impl Scan<'_> {
         let Some(path) = repo_relative(self.repo, file) else {
             return Ok(());
         };
+        // Review round 2, finding 3: the same block/docstring tracker the
+        // payload side runs, so prose is not evidence that a definition
+        // already exists here either. Per file, by construction.
+        let mut blocks = BlockState::default();
         for (number, line) in text.lines().enumerate() {
-            for (kind, existing) in definitions_on_line(line) {
-                let existing_variants: BTreeSet<String> = variants(&existing).into_iter().collect();
-                for (name, candidate_variants) in self.wanted {
-                    if self.reported.contains(name)
-                        || candidate_variants.is_disjoint(&existing_variants)
-                    {
-                        continue;
+            if blocks.admits(line) {
+                for (kind, existing) in definitions_on_line(line) {
+                    let existing_variants: BTreeSet<String> =
+                        variants(&existing).into_iter().collect();
+                    for (name, candidate_variants) in self.wanted {
+                        if self.reported.contains(name)
+                            || candidate_variants.is_disjoint(&existing_variants)
+                        {
+                            continue;
+                        }
+                        self.reported.insert(name.clone());
+                        self.matches.push(Match {
+                            kind,
+                            name: existing.clone(),
+                            path: path.clone(),
+                            line: number + 1,
+                        });
                     }
-                    self.reported.insert(name.clone());
-                    self.matches.push(Match {
-                        kind,
-                        name: existing.clone(),
-                        path: path.clone(),
-                        line: number + 1,
-                    });
                 }
             }
             if self.matches.len() >= MAX_MATCHES {
@@ -726,6 +804,40 @@ mod tests {
         assert!(added_definitions("pub fn run() {}\npub fn new() {}\n").is_empty());
     }
 
+    /// Review round 2, finding 3: prose is not a declaration. A column-0
+    /// `pub fn` inside a `/* ... */` block, or a `def` inside a Python
+    /// module docstring, used to be extracted exactly like real code.
+    #[test]
+    fn added_definitions_skip_block_comments_and_docstrings() {
+        assert!(
+            added_definitions("/*\npub fn parse_widget() {}\n*/\n").is_empty(),
+            "a Rust block comment declares nothing"
+        );
+        assert!(
+            added_definitions("\"\"\"\ndef compute_widget(x):\n\"\"\"\n").is_empty(),
+            "nor does a Python module docstring"
+        );
+        assert!(
+            added_definitions("'''\ndef compute_widget(x):\n'''\n").is_empty(),
+            "in either spelling"
+        );
+        assert_eq!(
+            added_definitions("/*\npub fn parse_widget() {}\n*/\npub fn render_widget() {}\n"),
+            vec!["render_widget".to_string()],
+            "and the real definition after the block still counts"
+        );
+        assert_eq!(
+            added_definitions("/* opened and closed */\npub fn render_widget() {}\n"),
+            vec!["render_widget".to_string()],
+            "a delimiter pair on one line leaves nothing open"
+        );
+        assert_eq!(
+            added_definitions("/// see the `/* ... */` above\npub fn render_widget() {}\n"),
+            vec!["render_widget".to_string()],
+            "and a line comment mentioning one opens nothing"
+        );
+    }
+
     #[test]
     fn variants_equate_the_documented_spellings() {
         let intersects = |a: &str, b: &str| {
@@ -771,6 +883,47 @@ mod tests {
         assert_eq!(matches[0].name, "foo_bar");
         assert_eq!(matches[0].path, "src/x.rs");
         assert_eq!(matches[0].line, 2);
+    }
+
+    /// Review round 2, finding 3, repository side: the same prose that
+    /// declares nothing on the payload side is not evidence that a
+    /// definition already exists here either.
+    #[test]
+    fn probe_ignores_definitions_inside_block_comments_and_docstrings() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let src = repo.path().join("src");
+        std::fs::create_dir_all(&src).expect("src dir");
+        std::fs::write(
+            src.join("commented.rs"),
+            "/*\npub fn widget_total() -> u8 {\n    0\n}\n*/\n",
+        )
+        .expect("write commented.rs");
+        std::fs::write(
+            src.join("docstring.py"),
+            "\"\"\"\ndef widget_total():\n    pass\n\"\"\"\n",
+        )
+        .expect("write docstring.py");
+
+        let wanted = ["widget_total".to_string()];
+        let target = src.join("new.rs");
+        assert_eq!(
+            probe(repo.path(), &target, &wanted, &[], Budget::default()),
+            ProbeOutcome::Matches(Vec::new()),
+            "neither the comment nor the docstring is a definition"
+        );
+
+        std::fs::write(
+            src.join("real.rs"),
+            "pub fn widget_total() -> u8 {\n    0\n}\n",
+        )
+        .expect("write real.rs");
+        let outcome = probe(repo.path(), &target, &wanted, &[], Budget::default());
+        let ProbeOutcome::Matches(matches) = outcome else {
+            panic!("expected matches, got {outcome:?}");
+        };
+        assert_eq!(matches.len(), 1, "{matches:?}");
+        assert_eq!(matches[0].path, "src/real.rs");
+        assert_eq!(matches[0].kind, "fn");
     }
 
     /// The file being written is never its own evidence.

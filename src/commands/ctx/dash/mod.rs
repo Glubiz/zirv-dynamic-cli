@@ -1298,6 +1298,17 @@ fn writer_text(holds_permit: bool, cwd: &Path) -> String {
 /// retained row rendered `●` immediately and the operator was never told the
 /// worker had finished. A nonzero exit is `✗` regardless of visibility, so it
 /// gets the exit observation alone.
+///
+/// Review round 2, finding 2: the exit observation also asserts
+/// `Attention::None`, which is what actually CLEARS a latch on the attention
+/// axis. Every other variant of `Attention` is a latch that survives until
+/// something positively says otherwise (`attention::compose` clears only
+/// `Compacting`, and only implicitly), so a pane that `report_stalled_
+/// compaction` latched `Stalled` and that then exited kept projecting
+/// `Blocked(Stalled)` forever -- `zirv ctx status` never showed the exit, and
+/// `zirv ctx wait` resolved for no target at all. A process that is gone is
+/// blocked on nothing, whatever it was blocked on while it lived, so exit is
+/// exactly the authority that may say so.
 fn reap_observations(
     prior: super::attention::Lifecycle,
     code: i32,
@@ -1327,7 +1338,8 @@ fn reap_observations(
             90,
             at,
         )
-        .with_lifecycle(super::attention::Lifecycle::Exited),
+        .with_lifecycle(super::attention::Lifecycle::Exited)
+        .with_attention(super::attention::Attention::None),
     );
     observations
 }
@@ -6933,6 +6945,12 @@ fn handle_spawn_requests(
 /// as a clean finish.
 const EXIT_KILLED: i32 = 143;
 
+/// SECURITY (review round 2, 2026-09-08): the refusal a `kill` request gets
+/// when it arrives on a channel that proves a pane's identity rather than on
+/// the dashboard's own shared one -- see [`drain_one_channel`].
+const KILL_OFF_CHANNEL_REFUSAL: &str =
+    "kill requests are accepted only on the dashboard's own channel";
+
 /// Issue #403: stops one pane THIS dashboard owns, on behalf of a `zirv ctx
 /// kill` that would otherwise have to signal the pane's pid from outside.
 ///
@@ -6984,8 +7002,25 @@ fn drain_one_channel(
         // spawn. It names a pane this dashboard already owns, so none of the
         // spawn gates below have anything to say about it, and it is answered
         // with the same ack shape before any of them run.
+        //
+        // SECURITY (review round 2, 2026-09-08): honoured ONLY on this
+        // dashboard's own shared channel (`requester.is_none()`, the one
+        // `zirv ctx kill` writes to). A pane-attributed channel
+        // (`Pane::intake_dir`) is reachable by that pane's own low-trust
+        // child tree, and #403 exists precisely because a sandboxed shell
+        // CANNOT signal a pane process itself (`EPERM`) -- so honouring
+        // `kill` there would hand a worker the very cross-pane stop the
+        // sandbox denies it, against a pane it does not own. `stop_owned_
+        // pane` matches on the short id alone and would not notice.
         if let Some(target) = req.kill.clone() {
-            let ack = match stop_owned_pane(&target, panes) {
+            let stopped = if requester.is_some() {
+                Err((KILL_OFF_CHANNEL_REFUSAL.to_string(), false))
+            } else {
+                // The requester's fallback is signalling the pid itself,
+                // which a refusal from THIS branch says nothing against.
+                stop_owned_pane(&target, panes).map_err(|reason| (reason, true))
+            };
+            let ack = match stopped {
                 Ok(()) => spawnreq::SpawnAck {
                     ok: true,
                     short: Some(target),
@@ -6994,7 +7029,7 @@ fn drain_one_channel(
                     budget_exhausted: false,
                     capability_warnings: Vec::new(),
                 },
-                Err(reason) => {
+                Err((reason, retryable)) => {
                     // R6, exactly as for a refused spawn: no pane was stopped
                     // and none will be, so the claim no longer stands for
                     // anything a requester that timed out could read.
@@ -7003,9 +7038,7 @@ fn drain_one_channel(
                         ok: false,
                         short: None,
                         reason: Some(reason),
-                        // The requester's fallback is signalling the pid
-                        // itself, which this refusal says nothing against.
-                        retryable: true,
+                        retryable,
                         budget_exhausted: false,
                         capability_warnings: Vec::new(),
                     }
@@ -14859,6 +14892,48 @@ mod tests {
                 "{prior:?}/{code}"
             );
         }
+    }
+
+    /// Review round 2, finding 2: `report_stalled_compaction` latches
+    /// `Attention::Stalled` from `Authority::Supervisor`, and `compose`'s own
+    /// clearing rule covers `Compacting` alone -- so a pane that stalled and
+    /// then EXITED went on projecting `Blocked(Stalled)` forever. `zirv ctx
+    /// status` never showed the exit, and `zirv ctx wait` resolved for no
+    /// `--until` target at all, because attention wins over lifecycle in
+    /// `project`. A process that is gone is blocked on nothing, and its exit
+    /// is the one authority entitled to say so.
+    #[test]
+    fn an_exit_clears_a_latched_stall_instead_of_projecting_blocked_forever() {
+        use super::super::attention::{
+            Attention, Authority, Lifecycle, Observation, Projection, compose, project,
+        };
+        // Exactly what `report_stalled_compaction` records for a wedged pane.
+        let stalled = compose(
+            None,
+            &[
+                Observation::new(Authority::Supervisor, "compaction is stalled", 90, 100)
+                    .with_attention(Attention::Stalled),
+            ],
+            100,
+        );
+        assert_eq!(project(&stalled), Projection::Blocked(Attention::Stalled));
+
+        let mut status = stalled;
+        for observation in reap_observations(status.lifecycle, 0, 200, "") {
+            status = compose(Some(&status), std::slice::from_ref(&observation), 200);
+        }
+        assert_eq!(status.lifecycle, Lifecycle::Exited);
+        assert_eq!(
+            status.attention,
+            Attention::None,
+            "the exit clears the latch, whatever it was latched on"
+        );
+        assert_eq!(
+            project(&status),
+            Projection::Failed,
+            "so the pane projects its own exit -- what `wait --until failed` resolves on -- \
+             instead of a stall nothing can ever clear"
+        );
     }
 
     /// Review of 5c1b6c3, finding 2: a retained row keeps the budget text and
@@ -26220,6 +26295,100 @@ mod tests {
 
         for pane in panes.iter_mut() {
             let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// SECURITY (review round 2, finding 1): a `kill` request is honoured
+    /// ONLY on the dashboard's own shared channel. A pane's attributed
+    /// intake channel is writable by that pane's own low-trust child tree,
+    /// and #403 exists precisely because a sandboxed shell cannot signal a
+    /// pane process itself -- so honouring one there handed a worker exactly
+    /// the cross-pane stop its sandbox denies it, against a pane it does not
+    /// own: the request names nothing but a short id, and `stop_owned_pane`
+    /// matches on that alone.
+    #[test]
+    fn a_kill_request_on_a_panes_own_channel_is_refused_and_stops_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = tmp
+            .path()
+            .join("dash")
+            .join("aaaa2222-token")
+            .join("requests");
+
+        let mut errors = ErrorLog::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        for session_id in [
+            "aaaaaaaa-3333-4444-8555-666666666666",
+            "bbbbbbbb-3333-4444-8555-666666666666",
+        ] {
+            let mut pane = Pane::spawn(
+                PaneSpec {
+                    agent_name: "test-agent".to_string(),
+                    argv: silent_long_lived_argv(),
+                    role: prompt::PromptRole::Worker,
+                    verb: sessions::Verb::Dash,
+                    session_id: session_id.to_string(),
+                    title: "wrk test".to_string(),
+                },
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn");
+            pane.set_intake_dir(mint_pane_channel(&requests_dir, &mut errors));
+            panes.push(pane);
+        }
+        let victim = panes[0].short().to_string();
+        let attacker_channel = panes[1]
+            .intake_dir()
+            .expect("the second pane has its own channel")
+            .to_path_buf();
+
+        let path =
+            spawnreq::write_request(&attacker_channel, &kill_request(&victim)).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new(); panes.len()];
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+
+        let ack = spawnreq::wait_for_ack(&attacker_channel, &stem, Duration::from_millis(50))
+            .expect("the refusal is acked on the channel it arrived on");
+        assert!(!ack.ok);
+        assert!(
+            !ack.retryable,
+            "and it is final -- no channel this request may be re-sent on exists: {ack:?}"
+        );
+        assert_eq!(ack.reason.as_deref(), Some(KILL_OFF_CHANNEL_REFUSAL));
+        assert!(
+            !matches!(panes[0].state(), PaneState::Ended(_)),
+            "the named pane is untouched"
+        );
+        assert!(
+            sessions::list(&state)
+                .iter()
+                .any(|(r, _)| r.short == victim),
+            "and still registered"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
         }
     }
 
