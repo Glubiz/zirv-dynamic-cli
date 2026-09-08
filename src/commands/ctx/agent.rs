@@ -2125,7 +2125,11 @@ fn cap_bytes(text: &str, max: usize) -> String {
 /// operator who is not actually running a dashboard right now (a stale
 /// `DASH_REQUESTS_ENV` inherited from a shell that used to be a pane, whose
 /// directory has not yet been reaped) is not kept waiting for long.
-const DASH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// `pub(crate)` (issue #403): `sessions::kill_via_dashboard` waits out the
+/// same ceiling for its own request on this same channel, and the two must
+/// not drift.
+pub(crate) const DASH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How much longer a *claimed* request is waited out past [`DASH_ACK_TIMEOUT`]
 /// before the delegation is called a failure.
@@ -2448,6 +2452,7 @@ fn try_join_dashboard<W: Write>(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     let req = spawnreq::SpawnRequest {
+        kill: None,
         agent: args.name.clone(),
         prompt: prompt.to_string(),
         cwd: repo.to_path_buf(),

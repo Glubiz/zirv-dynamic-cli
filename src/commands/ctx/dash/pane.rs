@@ -2348,6 +2348,28 @@ impl Pane {
         Ok(())
     }
 
+    /// Issue #403: stops this pane's child NOW -- [`Self::finish_shutdown`],
+    /// the escalation half with no quit sequence and no grace -- and records
+    /// `code` as its exit so this tick's `dash::reap_ended_panes` retires the
+    /// row by the one code path that retains it, settles its spend and closes
+    /// its work group. `finish_shutdown` on its own releases the registry
+    /// record, the writer permit and the socket but leaves `exit_code` unset,
+    /// so the pane would linger in `panes` until something else happened to
+    /// observe the child's exit.
+    ///
+    /// No polite quit sequence, unlike [`Self::enforce_deadline`]: this is
+    /// the operator saying kill it, and a pane settled enough to need `zirv
+    /// ctx kill` is precisely the pane that will not answer one. A child that
+    /// had already exited keeps its own exit code.
+    pub fn stop_now(&mut self, code: i32) -> CtxResult<()> {
+        self.poll_exit();
+        self.finish_shutdown()?;
+        if self.exit_code.is_none() {
+            self.exit_code = Some(code);
+        }
+        Ok(())
+    }
+
     /// Issue #84: swaps this pane's harness/model in place, keeping its
     /// registry short id (the same socket, the same mail/nudge address) --
     /// only the pty, the child, its job/console-close guard, the writer, the

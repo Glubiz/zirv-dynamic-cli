@@ -6926,6 +6926,33 @@ fn handle_spawn_requests(
     }
 }
 
+/// The exit code recorded for a pane an operator killed through `zirv ctx
+/// kill`: 128 + SIGTERM, the number a shell reports for a process a
+/// `kill -TERM` ended, so the reap path's own fold (`empty_exit_code`) and
+/// the delegation row both read it as the deliberate stop it was rather than
+/// as a clean finish.
+const EXIT_KILLED: i32 = 143;
+
+/// Issue #403: stops one pane THIS dashboard owns, on behalf of a `zirv ctx
+/// kill` that would otherwise have to signal the pane's pid from outside.
+///
+/// Two things an outside signal cannot do, and this can. The pane's process
+/// is this dashboard's own `Child`, so `Pane::stop_now` reaches it as its
+/// real parent even where a sandboxed harness shell's `kill` is refused with
+/// `EPERM`. And the writer permit the pane holds is released by this
+/// dashboard's own reap (`permit::HeavyPermit::drop`, once `reap_ended_panes`
+/// sees the child exit), never by anything the killing process does -- so a
+/// pane killed from outside used to leave its permit slot occupied by a
+/// session `zirv ctx kill` had already deregistered, and the next dispatch
+/// into that worktree was refused `writer-busy` naming a session that no
+/// longer existed.
+fn stop_owned_pane(short: &str, panes: &mut [Pane]) -> Result<(), String> {
+    let Some(pane) = panes.iter_mut().find(|pane| pane.short() == short) else {
+        return Err(format!("no pane {short} is running on this dashboard"));
+    };
+    pane.stop_now(EXIT_KILLED).map_err(|e| e.to_string())
+}
+
 /// One intake channel's own queue: every request in `dir`, each answered with
 /// an ack written back into that same `dir` so a requester only ever polls
 /// the channel it wrote to. `requester` is the identity that channel proves
@@ -6953,6 +6980,42 @@ fn drain_one_channel(
         // drop directory, so its widening fields are stripped before
         // anything below reads them -- see `sanitize_file_dropped_request`.
         let req = sanitize_file_dropped_request(req);
+        // Issue #403: the one request kind on this channel that is not a
+        // spawn. It names a pane this dashboard already owns, so none of the
+        // spawn gates below have anything to say about it, and it is answered
+        // with the same ack shape before any of them run.
+        if let Some(target) = req.kill.clone() {
+            let ack = match stop_owned_pane(&target, panes) {
+                Ok(()) => spawnreq::SpawnAck {
+                    ok: true,
+                    short: Some(target),
+                    reason: None,
+                    retryable: false,
+                    budget_exhausted: false,
+                    capability_warnings: Vec::new(),
+                },
+                Err(reason) => {
+                    // R6, exactly as for a refused spawn: no pane was stopped
+                    // and none will be, so the claim no longer stands for
+                    // anything a requester that timed out could read.
+                    spawnreq::remove_claim(dir, &stem);
+                    spawnreq::SpawnAck {
+                        ok: false,
+                        short: None,
+                        reason: Some(reason),
+                        // The requester's fallback is signalling the pid
+                        // itself, which this refusal says nothing against.
+                        retryable: true,
+                        budget_exhausted: false,
+                        capability_warnings: Vec::new(),
+                    }
+                }
+            };
+            if let Err(e) = spawnreq::write_ack(dir, &stem, &ack) {
+                push_error(errors, format!("kill ack: {e}"));
+            }
+            continue;
+        }
         // `FILE_DROP_TRUSTED_INTERACTIVE` (never a bare `false`, on purpose
         // -- a named constant is harder to accidentally swap for
         // `req.interactive` in a future edit than a literal in a long
@@ -11064,6 +11127,7 @@ pub fn run_dashboard(
                                             // rather than a second, parallel one.
                                             Some(SpawnEffect::Submit { agent, prompt }) => {
                                                 let req = spawnreq::SpawnRequest {
+                                                    kill: None,
                                                     agent,
                                                     prompt,
                                                     cwd: repo.to_path_buf(),
@@ -18003,6 +18067,7 @@ mod tests {
 
     fn spawn_request(prompt: &str, cwd: &Path) -> spawnreq::SpawnRequest {
         spawnreq::SpawnRequest {
+            kill: None,
             agent: "claude".to_string(),
             prompt: prompt.to_string(),
             cwd: cwd.to_path_buf(),
@@ -26070,6 +26135,135 @@ mod tests {
         let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
             .expect("the refusal is still acked");
         assert!(!ack.ok);
+        assert!(panes.is_empty(), "and nothing was spawned");
+    }
+
+    /// Issue #403: the one request kind on this channel that is not a spawn.
+    fn kill_request(short: &str) -> spawnreq::SpawnRequest {
+        spawnreq::SpawnRequest {
+            kill: Some(short.to_string()),
+            requested_by: "ctx kill".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Issue #403: `zirv ctx kill` against a dashboard pane asks the
+    /// dashboard that owns it, over this same channel, rather than signalling
+    /// the pane's pid from outside -- the owner is the child's real parent
+    /// (so no `EPERM` from a sandboxed shell) and the only thing that can
+    /// release the pane's writer permit, which its own reap does once the
+    /// child is seen to exit.
+    #[test]
+    fn a_kill_request_stops_the_named_pane_and_is_acked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let dir = tmp.path().join("requests");
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: silent_long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "bbbbbbbb-2222-4333-8444-555555555555".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let short = panes[0].short().to_string();
+        assert!(
+            sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "the pane registers before the kill"
+        );
+
+        let path = spawnreq::write_request(&dir, &kill_request(&short)).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        let mut errors = ErrorLog::default();
+        handle_spawn_requests(
+            &dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut HashMap::new(),
+        );
+
+        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
+            .expect("the kill is acked");
+        assert!(ack.ok, "the owner stopped its own pane: {ack:?}");
+        assert_eq!(ack.short.as_deref(), Some(short.as_str()));
+        assert!(
+            matches!(panes[0].state(), PaneState::Ended(_)),
+            "and the pane is left ready for this tick's reap, not lingering live"
+        );
+        assert!(
+            !sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "with its registry record released by the owner"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// Issue #403: a kill naming a pane this dashboard does not have is
+    /// refused, retryably -- the requester's own fallback is signalling the
+    /// pid directly, and this refusal says nothing against that.
+    #[test]
+    fn a_kill_request_naming_an_unknown_pane_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let dir = tmp.path().join("requests");
+
+        let path = spawnreq::write_request(&dir, &kill_request("deadbeef")).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = ErrorLog::default();
+        handle_spawn_requests(
+            &dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut HashMap::new(),
+        );
+
+        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
+            .expect("the refusal is acked");
+        assert!(!ack.ok);
+        assert!(ack.retryable, "so the requester may signal the pid itself");
+        assert!(
+            ack.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("no pane deadbeef is running on this dashboard")),
+            "and says why: {ack:?}"
+        );
+        assert!(
+            !spawnreq::is_claimed(&dir, &stem),
+            "a refusal withdraws its own claim, kill or spawn"
+        );
         assert!(panes.is_empty(), "and nothing was spawned");
     }
 
