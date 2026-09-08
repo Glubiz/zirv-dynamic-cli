@@ -4504,6 +4504,68 @@ mod tests {
     }
 
     #[test]
+    fn recall_adopts_a_legacy_bank_once_when_the_repository_slug_is_first_resolved() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("repository");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let _home = super::super::testenv::HomeGuard::set(tmp.path());
+        let _env = super::super::testenv::VarGuard::set(&[
+            (
+                super::super::state::STATE_ENV,
+                Some(state.root().to_str().expect("state")),
+            ),
+            (super::super::adapters::SESSION_ENV, None),
+        ]);
+        let legacy: String =
+            super::super::state::display_path(&repo.canonicalize().expect("canonical"))
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+        let entry = sample("legacy-fact", 1);
+        remember(&state, &legacy, &entry, &CtxConfig::default()).expect("legacy remember");
+        let mut out = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                key: Some(entry.key.clone()),
+                stale: None,
+                json: true,
+            },
+            &mut out,
+            &repo,
+            &|key| std::env::var(key).ok(),
+        )
+        .expect("recall");
+        let recalled = String::from_utf8(out).expect("utf8");
+        assert!(recalled.contains(&entry.key), "{recalled}");
+        assert!(recalled.contains(&entry.body), "{recalled}");
+        assert!(!state.memory().join(&legacy).exists());
+        let slug = repo_slug(&repo);
+        assert_eq!(
+            get(&state, &slug, &entry.key)
+                .expect("get")
+                .expect("entry")
+                .body,
+            entry.body
+        );
+
+        // A later legacy write (for example from a still-running old binary)
+        // must not cause another adoption in this process, even if current vanished.
+        std::fs::rename(state.memory().join(&slug), state.memory().join("saved"))
+            .expect("move current");
+        remember(&state, &legacy, &entry, &CtxConfig::default()).expect("late legacy write");
+        assert_eq!(repo_slug(&repo.join(".")), slug);
+        assert!(state.memory().join(&legacy).exists());
+        assert!(!state.memory().join(&slug).exists());
+    }
+
+    #[test]
     fn from_flags_prefers_global_then_shared_then_private() {
         assert_eq!(MemoryScope::from_flags(false, false), MemoryScope::Private);
         assert_eq!(MemoryScope::from_flags(true, false), MemoryScope::Shared);

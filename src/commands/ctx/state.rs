@@ -1,4 +1,8 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+use sha2::{Digest, Sha256};
 
 use super::CtxResult;
 use super::config::EnvLookup;
@@ -16,8 +20,8 @@ pub fn now_secs() -> u64 {
 }
 
 /// Canonicalizes first, then replaces every character outside `[A-Za-z0-9-]`
-/// with `-` -- the same rule the claude adapter uses for transcript
-/// directories.
+/// with `-`, then appends eight hex digits of the canonical display path
+/// SHA-256 so punctuation folding does not alias different repositories.
 ///
 /// The canonicalization is what makes this a single answer per repository.
 /// Callers reach it from both sides: some pass a path they canonicalized
@@ -30,7 +34,8 @@ pub fn now_secs() -> u64 {
 /// readable) falls back to its own text, which is the pre-existing behavior.
 pub fn repo_slug(path: &Path) -> String {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    display_path(&path)
+    let rendered = display_path(&path);
+    let legacy: String = rendered
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' {
@@ -39,7 +44,298 @@ pub fn repo_slug(path: &Path) -> String {
                 '-'
             }
         })
-        .collect()
+        .collect();
+    let hash: String = Sha256::digest(rendered.as_bytes())[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let current = format!("{legacy}-{hash}");
+
+    static ADOPTED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let mut adopted = ADOPTED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !adopted.contains(&path)
+        && path.is_dir()
+        && path.ancestors().any(|parent| parent.join(".git").exists())
+    {
+        adopted.insert(path);
+        match StateDir::resolve(&|key| std::env::var(key).ok()) {
+            Ok(state) => adopt_legacy_slug_state(state.root(), &legacy, &current),
+            Err(error) => eprintln!("zirv: could not migrate repository state: {error}"),
+        }
+    }
+    current
+}
+
+#[derive(Clone, Copy)]
+enum SlugEntry {
+    Directory,
+    File(&'static str, &'static str),
+    HomeFile(&'static str),
+}
+
+impl SlugEntry {
+    fn path(self, state: &Path, home: Option<&Path>, dir: &str, slug: &str) -> Option<PathBuf> {
+        Some(match self {
+            Self::Directory => state.join(dir).join(slug),
+            Self::File(prefix, suffix) => state.join(dir).join(format!("{prefix}{slug}{suffix}")),
+            Self::HomeFile(suffix) => home?
+                .join(crate::utils::SCRIPT_DIR_NAME)
+                .join(dir)
+                .join(format!("{slug}{suffix}")),
+        })
+    }
+}
+
+// Each row names a storage layout and its consumers (relative to src).
+// Session records embed the slug but are keyed by session id; their callers
+// are listed with the buckets they address. Worktree archives use a basename,
+// and harness transcript directories use the adapter's separate project slug.
+const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
+    (
+        "memory",
+        SlugEntry::Directory,
+        &[
+            "commands/setup.rs",
+            "commands/ctx/memory.rs",
+            "commands/ctx/memory_cli.rs",
+            "commands/ctx/compile.rs",
+            "commands/ctx/context_status.rs",
+            "commands/ctx/status.rs",
+            "commands/ctx/chat.rs",
+            "commands/ctx/handover.rs",
+            "commands/ctx/wrap.rs",
+            "commands/workflow/review.rs",
+        ],
+    ),
+    (
+        "mail",
+        SlugEntry::Directory,
+        &[
+            "commands/ctx/mail.rs",
+            "commands/ctx/sessions.rs",
+            "commands/ctx/hook.rs",
+            "commands/ctx/run_loop.rs",
+            "commands/ctx/dash/pane.rs",
+        ],
+    ),
+    (
+        "handoffs",
+        SlugEntry::Directory,
+        &["commands/ctx/handoff.rs"],
+    ),
+    (
+        "optimize",
+        SlugEntry::Directory,
+        &["commands/ctx/optimize.rs"],
+    ),
+    (
+        "search",
+        SlugEntry::Directory,
+        &["commands/ctx/search.rs", "commands/ctx/search_index.rs"],
+    ),
+    (
+        "workflows",
+        SlugEntry::Directory,
+        &["commands/workflow/engine.rs"],
+    ),
+    (
+        "verification",
+        SlugEntry::Directory,
+        &["commands/workflow/verification.rs"],
+    ),
+    (
+        "artifacts",
+        SlugEntry::Directory,
+        &["commands/workflow/artifact.rs"],
+    ),
+    (
+        "workflow-telemetry",
+        SlugEntry::Directory,
+        &["commands/workflow/telemetry.rs"],
+    ),
+    (
+        "frontend",
+        SlugEntry::Directory,
+        &[
+            "commands/workflow/frontend.rs",
+            "commands/workflow/frontend_detector.rs",
+            "commands/workflow/frontend_render.rs",
+        ],
+    ),
+    (
+        "maintenance",
+        SlugEntry::Directory,
+        &["commands/workflow/maintain.rs"],
+    ),
+    (
+        "diagnostics",
+        SlugEntry::Directory,
+        &["commands/ctx/diagnostics.rs"],
+    ),
+    ("outputs", SlugEntry::Directory, &["commands/ctx/output.rs"]),
+    (
+        "tasks",
+        SlugEntry::Directory,
+        &["commands/ctx/task.rs", "commands/ctx/agent.rs"],
+    ),
+    (
+        "worktrees",
+        SlugEntry::File("", ".jsonl"),
+        &["commands/ctx/worktree.rs"],
+    ),
+    (
+        "objective",
+        SlugEntry::File("", ".json"),
+        &["commands/ctx/objective.rs"],
+    ),
+    (
+        "restart-chains",
+        SlugEntry::File("", ".json"),
+        &["commands/ctx/exec.rs", "commands/ctx/chain.rs"],
+    ),
+    (
+        "probes",
+        SlugEntry::File("", ".json"),
+        &["commands/ctx/adapters/mod.rs"],
+    ),
+    (
+        "dash",
+        SlugEntry::File("roster-", ".json"),
+        &["commands/ctx/dash/mod.rs", "commands/ctx/dash/roster.rs"],
+    ),
+    (
+        "dash",
+        SlugEntry::File("roster-", ".consumed.json"),
+        &["commands/ctx/dash/roster.rs"],
+    ),
+    (
+        "test-baseline",
+        SlugEntry::HomeFile(".json"),
+        &["commands/workflow/verification.rs"],
+    ),
+    (
+        "test-baseline",
+        SlugEntry::HomeFile(".lock"),
+        &["commands/workflow/verification.rs"],
+    ),
+    (
+        "ctx-measure-baseline",
+        SlugEntry::HomeFile(".json"),
+        &["commands/ctx/measure.rs"],
+    ),
+];
+
+// The existence check is only a fast path: another process can create the
+// destination before rename. The OS must enforce no replacement as well.
+fn rename_legacy_entry(source: &Path, target: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+        let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
+        // SAFETY: both C strings remain live for the call, and the flags
+        // request an atomic rename that fails if the destination exists.
+        let result = unsafe {
+            #[cfg(target_vendor = "apple")]
+            {
+                libc::renamex_np(source.as_ptr(), target.as_ptr(), libc::RENAME_EXCL)
+                    as libc::c_long
+            }
+            #[cfg(target_os = "linux")]
+            {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    source.as_ptr(),
+                    libc::AT_FDCWD,
+                    target.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            }
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: both paths are NUL-terminated and live for the call. Zero
+        // flags deliberately omit MOVEFILE_REPLACE_EXISTING.
+        if unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                source.as_ptr(),
+                target.as_ptr(),
+                0,
+            )
+        } != 0
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", windows)))]
+    {
+        let _ = (source, target);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic no-replace repository state migration is unavailable on this platform",
+        ))
+    }
+}
+
+/// Best-effort adoption of the pre-hash buckets; never merges existing state.
+pub(crate) fn adopt_legacy_slug_state(state_dir: &Path, legacy: &str, current: &str) {
+    if legacy == super::memory::GLOBAL_SLUG
+        || current == super::memory::GLOBAL_SLUG
+        || legacy == current
+    {
+        return;
+    }
+    let home = crate::utils::home_dir().ok();
+    let mut moved = false;
+    for &(dir, kind, _) in LEGACY_SLUG_LAYOUTS {
+        let Some(source) = kind.path(state_dir, home.as_deref(), dir, legacy) else {
+            continue;
+        };
+        let Some(target) = kind.path(state_dir, home.as_deref(), dir, current) else {
+            continue;
+        };
+        let rename = || -> std::io::Result<bool> {
+            std::fs::symlink_metadata(&source)?;
+            match std::fs::symlink_metadata(&target) {
+                Ok(_) => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            rename_legacy_entry(&source, &target)?;
+            Ok(true)
+        };
+        match rename() {
+            Ok(renamed) => moved |= renamed,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
+                ) => {}
+            Err(error) => eprintln!(
+                "zirv: could not migrate repository state {} -> {}: {error}",
+                source.display(),
+                target.display()
+            ),
+        }
+    }
+    if moved {
+        eprintln!("zirv: migrated repository state {legacy} -> {current}");
+    }
 }
 
 /// Strips a Windows verbatim path prefix (`\\?\`, or `\\?\UNC\` for a UNC
@@ -69,7 +365,7 @@ pub fn display_path(path: &Path) -> String {
 /// Filesystem-safe form of an adapter's provider slug
 /// (`AgentAdapter::provider`), for the per-provider usage files. Lowercased
 /// first, then every character outside `[a-z0-9-]` replaced with `-`, the
-/// same shape as `repo_slug` above: a provider name is a `&'static str` an
+/// same character set as `repo_slug` above: a provider name is a `&'static str` an
 /// adapter chose, but the rule is what guarantees it can never carry a
 /// separator or a `..` out of the state directory. An empty result (a slug
 /// of nothing but punctuation) becomes `unknown` rather than an empty file
@@ -690,10 +986,13 @@ mod tests {
 
     #[test]
     fn repo_slug_is_filesystem_safe() {
-        assert_eq!(
-            repo_slug(std::path::Path::new("/Users/x/Documents/my repo.git")),
-            "-Users-x-Documents-my-repo-git"
-        );
+        let path = Path::new("/Users/x/Documents/my repo.git");
+        let slug = repo_slug(path);
+        assert!(slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert_eq!(slug, repo_slug(path));
+        let (folded, hash) = slug.rsplit_once('-').expect("hash suffix");
+        assert_eq!(folded, "-Users-x-Documents-my-repo-git");
+        assert_eq!(hash, "61193613");
     }
 
     #[test]
@@ -707,6 +1006,196 @@ mod tests {
                 .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-'),
             "the reserved global slug must contain a character repo_slug never emits"
         );
+    }
+
+    #[test]
+    fn repository_slugs_distinguish_paths_that_fold_to_the_same_stem() {
+        for (left, right) in [
+            ("/x/client_a", "/x/client-a"),
+            ("/x/foo.bar", "/x/foo-bar"),
+            ("/a/b-c", "/a-b/c"),
+        ] {
+            assert_ne!(repo_slug(Path::new(left)), repo_slug(Path::new(right)));
+        }
+    }
+
+    fn legacy_fixture(root: &Path, home: &Path, slug: &str, contents: &str) -> Vec<PathBuf> {
+        LEGACY_SLUG_LAYOUTS
+            .iter()
+            .map(|&(dir, kind, _)| {
+                let path = kind.path(root, Some(home), dir, slug).expect("layout path");
+                let payload = if matches!(kind, SlugEntry::Directory) {
+                    path.join("entry")
+                } else {
+                    path
+                };
+                std::fs::create_dir_all(payload.parent().expect("parent")).expect("mkdir");
+                std::fs::write(&payload, contents).expect("write");
+                payload
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legacy_state_moves_every_layout_once_with_contents_intact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = super::super::testenv::HomeGuard::set(&home);
+        let root = tmp.path().join("state");
+        let sources = legacy_fixture(&root, &home, "legacy", "retained");
+        adopt_legacy_slug_state(&root, "legacy", "current");
+        adopt_legacy_slug_state(&root, "legacy", "current");
+        for (source, &(dir, kind, _)) in sources.iter().zip(LEGACY_SLUG_LAYOUTS) {
+            assert!(!source.exists(), "{}", source.display());
+            let target = kind
+                .path(&root, Some(&home), dir, "current")
+                .expect("target");
+            let payload = if matches!(kind, SlugEntry::Directory) {
+                target.join("entry")
+            } else {
+                target
+            };
+            assert_eq!(std::fs::read_to_string(payload).expect("read"), "retained");
+        }
+    }
+
+    #[test]
+    fn a_destination_created_before_the_rename_is_never_replaced() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for directory in [false, true] {
+            let source = tmp
+                .path()
+                .join(if directory { "old-dir" } else { "old-file" });
+            let target = tmp
+                .path()
+                .join(if directory { "new-dir" } else { "new-file" });
+            if directory {
+                std::fs::create_dir(&source).expect("source");
+                std::fs::create_dir(&target).expect("target");
+            } else {
+                std::fs::write(&source, "old").expect("source");
+                std::fs::write(&target, "current").expect("target");
+            }
+            assert_eq!(
+                rename_legacy_entry(&source, &target)
+                    .expect_err("destination exists")
+                    .kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
+            assert!(source.exists());
+            if !directory {
+                assert_eq!(std::fs::read_to_string(&target).expect("target"), "current");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_state_never_overwrites_an_existing_current_bucket() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = super::super::testenv::HomeGuard::set(&home);
+        let root = tmp.path().join("state");
+        let sources = legacy_fixture(&root, &home, "legacy", "old");
+        let targets = legacy_fixture(&root, &home, "current", "new");
+        adopt_legacy_slug_state(&root, "legacy", "current");
+        for (source, target) in sources.iter().zip(targets) {
+            assert_eq!(std::fs::read_to_string(source).expect("legacy"), "old");
+            assert_eq!(std::fs::read_to_string(target).expect("current"), "new");
+        }
+    }
+
+    #[test]
+    fn legacy_state_migration_never_moves_or_targets_the_global_slug() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = super::super::testenv::HomeGuard::set(&home);
+        let global = super::super::memory::GLOBAL_SLUG;
+        let sources = legacy_fixture(tmp.path(), &home, global, "global");
+        let legacy = legacy_fixture(tmp.path(), &home, "legacy", "repo");
+        adopt_legacy_slug_state(tmp.path(), global, "current");
+        adopt_legacy_slug_state(tmp.path(), "legacy", global);
+        for path in sources {
+            assert_eq!(std::fs::read_to_string(path).expect("global"), "global");
+        }
+        for path in legacy {
+            assert_eq!(std::fs::read_to_string(path).expect("legacy"), "repo");
+        }
+        assert!(!tmp.path().join("memory/current").exists());
+    }
+
+    #[test]
+    fn only_a_repository_adopts_state_even_if_its_slug_was_resolved_before_it_existed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = tmp.path().join("state");
+        let _env = super::super::testenv::VarGuard::set(&[(
+            STATE_ENV,
+            Some(state.to_str().expect("state")),
+        )]);
+        let canonical_root = tmp.path().canonicalize().expect("canonical root");
+        for path in [
+            canonical_root.join("ordinary-directory"),
+            canonical_root.join("missing"),
+        ] {
+            if path.ends_with("ordinary-directory") {
+                std::fs::create_dir(&path).expect("mkdir");
+            }
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let legacy: String = display_path(&canonical)
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            let bank = state.join("memory").join(&legacy);
+            std::fs::create_dir_all(&bank).expect("bank");
+            let slug = repo_slug(&path);
+            assert!(bank.exists());
+            assert!(!state.join("memory").join(&slug).exists());
+            std::fs::create_dir_all(path.join(".git")).expect("repository");
+            let current = repo_slug(&path);
+            assert!(!bank.exists());
+            assert!(state.join("memory").join(current).exists());
+        }
+    }
+
+    #[test]
+    fn every_repo_slug_consumer_is_represented_in_the_migration_layouts() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let consumers: HashSet<&str> = LEGACY_SLUG_LAYOUTS
+            .iter()
+            .flat_map(|(_, _, modules)| modules.iter().copied())
+            .collect();
+        let pattern = regex::Regex::new(r"\brepo_slug\s*\(").expect("regex");
+        let mut pending = vec![root.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).expect("source directory") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let module = path
+                    .strip_prefix(&root)
+                    .expect("relative")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if module != "commands/ctx/state.rs"
+                    && pattern.is_match(&std::fs::read_to_string(&path).expect("source"))
+                {
+                    assert!(
+                        consumers.contains(module.as_str()),
+                        "{module} needs a migration layout or an entry with the bucket it consumes"
+                    );
+                }
+            }
+        }
     }
 
     // -- display_path (issue #101) ---------------------------------------
@@ -734,10 +1223,10 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn repo_slug_matches_claudes_transcript_slug_after_canonicalization() {
+    fn repo_slug_preserves_claudes_transcript_stem_before_the_hash() {
         let repo = crate::commands::ctx::testenv::repo();
         assert_eq!(
-            repo_slug(repo.path()),
+            repo_slug(repo.path()).rsplit_once('-').expect("suffix").0,
             super::super::adapters::claude::project_slug(repo.path())
         );
     }
@@ -771,7 +1260,11 @@ mod tests {
                     '-'
                 });
             }
-            expected
+            let hash: String = Sha256::digest(display_path(&missing).as_bytes())[..4]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("{expected}-{hash}")
         });
     }
 

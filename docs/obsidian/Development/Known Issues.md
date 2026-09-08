@@ -409,7 +409,7 @@ Blocking detector rules are kept to structural accessibility hazards with relati
 
 ## Repository state slugs now canonicalize, and a relocated slug orphans state filed under the old one
 
-**Fixed 2026-08-21 (`fix(ctx): give one repository one state slug`).** `state::repo_slug` now canonicalizes the path before slugging it, so macOS's `/var` → `/private/var` split, or any symlinked checkout, no longer writes one repository's memory/mail/handoffs/workflow state across two different slugs depending on which spelling a given caller happened to pass in.
+**Fixed 2026-08-21 (`fix(ctx): give one repository one state slug`).** `state::repo_slug` now canonicalizes the path before slugging it, so macOS's `/var` → `/private/var` split, or any symlinked checkout, no longer writes one repository's memory/mail/handoffs/workflow state across two different slugs depending on which spelling a given caller happened to pass in. The slug now carries an 8-hex SHA-256 suffix, and a one-shot migration moves legacy canonical-slug buckets to the suffixed name when no current bucket exists.
 
 **Residual: no migration for state filed under the old, non-canonical slug.** A repository whose raw and canonical paths already differed before this fix has real state sitting under the old slug; after upgrading, every reader computes the new canonical slug and simply does not find it — the old directory is not moved, merged, or even flagged as orphaned. There is no cleanup command for it today.
 
