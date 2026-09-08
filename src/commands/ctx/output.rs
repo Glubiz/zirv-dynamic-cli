@@ -178,7 +178,7 @@ pub(crate) struct DisplayScan {
 /// controlled text on its way to an operator's terminal, exactly the threat
 /// `verification::scrub_output` already handles) and capped, so no single
 /// line can dominate the summary.
-fn display_line(raw: &str) -> String {
+pub(crate) fn display_line(raw: &str) -> String {
     let scrubbed = scrub_output(raw).replace(['\n', '\t'], " ");
     let trimmed = scrubbed.trim_end();
     if trimmed.len() <= MAX_LINE_BYTES {
@@ -1058,6 +1058,29 @@ pub(crate) fn summarize_stored(
         &serde_json::to_string(&record)?,
     );
     prune_outputs(dir, KEEP_NEWEST_OUTPUTS);
+
+    // Issue #411: binary safety comes first, ahead of every shaping pass --
+    // a NUL byte or a mostly-replacement-character decode means these are
+    // not text at all, and no summary (line-based or JSON) is ever built
+    // from them.
+    if output_shape::sniff_is_binary(path) {
+        return Ok((record, None));
+    }
+
+    // Issue #411: a bracket-shaped stored output is tried as JSON before the
+    // line-based scan -- a minified document is one line, so head/tail is
+    // the wrong shape for it. Falls through to the ordinary summary on
+    // anything that is not this shape, does not parse, or does not fit.
+    if let Some(summary) = output_shape::try_json_summary(
+        id,
+        &command.join(" "),
+        exit_code,
+        path,
+        scan.total_lines,
+        max_summary_bytes,
+    ) {
+        return Ok((record, Some(summary)));
+    }
 
     let summary = render_summary(
         id,
@@ -2486,5 +2509,71 @@ mod tests {
         .expect("a summary");
         assert!(!failing.contains("nothing flagged"), "{failing}");
         assert!(failing.contains("Compiling"), "{failing}");
+    }
+
+    // -- Issue #411: JSON-aware summary + binary safety ---------------------
+
+    /// A large `gh api`-style JSON array is summarized structurally rather
+    /// than cut as a line-based head/tail, which would hand back an
+    /// unparsable fragment of what is really a single minified line.
+    #[test]
+    fn a_large_json_array_is_captured_as_a_bounded_structural_summary() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let items: Vec<serde_json::Value> = (0..1000)
+            .map(|i| {
+                serde_json::json!({"id": i, "title": format!("issue number {i}"), "state": "open"})
+            })
+            .collect();
+        let raw = serde_json::to_string(&serde_json::Value::Array(items)).expect("json");
+        assert!(raw.len() > 40_000, "{}", raw.len());
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &[
+                "gh".to_string(),
+                "api".to_string(),
+                "/repos/x/y/issues".to_string(),
+            ],
+            Some(0),
+            &raw,
+            4096,
+        )
+        .expect("capture");
+        let summary = summary.expect("a structural summary");
+        assert!(summary.len() <= 4096, "{} bytes", summary.len());
+        assert!(summary.contains("json summary:"), "{summary}");
+        assert!(summary.contains("more"), "{summary}");
+        assert!(summary.len() < raw.len(), "{summary}");
+    }
+
+    /// A small JSON document is left untouched -- never-worse applies to the
+    /// JSON path exactly as it does to the line-based one.
+    #[test]
+    fn a_small_json_object_is_captured_untouched() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let raw = serde_json::json!({"ok": true, "count": 3, "name": "small"}).to_string();
+        let (_, summary) =
+            capture_text(&state, &repo, &["gh".to_string()], Some(0), &raw, 4096).expect("capture");
+        assert!(
+            summary.is_none(),
+            "a tiny document must not gain a summary: {raw}"
+        );
+    }
+
+    /// Binary output (a NUL byte, as any binary format carries) is never
+    /// replaced with a summary, line-based or structural.
+    #[test]
+    fn binary_output_is_never_replaced_with_a_summary() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let mut raw = String::from("cargo build\n");
+        raw.push('\0');
+        raw.push_str(&"line ".repeat(2000));
+        let (_, summary) = capture_text(&state, &repo, &["cat".to_string()], Some(0), &raw, 4096)
+            .expect("capture");
+        assert!(summary.is_none(), "binary output must never be summarized");
     }
 }
