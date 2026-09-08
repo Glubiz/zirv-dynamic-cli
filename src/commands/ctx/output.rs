@@ -936,7 +936,7 @@ pub(crate) fn summarize_stored(
     // `test result:`/`Summary [...]` line was seen anywhere in the full
     // stream. Never a second implementation of either; see this module's own
     // doc comment.
-    let (_, read_errored, failures, summary_seen, _) = match std::fs::File::open(path) {
+    let (tail_bytes, read_errored, failures, summary_seen, _) = match std::fs::File::open(path) {
         Ok(file) => read_capped_tail_and_scan(file, MAX_FAILURE_OUTPUT_BYTES),
         Err(_) => (
             Vec::new(),
@@ -955,6 +955,23 @@ pub(crate) fn summarize_stored(
         },
     };
     scan.read_error |= read_errored;
+
+    // Issue #413: a known test family's own structural shape (a pytest
+    // `FAILED path::test - message` line, a jest/vitest bullet, a go
+    // `--- FAIL:` block) replaces the generic diagnostic blocks above with
+    // exact failing-test names and locations, over the SAME bounded tail
+    // Pass 1 already retained -- never a third read of a potentially huge
+    // log. Declines (leaving `scan.failures` untouched) for anything that is
+    // not a confirmed match, so an unrecognised producer or a compile error
+    // before any test ran still gets the generic scan's own answer.
+    if scope == CompactionScope::Known
+        && let Some(family) =
+            super::testrun::extract(&command.join(" "), &String::from_utf8_lossy(&tail_bytes))
+    {
+        scan.failures = family.failure_blocks();
+        scan.failures_truncated = family.truncated;
+        scan.summaries.push(family.summary_line());
+    }
 
     let record = OutputRecord {
         schema_version: OUTPUT_SCHEMA_VERSION,

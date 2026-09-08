@@ -6340,6 +6340,88 @@ mod tests {
         );
     }
 
+    /// Issue #413 end to end: a `pytest` result over the compaction
+    /// threshold gets the family extractor's exact names and locations
+    /// (`testrun::extract_pytest`), not the generic scan's diagnostic-line
+    /// guesswork.
+    #[test]
+    fn posttool_compacts_a_pytest_failure_with_names_and_locations() {
+        let rig = posttool_rig(&[]);
+        let mut output: String = (1..=400)
+            .map(|i| format!("collecting item {i}\n"))
+            .collect();
+        output.push_str(
+            "=========================== short test summary info ===========================\n",
+        );
+        output.push_str("FAILED test_foo.py::test_alpha - AssertionError: 1 != 2\n");
+        output.push_str(
+            "========================= 1 failed, 400 passed in 1.2s =========================\n",
+        );
+        assert!(output.len() >= 4096, "{}", output.len());
+
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "pytest -q",
+                serde_json::json!({
+                    "stdout": output,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let summary = parsed["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .expect("a summary");
+        assert!(summary.contains("test_foo.py::test_alpha"), "{summary}");
+        assert!(summary.contains("test_foo.py"), "{summary}");
+        assert!(summary.contains("AssertionError: 1 != 2"), "{summary}");
+    }
+
+    /// Issue #413, "green is never red": a clean `pytest` run past the
+    /// compaction threshold must never surface a failure block, even though
+    /// the generic scan's own diagnostic heuristic (`error:`/`warning:`)
+    /// never runs a pytest-specific check to rule that out on its own.
+    #[test]
+    fn posttool_never_reports_a_clean_pytest_run_as_red() {
+        let rig = posttool_rig(&[]);
+        let mut output: String = (1..=400)
+            .map(|i| format!("test_foo.py::test_{i} PASSED\n"))
+            .collect();
+        output.push_str(
+            "============================== 400 passed in 1.2s ===============================\n",
+        );
+        assert!(output.len() >= 4096, "{}", output.len());
+
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "pytest -q",
+                serde_json::json!({
+                    "stdout": output,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let summary = parsed["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .expect("a summary");
+        assert!(
+            !summary.to_ascii_uppercase().contains("FAILED"),
+            "a clean pytest run must never be reported red: {summary}"
+        );
+        assert!(summary.contains("all tests passed"), "{summary}");
+    }
+
     /// Review finding 6b/6c: a modelled build/test family is compacted from
     /// the low threshold, because the summary provably keeps the lines that
     /// matter; an unrecognised producer only past the much higher generic

@@ -74,6 +74,7 @@ pub mod supervise;
 pub mod surface;
 pub mod task;
 pub mod term;
+pub(crate) mod testrun;
 pub mod transcript_source;
 pub mod usage;
 pub mod window;
