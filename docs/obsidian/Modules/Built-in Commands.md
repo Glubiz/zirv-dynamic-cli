@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-07
+last-verified: 2026-09-08
 ---
 
 # Built-in Commands
@@ -35,6 +35,8 @@ The complete set of `zirv ctx <verb>` names, kept in sync with `CtxVerb` (`src/c
 | `ZCHK-FORBIDDEN-WIDENING` | every `ctx.toml` key `config.rs`'s `ENV_MAP` enumerates is `REPO_FORBIDDEN` or on an explicit narrow-only allow-list | `forbidden.rs` |
 | `ZCHK-UNIX-TESTS-DOC` | `wrap.rs`'s `#[cfg(unix)]` test count matches what the paragraph of `Known Issues.md` discussing `#[cfg(unix)]` states, or that doc points at this check instead | `docs.rs` |
 | `ZCHK-DOC-VERBS` | the ctx verbs above match the real clap tree, in both directions | `docs.rs` |
+| `ZCHK-DOC-EXIT-CODES` | README supervised exit codes match `exec::EXIT_CODES`, in both directions | `docs.rs` |
+| `ZCHK-DOC-RESERVED` | README reserved names and aliases match `utils::RESERVED_COMMANDS`, in both directions | `docs.rs` |
 | `ZCHK-DECISION-GRAPH` | `Decision Log.md`'s `**Supersedes:**` links resolve and contain no cycle | `decision_graph.rs` |
 | `ZCHK-HOOK-WINDOWS` | every hook command `zirv setup apply` installs is a plain `zirv ...` invocation, no bash-only syntax | `hooks.rs` |
 | `ZCHK-EOL-PINS` | `.gitattributes` still carries issue #247's anchored EOL pins | `eol.rs` |

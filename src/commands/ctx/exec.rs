@@ -63,6 +63,17 @@ pub const EXIT_WRITER_BUSY: i32 = 80;
 /// class rather than folding it into `crash`.
 pub const EXIT_STALLED: i32 = 81;
 
+/// Supervisor-owned exit codes, shared with the README completeness check.
+pub(crate) const EXIT_CODES: &[(i32, &str)] = &[
+    (EXIT_ROT_EXHAUSTED, "EXIT_ROT_EXHAUSTED"),
+    (EXIT_TIMEOUT, "EXIT_TIMEOUT"),
+    (EXIT_BUDGET_EXHAUSTED, "EXIT_BUDGET_EXHAUSTED"),
+    (EXIT_CAPACITY_EXHAUSTED, "EXIT_CAPACITY_EXHAUSTED"),
+    (EXIT_ACCOUNT_EXHAUSTED, "EXIT_ACCOUNT_EXHAUSTED"),
+    (EXIT_WRITER_BUSY, "EXIT_WRITER_BUSY"),
+    (EXIT_STALLED, "EXIT_STALLED"),
+];
+
 /// The supervisor reports its own outcomes through the same `i32` an agent's
 /// exit code arrives on, so "exited with code 75" reads as something the
 /// agent did rather than as zirv giving up. Shared by `zirv ctx agent`

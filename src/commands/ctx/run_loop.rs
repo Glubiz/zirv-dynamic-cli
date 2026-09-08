@@ -850,7 +850,14 @@ pub(crate) fn run_with_clock<W: Write>(
             session.as_str(),
             parent_short.as_deref(),
             &mut objective_progress,
-        ) {
+        )
+        .unwrap_or_else(|step| {
+            let _ = writeln!(
+                w,
+                "zirv ctx loop: unexpected objective step {step:?}; continuing"
+            );
+            ObjectiveOutcome::Continue
+        }) {
             ObjectiveOutcome::Inactive | ObjectiveOutcome::Continue => {}
             ObjectiveOutcome::Stop(code) => {
                 if let Some(guard) = session_guard.as_mut() {
@@ -1106,11 +1113,11 @@ fn evaluate_objective_after_cycle<W: Write>(
     session: &str,
     parent_short: Option<&str>,
     progress: &mut ObjectiveProgress,
-) -> ObjectiveOutcome {
+) -> Result<ObjectiveOutcome, Step> {
     let key = super::state::repo_slug(repo);
     let record = match objective::load(state, &key) {
         Ok(Some(record)) if record.status == objective::Status::Active => record,
-        _ => return ObjectiveOutcome::Inactive,
+        _ => return Ok(ObjectiveOutcome::Inactive),
     };
 
     let mut gate_outcome = GateOutcome::Green;
@@ -1177,15 +1184,15 @@ fn evaluate_objective_after_cycle<W: Write>(
             let _ = objective::store(state, &key, &updated);
             log_decision("n/a", "objective-gate-red", &note);
             let _ = writeln!(w, "zirv ctx loop: objective gate red: {note}");
-            ObjectiveOutcome::Continue
+            Ok(ObjectiveOutcome::Continue)
         }
         Step::StopNoProgress => {
             log_decision("n/a", "objective-no-progress", "gave up: no progress");
-            ObjectiveOutcome::Stop(EXIT_OBJECTIVE_NO_PROGRESS)
+            Ok(ObjectiveOutcome::Stop(EXIT_OBJECTIVE_NO_PROGRESS))
         }
         Step::Continue => {
             clear_pending_note();
-            ObjectiveOutcome::Continue
+            Ok(ObjectiveOutcome::Continue)
         }
         Step::RunJudge => {
             let model = handoff::resolve_distiller_model(cfg.handoff.model.as_deref(), adapter);
@@ -1212,7 +1219,7 @@ fn evaluate_objective_after_cycle<W: Write>(
                     "judge call failed or its answer did not parse",
                 );
                 clear_pending_note();
-                return ObjectiveOutcome::Continue;
+                return Ok(ObjectiveOutcome::Continue);
             };
             clear_pending_note();
             match judge::next_step(
@@ -1228,7 +1235,7 @@ fn evaluate_objective_after_cycle<W: Write>(
                         Ok(true) => {
                             log_decision("done", "objective-done", &reason);
                             let _ = writeln!(w, "zirv ctx loop: objective done -- {reason}");
-                            ObjectiveOutcome::Stop(0)
+                            Ok(ObjectiveOutcome::Stop(0))
                         }
                         _ => {
                             // The fresh-and-passing precondition refused (or
@@ -1239,7 +1246,7 @@ fn evaluate_objective_after_cycle<W: Write>(
                                 "objective-close-refused",
                                 "no fresh, passing final verification; continuing",
                             );
-                            ObjectiveOutcome::Continue
+                            Ok(ObjectiveOutcome::Continue)
                         }
                     }
                 }
@@ -1265,25 +1272,21 @@ fn evaluate_objective_after_cycle<W: Write>(
                     }
                     log_decision("blocked", "objective-blocked", &reason);
                     let _ = writeln!(w, "zirv ctx loop: objective blocked -- {reason}");
-                    ObjectiveOutcome::Stop(EXIT_OBJECTIVE_BLOCKED)
+                    Ok(ObjectiveOutcome::Stop(EXIT_OBJECTIVE_BLOCKED))
                 }
                 Step::Park(wait_on) => {
                     log_decision("wait", "objective-park", &reason);
-                    ObjectiveOutcome::Park(wait_on)
+                    Ok(ObjectiveOutcome::Park(wait_on))
                 }
-                Step::Continue => ObjectiveOutcome::Continue,
+                Step::Continue => Ok(ObjectiveOutcome::Continue),
                 Step::StopNoProgress => {
                     log_decision("n/a", "objective-no-progress", "gave up: no progress");
-                    ObjectiveOutcome::Stop(EXIT_OBJECTIVE_NO_PROGRESS)
+                    Ok(ObjectiveOutcome::Stop(EXIT_OBJECTIVE_NO_PROGRESS))
                 }
-                Step::RunJudge | Step::InjectFailure(_) => {
-                    unreachable!("a green gate's second-stage next_step never re-requests either")
-                }
+                step @ (Step::RunJudge | Step::InjectFailure(_)) => Err(step),
             }
         }
-        Step::Close(_) | Step::StopBlocked(_) | Step::Park(_) => {
-            unreachable!("the first-stage next_step call (verdict: None) never returns these")
-        }
+        step @ (Step::Close(_) | Step::StopBlocked(_) | Step::Park(_)) => Err(step),
     }
 }
 
