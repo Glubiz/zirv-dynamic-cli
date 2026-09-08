@@ -2266,13 +2266,12 @@ mod tests {
     }
 
     /// Where `ClaudeAdapter::transcript_path` computes this session's
-    /// transcript under a test `HOME`: `~/.claude/projects/<repo slug>/`,
-    /// which uses the same character rule as `state::repo_slug`.
+    /// transcript under a test `HOME`: `~/.claude/projects/<project slug>/`.
     fn claude_transcript(home: &Path, repo: &Path, session: &str) -> PathBuf {
         let dir = home
             .join(".claude")
             .join("projects")
-            .join(super::super::state::repo_slug(repo));
+            .join(super::super::adapters::claude::project_slug(repo));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir.join(format!("{session}.jsonl"))
     }

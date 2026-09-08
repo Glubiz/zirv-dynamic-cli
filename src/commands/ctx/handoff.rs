@@ -2756,7 +2756,7 @@ mod tests {
         let repo = std::path::Path::new("/work/my-repo");
 
         let path = store(&state, repo, "11111111-2222", &sample()).expect("store");
-        assert!(path.starts_with(state.handoffs().join("-work-my-repo")));
+        assert!(path.starts_with(state.handoffs().join(repo_slug(repo))));
         assert_eq!(path.extension().and_then(|e| e.to_str()), Some("md"));
 
         let text = std::fs::read_to_string(&path).expect("read");
@@ -2799,7 +2799,7 @@ mod tests {
         let repo = std::path::Path::new("/work/my-repo");
         state.ensure().expect("ensure");
 
-        let dir = state.handoffs().join("-work-my-repo");
+        let dir = state.handoffs().join(repo_slug(repo));
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("1700000000-aaaa.md"),
