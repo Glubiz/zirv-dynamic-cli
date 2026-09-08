@@ -1866,6 +1866,12 @@ pub struct PreToolInput {
     /// `MultiEdit`'s own list of edits (issue #406), each with the same
     /// `old_string`/`new_string` pair a single `Edit` carries.
     pub edits: Vec<PreToolEdit>,
+    /// `Bash`'s own command line (issue #419): the text the bare-`git log`
+    /// rewrite reads to build `updatedInput`. Every other tool's `tool_input`
+    /// simply never carries this key, so the zero default is never mistaken
+    /// for a real (empty) `Bash` command -- `run_pretool_bash_rewrite` is
+    /// only ever reached when `payload.tool_name == "Bash"`.
+    pub command: String,
 }
 
 /// One entry of `MultiEdit`'s `edits` array (issue #406). `#[serde(default)]`
@@ -2254,6 +2260,142 @@ fn pretool_advise_output(note: &str) -> String {
     .to_string()
 }
 
+/// The documented PreToolUse rewrite envelope (issue #419): the same `allow`
+/// shape [`pretool_advise_output`] prints, plus `updatedInput` -- claude
+/// replaces its own `tool_input` with this object before running the tool,
+/// rather than the one the model actually proposed. Only ever emitted for a
+/// `Bash` command the safety layer ([`super::safety::evaluate`]) already
+/// classifies as a plain, unconditional `Allow`: never for anything it would
+/// ask about or deny (see `run_pretool_bash_rewrite`'s own call site, the
+/// only place that builds this envelope). `reason` doubles as both channels
+/// a caller might otherwise need: it is the only place this envelope has to
+/// say anything at all, since the guards that produce a separate
+/// `additionalContext` note (the orchestrator-write advisory, the issue
+/// #406 reuse probe) are scoped to [`FILE_MODIFICATION_TOOLS`] and can never
+/// fire on the same `Bash` call this envelope answers.
+fn pretool_rewrite_output(command: &str, reason: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": reason,
+            "updatedInput": { "command": command }
+        }
+    })
+    .to_string()
+}
+
+// -- PreToolUse: the bare `git log` rewrite (issue #419) -------------------
+
+/// Whether `token` already limits a `git log` invocation: `-n`, `--max-
+/// count`/`--max-count=<N>`, or a bare `-<digits>` count flag (`-3`, `-10`).
+/// `--oneline` and every other formatting flag do NOT count -- issue #419's
+/// bare-`git log` rule is about the absence of a limit, not the absence of
+/// flags altogether.
+fn is_git_log_limit_flag(token: &str) -> bool {
+    token == "-n"
+        || token == "--max-count"
+        || token.starts_with("--max-count=")
+        || (token.len() > 1
+            && token.starts_with('-')
+            && token[1..].bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Issue #419: appends ` -n 50` to `command` when the WHOLE trimmed command
+/// is one bare `git log` invocation -- `git`/`log` as its first two tokens,
+/// no [`is_git_log_limit_flag`] token anywhere in it, and none of `|`, `>`,
+/// `;`, `&&`, `||` at all -- so an orchestrator's habitual unbounded
+/// `git log` does not dump the whole history into a transcript. Returns
+/// `None` for anything else, including a compound command (`cd x && git
+/// log`): deliberately not a general shell splitter -- this codebase
+/// already has two of those (`safety::split_segments`, `safety::
+/// split_segments_with_pipe_marker`) -- a chained or redirected command is
+/// simply left alone rather than picked apart to rewrite one piece of it.
+fn rewrite_bare_git_log(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.contains(['|', '>', ';']) || trimmed.contains("&&") || trimmed.contains("||") {
+        return None;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    if tokens.next() != Some("git") || tokens.next() != Some("log") {
+        return None;
+    }
+    if tokens.any(is_git_log_limit_flag) {
+        return None;
+    }
+    Some(format!("{trimmed} -n 50"))
+}
+
+/// Issue #419's whole `Bash` decision, independent of every guard above and
+/// below: rewrites exactly one shape (a bare `git log`) via `updatedInput`,
+/// and never denies or advises. `Bash` is not a [`FILE_MODIFICATION_TOOLS`]
+/// entry, so the orchestrator-write guard and the issue #406 reuse probe
+/// never see this call at all -- this function is the entirety of what
+/// `run_pretool` does for `Bash`.
+///
+/// Fails open on every path, matching every other guard in this file: an
+/// empty or unrewritable command, an unresolvable `cwd`, or a command the
+/// safety layer does not classify as a plain, unconditional `Allow` all
+/// print nothing, and the `Bash` call proceeds through claude's ordinary
+/// permission flow untouched. The safety check uses `LaunchMode::Headless`
+/// -- the stricter of the two defaults -- because this payload carries no
+/// `permission_mode` field (that lives only in `safety.rs`'s own hook
+/// payload), so there is no in-band signal here that a human is watching to
+/// answer an `Ask` verdict.
+fn run_pretool_bash_rewrite<W: Write>(
+    w: &mut W,
+    payload: &PreToolPayload,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let command = payload.tool_input.command.trim();
+    if command.is_empty() {
+        return Ok(0);
+    }
+    let Some(rewritten) = rewrite_bare_git_log(command) else {
+        return Ok(0);
+    };
+    let cwd = if !payload.cwd.is_empty() {
+        PathBuf::from(&payload.cwd)
+    } else {
+        let Ok(cwd) = std::env::current_dir() else {
+            return Ok(0);
+        };
+        cwd
+    };
+    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    let outcome =
+        super::safety::evaluate(&cfg.safety, command, super::adapters::LaunchMode::Headless);
+    if outcome.verdict != super::safety::Verdict::Allow {
+        return Ok(0);
+    }
+
+    let reason =
+        format!("zirv rewrite: bare `git log` capped at 50 entries (`{command}` -> `{rewritten}`)");
+    let _ = writeln!(w, "{}", pretool_rewrite_output(&rewritten, &reason));
+
+    // Best-effort, matching every other decision log write on this path: a
+    // row that fails to write costs an operator one audit-log entry, never a
+    // hook failure.
+    if let Ok(state) = StateDir::resolve(env) {
+        let session =
+            super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+        let _ = log::append(
+            &state,
+            &log::Decision {
+                ts: now_secs(),
+                session: &session,
+                verb: "hook",
+                verdict: "n/a",
+                score: 0,
+                action: "rewrite",
+                detail: &format!("{command} -> {rewritten}"),
+                observed_at: None,
+            },
+        );
+    }
+    Ok(0)
+}
+
 /// Runs three independent guards against the same payload: the expensive-seat
 /// subagent guard above (gated on `SEAT_MODEL_ENV`) and the orchestrator-
 /// write guard below (gated on `SEAT_ROLE_ENV`, issue #334) -- an
@@ -2281,6 +2423,14 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     {
         let _ = writeln!(w, "{}", pretool_output(&reason));
         return Ok(0);
+    }
+
+    // Issue #419: a `Bash` call gets its own, much narrower treatment --
+    // see `run_pretool_bash_rewrite`'s own doc comment -- and never falls
+    // through to the orchestrator-write guard below, which only ever looks
+    // at `FILE_MODIFICATION_TOOLS` and would not recognize `Bash` anyway.
+    if payload.tool_name == "Bash" {
+        return run_pretool_bash_rewrite(w, &payload, env);
     }
 
     if !FILE_MODIFICATION_TOOLS.contains(&payload.tool_name.as_str()) {
@@ -7033,6 +7183,196 @@ mod tests {
             "every write is logged regardless of whether the note surfaced: {rows:?}"
         );
         assert!(rows.iter().all(|row| row.outcome == "advised"));
+    }
+
+    // -- PreToolUse: the bare `git log` rewrite (issue #419) ----------------
+
+    fn bash_pretool_stdin(cwd: &str, command: &str) -> String {
+        orchestrator_pretool_stdin(
+            cwd,
+            "claude-session-id",
+            "Bash",
+            serde_json::json!({"command": command}),
+        )
+    }
+
+    /// End to end: an unlimited `git log` gets `-n 50` appended via
+    /// `updatedInput`, and the reason names the rewrite.
+    #[test]
+    fn run_pretool_rewrites_a_bare_git_log_with_a_cap() {
+        let repo = orchestrator_repo();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.path().display().to_string(), "git log"),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["updatedInput"]["command"],
+            "git log -n 50"
+        );
+        assert!(
+            parsed["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rewrite"),
+            "got {parsed}"
+        );
+    }
+
+    /// A `git log` that already names its own limit -- `-n`, `--max-count=`,
+    /// or a bare `-<digits>` -- is left completely untouched: no output at
+    /// all, since nothing else can fire for a `Bash` call.
+    #[test]
+    fn run_pretool_leaves_an_already_limited_git_log_alone() {
+        let repo = orchestrator_repo();
+        for command in ["git log -n 5", "git log --max-count=3", "git log -3"] {
+            let mut out = Vec::new();
+            let code = run_pretool(
+                &mut out,
+                &bash_pretool_stdin(&repo.path().display().to_string(), command),
+                &|_| None,
+            )
+            .expect("never errors");
+            assert_eq!(code, 0);
+            assert!(
+                out.is_empty(),
+                "{command} already names its own limit, so no updatedInput: {out:?}"
+            );
+        }
+    }
+
+    /// A piped `git log` is left alone entirely -- the author already shaped
+    /// its output, so the whole command is skipped rather than only the
+    /// `git log` part.
+    #[test]
+    fn run_pretool_leaves_a_piped_git_log_alone() {
+        let repo = orchestrator_repo();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.path().display().to_string(), "git log | head"),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a pipe means the author already shaped the output: {out:?}"
+        );
+    }
+
+    /// A compound command is left alone entirely, even when one of its parts
+    /// is a bare `git log` -- the rewrite only ever fires when the WHOLE
+    /// trimmed command is a single `git log` invocation, never a piece of a
+    /// chain.
+    #[test]
+    fn run_pretool_leaves_a_compound_git_log_alone() {
+        let repo = orchestrator_repo();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.path().display().to_string(), "git log && ls"),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a compound command is not picked apart to rewrite one piece of it: {out:?}"
+        );
+    }
+
+    /// A denied command -- the expensive-seat guard's fork denial, and the
+    /// orchestrator-write guard's edit denial -- never carries `updatedInput`
+    /// alongside its deny envelope.
+    #[test]
+    fn run_pretool_never_attaches_updated_input_to_a_denied_command() {
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
+            "fable".to_string(),
+        )]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin(
+                "Agent",
+                serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"}),
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            parsed["hookSpecificOutput"].get("updatedInput").is_none(),
+            "a fork denial must never carry updatedInput: {parsed}"
+        );
+
+        let repo = orchestrator_repo();
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+                "deny".to_string(),
+            ),
+        ]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &edit_payload_stdin(repo.path(), "src/x.rs"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            parsed["hookSpecificOutput"].get("updatedInput").is_none(),
+            "an orchestrator-write denial must never carry updatedInput: {parsed}"
+        );
+    }
+
+    /// The decision-log row for a rewrite records BOTH the original and the
+    /// rewritten command, action `"rewrite"`.
+    #[test]
+    fn run_pretool_rewrite_logs_the_original_and_rewritten_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = orchestrator_repo();
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.path().display().to_string(), "git log"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(!out.is_empty());
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log written");
+        assert!(log.contains("\"action\":\"rewrite\""), "got {log}");
+        assert!(log.contains("git log -> git log -n 50"), "got {log}");
     }
 
     // -- the seat env the orchestrator exports ------------------------------
