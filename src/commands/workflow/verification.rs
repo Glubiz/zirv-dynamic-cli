@@ -430,25 +430,41 @@ fn git_root(repo: &Path) -> PathBuf {
     }
 }
 
-/// `-c core.quotePath=false`: with the default on, git escapes any non-ASCII
-/// path into `"\303\244..."`, which no later `hash-object`/pattern match can
-/// resolve back to the real file.
 fn git_at(repo: &Path) -> Command {
     let mut command = Command::new("git");
+    command.arg("-C").arg(repo);
     command
-        .arg("-c")
-        .arg("core.quotePath=false")
-        .arg("-C")
-        .arg(repo);
-    command
+}
+
+fn git_paths(stdout: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
+    stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                PathBuf::from(std::ffi::OsStr::from_bytes(path))
+            }
+            #[cfg(not(unix))]
+            {
+                PathBuf::from(String::from_utf8_lossy(path).as_ref())
+            }
+        })
 }
 
 pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
     let root = git_root(repo);
     let mut paths = Vec::new();
     for args in [
-        &["diff", "--name-only", "HEAD"][..],
-        &["ls-files", "--others", "--exclude-standard", "--full-name"][..],
+        &["diff", "--name-only", "-z", "HEAD"][..],
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+        ][..],
     ] {
         let output = git_at(&root).args(args).output()?;
         if !output.status.success() {
@@ -459,10 +475,7 @@ pub fn changed_paths(repo: &Path) -> CtxResult<Vec<PathBuf>> {
             .into());
         }
         paths.extend(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(PathBuf::from)
+            git_paths(&output.stdout)
                 // #229/#232: the workflow's own `.zirv/work/<id>/*` artifacts
                 // (plans, execute-plan pages, raw review salvage) are not the
                 // operator's change surface. Left in, an edit to one of them
@@ -492,9 +505,15 @@ pub fn changed_paths_since_base(repo: &Path) -> CtxResult<Vec<PathBuf>> {
         .map_err(|err| format!("cannot inspect changed paths: {err}"))?;
     let mut paths = Vec::new();
     for args in [
-        &["diff", "--name-only", base.as_str()][..],
-        &["diff", "--name-only", "HEAD"][..],
-        &["ls-files", "--others", "--exclude-standard", "--full-name"][..],
+        &["diff", "--name-only", "-z", base.as_str()][..],
+        &["diff", "--name-only", "-z", "HEAD"][..],
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+        ][..],
     ] {
         let output = git_at(&root).args(args).output()?;
         if !output.status.success() {
@@ -505,10 +524,7 @@ pub fn changed_paths_since_base(repo: &Path) -> CtxResult<Vec<PathBuf>> {
             .into());
         }
         paths.extend(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(PathBuf::from)
+            git_paths(&output.stdout)
                 .filter(|path: &PathBuf| !super::classify::is_workflow_work_path(path)),
         );
     }
@@ -3496,6 +3512,44 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn verify_reruns_after_editing_a_quoted_name_file() {
+        let repo = git_repo();
+        std::fs::write(repo.path().join("quoted\"name.txt"), "one\n").unwrap();
+        let state_root = tempdir().unwrap();
+        let marker_dir = tempdir().unwrap();
+        let marker = marker_dir.path().join("unit.marker");
+        write_verify_toml(
+            repo.path(),
+            &format!(
+                "schema_version=1\n[[checks]]\nid='unit'\nkind='unit'\ncommand='{}'\n",
+                counting_command(&marker)
+            ),
+        );
+        with_state(state_root.path(), || {
+            let changed = run_mode(repo.path(), VerificationMode::Changed, &[], false).unwrap();
+            persist(&changed, repo.path(), VerificationMode::Changed).unwrap();
+            assert_eq!(ran_count(&marker), 1);
+
+            std::fs::write(repo.path().join("quoted\"name.txt"), "two\n").unwrap();
+            let verify = run_mode(repo.path(), VerificationMode::Final, &[], false).unwrap();
+            assert_eq!(
+                ran_count(&marker),
+                2,
+                "a moved fingerprint must force a real rerun"
+            );
+            assert!(
+                !verify
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("reused test evidence")),
+                "got {:?}",
+                verify.notes
+            );
+        });
+    }
+
     /// Reuse is per-check, by id: a check the changed run never selected
     /// (here, `final_check`-only) must still execute during `verify`, even
     /// though the fingerprint matches and a sibling check is reused.
@@ -3698,6 +3752,55 @@ mod tests {
             before,
             "an ordinary untracked file must still move the fingerprint"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_paths_preserves_c_quoted_names() {
+        let repo = git_repo();
+        let mut names: Vec<PathBuf> = ["quoted\"name.txt", "back\\slash.txt", "line\nbreak.txt"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        names.sort();
+        for name in &names {
+            std::fs::write(repo.path().join(name), "one\n").unwrap();
+        }
+        assert_eq!(changed_paths(repo.path()).unwrap(), names);
+        assert_eq!(changed_paths_since_base(repo.path()).unwrap(), names);
+        assert!(
+            git_at(repo.path())
+                .args(["add", "--all"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(changed_paths(repo.path()).unwrap(), names);
+        assert_eq!(changed_paths_since_base(repo.path()).unwrap(), names);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_paths_preserves_non_utf8_filename_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let paths: Vec<_> = git_paths(b"non-utf8-\xff.txt\0").collect();
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(std::ffi::OsStr::from_bytes(
+                b"non-utf8-\xff.txt"
+            ))]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn change_fingerprint_moves_when_a_quoted_name_file_is_edited() {
+        let repo = git_repo();
+        let path = repo.path().join("quoted\"name.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let before = change_fingerprint(repo.path()).unwrap();
+        std::fs::write(&path, "two\n").unwrap();
+        assert_ne!(change_fingerprint(repo.path()).unwrap(), before);
     }
 
     /// #251: after a workflow step commits its edits, `changed_paths`
@@ -5364,6 +5467,8 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     /// previous failed attempt" here.
     #[test]
     fn last_failure_fingerprint_is_none_when_the_only_failure_is_baselined() {
+        let home = tempdir().unwrap();
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(home.path());
         let repo = git_repo();
         let state_root = tempdir().unwrap();
         let state = StateDir::from_root(state_root.path().to_path_buf());

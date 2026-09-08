@@ -437,11 +437,11 @@ fn allocate_worktree(
 /// [`Archived`]: ReclaimOutcome::Archived
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReclaimOutcome {
-    /// Every probe (`ahead`/`dirty`/`cherry`) came back clean and `git
-    /// worktree remove` (no `--force`) succeeded -- the directory is gone,
-    /// but the branch survives untouched.
+    /// Every probe allowed removal; only ignored regenerable build output
+    /// may have remained. `git worktree remove` (no `--force`) succeeded,
+    /// and the branch survives untouched.
     Removed,
-    /// The tree carried only untracked content, which was copied to the
+    /// The tree carried untracked or ignored content, which was copied to the
     /// returned archive directory before the tree was removed.
     Archived(PathBuf),
     /// Issue #319: `worktree::decide` refused -- an unpushed commit, tracked
@@ -484,8 +484,10 @@ pub(crate) fn reclaim_worktree(state: &StateDir, repo: &Path, path: &Path) -> Re
         };
     };
     match worktree::prune_one(state, repo, &repo_slug, path, &record.base_commit) {
-        worktree::PruneOutcome::Removed => ReclaimOutcome::Removed,
-        worktree::PruneOutcome::Archived(dest) => ReclaimOutcome::Archived(dest),
+        worktree::PruneOutcome::Removed | worktree::PruneOutcome::RemovedWithSkipped(_) => {
+            ReclaimOutcome::Removed
+        }
+        worktree::PruneOutcome::Archived { dest, .. } => ReclaimOutcome::Archived(dest),
         worktree::PruneOutcome::Kept(reason) => ReclaimOutcome::InspectionFailed {
             probe: reason.probe,
             note: reason.note,
@@ -527,13 +529,13 @@ fn reclaim_worktree_and_report(state: &StateDir, repo: &Path, path: &Path) {
     match reclaim_worktree(state, repo, path) {
         ReclaimOutcome::Removed => {
             eprintln!(
-                "--worktree {}: clean, reclaimed; branch {short} keeps the worker's commits",
+                "--worktree {}: reclaimed; branch {short} keeps the worker's commits",
                 path.display()
             );
         }
         ReclaimOutcome::Archived(dest) => {
             eprintln!(
-                "--worktree {}: untracked content archived to {}, then reclaimed; branch {short} \
+                "--worktree {}: untracked/ignored content archived to {}, then reclaimed; branch {short} \
                  keeps the worker's commits",
                 path.display(),
                 dest.display()
