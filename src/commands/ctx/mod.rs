@@ -39,6 +39,7 @@ pub mod objective;
 pub mod optimize;
 pub mod output;
 pub mod pace;
+pub(crate) mod pathutil;
 pub mod permissions;
 pub mod permit;
 pub mod policy;

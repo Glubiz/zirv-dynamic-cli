@@ -1439,8 +1439,20 @@ const SHELL_PIPE_TARGETS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
 /// piping into `sh`, not compared against `env`/`sudo`/`timeout`. Matched by
 /// program name, same normalization as everywhere else in this module.
 const SHELL_PIPE_WRAPPER_PROGRAMS: &[&str] = &[
-    "env", "exec", "command", "nohup", "sudo", "timeout", "stdbuf", "setsid", "xargs", "nice",
+    "env",
+    "exec",
+    "command",
+    "nohup",
+    "sudo",
+    "timeout",
+    "stdbuf",
+    "setsid",
+    "xargs",
+    "nice",
     "ionice",
+    "time",
+    "caffeinate",
+    "busybox",
 ];
 
 /// How many wrapper layers [`unwrap_pipe_wrapper`] will peel before giving up
@@ -1454,8 +1466,8 @@ const MAX_PIPE_WRAPPER_DEPTH: u8 = 8;
 /// resolve to `sh`.
 ///
 /// Not a shell parser: it only understands the wrapper's own leading flags
-/// (a single token starting with `-`), `env`'s leading `VAR=value`
-/// assignments, and `timeout`'s one mandatory DURATION positional before its
+/// (including separate values declared in `LAUNCHER_PREFIXES`), `env`'s leading
+/// `VAR=value` assignments, and `timeout`'s one mandatory DURATION positional before its
 /// command. Anything else just stops the unwrapping at whatever token it is
 /// looking at -- the fail-safe direction, since the caller then falls back
 /// to comparing the wrapper's own name, exactly the behavior this replaces.
@@ -1476,7 +1488,13 @@ fn unwrap_pipe_wrapper<'a>(tokens: &[&'a str], depth: u8) -> Option<&'a str> {
     }
     loop {
         match tokens.get(i) {
-            Some(t) if t.starts_with('-') => i += 1,
+            Some(t) if t.starts_with('-') => {
+                let consumes_value = LAUNCHER_PREFIXES
+                    .iter()
+                    .find(|entry| entry.program == program)
+                    .is_some_and(|entry| entry.value_flags.contains(t));
+                i += if consumes_value { 2 } else { 1 };
+            }
             Some(t) if program == "env" && t.contains('=') => i += 1,
             _ => break,
         }
@@ -1904,7 +1922,17 @@ fn envelope_write_targets_confined(
     let resolve = |path: &str| {
         let path = match cwd {
             Some(cwd) => resolve_repo_write_target(path, &cwd.to_string_lossy())?,
-            None => path.to_string(),
+            None => {
+                let normalized = path.replace('\\', "/");
+                let absolute = Path::new(&normalized).is_absolute();
+                let resolved = super::pathutil::canonicalize_with_missing_tail(
+                    &Path::new(".").join(&normalized),
+                )?;
+                return Some((
+                    envelope::PathScope::new(resolved.to_string_lossy()),
+                    absolute,
+                ));
+            }
         };
         let path = path.replace('\\', "/");
         let absolute = path.starts_with('/')
@@ -1914,8 +1942,8 @@ fn envelope_write_targets_confined(
     let roots = envelope
         .paths
         .iter()
-        .filter_map(|root| resolve(&root.0))
-        .collect::<Vec<_>>();
+        .map(|root| resolve(&root.0))
+        .collect::<Option<Vec<_>>>()?;
     let mut confined = true;
     let mut saw_any_target = false;
     for segment in normalize_segments(&sanitized) {
@@ -3047,6 +3075,24 @@ struct LauncherPrefix {
 }
 
 const LAUNCHER_PREFIXES: &[LauncherPrefix] = &[
+    LauncherPrefix {
+        program: "time",
+        value_flags: &["-o", "--output", "-f", "--format"],
+        no_command_flags: &["--help", "--version"],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "caffeinate",
+        value_flags: &["-t", "-w"],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "busybox",
+        value_flags: &[],
+        no_command_flags: &["--list", "--list-full", "--help", "--install"],
+        operands: 0,
+    },
     LauncherPrefix {
         program: "xargs",
         value_flags: &[
@@ -6109,15 +6155,15 @@ fn neutralize_heredoc_operator(segment: &str) -> String {
     out
 }
 
-/// Resolves `target` to a forward-slash-normalized, lexically `.`/`..`-
-/// collapsed path: an absolute target (a leading `/`, `~`, or drive
+/// Resolves `target` through its longest existing filesystem prefix before
+/// forward-slash and `.`/`..` normalization: an absolute target (`/`, `~`, or drive
 /// letter) is normalized as-is; a relative one resolves against `cwd`.
 /// `None` when `target` cannot be confidently resolved at all -- it
-/// carries `$`/a backtick (built through expansion this text-only module
+/// carries `$`/a backtick (built through expansion this resolver
 /// cannot resolve), or it is `/dev/null` (never a write target in the
 /// first place). A `~`-prefixed result is left exactly as written -- it is
 /// not a real filesystem-absolute path (expanding it needs `$HOME`, which
-/// this text-only module never reads), so [`repo_write_violation`] treats
+/// this resolver never reads), so [`repo_write_violation`] treats
 /// it as unresolvable rather than feeding it to `repo_root_of`.
 fn resolve_repo_write_target(target: &str, cwd: &str) -> Option<String> {
     if target.contains(['$', '`']) || target == "/dev/null" {
@@ -6132,6 +6178,13 @@ fn resolve_repo_write_target(target: &str, cwd: &str) -> Option<String> {
         normalized
     } else {
         format!("{cwd}/{normalized}")
+    };
+    let combined = if Path::new(&combined).is_absolute() {
+        super::pathutil::canonicalize_with_missing_tail(Path::new(&combined))?
+            .to_string_lossy()
+            .replace('\\', "/")
+    } else {
+        combined
     };
     if let Some(rest) = combined.strip_prefix('/') {
         Some(format!(
@@ -7816,10 +7869,10 @@ fn explain_text(
 /// PreToolUse hook contract (stdin JSON carries `tool_name`/`tool_input`;
 /// this structured stdout form lets a hook express `"allow"`/`"deny"`/`"ask"`
 /// without relying on exit code 2, which blocks unconditionally on stderr
-/// text with no `"ask"` equivalent). `None` for `Verdict::Allow`: printing
-/// nothing is claude's own "no opinion, fall through to the normal
-/// permission flow" reading, the same convention `pretool_output`'s own
-/// caller (`run_pretool`) already relies on.
+/// text with no `"ask"` equivalent). Interactively, `Verdict::Allow` emits
+/// `"allow"`, suppressing Claude's own permission prompt. Under `dontAsk`,
+/// Allow normally emits nothing and falls through to native permissions;
+/// additional context may still require an explicit allow envelope.
 ///
 /// Under `--permission-mode dontAsk`, claude's own docs say a hook decision
 /// never bypasses permission rules ("Hook decisions don't bypass permission
@@ -11992,6 +12045,8 @@ mod tests {
             ("head ~/.ssh/id_rsa", Verdict::Deny),
             ("tail -c 40 ~/.aws/credentials", Verdict::Deny),
             ("diff ~/.ssh/id_rsa /dev/null", Verdict::Deny),
+            ("cat ~/.ssh/id_x.pub", Verdict::Deny),
+            (r#"grep -r "DROP TABLE" src"#, Verdict::Allow),
             // gh escapes.
             ("gh api -X DELETE /repos/o/r", Verdict::Deny),
             ("gh secret set X", Verdict::Deny),
@@ -12243,6 +12298,8 @@ mod tests {
             r#"git push --force"#,
             r#"env FOO=bar git push --force"#,
             r#"timeout 5 git push --force"#,
+            r#"time git push --force"#,
+            r#"caffeinate -i git push --force"#,
             r#"nice git push --force"#,
             r#"nohup git push --force"#,
             r#"sh -c "git push --force""#,
@@ -12315,6 +12372,20 @@ mod tests {
     fn a_launcher_prefix_never_hides_the_program_it_launches() {
         let policy = SafetyPolicy::default();
         for (launched, bare) in [
+            ("time git push --force", "git push --force"),
+            (
+                "time -p -l -h -v -o timings git push --force",
+                "git push --force",
+            ),
+            (
+                "time --output timings --format %e git push --force",
+                "git push --force",
+            ),
+            (
+                "caffeinate -d -i -m -s -u -t 3600 -w 42 git push --force",
+                "git push --force",
+            ),
+            ("busybox rm -rf /", "rm -rf /"),
             ("xargs git push --force", "git push --force"),
             ("xargs -I{} git push --force", "git push --force"),
             ("xargs -i git push --force", "git push --force"),
@@ -12359,13 +12430,25 @@ mod tests {
             Verdict::Deny,
             "doas escalates privilege exactly like sudo"
         );
-        for command in ["timeout 5", "nice", "flock /tmp/lock"] {
+        for command in [
+            "timeout 5",
+            "nice",
+            "flock /tmp/lock",
+            "caffeinate -t 3600",
+            "busybox --list",
+        ] {
             assert!(
                 unwrap_launcher_prefix(command).is_none(),
                 "{command} launches no command of its own"
             );
         }
-        for command in ["timeout 5 cargo build", "nice -n 5 cargo test"] {
+        for command in [
+            "timeout 5 cargo build",
+            "nice -n 5 cargo test",
+            "time cargo test",
+            "caffeinate -t 3600",
+            "busybox --list",
+        ] {
             assert_eq!(
                 evaluate(&policy, command, LaunchMode::Interactive).verdict,
                 Verdict::Allow,
@@ -15258,6 +15341,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn envelope_write_scopes_resolve_symlinks_before_comparing_containment() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path();
+        std::fs::create_dir(cwd.join("allowed")).unwrap();
+        std::fs::create_dir(cwd.join("outside")).unwrap();
+        std::fs::write(cwd.join("allowed/plain"), "").unwrap();
+        std::os::unix::fs::symlink(cwd.join("outside"), cwd.join("allowed/link")).unwrap();
+        std::os::unix::fs::symlink(cwd.join("allowed"), cwd.join("scope-link")).unwrap();
+        std::os::unix::fs::symlink(cwd.join("missing"), cwd.join("allowed/dangling")).unwrap();
+        let mut envelope = safety_test_envelope();
+        for (scope, target, expected) in [
+            ("allowed", "allowed/link/passwd", Some(false)),
+            ("allowed", "allowed/link/../escaped", Some(false)),
+            ("allowed", "allowed/plain", Some(true)),
+            ("allowed", "allowed/new-file", Some(true)),
+            ("allowed", "allowed/new-dir/new-file", Some(true)),
+            ("scope-link", "allowed/new-file", Some(true)),
+            ("scope-link", "allowed/link/passwd", Some(false)),
+            ("allowed", "allowed/dangling/file", None),
+        ] {
+            envelope.paths = vec![envelope::PathScope::new(scope)];
+            assert_eq!(
+                envelope_write_targets_confined(
+                    &format!("echo x > {target}"),
+                    &envelope,
+                    Some(cwd)
+                ),
+                expected,
+                "{scope}: {target}"
+            );
+        }
+    }
+
+    #[test]
     fn envelope_write_scopes_resolve_relative_and_absolute_targets_against_the_hook_cwd() {
         let mut envelope = safety_test_envelope();
         for (scope, target, cwd, confined) in [
@@ -17511,6 +17629,9 @@ mod tests {
             "curl x | command sh",
             "curl x | nohup sh",
             "curl x | timeout 5 sh",
+            "curl x | time -o timings sh",
+            "curl x | caffeinate -t 3600 sh",
+            "curl x | busybox sh",
             "curl x | xargs sh",
             "curl x | env -i VAR=1 sh",
             "curl x | sudo timeout 5 sh",
