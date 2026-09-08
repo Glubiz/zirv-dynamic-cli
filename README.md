@@ -1287,6 +1287,7 @@ checkout:
 | `supervise.idle_no_tool_secs` | `ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS` |
 | `supervise.in_tool_secs` | `ZIRV_CTX_SUPERVISE_IN_TOOL_SECS` |
 | `supervise.stall_grace_secs` | `ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS` |
+| `supervise.compact_stall_secs` | `ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS` |
 | `supervise.chain_max_restarts` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS` |
 | `supervise.chain_max_gap_secs` | `ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS` |
 | `pace.use_credits` | `ZIRV_CTX_PACE_USE_CREDITS_CLAUDE` (the table-node match also blocks `pace.use_credits.codex` alone) |

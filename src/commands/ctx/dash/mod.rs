@@ -1298,6 +1298,17 @@ fn writer_text(holds_permit: bool, cwd: &Path) -> String {
 /// retained row rendered `●` immediately and the operator was never told the
 /// worker had finished. A nonzero exit is `✗` regardless of visibility, so it
 /// gets the exit observation alone.
+///
+/// Review round 2, finding 2: the exit observation also asserts
+/// `Attention::None`, which is what actually CLEARS a latch on the attention
+/// axis. Every other variant of `Attention` is a latch that survives until
+/// something positively says otherwise (`attention::compose` clears only
+/// `Compacting`, and only implicitly), so a pane that `report_stalled_
+/// compaction` latched `Stalled` and that then exited kept projecting
+/// `Blocked(Stalled)` forever -- `zirv ctx status` never showed the exit, and
+/// `zirv ctx wait` resolved for no target at all. A process that is gone is
+/// blocked on nothing, whatever it was blocked on while it lived, so exit is
+/// exactly the authority that may say so.
 fn reap_observations(
     prior: super::attention::Lifecycle,
     code: i32,
@@ -1327,7 +1338,8 @@ fn reap_observations(
             90,
             at,
         )
-        .with_lifecycle(super::attention::Lifecycle::Exited),
+        .with_lifecycle(super::attention::Lifecycle::Exited)
+        .with_attention(super::attention::Attention::None),
     );
     observations
 }
@@ -6029,7 +6041,7 @@ fn fulfill_spawn_request(
     size: (u16, u16),
     requests_dir: &Path,
     errors: &mut ErrorLog,
-) -> Result<(String, Vec<policy::CapabilityWarning>), SpawnRefusal> {
+) -> Result<(String, Vec<policy::CapabilityWarning>, Option<String>), SpawnRefusal> {
     // Every one of these is checked before anything is spawned, resolved or
     // written, in cheapest-and-most-hostile-first order.
     if argv_unsafe_prompt(&req.prompt) {
@@ -6748,12 +6760,15 @@ fn fulfill_spawn_request(
     // already satisfied -- and `--max-tool-calls` is reported just below
     // rather than enforced, because a pane has no verified tool-call counter.
     pane.set_timeout(Instant::now(), req.timeout_secs);
-    if let Some(warning) = super::agent::codex_read_only_build_warning(adapter.name(), req.mode) {
-        push_error(
-            errors,
-            format!("pane '{}' ({}): {warning}", pane.title(), pane.short()),
-        );
-    }
+    // Issue #399: informational, not a failure -- the sandbox posture is
+    // exactly what `--mode read-only` asked for, and `codex_read_only_build_
+    // warning`'s own stderr print (`agent::run_with`) already told the
+    // operator once at dispatch time. Pushing this through `push_error`
+    // pinned the sticky `\u{26a0}` header line for the pane's whole life over
+    // an expected posture, not a real failure; the notice channel says it
+    // once and lets it expire like any other spawn confirmation.
+    let read_only_advisory = super::agent::codex_read_only_build_warning(adapter.name(), req.mode)
+        .map(|warning| format!("pane '{}' ({}): {warning}", pane.title(), pane.short()));
     if let Some(calls) = req.max_tool_calls {
         push_error(
             errors,
@@ -6842,7 +6857,7 @@ fn fulfill_spawn_request(
         );
     }
 
-    Ok((short, capability_warnings))
+    Ok((short, capability_warnings, read_only_advisory))
 }
 
 /// Pairs every request in one taken batch with its own file stem, in order.
@@ -6902,6 +6917,7 @@ fn handle_spawn_requests(
     repo: &Path,
     size: (u16, u16),
     errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
     kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     for (dir, requester) in intake_channels(requests_dir, panes) {
@@ -6916,9 +6932,43 @@ fn handle_spawn_requests(
             repo,
             size,
             errors,
+            notices,
             kept_requests,
         );
     }
+}
+
+/// The exit code recorded for a pane an operator killed through `zirv ctx
+/// kill`: 128 + SIGTERM, the number a shell reports for a process a
+/// `kill -TERM` ended, so the reap path's own fold (`empty_exit_code`) and
+/// the delegation row both read it as the deliberate stop it was rather than
+/// as a clean finish.
+const EXIT_KILLED: i32 = 143;
+
+/// SECURITY (review round 2, 2026-09-08): the refusal a `kill` request gets
+/// when it arrives on a channel that proves a pane's identity rather than on
+/// the dashboard's own shared one -- see [`drain_one_channel`].
+const KILL_OFF_CHANNEL_REFUSAL: &str =
+    "kill requests are accepted only on the dashboard's own channel";
+
+/// Issue #403: stops one pane THIS dashboard owns, on behalf of a `zirv ctx
+/// kill` that would otherwise have to signal the pane's pid from outside.
+///
+/// Two things an outside signal cannot do, and this can. The pane's process
+/// is this dashboard's own `Child`, so `Pane::stop_now` reaches it as its
+/// real parent even where a sandboxed harness shell's `kill` is refused with
+/// `EPERM`. And the writer permit the pane holds is released by this
+/// dashboard's own reap (`permit::HeavyPermit::drop`, once `reap_ended_panes`
+/// sees the child exit), never by anything the killing process does -- so a
+/// pane killed from outside used to leave its permit slot occupied by a
+/// session `zirv ctx kill` had already deregistered, and the next dispatch
+/// into that worktree was refused `writer-busy` naming a session that no
+/// longer existed.
+fn stop_owned_pane(short: &str, panes: &mut [Pane]) -> Result<(), String> {
+    let Some(pane) = panes.iter_mut().find(|pane| pane.short() == short) else {
+        return Err(format!("no pane {short} is running on this dashboard"));
+    };
+    pane.stop_now(EXIT_KILLED).map_err(|e| e.to_string())
 }
 
 /// One intake channel's own queue: every request in `dir`, each answered with
@@ -6939,6 +6989,7 @@ fn drain_one_channel(
     repo: &Path,
     size: (u16, u16),
     errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
     kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     let batch = claim_batch(spawnreq::take_requests(dir));
@@ -6947,6 +6998,57 @@ fn drain_one_channel(
         // drop directory, so its widening fields are stripped before
         // anything below reads them -- see `sanitize_file_dropped_request`.
         let req = sanitize_file_dropped_request(req);
+        // Issue #403: the one request kind on this channel that is not a
+        // spawn. It names a pane this dashboard already owns, so none of the
+        // spawn gates below have anything to say about it, and it is answered
+        // with the same ack shape before any of them run.
+        //
+        // SECURITY (review round 2, 2026-09-08): honoured ONLY on this
+        // dashboard's own shared channel (`requester.is_none()`, the one
+        // `zirv ctx kill` writes to). A pane-attributed channel
+        // (`Pane::intake_dir`) is reachable by that pane's own low-trust
+        // child tree, and #403 exists precisely because a sandboxed shell
+        // CANNOT signal a pane process itself (`EPERM`) -- so honouring
+        // `kill` there would hand a worker the very cross-pane stop the
+        // sandbox denies it, against a pane it does not own. `stop_owned_
+        // pane` matches on the short id alone and would not notice.
+        if let Some(target) = req.kill.clone() {
+            let stopped = if requester.is_some() {
+                Err((KILL_OFF_CHANNEL_REFUSAL.to_string(), false))
+            } else {
+                // The requester's fallback is signalling the pid itself,
+                // which a refusal from THIS branch says nothing against.
+                stop_owned_pane(&target, panes).map_err(|reason| (reason, true))
+            };
+            let ack = match stopped {
+                Ok(()) => spawnreq::SpawnAck {
+                    ok: true,
+                    short: Some(target),
+                    reason: None,
+                    retryable: false,
+                    budget_exhausted: false,
+                    capability_warnings: Vec::new(),
+                },
+                Err((reason, retryable)) => {
+                    // R6, exactly as for a refused spawn: no pane was stopped
+                    // and none will be, so the claim no longer stands for
+                    // anything a requester that timed out could read.
+                    spawnreq::remove_claim(dir, &stem);
+                    spawnreq::SpawnAck {
+                        ok: false,
+                        short: None,
+                        reason: Some(reason),
+                        retryable,
+                        budget_exhausted: false,
+                        capability_warnings: Vec::new(),
+                    }
+                }
+            };
+            if let Err(e) = spawnreq::write_ack(dir, &stem, &ack) {
+                push_error(errors, format!("kill ack: {e}"));
+            }
+            continue;
+        }
         // `FILE_DROP_TRUSTED_INTERACTIVE` (never a bare `false`, on purpose
         // -- a named constant is harder to accidentally swap for
         // `req.interactive` in a future edit than a literal in a long
@@ -6969,13 +7071,19 @@ fn drain_one_channel(
             requests_dir,
             errors,
         ) {
-            Ok((short, capability_warnings)) => {
+            Ok((short, capability_warnings, advisory)) => {
                 // Issue #354 phase 3: the request that actually produced this
                 // pane, kept verbatim so `restore`/`retry` can replay THIS --
                 // never a reconstructed argv. It is moved onto the pane's
                 // retained ended row when the pane is reaped, and dropped
                 // with that row.
                 kept_requests.insert(short.clone(), (req.clone(), requester.map(str::to_string)));
+                // Issue #399: same posture as every other spawn confirmation
+                // on this path -- informational, so it goes through the
+                // transient notice channel, never the sticky error log.
+                if let Some(text) = advisory {
+                    push_notice(notices, Instant::now(), text);
+                }
                 spawnreq::SpawnAck {
                     ok: true,
                     short: Some(short),
@@ -7075,13 +7183,18 @@ fn restore_ended_row(
         requests_dir,
         errors,
     ) {
-        Ok((new_short, _)) => {
+        Ok((new_short, _, advisory)) => {
             retained.remove(index);
             kept_requests.insert(new_short.clone(), (request, requested_by));
             if let Some(restored_row) = restored_row {
                 *selected = restore_fixup(old_pane_count, panes.len(), restored_row, *selected);
             }
             push_notice(notices, now, format!("restored {short} as {new_short}"));
+            // Issue #399: same posture as the fresh-spawn path -- informational,
+            // never the sticky error log.
+            if let Some(text) = advisory {
+                push_notice(notices, now, text);
+            }
         }
         Err(refusal) => push_error(errors, format!("restore {short}: {}", refusal.reason)),
     }
@@ -9420,6 +9533,69 @@ fn report_settled_pane_with(
     }
 }
 
+/// Issue #379: a pane whose last signal was "a compaction started" and that
+/// has said nothing for `supervise.compact_stall_secs` since. A codex pane
+/// wedged exactly this way -- 18 minutes into a second compaction, with
+/// `zirv ctx status` still reporting "working (user prompt submitted)" and
+/// not one word reaching the session that delegated to it.
+///
+/// Two things happen, both once per pane: a `Supervisor` observation latches
+/// `Attention::Stalled` with the rendered reason, so a `zirv ctx status` run
+/// from ANY other process sees it too (the projection alone is derived, and
+/// nothing outside this dashboard applies the compaction clock to a pane it
+/// cannot see); and the delegating session gets one mail. `now` is the
+/// caller's clock, so the whole decision is testable without waiting.
+fn report_stalled_compaction(
+    pane: &mut Pane,
+    state: &StateDir,
+    cfg: &CtxConfig,
+    errors: &mut ErrorLog,
+    now: u64,
+) {
+    if pane.stalled_mail_sent || matches!(pane.state(), PaneState::Ended(_)) {
+        return;
+    }
+    let status = super::attention::load(state, pane.short());
+    let threshold = cfg.supervise.compact_stall_secs;
+    if status.attention != super::attention::Attention::Compacting
+        || super::attention::project_at(&status, now, threshold)
+            != super::attention::Projection::Blocked(super::attention::Attention::Stalled)
+    {
+        return;
+    }
+    let reason = super::attention::reason_at(&status, now, threshold);
+    let quiet_mins = now.saturating_sub(status.last_transition) / 60;
+    // Latched before the mail is attempted, and left latched even when the
+    // pane owes nobody a report: this fires off a per-tick sweep, and a
+    // second observation (or a second mail) would say nothing the first did
+    // not.
+    pane.stalled_mail_sent = true;
+    let _ = super::attention::record(
+        state,
+        pane.short(),
+        super::attention::Observation::new(
+            super::attention::Authority::Supervisor,
+            reason.clone(),
+            90,
+            now,
+        )
+        .with_attention(super::attention::Attention::Stalled),
+        now,
+    );
+    let Some(recipient) = pane.report_to().map(str::to_string) else {
+        return;
+    };
+    let body = format!(
+        "pane {} ({}, {}) {reason}, no output for {quiet_mins} min; restart or resume it",
+        pane.short(),
+        pane.agent(),
+        pane.cwd().display()
+    );
+    if let Err(error) = store_pane_system_mail(pane, &recipient, body, state, cfg) {
+        push_error(errors, format!("stalled report: {error}"));
+    }
+}
+
 /// Pure: which live pane a short id names right now, or `None` when no pane
 /// carries it any more.
 ///
@@ -10504,6 +10680,7 @@ pub fn run_dashboard(
                 repo,
                 pane_size,
                 &mut errors,
+                &mut notices,
                 &mut kept_requests,
             );
         }
@@ -10701,8 +10878,10 @@ pub fn run_dashboard(
         // per tick purely to re-render (see its own doc comment), so doing
         // it there would double-fire for the same tick's own transition.
         sync_quiet_heuristic_attention(&panes, state, &mut quiet_lifecycle);
+        let tick_now = super::state::now_secs();
         for pane in &mut panes {
             report_settled_pane(pane, state, cfg, &mut errors);
+            report_stalled_compaction(pane, state, cfg, &mut errors, tick_now);
         }
         let rows = assemble_sidebar(
             &build_pane_rows(&panes, &retained_ended),
@@ -10981,6 +11160,7 @@ pub fn run_dashboard(
                                             // rather than a second, parallel one.
                                             Some(SpawnEffect::Submit { agent, prompt }) => {
                                                 let req = spawnreq::SpawnRequest {
+                                                    kill: None,
                                                     agent,
                                                     prompt,
                                                     cwd: repo.to_path_buf(),
@@ -11128,11 +11308,27 @@ pub fn run_dashboard(
                                                 match fulfilled {
                                                     // L13: a spawn confirmation is
                                                     // information, not a warning.
-                                                    Ok((short, _)) => push_notice(
-                                                        &mut notices,
-                                                        Instant::now(),
-                                                        format!("spawned {} as {short}", req.agent),
-                                                    ),
+                                                    Ok((short, _, advisory)) => {
+                                                        push_notice(
+                                                            &mut notices,
+                                                            Instant::now(),
+                                                            format!(
+                                                                "spawned {} as {short}",
+                                                                req.agent
+                                                            ),
+                                                        );
+                                                        // Issue #399: same posture as
+                                                        // every other spawn
+                                                        // confirmation -- informational,
+                                                        // never the sticky error log.
+                                                        if let Some(text) = advisory {
+                                                            push_notice(
+                                                                &mut notices,
+                                                                Instant::now(),
+                                                                text,
+                                                            );
+                                                        }
+                                                    }
                                                     Err(refusal) => {
                                                         push_error(&mut errors, refusal.reason)
                                                     }
@@ -14698,6 +14894,48 @@ mod tests {
         }
     }
 
+    /// Review round 2, finding 2: `report_stalled_compaction` latches
+    /// `Attention::Stalled` from `Authority::Supervisor`, and `compose`'s own
+    /// clearing rule covers `Compacting` alone -- so a pane that stalled and
+    /// then EXITED went on projecting `Blocked(Stalled)` forever. `zirv ctx
+    /// status` never showed the exit, and `zirv ctx wait` resolved for no
+    /// `--until` target at all, because attention wins over lifecycle in
+    /// `project`. A process that is gone is blocked on nothing, and its exit
+    /// is the one authority entitled to say so.
+    #[test]
+    fn an_exit_clears_a_latched_stall_instead_of_projecting_blocked_forever() {
+        use super::super::attention::{
+            Attention, Authority, Lifecycle, Observation, Projection, compose, project,
+        };
+        // Exactly what `report_stalled_compaction` records for a wedged pane.
+        let stalled = compose(
+            None,
+            &[
+                Observation::new(Authority::Supervisor, "compaction is stalled", 90, 100)
+                    .with_attention(Attention::Stalled),
+            ],
+            100,
+        );
+        assert_eq!(project(&stalled), Projection::Blocked(Attention::Stalled));
+
+        let mut status = stalled;
+        for observation in reap_observations(status.lifecycle, 0, 200, "") {
+            status = compose(Some(&status), std::slice::from_ref(&observation), 200);
+        }
+        assert_eq!(status.lifecycle, Lifecycle::Exited);
+        assert_eq!(
+            status.attention,
+            Attention::None,
+            "the exit clears the latch, whatever it was latched on"
+        );
+        assert_eq!(
+            project(&status),
+            Projection::Failed,
+            "so the pane projects its own exit -- what `wait --until failed` resolves on -- \
+             instead of a stall nothing can ever clear"
+        );
+    }
+
     /// Review of 5c1b6c3, finding 2: a retained row keeps the budget text and
     /// writer state its pane had, not a pair of placeholders -- through the
     /// very same helpers the live row uses, so the two can never drift.
@@ -16739,6 +16977,79 @@ mod tests {
         );
     }
 
+    /// Issue #399: a read-only codex pane's sandbox advisory
+    /// (`agent::codex_read_only_build_warning`) is informational, not a
+    /// failure -- its own stderr print (`agent::run_with`) already told the
+    /// operator once at dispatch time. Before this fix `fulfill_spawn_
+    /// request` pushed the identical text through `push_error`, pinning the
+    /// sticky `\u{26a0}` header line for the pane's whole life over an
+    /// expected posture, not a real one. This proves both halves: the spawn
+    /// itself leaves the sticky error log untouched, and the advisory
+    /// `fulfill_spawn_request` now returns is exactly what every real caller
+    /// (`drain_one_channel`, `restore_ended_row`, the dashboard's own Spawn
+    /// overlay) pushes into the transient notice channel instead.
+    #[test]
+    fn a_read_only_codex_spawns_advisory_is_a_notice_not_a_sticky_error() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.fallback.enabled = false;
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "codex".to_string();
+        req.mode = super::super::permit::WorkerMode::ReadOnly;
+
+        let mut panes = Vec::new();
+        let mut queues = Vec::new();
+        let mut errors = ErrorLog::default();
+        let result = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+        let (_, _, advisory) = result.expect("a read-only codex pane still spawns");
+        assert_eq!(
+            errors.sticky_count(),
+            0,
+            "the read-only posture is expected, not a failure: {errors:?}"
+        );
+        let advisory = advisory.expect("codex_read_only_build_warning fires for codex + read-only");
+        assert!(
+            advisory.contains("codex --sandbox read-only denies every write"),
+            "got {advisory}"
+        );
+
+        // What every real caller does with it (`drain_one_channel`,
+        // `restore_ended_row`, the Spawn overlay's own match arm).
+        let mut notices: Vec<Notice> = Vec::new();
+        push_notice(&mut notices, Instant::now(), advisory.clone());
+        let notice_texts: Vec<&str> = notices.iter().map(|n| n.text.as_str()).collect();
+        assert!(
+            notice_texts.contains(&advisory.as_str()),
+            "the advisory reaches the transient notice channel: {notice_texts:?}"
+        );
+    }
+
     #[test]
     fn early_pane_failure_bounds_age_and_unicode_tail() {
         let tail = "é".repeat(180);
@@ -17831,6 +18142,7 @@ mod tests {
 
     fn spawn_request(prompt: &str, cwd: &Path) -> spawnreq::SpawnRequest {
         spawnreq::SpawnRequest {
+            kill: None,
             agent: "claude".to_string(),
             prompt: prompt.to_string(),
             cwd: cwd.to_path_buf(),
@@ -20271,7 +20583,7 @@ mod tests {
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = ErrorLog::default();
 
-        let (_, capability_warnings) = fulfill_spawn_request(
+        let (_, capability_warnings, _) = fulfill_spawn_request(
             &req,
             true,
             None,
@@ -21135,7 +21447,7 @@ mod tests {
         let mut sub_req = spawn_request("own this scope", &repo);
         sub_req.parent_session = Some(orch_short.clone());
         sub_req.role = Some("sub-orchestrator".to_string());
-        let (sub_short, _) = fulfill_spawn_request(
+        let (sub_short, _, _) = fulfill_spawn_request(
             &sub_req,
             false,
             Some(&orch_short),
@@ -24274,6 +24586,114 @@ mod tests {
         panes[0].finish_shutdown().expect("shutdown");
     }
 
+    /// Issue #379: a pane that started a compaction and never came back mails
+    /// its delegating session exactly once, past `compact_stall_secs` -- the
+    /// silence the wedged codex pane sat in for 18 minutes. A pane still
+    /// inside a plausible compaction mails nothing at all.
+    #[test]
+    fn a_compaction_that_never_returns_mails_the_delegating_session_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        pane.set_report_to(Some("aaaa1111".to_string()));
+        let pane_short = pane.short().to_string();
+
+        // The pre-compact hook's own observation, at a fixed fake "now" so
+        // this test never waits on a real clock.
+        let started = 100_000_u64;
+        let start_compaction = |at: u64| {
+            super::super::attention::record(
+                &state,
+                pane_short.as_str(),
+                super::super::attention::Observation::new(
+                    super::super::attention::Authority::AdapterHook,
+                    "compaction started",
+                    100,
+                    at,
+                )
+                .with_attention(super::super::attention::Attention::Compacting),
+                at,
+            );
+        };
+        start_compaction(started);
+
+        let inbox = |state: &StateDir| {
+            mail::list(
+                state,
+                &super::super::state::repo_slug(tmp.path()),
+                None,
+                Some("aaaa1111"),
+            )
+            .expect("list")
+        };
+
+        // Still inside the fuse: nothing is reported, and the pane stays
+        // eligible.
+        let mut errors = ErrorLog::default();
+        report_stalled_compaction(
+            &mut pane,
+            &state,
+            &cfg,
+            &mut errors,
+            started + cfg.supervise.compact_stall_secs - 1,
+        );
+        assert!(inbox(&state).is_empty());
+        assert!(!pane.stalled_mail_sent);
+
+        // The session came back (a prompt hook fired on the far side of the
+        // compaction): the marker is gone, so no amount of later clock makes
+        // this a stall.
+        super::super::attention::record(
+            &state,
+            &pane_short,
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "user prompt submitted",
+                100,
+                started + 60,
+            )
+            .with_lifecycle(super::super::attention::Lifecycle::Working),
+            started + 60,
+        );
+        report_stalled_compaction(&mut pane, &state, &cfg, &mut errors, started + 100_000);
+        assert!(inbox(&state).is_empty(), "a resumed session owes no report");
+        assert!(!pane.stalled_mail_sent);
+
+        // A second compaction that never returns. Past the fuse: one mail,
+        // and a `Supervisor` latch a `zirv ctx status` in any other process
+        // can read off disk.
+        let started = started + 120;
+        start_compaction(started);
+        let now = started + cfg.supervise.compact_stall_secs + 480;
+        for _ in 0..2 {
+            report_stalled_compaction(&mut pane, &state, &cfg, &mut errors, now);
+        }
+        let messages = inbox(&state);
+        assert_eq!(messages.len(), 1, "exactly one report, not one per tick");
+        let body = &messages[0].1.body;
+        assert!(body.contains("stalled after compaction"), "got {body}");
+        assert!(body.contains("compacting since"), "got {body}");
+        assert!(body.contains("no output for 18 min"), "got {body}");
+        assert!(body.contains("restart or resume it"), "got {body}");
+        let status = super::super::attention::load(&state, pane.short());
+        assert_eq!(
+            status.attention,
+            super::super::attention::Attention::Stalled
+        );
+        assert!(
+            super::super::attention::reason(&status).contains("stalled after compaction"),
+            "got {}",
+            super::super::attention::reason(&status)
+        );
+        assert!(errors.entries.is_empty(), "{:?}", errors.entries);
+        pane.finish_shutdown().expect("shutdown");
+    }
+
     #[test]
     fn settled_worker_with_zero_outbound_mail_recovers_transcript_report_once() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -25769,6 +26189,7 @@ mod tests {
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         handle_spawn_requests(
             &dir,
             &mut panes,
@@ -25778,6 +26199,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut HashMap::new(),
         );
 
@@ -25788,6 +26210,231 @@ mod tests {
         let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
             .expect("the refusal is still acked");
         assert!(!ack.ok);
+        assert!(panes.is_empty(), "and nothing was spawned");
+    }
+
+    /// Issue #403: the one request kind on this channel that is not a spawn.
+    fn kill_request(short: &str) -> spawnreq::SpawnRequest {
+        spawnreq::SpawnRequest {
+            kill: Some(short.to_string()),
+            requested_by: "ctx kill".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Issue #403: `zirv ctx kill` against a dashboard pane asks the
+    /// dashboard that owns it, over this same channel, rather than signalling
+    /// the pane's pid from outside -- the owner is the child's real parent
+    /// (so no `EPERM` from a sandboxed shell) and the only thing that can
+    /// release the pane's writer permit, which its own reap does once the
+    /// child is seen to exit.
+    #[test]
+    fn a_kill_request_stops_the_named_pane_and_is_acked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let dir = tmp.path().join("requests");
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: silent_long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "bbbbbbbb-2222-4333-8444-555555555555".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        let short = panes[0].short().to_string();
+        assert!(
+            sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "the pane registers before the kill"
+        );
+
+        let path = spawnreq::write_request(&dir, &kill_request(&short)).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        let mut errors = ErrorLog::default();
+        handle_spawn_requests(
+            &dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+
+        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
+            .expect("the kill is acked");
+        assert!(ack.ok, "the owner stopped its own pane: {ack:?}");
+        assert_eq!(ack.short.as_deref(), Some(short.as_str()));
+        assert!(
+            matches!(panes[0].state(), PaneState::Ended(_)),
+            "and the pane is left ready for this tick's reap, not lingering live"
+        );
+        assert!(
+            !sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "with its registry record released by the owner"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// SECURITY (review round 2, finding 1): a `kill` request is honoured
+    /// ONLY on the dashboard's own shared channel. A pane's attributed
+    /// intake channel is writable by that pane's own low-trust child tree,
+    /// and #403 exists precisely because a sandboxed shell cannot signal a
+    /// pane process itself -- so honouring one there handed a worker exactly
+    /// the cross-pane stop its sandbox denies it, against a pane it does not
+    /// own: the request names nothing but a short id, and `stop_owned_pane`
+    /// matches on that alone.
+    #[test]
+    fn a_kill_request_on_a_panes_own_channel_is_refused_and_stops_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = tmp
+            .path()
+            .join("dash")
+            .join("aaaa2222-token")
+            .join("requests");
+
+        let mut errors = ErrorLog::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        for session_id in [
+            "aaaaaaaa-3333-4444-8555-666666666666",
+            "bbbbbbbb-3333-4444-8555-666666666666",
+        ] {
+            let mut pane = Pane::spawn(
+                PaneSpec {
+                    agent_name: "test-agent".to_string(),
+                    argv: silent_long_lived_argv(),
+                    role: prompt::PromptRole::Worker,
+                    verb: sessions::Verb::Dash,
+                    session_id: session_id.to_string(),
+                    title: "wrk test".to_string(),
+                },
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn");
+            pane.set_intake_dir(mint_pane_channel(&requests_dir, &mut errors));
+            panes.push(pane);
+        }
+        let victim = panes[0].short().to_string();
+        let attacker_channel = panes[1]
+            .intake_dir()
+            .expect("the second pane has its own channel")
+            .to_path_buf();
+
+        let path =
+            spawnreq::write_request(&attacker_channel, &kill_request(&victim)).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new(); panes.len()];
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+
+        let ack = spawnreq::wait_for_ack(&attacker_channel, &stem, Duration::from_millis(50))
+            .expect("the refusal is acked on the channel it arrived on");
+        assert!(!ack.ok);
+        assert!(
+            !ack.retryable,
+            "and it is final -- no channel this request may be re-sent on exists: {ack:?}"
+        );
+        assert_eq!(ack.reason.as_deref(), Some(KILL_OFF_CHANNEL_REFUSAL));
+        assert!(
+            !matches!(panes[0].state(), PaneState::Ended(_)),
+            "the named pane is untouched"
+        );
+        assert!(
+            sessions::list(&state)
+                .iter()
+                .any(|(r, _)| r.short == victim),
+            "and still registered"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// Issue #403: a kill naming a pane this dashboard does not have is
+    /// refused, retryably -- the requester's own fallback is signalling the
+    /// pid directly, and this refusal says nothing against that.
+    #[test]
+    fn a_kill_request_naming_an_unknown_pane_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let dir = tmp.path().join("requests");
+
+        let path = spawnreq::write_request(&dir, &kill_request("deadbeef")).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = ErrorLog::default();
+        handle_spawn_requests(
+            &dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+
+        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
+            .expect("the refusal is acked");
+        assert!(!ack.ok);
+        assert!(ack.retryable, "so the requester may signal the pid itself");
+        assert!(
+            ack.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("no pane deadbeef is running on this dashboard")),
+            "and says why: {ack:?}"
+        );
+        assert!(
+            !spawnreq::is_claimed(&dir, &stem),
+            "a refusal withdraws its own claim, kill or spawn"
+        );
         assert!(panes.is_empty(), "and nothing was spawned");
     }
 
@@ -25877,6 +26524,7 @@ mod tests {
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         let mut kept: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> = HashMap::new();
         handle_spawn_requests(
             &dir,
@@ -25887,6 +26535,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut kept,
         );
         assert_eq!(
@@ -26212,6 +26861,7 @@ mod tests {
         let stem = spawnreq::request_stem(&path).expect("stem");
 
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         handle_spawn_requests(
             &requests_dir,
             &mut panes,
@@ -26221,6 +26871,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut HashMap::new(),
         );
 
@@ -26309,6 +26960,7 @@ mod tests {
         spawnreq::write_request(&orch_channel, &req).expect("write");
 
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         handle_spawn_requests(
             &requests_dir,
             &mut panes,
@@ -26318,6 +26970,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut HashMap::new(),
         );
         assert_eq!(panes.len(), 3, "the coordinator pane spawned: {errors:?}");
@@ -26445,6 +27098,7 @@ mod tests {
         let orch_stem = spawnreq::request_stem(&orch_path).expect("stem");
 
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         handle_spawn_requests(
             &requests_dir,
             &mut panes,
@@ -26454,6 +27108,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut HashMap::new(),
         );
 

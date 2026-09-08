@@ -949,6 +949,14 @@ pub struct Pane {
     /// "once per turn."
     report_reminder_sent: bool,
     pub(crate) settled_mail_sent: bool,
+    /// Issue #379: the `settled_mail_sent` of the stalled-after-compaction
+    /// report -- at most one such mail per pane, ever. Deliberately NOT
+    /// carried across a roster save/restore like `settled_mail_sent` is: a
+    /// restored pane is a fresh dashboard's fresh look at the session, and
+    /// re-reporting a compaction that is somehow STILL wedged is the safe
+    /// direction, where re-reporting a completed one is not (which is why
+    /// the settled flag is persisted and this one is not).
+    pub(crate) stalled_mail_sent: bool,
     pub(crate) result_schema: Option<String>,
     /// Review F1/F2 (PR #116): the deadline for phase 2 of a deferred
     /// `inject_visible` call -- `Some` from the moment phase 1's write
@@ -1276,6 +1284,7 @@ impl Pane {
             parent_session: None,
             report_reminder_sent: false,
             settled_mail_sent: false,
+            stalled_mail_sent: false,
             result_schema: turn_env
                 .iter()
                 .find(|(key, _)| key == super::super::agent::RESULT_SCHEMA_ENV)
@@ -2336,6 +2345,28 @@ impl Pane {
         }
         self.guard.release();
         self.writer_permit.take();
+        Ok(())
+    }
+
+    /// Issue #403: stops this pane's child NOW -- [`Self::finish_shutdown`],
+    /// the escalation half with no quit sequence and no grace -- and records
+    /// `code` as its exit so this tick's `dash::reap_ended_panes` retires the
+    /// row by the one code path that retains it, settles its spend and closes
+    /// its work group. `finish_shutdown` on its own releases the registry
+    /// record, the writer permit and the socket but leaves `exit_code` unset,
+    /// so the pane would linger in `panes` until something else happened to
+    /// observe the child's exit.
+    ///
+    /// No polite quit sequence, unlike [`Self::enforce_deadline`]: this is
+    /// the operator saying kill it, and a pane settled enough to need `zirv
+    /// ctx kill` is precisely the pane that will not answer one. A child that
+    /// had already exited keeps its own exit code.
+    pub fn stop_now(&mut self, code: i32) -> CtxResult<()> {
+        self.poll_exit();
+        self.finish_shutdown()?;
+        if self.exit_code.is_none() {
+            self.exit_code = Some(code);
+        }
         Ok(())
     }
 

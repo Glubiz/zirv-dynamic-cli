@@ -90,6 +90,13 @@ pub enum Attention {
     WorkflowGate,
     WriterConflict,
     VerificationFailure,
+    /// Issue #379: a compaction has started and nothing has been heard from
+    /// the session since. Transient by construction, not a latch -- see
+    /// [`compose`]'s own clearing rule -- and rendered two different ways by
+    /// [`project_at`]/[`reason_at`] depending on how long ago it started:
+    /// "compacting since HH:MM" while a compaction plausibly is still
+    /// running, "stalled after compaction" once it has gone on too long.
+    Compacting,
     Stalled,
     #[serde(other)]
     Unknown,
@@ -380,6 +387,22 @@ pub fn compose(
             }
             winner.attention.expect("has_field guaranteed Some")
         }
+        // Issue #379: `Compacting` is a marker for "a compaction started and
+        // we have heard nothing since", so ANY later observation from an
+        // authority that speaks for the session itself clears it -- not just
+        // one that happens to assert the attention axis. Without this it
+        // would outlive the compaction, because the hooks that fire on the
+        // other side of one (`Prompt`, `SessionStart`) assert a lifecycle
+        // only and would leave `base.attention` untouched. No other variant
+        // gets this treatment: every one of them is a real latch that must
+        // survive until something positively says otherwise.
+        None if base.attention == Attention::Compacting
+            && observations
+                .iter()
+                .any(|o| matches!(o.authority, Authority::AdapterHook | Authority::Supervisor)) =>
+        {
+            Attention::None
+        }
         None => base.attention,
     };
 
@@ -436,11 +459,62 @@ pub fn project(status: &SessionStatus) -> Projection {
     }
 }
 
+/// Issue #379: when a compaction started (`status.last_transition` is the
+/// timestamp of the transition INTO [`Attention::Compacting`], which is the
+/// only way that variant is ever reached), and whether it has been running
+/// long enough to count as stalled. Pure: `now` and the threshold are the
+/// caller's, never read from a clock or a config file here.
+fn compaction_stalled(status: &SessionStatus, now: u64, compact_stall_secs: u64) -> bool {
+    status.attention == Attention::Compacting
+        && now.saturating_sub(status.last_transition) >= compact_stall_secs
+}
+
+/// `HH:MM`, UTC, from a unix timestamp -- the same bare modular arithmetic
+/// `announce::Event::clock` already uses rather than taking on a timezone
+/// dependency just to print a clock face.
+fn utc_hhmm(ts: u64) -> String {
+    let secs_of_day = ts % 86_400;
+    format!("{:02}:{:02}", secs_of_day / 3600, (secs_of_day / 60) % 60)
+}
+
+/// Issue #379: [`project`] with the compaction clock applied. A session whose
+/// last word was "a compaction started" and that has said nothing for
+/// `compact_stall_secs` since is `Blocked(Stalled)`, not merely
+/// `Blocked(Compacting)` -- the codex pane in issue #379 sat in a compaction
+/// that never returned, and "working" is exactly the wrong thing to show for
+/// it. Every non-`Compacting` status projects identically to [`project`].
+pub fn project_at(status: &SessionStatus, now: u64, compact_stall_secs: u64) -> Projection {
+    if compaction_stalled(status, now, compact_stall_secs) {
+        return Projection::Blocked(Attention::Stalled);
+    }
+    project(status)
+}
+
+/// [`reason`] with the same compaction clock [`project_at`] applies.
+pub fn reason_at(status: &SessionStatus, now: u64, compact_stall_secs: u64) -> String {
+    if status.attention == Attention::Compacting {
+        let since = utc_hhmm(status.last_transition);
+        return if compaction_stalled(status, now, compact_stall_secs) {
+            format!("stalled after compaction (compacting since {since} UTC)")
+        } else {
+            format!("compacting since {since} UTC")
+        };
+    }
+    reason(status)
+}
+
 /// The reason text `explain-status`/`status --json`/the dashboard badge show
 /// alongside [`Projection::label`]. Prefers `status.evidence` (the actual
 /// recorded "why"); falls back to a generic sentence per projection when no
 /// evidence was ever recorded (e.g. a fresh, never-observed session).
+///
+/// Callers that have a clock and the configured threshold in hand should
+/// prefer [`reason_at`]: this one can never report a compaction as stalled,
+/// only as still running.
 pub fn reason(status: &SessionStatus) -> String {
+    if status.attention == Attention::Compacting {
+        return format!("compacting since {} UTC", utc_hhmm(status.last_transition));
+    }
     let projection = project(status);
     if !status.evidence.is_empty() {
         return match projection {
@@ -999,6 +1073,121 @@ mod tests {
         let obs: Observation =
             serde_json::from_str(r#"{"authority":"some_future_authority"}"#).unwrap();
         assert_eq!(obs.authority, Authority::QuietHeuristic);
+    }
+
+    /// Issue #379: `Compacting` survives its own round trip, and an OLDER
+    /// build that has never heard of it degrades it exactly the way every
+    /// other unknown attention value degrades -- to `Unknown`, which still
+    /// projects as blocked. Over-flagging a compaction it cannot name is the
+    /// safe direction; silently reading it as "nothing to see" is not.
+    #[test]
+    fn compacting_round_trips_and_degrades_to_unknown_for_an_older_reader() {
+        let status = SessionStatus {
+            attention: Attention::Compacting,
+            last_transition: 42,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"compacting\""), "got {json}");
+        let back: SessionStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, status);
+
+        /// The `Attention` enum as it stood before issue #379, standing in
+        /// for a build that predates the variant.
+        #[derive(Debug, PartialEq, Deserialize, Default)]
+        #[serde(rename_all = "snake_case")]
+        enum OlderAttention {
+            #[default]
+            None,
+            Stalled,
+            #[serde(other)]
+            Unknown,
+        }
+        #[derive(Debug, Deserialize, Default)]
+        struct OlderStatus {
+            #[serde(default)]
+            attention: OlderAttention,
+        }
+        let older: OlderStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(older.attention, OlderAttention::Unknown);
+    }
+
+    /// Issue #379: `Compacting` is a marker, not a latch -- the next hook to
+    /// fire on the other side of the compaction clears it even though it
+    /// speaks only to the lifecycle axis, which is exactly what the `Prompt`
+    /// hook's own observation looks like.
+    #[test]
+    fn a_later_prompt_observation_clears_a_compacting_marker() {
+        let compacting = compose(
+            None,
+            &[obs(Authority::AdapterHook, 10).with_attention(Attention::Compacting)],
+            10,
+        );
+        assert_eq!(compacting.attention, Attention::Compacting);
+
+        let prompt = Observation::new(Authority::AdapterHook, "user prompt submitted", 100, 20)
+            .with_lifecycle(Lifecycle::Working);
+        let after = compose(Some(&compacting), &[prompt], 20);
+        assert_eq!(after.attention, Attention::None);
+        assert_eq!(project(&after), Projection::Working);
+
+        // A weaker authority saying nothing about attention does NOT clear
+        // it: a pane's own quiescence heuristic cannot tell a compaction
+        // apart from any other silence.
+        let quiet = compose(
+            Some(&compacting),
+            &[obs(Authority::QuietHeuristic, 20).with_lifecycle(Lifecycle::Working)],
+            20,
+        );
+        assert_eq!(quiet.attention, Attention::Compacting);
+    }
+
+    /// Issue #379: the projection is a pure function of the caller's clock
+    /// and the caller's threshold. Young means "still compacting"; at or past
+    /// the threshold it is a stall, named as one.
+    #[test]
+    fn a_compaction_reads_as_stalled_only_once_it_passes_the_threshold() {
+        let status = SessionStatus {
+            attention: Attention::Compacting,
+            lifecycle: Lifecycle::Working,
+            last_transition: 1_000,
+            ..Default::default()
+        };
+
+        for (now, stalled) in [(1_000, false), (1_599, false), (1_600, true), (9_000, true)] {
+            let projection = project_at(&status, now, 600);
+            let reason = reason_at(&status, now, 600);
+            if stalled {
+                assert_eq!(
+                    projection,
+                    Projection::Blocked(Attention::Stalled),
+                    "now={now}"
+                );
+                assert_eq!(
+                    reason, "stalled after compaction (compacting since 00:16 UTC)",
+                    "now={now}"
+                );
+            } else {
+                assert_eq!(
+                    projection,
+                    Projection::Blocked(Attention::Compacting),
+                    "now={now}"
+                );
+                assert_eq!(reason, "compacting since 00:16 UTC", "now={now}");
+            }
+        }
+
+        // Every other status is untouched by the compaction clock, at any
+        // age: `project_at`/`reason_at` must be drop-in for `project`/
+        // `reason` everywhere else.
+        let settled = SessionStatus {
+            lifecycle: Lifecycle::Settled,
+            evidence: "turn completed cleanly".to_string(),
+            last_transition: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(project_at(&settled, 9_000, 600), project(&settled));
+        assert_eq!(reason_at(&settled, 9_000, 600), reason(&settled));
     }
 
     #[test]

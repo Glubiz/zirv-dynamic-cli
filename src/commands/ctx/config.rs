@@ -246,6 +246,18 @@ pub struct SuperviseConfig {
     ///
     /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`.
     pub stall_grace_secs: u64,
+    /// Issue #379: how long a session may sit in `Attention::Compacting` (a
+    /// `PreCompact` hook fired and nothing has been heard from the session
+    /// since) before `attention::project_at` renders it as stalled and a
+    /// dashboard pane mails its delegating session once. 600s is roughly
+    /// double the slowest compaction actually observed (a codex pane at
+    /// ~242K of 258K tokens took 5-6.5 minutes), so a compaction that is
+    /// merely slow never trips it.
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`: a checked-out
+    /// repo raising its own compaction fuse could silently defeat the
+    /// detector for a session running against it.
+    pub compact_stall_secs: u64,
     /// Issue #310 (3b): the restart-chain breaker's own trip threshold --
     /// this many unplanned, same-class respawns, each no more than
     /// `chain_max_gap_secs` apart, means "do not auto-resume, report"
@@ -317,12 +329,33 @@ impl Default for SuperviseConfig {
             idle_no_tool_secs: 450,
             in_tool_secs: 1200,
             stall_grace_secs: 120,
+            compact_stall_secs: 600,
             chain_max_restarts: 3,
             chain_max_gap_secs: 300,
             orchestrator_writes: OrchestratorWrites::Advise,
             loop_backoff_ceiling_secs: 900,
         }
     }
+}
+
+/// `[hooks]` -- knobs for the PreToolUse hooks themselves, alongside
+/// `[supervise] orchestrator_writes` above (the other decision
+/// `hook::run_pretool` makes on the same event).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HooksConfig {
+    /// Issue #406: repository-relative path prefixes the pre-write reuse
+    /// probe (`hook::run_pretool` -> `reuse::evaluate`) neither scans nor
+    /// advises on -- generated code, a vendored tree, a directory whose
+    /// duplication is deliberate. Empty by default, so the whole checkout is
+    /// in scope.
+    ///
+    /// NOT `REPO_FORBIDDEN` (it is on `workflow::checks::forbidden::
+    /// NARROW_ONLY_ALLOWLIST` instead): this is a SCOPE knob on an
+    /// advisory-only probe that never denies a write, so a repository
+    /// listing a prefix here can only make zirv say LESS, never widen what
+    /// the session is allowed to do.
+    pub reuse_exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1885,6 +1918,7 @@ pub struct CtxConfig {
     pub score: ScoreConfig,
     pub wrap: WrapConfig,
     pub supervise: SuperviseConfig,
+    pub hooks: HooksConfig,
     pub handoff: HandoffConfig,
     pub pace: PaceConfig,
     pub price: PriceConfig,
@@ -2083,6 +2117,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS",
         &["supervise", "stall_grace_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS",
+        &["supervise", "compact_stall_secs"],
         EnvKind::Int,
     ),
     (
@@ -3367,6 +3406,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["supervise", "stall_grace_secs"],
         "ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS",
+    ),
+    // Issue #379: same reasoning again for the compaction fuse -- a repo
+    // checkout raising it could silently defeat the stalled-after-compaction
+    // detector for a session running against it.
+    (
+        &["supervise", "compact_stall_secs"],
+        "ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS",
     ),
     // Same reasoning, for the 3b restart-chain breaker: a repo checkout
     // raising its own restart budget or gap window could silently defeat
@@ -5103,6 +5149,11 @@ mod tests {
             SuperviseConfig::default().stall_grace_secs,
             120,
             "issue #310: mirrors the Hermes reference's own _STALL_GRACE_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().compact_stall_secs,
+            600,
+            "issue #379: roughly double the slowest compaction actually observed"
         );
         assert_eq!(
             SuperviseConfig::default().chain_max_restarts,
@@ -7695,6 +7746,16 @@ mod tests {
         assert_eq!(cfg.supervise.stall_grace_secs, 30);
     }
 
+    /// Issue #379: the compaction fuse reads from its own env var like every
+    /// other `supervise.*` key.
+    #[test]
+    fn compact_stall_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS", "90")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.compact_stall_secs, 90);
+    }
+
     #[test]
     fn chain_max_restarts_env_override_sets_the_key() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -7721,6 +7782,8 @@ mod tests {
             "idle_no_tool_secs",
             "in_tool_secs",
             "stall_grace_secs",
+            // Issue #379: the compaction fuse is one of these too.
+            "compact_stall_secs",
             "chain_max_restarts",
             "chain_max_gap_secs",
         ] {
@@ -8113,6 +8176,35 @@ mod tests {
             err.contains("ZIRV_CTX_DASH_WORKDIR_ROOTS"),
             "names the operator escape hatch: {err}"
         );
+    }
+
+    /// Issue #233: `workflow.check_env_passthrough` is operator-only, the
+    /// identical widening-only asymmetry `repo_layer_cannot_add_sandbox_
+    /// extra_allow_entries` above pins for `sandbox.extra_allow` -- a repo
+    /// checkout naming a variable here would let its own `verify.toml`
+    /// checks read it out of the operator's process environment.
+    /// Issue #406: `hooks.reuse_exclude` is empty by default -- the whole
+    /// checkout is in the reuse probe's scope until someone narrows it --
+    /// and a REPO layer may narrow it, unlike every operator-only key below.
+    #[test]
+    fn a_repo_layer_may_set_hooks_reuse_exclude() {
+        assert!(
+            CtxConfig::default().hooks.reuse_exclude.is_empty(),
+            "the default must probe the whole checkout"
+        );
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[hooks]\nreuse_exclude = [\"src/generated\"]\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("a repo may narrow the reuse probe's own scope");
+        assert_eq!(cfg.hooks.reuse_exclude, vec!["src/generated".to_string()]);
     }
 
     /// Issue #233: `workflow.check_env_passthrough` is operator-only, the
@@ -9068,6 +9160,7 @@ mod tests {
         ("supervise", "idle_no_tool_secs"),
         ("supervise", "in_tool_secs"),
         ("supervise", "stall_grace_secs"),
+        ("supervise", "compact_stall_secs"),
         ("supervise", "chain_max_restarts"),
         ("supervise", "chain_max_gap_secs"),
         ("supervise", "orchestrator_writes"),

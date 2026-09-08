@@ -139,54 +139,114 @@ pub(crate) fn terminate_group(child: &mut Child, grace: Duration) -> CtxResult<(
     Ok(())
 }
 
+/// What [`terminate_pid`] actually achieved. Issue #403: it used to report a
+/// bare `bool`, and both of its `kill` calls discarded their return value --
+/// so a signal the kernel REFUSED (`EPERM`: the caller runs inside a
+/// sandboxed harness shell that may not signal processes outside it) was
+/// indistinguishable from one that was delivered and ignored. `is_alive`
+/// reads `EPERM` as alive (see its own doc comment), so the caller printed
+/// "sent SIGTERM/SIGKILL" for a signal that was never sent at all, and
+/// deregistered a session whose process was still running and still holding
+/// its writer permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KillOutcome {
+    /// The pid is gone -- either it exited under the ladder below, or it was
+    /// already gone when this started (including a `kill` that answered
+    /// `ESRCH`).
+    Terminated,
+    /// The first signal the kernel refused for any reason other than "no
+    /// such process": nothing was delivered, and nothing about the target
+    /// changed.
+    ///
+    /// Only the `#[cfg(unix)]` [`terminate_pid`] ever builds this -- Windows'
+    /// `taskkill` reports no errno to map onto it -- but the enum itself is
+    /// portable so `sessions::report_kill_outcome` stays one match on both
+    /// platforms rather than two cfg'd copies.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Refused { errno: i32, signal: &'static str },
+    /// Both signals were accepted and the pid is still alive after the grace
+    /// period plus the settle window -- a zombie stuck on an uninterruptible
+    /// syscall, which is not something any caller here can fix.
+    Survived,
+}
+
+/// `None` when `sig` was delivered, or when the target was already gone
+/// (`ESRCH`, which the liveness loops around this then read as dead);
+/// `Some(Refused)` for every other errno -- the refusal the caller must
+/// report rather than paper over.
+#[cfg(unix)]
+fn send_signal(pid: u32, sig: libc::c_int, name: &'static str) -> Option<KillOutcome> {
+    // SAFETY: `kill` with a pid and a valid signal number.
+    if unsafe { libc::kill(pid as libc::pid_t, sig) } == 0 {
+        return None;
+    }
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or_default();
+    if errno == libc::ESRCH {
+        return None;
+    }
+    Some(KillOutcome::Refused {
+        errno,
+        signal: name,
+    })
+}
+
 /// SIGTERM, then SIGKILL after `grace`, against a bare pid this process does
 /// not own as a `Child` -- `zirv ctx kill` resolves a session's pid from the
 /// on-disk registry in an entirely different process, so unlike `terminate`
 /// above there is no `Child` handle to call, only the pid itself. Mirrors
-/// `terminate`'s grace ladder, but addresses only this pid. Returns whether the pid was confirmed dead by the end of
-/// the grace period plus a brief settle window after the final signal --
-/// best-effort, like every other piece of state-dir housekeeping in this
-/// codebase, since a pid that ignores even `SIGKILL` (a zombie stuck on an
-/// uninterruptible syscall) is not something any caller here can fix.
+/// `terminate`'s grace ladder, but addresses only this pid, and reports which
+/// of [`KillOutcome`]'s three genuinely different endings it reached: the
+/// caller decides what to say and whether to deregister anything, and a
+/// refused signal must never be described as a sent one.
 #[cfg(unix)]
-pub(crate) fn terminate_pid(pid: u32, grace: Duration) -> bool {
+pub(crate) fn terminate_pid(pid: u32, grace: Duration) -> KillOutcome {
     if !is_alive(pid) {
-        return true;
+        return KillOutcome::Terminated;
     }
-    // SAFETY: `kill` with a pid and a valid signal number.
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    if let Some(refused) = send_signal(pid, libc::SIGTERM, "SIGTERM") {
+        return refused;
     }
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
         if !is_alive(pid) {
-            return true;
+            return KillOutcome::Terminated;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    // SAFETY: same as above.
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    if let Some(refused) = send_signal(pid, libc::SIGKILL, "SIGKILL") {
+        return refused;
     }
     let settle = Instant::now() + Duration::from_millis(250);
     while Instant::now() < settle {
         if !is_alive(pid) {
-            return true;
+            return KillOutcome::Terminated;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    !is_alive(pid)
+    if is_alive(pid) {
+        KillOutcome::Survived
+    } else {
+        KillOutcome::Terminated
+    }
 }
 
 /// The non-unix counterpart: there is no SIGTERM to escalate from, so this
 /// goes straight to the same tree-kill `terminate`'s own non-unix branch
-/// uses.
+/// uses. `taskkill` reports no errno this could map onto a
+/// [`KillOutcome::Refused`], so its two existing outcomes are the two
+/// remaining variants.
 #[cfg(not(unix))]
-pub(crate) fn terminate_pid(pid: u32, _grace: Duration) -> bool {
+pub(crate) fn terminate_pid(pid: u32, _grace: Duration) -> KillOutcome {
     if !is_alive(pid) {
-        return true;
+        return KillOutcome::Terminated;
     }
-    kill_tree(pid) || !is_alive(pid)
+    if kill_tree(pid) || !is_alive(pid) {
+        KillOutcome::Terminated
+    } else {
+        KillOutcome::Survived
+    }
 }
 
 /// The `taskkill` invocation that terminates the whole process tree rooted at
@@ -1135,7 +1195,10 @@ mod tests {
             let _ = child.wait();
         });
         let started = Instant::now();
-        assert!(terminate_pid(pid, Duration::from_millis(150)));
+        assert_eq!(
+            terminate_pid(pid, Duration::from_millis(150)),
+            KillOutcome::Terminated
+        );
         assert!(started.elapsed() < Duration::from_secs(5));
         reaper.join().expect("reaper thread");
     }
@@ -1145,8 +1208,9 @@ mod tests {
         let mut child = spawn(sh("exit 0")).expect("spawn");
         let pid = child.id();
         let _ = child.wait();
-        assert!(
+        assert_eq!(
             terminate_pid(pid, Duration::from_millis(50)),
+            KillOutcome::Terminated,
             "an already-dead pid reads as confirmed dead, not an error"
         );
     }

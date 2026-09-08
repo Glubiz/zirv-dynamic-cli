@@ -33,6 +33,13 @@ This replaces only the finding #14 absolute "never mid-turn" rollover wait assoc
 
 ## Decisions
 
+### 2026-09-08 -- Issue #406: the reuse probe stays a `PreToolUse` hook plus a review dimension; no rot-side signal
+**Context:** The overcomplication guard (issue #406) needed a place to catch a session re-declaring something the repository already has. `rot.rs` already scores a session down for other repeated-failure patterns, so folding "keeps re-declaring the same thing" into the rot verdict was considered alongside the two layers that shipped (the pre-write `ctx::reuse` probe, and a `reuse-and-simplicity` reviewer-prompt dimension).
+**Decision:** Ship only the two layers that need no new event shape: an advisory-only `PreToolUse` probe (`hook::run_pretool` -> `reuse::evaluate`, never denies) and a reviewer-prompt paragraph over the whole diff. No rot-side duplicate-write signal.
+**Rejected:** A `rot.rs` signal scoring repeated near-duplicate definitions -- `rot.rs` is pure and scores off `NormalizedEvent`, none of which carries the identifier TEXT a duplicate-write check needs (only tool-call shape/timing); teaching every adapter's event parser to extract and carry write-target identifiers is a materially larger change than this issue's own scope, for a signal the advisory hook and the reviewer dimension already cover at the two points that matter (write time, review time).
+**Consequences:** `rot.rs`/`event.rs` are untouched by this issue. A future issue that wants rot-side detection of repeated duplication has to add identifier text to `NormalizedEvent` first — not a small follow-up, and not assumed here.
+**Spec / link:** Issue #406; [[Ctx Subsystem]], [[Rot Engine]], [[Workflows]].
+
 ### 2026-09-07 -- Copilot's provider stays a static `"github"`, no per-model override
 **Context:** Wave-1/2 introduced `provider_for_model` for genuinely multi-vendor CLIs (opencode, pi, droid, qwen each resolve a per-launch vendor via `catalogue::vendor_of`); copilot needed the same call made explicitly rather than left implicit.
 **Decision:** `CopilotAdapter` does not override `provider_for_model` -- every copilot launch bills the operator's own GitHub Copilot subscription regardless of which underlying model answers, so the static `provider() == "github"` is already the correct billed account for every model copilot can select.

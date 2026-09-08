@@ -1948,11 +1948,27 @@ fn process_age_secs(_pid: u32) -> Option<u64> {
 }
 
 /// Terminates a registered session's process outright -- SIGTERM, escalating
-/// to SIGKILL after `KILL_GRACE` -- and deregisters it. Unlike `nudge`, this
-/// never depends on the target being able to notice or act on anything: it
-/// is a plain process signal, not mail. Freeing whatever machine-wide
-/// heavy-operation permit the session's pid held (`permit::live_records`) is
-/// a direct consequence of the pid actually dying, not a separate step here.
+/// to SIGKILL after `KILL_GRACE` -- and deregisters it **once it is actually
+/// dead**. Unlike `nudge`, this never depends on the target being able to
+/// notice or act on anything: it is a plain process signal, not mail.
+///
+/// Issue #403 changed two things about that sentence. A session whose
+/// process this could NOT stop -- because the signal was refused (`EPERM`,
+/// what a caller inside a sandboxed harness shell gets for a process outside
+/// it), or because the process outlived both signals -- stays registered, and
+/// this exits 1 saying so: deregistering it printed a comforting message
+/// while leaving a live process holding a writer permit whose slot nothing
+/// could then be attributed to, so the next dispatch into that worktree was
+/// refused `writer-busy` naming a session no longer in the registry (see
+/// [`report_kill_outcome`]). And a `Verb::Dash` pane is asked of the
+/// dashboard that owns it first ([`kill_via_dashboard`]), because that
+/// dashboard is the pane process's real parent AND the holder of its writer
+/// permit -- freeing the permit is a consequence of the OWNER reaping its own
+/// child (`dash::reap_ended_panes`), which no outside signal can bring about.
+/// For every other verb, and whenever no owning dashboard answers, freeing
+/// whatever machine-wide heavy-operation permit the session's pid held
+/// (`permit::live_records`) remains a direct consequence of the pid actually
+/// dying, not a separate step here.
 ///
 /// Only a live session is a valid kill target: `resolve_prefix` already
 /// filters to live records (a stale one was already swept from disk, and
@@ -2005,28 +2021,133 @@ pub fn run_kill_with<W: Write>(args: &KillArgs, w: &mut W, env: EnvLookup<'_>) -
         return Ok(0);
     }
 
-    let confirmed_dead = super::supervise::terminate_pid(record.pid, KILL_GRACE);
-    // Best-effort, matching every other piece of state-dir housekeeping in
-    // this module: whether or not the process could be confirmed dead, there
-    // is no reason left to keep the record around -- `kill` is the operator
-    // saying this session is done, not asking to retry.
-    let _ = std::fs::remove_file(record_path(&state, &record.short));
-
-    if confirmed_dead {
+    // Issue #403: a pane is the dashboard's own child and its writer permit
+    // is released by that dashboard's own reap, so ask the owner first and
+    // signal the bare pid only if no owner answers.
+    if record.verb == Verb::Dash
+        && let Some(ack) = kill_via_dashboard(&state, &record)
+    {
+        if ack.ok {
+            writeln!(
+                w,
+                "zirv ctx kill: stopped {} ({}, {}, pid {}) through the dashboard that owns it, \
+                 which released its writer permit and deregistered it",
+                record.short, record.agent, record.verb, record.pid
+            )?;
+            return Ok(0);
+        }
         writeln!(
             w,
-            "zirv ctx kill: terminated {} ({}, {}, pid {}) and deregistered it",
-            record.short, record.agent, record.verb, record.pid
-        )?;
-    } else {
-        writeln!(
-            w,
-            "zirv ctx kill: sent SIGTERM/SIGKILL to {} ({}, {}, pid {}) but could not confirm \
-             it exited; deregistered it from the session registry regardless",
-            record.short, record.agent, record.verb, record.pid
+            "zirv ctx kill: the dashboard owning {} would not stop it ({}); signalling pid {} \
+             directly instead",
+            record.short,
+            ack.reason.as_deref().unwrap_or("no reason given"),
+            record.pid
         )?;
     }
-    Ok(0)
+
+    report_kill_outcome(
+        &state,
+        &record,
+        super::supervise::terminate_pid(record.pid, KILL_GRACE),
+        w,
+    )
+}
+
+/// Asks the dashboard that OWNS `record`'s pane to stop it, over the same
+/// file-backed request channel `zirv ctx agent` already uses to have a pane
+/// spawned (`dash::spawnreq`), with the same bounded ack wait.
+///
+/// `Record::owner_pid` is the dashboard's own pid for a pane (`Pane::new`
+/// registers from inside the dashboard process -- see that field's own doc
+/// comment), and each `<state>/dash/<short>-<token>/owner.pid` holds that
+/// same pid, so the owning channel is identified rather than guessed. `None`
+/// -- no `owner_pid`, no live dashboard claiming it, the request could not be
+/// written, or nobody answered within the timeout -- means the caller falls
+/// back to signalling the bare pid itself.
+fn kill_via_dashboard(
+    state: &StateDir,
+    record: &Record,
+) -> Option<super::dash::spawnreq::SpawnAck> {
+    use super::dash::spawnreq;
+
+    let owner = record.owner_pid?;
+    let dir = super::dash::discover_live_dash_dirs(state)
+        .into_iter()
+        .find(|candidate| {
+            matches!(candidate.status, super::dash::CandidateStatus::Live { pid, .. } if pid == owner)
+        })?
+        .requests_dir;
+    let req = spawnreq::SpawnRequest {
+        kill: Some(record.short.clone()),
+        requested_by: "ctx kill".to_string(),
+        ..Default::default()
+    };
+    let path = spawnreq::write_request(&dir, &req).ok()?;
+    let stem = spawnreq::request_stem(&path)?;
+    let ack = spawnreq::wait_for_ack(&dir, &stem, super::agent::DASH_ACK_TIMEOUT);
+    if ack.is_none() {
+        // Nobody answered in time. Withdraw the request so a dashboard that
+        // only gets to it later cannot kill a pane this command has already
+        // reported on -- exactly `agent::try_join_dashboard`'s own remove-or-
+        // lose race, where whichever of the two operations wins decides.
+        let _ = std::fs::remove_file(&path);
+    }
+    ack
+}
+
+/// The one place a [`supervise::KillOutcome`] decides what the operator is
+/// told, whether the record is deregistered, and what `zirv ctx kill` exits
+/// with.
+///
+/// Issue #403: the record used to be removed and "sent SIGTERM/SIGKILL"
+/// printed whatever came back, so a signal the kernel REFUSED (`EPERM`, for a
+/// caller inside a sandboxed harness shell) was reported as a sent one and a
+/// live session -- still running, still holding its writer permit -- vanished
+/// from the registry. Only a confirmed death deregisters now: a session this
+/// could not stop stays registered, because a registry that still names it is
+/// the only thing standing between the operator and a `writer-busy` refusal
+/// naming a session nothing can look up.
+fn report_kill_outcome<W: Write>(
+    state: &StateDir,
+    record: &Record,
+    outcome: super::supervise::KillOutcome,
+    w: &mut W,
+) -> CtxResult<i32> {
+    match outcome {
+        super::supervise::KillOutcome::Terminated => {
+            let _ = std::fs::remove_file(record_path(state, &record.short));
+            writeln!(
+                w,
+                "zirv ctx kill: terminated {} ({}, {}, pid {}) and deregistered it",
+                record.short, record.agent, record.verb, record.pid
+            )?;
+            Ok(0)
+        }
+        super::supervise::KillOutcome::Refused { errno, signal } => {
+            writeln!(
+                w,
+                "zirv ctx kill: could not signal {} ({}, {}, pid {}): {signal} refused (errno \
+                 {errno}); nothing was sent and the session stays registered -- run `kill -TERM \
+                 {}` from an unsandboxed shell, or kill the pane from the dashboard",
+                record.short, record.agent, record.verb, record.pid, record.pid
+            )?;
+            Ok(1)
+        }
+        super::supervise::KillOutcome::Survived => {
+            writeln!(
+                w,
+                "zirv ctx kill: {} ({}, {}, pid {}) survived SIGTERM and SIGKILL after {}s; the \
+                 session stays registered",
+                record.short,
+                record.agent,
+                record.verb,
+                record.pid,
+                KILL_GRACE.as_secs()
+            )?;
+            Ok(1)
+        }
+    }
 }
 
 pub fn run_kill<W: Write>(args: &KillArgs, w: &mut W) -> CtxResult<i32> {
@@ -4554,6 +4675,105 @@ mod tests {
             "and the operator is told why: {text}"
         );
 
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Issue #403: the three genuinely different endings `supervise::
+    /// terminate_pid` can reach, and what each one is allowed to say and to
+    /// do to the registry. Driven through the mapping rather than through a
+    /// real signal -- an `EPERM` refusal is not something a test can provoke
+    /// from the process that owns the target -- because the bug was never in
+    /// the syscall: it was in reporting a refused signal as a sent one and
+    /// deregistering a session that was still running and still holding its
+    /// writer permit.
+    #[test]
+    fn only_a_confirmed_death_deregisters_the_record() {
+        use crate::commands::ctx::supervise::KillOutcome;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(&tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        let mut record = record_for("abababab-2222-4333-8444-555555555555", &repo, Verb::Dash);
+        record.pid = 4242;
+        let path = record_path(&state, &record.short);
+        write_record(&state, &record);
+
+        let mut out = Vec::new();
+        let code = report_kill_outcome(
+            &state,
+            &record,
+            KillOutcome::Refused {
+                errno: 1,
+                signal: "SIGTERM",
+            },
+            &mut out,
+        )
+        .expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, 1, "a refused signal is not a success: {text}");
+        assert!(
+            text.contains("SIGTERM refused (errno 1)"),
+            "names the signal and the errno: {text}"
+        );
+        assert!(
+            text.contains("nothing was sent and the session stays registered"),
+            "and never claims to have sent one: {text}"
+        );
+        assert!(
+            text.contains("kill -TERM 4242"),
+            "and says what to run instead: {text}"
+        );
+        assert!(
+            path.exists(),
+            "a session whose process is still running stays in the registry"
+        );
+
+        let mut out = Vec::new();
+        let code =
+            report_kill_outcome(&state, &record, KillOutcome::Survived, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            code, 1,
+            "nor is a process that outlived both signals: {text}"
+        );
+        assert!(
+            text.contains("survived SIGTERM and SIGKILL after 5s"),
+            "{text}"
+        );
+        assert!(text.contains("the session stays registered"), "{text}");
+        assert!(path.exists(), "so its record stays too");
+
+        let mut out = Vec::new();
+        let code = report_kill_outcome(&state, &record, KillOutcome::Terminated, &mut out)
+            .expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(code, 0);
+        assert!(
+            text.contains("terminated") && text.contains("deregistered it"),
+            "{text}"
+        );
+        assert!(!path.exists(), "only a confirmed death deregisters");
+    }
+
+    /// Issue #403: the recycling guard is NOT what removed the live session
+    /// behind the reported kill -- a pane's record is written the instant it
+    /// spawns, so its process always predates it and both halves of the guard
+    /// must agree it is genuine. Pinned against a real live child so a future
+    /// tightening of either half cannot start discarding live panes silently.
+    #[cfg(unix)]
+    #[test]
+    fn a_freshly_registered_live_child_never_looks_like_a_recycled_pid() {
+        let mut child = sh("sleep 30").spawn().expect("spawn a stand-in pane");
+        let pid = child.id();
+        let registered_at = super::super::state::now_secs();
+        match process_age_secs(pid) {
+            Some(age) => assert!(
+                !pid_looks_recycled(registered_at, age, super::super::state::now_secs()),
+                "a child that predates its own record must never look recycled (age {age}s)"
+            ),
+            None => eprintln!("skipping: no usable `ps` in this environment"),
+        }
         let _ = child.kill();
         let _ = child.wait();
     }

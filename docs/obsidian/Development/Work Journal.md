@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-07
+last-verified: 2026-09-08
 ---
 
 # Work Journal
@@ -19,6 +19,11 @@ last-verified: 2026-09-07
 **Follow-up:** anything unfinished (optional).
 
 ## Entries
+
+### 2026-09-08: overcomplication guard, truthful kill contract, compacting attention, read-only advisory notice (`feat/overcomplication-guard-and-bugs`, v3.35.0, issues #406/#403/#399/#379)
+**What:** A new `ctx::reuse` pre-write reuse probe (`PreToolUse`, claude-only, advisory) plus a matching `reuse-and-simplicity` reviewer-prompt dimension (#406); `zirv ctx kill` now reports refused/survived signals truthfully and deregisters only a confirmed death, routing a dashboard pane's kill through its owning dashboard first (#403); a read-only codex pane's sandbox advisory moved from the sticky header to the transient notice channel (#399); `Attention::Compacting`, cleared on any later observation, with a `supervise.compact_stall_secs`-gated stalled-after-compaction dashboard mail (#379).
+**Key changes:** `src/commands/ctx/{reuse,config,hook}.rs` (new module + config key + third guard), `src/commands/workflow/{review,checks/forbidden}.rs` (reviewer dimension + allowlist entry), `src/commands/ctx/{supervise,sessions,agent}.rs` (`KillOutcome`, `report_kill_outcome`, `kill_via_dashboard`), `src/commands/ctx/dash/{mod,pane,spawnreq}.rs` (`SpawnRequest.kill`, `Pane::stop_now`, the transient-notice fix), `src/commands/ctx/attention.rs` (new file), `src/commands/ctx/status.rs`.
+**Follow-up:** Run the five verification gates, open the PR. See [[Active Work]]'s matching entry and the 2026-09-08 [[Decision Log]] entry (rot-side duplicate-write signal deferred).
 
 ### 2026-09-07: six wave-1/2 harness adapters -- gemini, opencode, pi, copilot, droid, qwen (`feat/adapters-waves-1-2`, v3.32.0, issues #384-#389, umbrella #396)
 **What:** Six new `AgentAdapter` implementations registered in `adapters::mod::ADAPTERS` (now eight total: claude, codex, copilot, droid, gemini, opencode, pi, qwen), built on top of the merged wave-1 foundation (`catalogue.rs`/`transcript_source.rs`/`provider_for_model`). None of the six is installed on this machine, so every fact is sourced and cited from the real published release rather than probed live -- gemini/qwen from bundled JS in their npm tarballs (correcting the wave's own survey assumption that gemini-cli's session file is a rewritten JSON array; it is genuinely append-only JSONL, read directly like codex instead of through `transcript_source::ShadowTranscript`), opencode from GitHub source pinned at the exact `v1.18.29` tag (its transcript is a SQLite database, the first real caller of `transcript_source::sync_sqlite`), pi from badlogic/pi-mono's own source (genuinely multi-provider, the first adapter to resolve every ladder method through `catalogue::vendor_of` instead of one static vendor), copilot from two independent third-party sources since GitHub publishes no schema for its `events.jsonl`, and droid -- closed-source, no public source at all -- from directly running the real compiled Windows binary plus one live end-to-end agentic turn against a local BYOK mock model server.

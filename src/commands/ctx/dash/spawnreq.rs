@@ -77,8 +77,35 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// agent`'s own request-file write, which cannot prove a human is watching
 /// the dashboard that will fulfil it -- deserialises to. `worker_pane_
 /// extra_args`/`compose_worker_prompt` are what actually read it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpawnRequest {
+    /// Issue #403: the ONE request kind on this channel that is not a spawn.
+    /// `Some(short)` asks the dashboard to stop the pane it already owns at
+    /// that short id and answer with the same [`SpawnAck`] shape; every
+    /// spawn field above and below is then unread. `None` -- also what every
+    /// request written before this field existed deserialises to -- is the
+    /// ordinary spawn this struct has always described.
+    ///
+    /// `zirv ctx kill` writes it: a pane's process is the DASHBOARD's own
+    /// `Child` and its writer permit is released by that dashboard's own
+    /// reap, so an outside signal against the bare pid cannot free the slot
+    /// even when it lands -- and from a sandboxed harness shell it may not
+    /// land at all (`EPERM`).
+    ///
+    /// SECURITY (review round 2, 2026-09-08): honoured only on the
+    /// DASHBOARD'S OWN shared channel, never on a pane's attributed intake
+    /// channel (`dash::drain_one_channel`). The earlier justification here
+    /// -- that any process able to write into this directory can already
+    /// signal the same-uid pane itself -- is exactly what #403 disproves: a
+    /// sandboxed pane's own child tree can write into that pane's channel
+    /// and cannot signal anything. Left unguarded, that would let one worker
+    /// stop an unrelated pane through the unsandboxed dashboard, since the
+    /// request names nothing but a short id. On the dashboard's own channel
+    /// it is still safe to honour from an untrusted file drop, unlike
+    /// `flags`/`force`: it only ever NARROWS (it stops work, never starts
+    /// any).
+    #[serde(default)]
+    pub kill: Option<String>,
     pub agent: String,
     pub prompt: String,
     pub cwd: PathBuf,
@@ -595,6 +622,7 @@ mod tests {
 
     fn sample_request() -> SpawnRequest {
         SpawnRequest {
+            kill: None,
             agent: "claude".to_string(),
             prompt: "fix the failing tests".to_string(),
             cwd: PathBuf::from("/repo"),
