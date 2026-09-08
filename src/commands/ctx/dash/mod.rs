@@ -2199,7 +2199,7 @@ fn collect_facts_snapshot(inputs: &FactsInputs, group_ids: &[String]) -> FactsSn
     let mail = mail::unread_counts(state, repo, agent_name, session_short, *mail_enabled);
     let slug = super::state::repo_slug(repo);
     let memory_count = memory::list(state, &slug).map(|v| v.len()).unwrap_or(0);
-    let registry = sessions::list(state);
+    let registry = sessions::list_with_retention(state, cfg.dash.roster_max_age_secs);
     // Issue #354: the sidebar's group headers name a scope -- one `group::
     // load` per distinct live group, never one per frame.
     let groups = group_ids
@@ -9374,8 +9374,26 @@ fn report_settled_pane_with(
     {
         match super::result_schema::Schema::from_json(schema) {
             Ok(schema) => {
-                if let Err(errors) = super::result_schema::evaluate(&schema, &tail) {
-                    tail = format!("contract_failed:\n{}\n\n{tail}", errors.join("\n"));
+                let mut undeclared = Vec::new();
+                let evaluation =
+                    super::agent::evaluate_report(&schema, &tail, pane.cwd(), &mut undeclared);
+                let (validated, errors) = match evaluation {
+                    Ok(value) => (Some(value), Vec::new()),
+                    Err(errors) => {
+                        tail = format!("contract_failed:\n- {}\n\n{tail}", errors.join("\n- "));
+                        (None, vec![errors])
+                    }
+                };
+                super::agent::store_result(
+                    state,
+                    pane.short(),
+                    pane.agent(),
+                    &validated,
+                    &errors,
+                    &undeclared,
+                );
+                if !undeclared.is_empty() {
+                    tail.push_str(&format!("\nundeclared changes: {}", undeclared.join(", ")));
                 }
             }
             Err(error) => {
@@ -24314,6 +24332,105 @@ mod tests {
         assert!(!report.contains("secret tool arguments"));
         assert!(!report.contains("hello"), "screen tail must be replaced");
         pane.finish_shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn recovered_implement_report_audits_deliverables_and_records_outcome() {
+        use super::super::attention::{self, Authority, Lifecycle, Observation};
+
+        for missing in [true, false] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(tmp.path().join("state"));
+            let repo = tmp.path().join("repo");
+            git_init_repo(&repo);
+            std::fs::write(repo.join("undeclared.rs"), "content").expect("undeclared file");
+            if !missing {
+                std::fs::write(repo.join("declared.rs"), "content").expect("declared file");
+            }
+            let mut pane = spawn_idle_signal_less_worker_pane(
+                &state,
+                &repo,
+                "dddddddd-2222-4333-8444-555555555555",
+            );
+            pane.set_report_to(Some("aaaa1111".into()));
+            pane.set_delegation(pane::DelegationFacts {
+                requester: "aaaa1111".into(),
+                mode: super::super::permit::WorkerMode::Writing,
+                principal: "aaaa1111/dddddddd".into(),
+                envelope_sha256: None,
+                started_at: Instant::now(),
+            });
+            pane.result_schema = Some(include_str!("../schemas/implement.json").into());
+            let now = super::super::state::now_secs();
+            for lifecycle in [Lifecycle::Working, Lifecycle::Settled] {
+                attention::record(
+                    &state,
+                    pane.short(),
+                    Observation::new(Authority::QuietHeuristic, "worker lifecycle", 50, now)
+                        .with_lifecycle(lifecycle),
+                    now,
+                );
+            }
+            assert_eq!(
+                mail::session_delivery_metrics(&state, pane.short(), now).recent_out,
+                0
+            );
+            let mut errors = ErrorLog::default();
+            for _ in 0..2 {
+                report_settled_pane_with(
+                    &mut pane,
+                    &state,
+                    &CtxConfig::default(),
+                    &mut errors,
+                    |_| Some(r#"{"status":"done","changed_files":["declared.rs"]}"#.into()),
+                );
+            }
+            pane.finish_shutdown().expect("shutdown");
+            assert!(errors.is_empty(), "{errors:?}");
+            let messages = mail::list(
+                &state,
+                &super::super::state::repo_slug(&repo),
+                None,
+                Some("aaaa1111"),
+            )
+            .expect("mail");
+            assert_eq!(messages.len(), 1);
+            let report = &messages[0].1.body;
+            assert!(report.starts_with("recovered-from-transcript\n"));
+            assert_eq!(report.contains("contract_failed:"), missing);
+            assert_eq!(report.contains("deliverable missing: declared.rs"), missing);
+            assert!(report.contains("undeclared changes: undeclared.rs"));
+            let record: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(state.logs().join("delegation-results/dddddddd.json"))
+                    .expect("stored result"),
+            )
+            .expect("result json");
+            assert_eq!(
+                record["outcome"],
+                if missing {
+                    "contract_failed"
+                } else {
+                    "validated"
+                }
+            );
+            assert_eq!(
+                record["undeclared_changes"],
+                serde_json::json!(["undeclared.rs"])
+            );
+            if missing {
+                assert_eq!(
+                    record["errors"],
+                    serde_json::json!([["deliverable missing: declared.rs"]])
+                );
+            }
+            account_reaped_pane_spend(&pane, &CtxConfig::default(), &state, 0);
+            let rows = super::super::log::read_delegations(&state, usize::MAX);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].outcome,
+                if missing { "contract_failed" } else { "ok" }
+            );
+        }
     }
 
     #[test]

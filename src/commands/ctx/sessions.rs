@@ -1209,9 +1209,13 @@ fn interrupted_record(state: &StateDir, repo: &Path) -> Option<(PathBuf, Record)
 /// fails to parse is skipped outright: one malformed record must never fail
 /// the whole listing.
 pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
+    let cfg = CtxConfig::load(Path::new("."), &env_from_process()).unwrap_or_default();
+    list_with_retention(state, cfg.dash.roster_max_age_secs)
+}
+
+pub fn list_with_retention(state: &StateDir, retention_secs: u64) -> Vec<(Record, Liveness)> {
     let mut found = Vec::new();
     let now = state::now_secs();
-    let retention = super::config::DashConfig::default().roster_max_age_secs;
     // Issue #99 (2026-08-23): an absent `sessions/` directory used to make
     // this whole function return immediately, before `sweep_orphan_endpoints`
     // below ever ran. That is exactly the state a fresh install, or a
@@ -1237,7 +1241,7 @@ pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
             } else if record
                 .in_flight
                 .as_ref()
-                .is_some_and(|in_flight| now.saturating_sub(in_flight.since) <= retention)
+                .is_some_and(|in_flight| now.saturating_sub(in_flight.since) <= retention_secs)
             {
                 found.push((record, Liveness::Crashed));
             } else {
@@ -2627,6 +2631,35 @@ mod tests {
         assert!(!path.exists());
 
         record.in_flight = None;
+        write_record(&state, &record);
+        assert_eq!(list(&state)[0].1, Liveness::Stale);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn listing_prunes_crash_witnesses_after_the_configured_retention() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        std::fs::create_dir_all(home.join(".zirv")).expect("config dir");
+        std::fs::write(
+            home.join(".zirv/ctx.toml"),
+            "[dash]\nroster_max_age_secs = 60\n",
+        )
+        .expect("operator config");
+        let state = state_in(tmp.path());
+        let mut record = record_for(
+            "33333333-2222-4333-8444-555555555555",
+            tmp.path(),
+            Verb::Exec,
+        );
+        record.pid = dead_pid();
+        record.in_flight = Some(InFlight {
+            verb: "exec".into(),
+            turn: 2,
+            since: state::now_secs() - 61,
+        });
+        let path = record_path(&state, &record.short);
         write_record(&state, &record);
         assert_eq!(list(&state)[0].1, Liveness::Stale);
         assert!(!path.exists());

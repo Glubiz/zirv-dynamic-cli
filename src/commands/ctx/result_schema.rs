@@ -44,7 +44,10 @@ pub fn audit_deliverables(
         if status.contains(&b'D') {
             removed.insert(path.clone());
         }
-        if status != b"!!" {
+        let declared_directory = status == b"??"
+            && path.ends_with('/')
+            && claimed.iter().any(|claim| claim.starts_with(&path));
+        if status != b"!!" && !declared_directory {
             changed.insert(path);
         }
         if (status.contains(&b'R') || status.contains(&b'C'))
@@ -695,6 +698,24 @@ mod tests {
         assert_eq!(
             audit.undeclared,
             ["Cargo.lock", "added", "deleted", "new file"]
+        );
+    }
+
+    #[test]
+    fn deliverables_accept_untracked_directories_containing_claimed_files() {
+        let claimed = ["new_dir/file.rs".into()];
+        assert_eq!(
+            audit_deliverables(&claimed, "?? new_dir/\0", |_| true),
+            DeliverableAudit::default()
+        );
+        let audit = audit_deliverables(
+            &claimed,
+            "?? new_dir_other/\0?? new_di/\0?? new_dir/extra.rs\0",
+            |_| true,
+        );
+        assert_eq!(
+            audit.undeclared,
+            ["new_di/", "new_dir/extra.rs", "new_dir_other/"]
         );
     }
 

@@ -1414,7 +1414,7 @@ impl AgentAdapter for CodexAdapter {
     ) -> crate::commands::ctx::policy::CapabilityDescriptor {
         use crate::commands::ctx::policy::{Capability, CapabilityDescriptor, Stance};
 
-        const SANDBOX: &str = "the read-only permissions profile (zirv state writes allowed), which scopes what an executed shell command may write rather \
+        const SANDBOX: &str = "-c sandbox_mode=\"read-only\" plus the zirv-read-only permissions profile (writes allowed only to the zirv state directory), which scopes what an executed shell command may write rather \
              than which of codex's own tools may run (recorded facts only -- not verified against \
              a live codex CLI)";
         const WORKSPACE: &str = "--sandbox workspace-write, which keeps writes inside the workspace (documented, not \

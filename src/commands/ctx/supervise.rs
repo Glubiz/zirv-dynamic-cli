@@ -95,37 +95,26 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
 }
 
 /// SIGTERM then SIGKILL for the Unix process group; Windows keeps its tree
-/// kill. Reap the direct child even when descendants outlive it.
+/// kill. Stop signalling once the direct child is reaped: its pid/pgid can
+/// then be reused by an unrelated process group.
 pub(crate) fn terminate_group(child: &mut Child, grace: Duration) -> CtxResult<()> {
-    let direct_child_exited = child.try_wait()?.is_some();
-    #[cfg(not(unix))]
-    if direct_child_exited {
+    if child.try_wait()?.is_some() {
         return Ok(());
     }
     #[cfg(unix)]
     let group = child.id() as libc::pid_t;
     #[cfg(unix)]
-    let group_alive = || unsafe {
-        libc::kill(-group, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-    };
-    #[cfg(unix)]
-    if direct_child_exited && !group_alive() {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    let signal = |sig, direct_child_exited: bool| unsafe {
+    let signal = |sig| unsafe {
         // The isolated child's pid is its pgid. A legacy, ungrouped child
         // needs a direct signal when no such group exists.
         if libc::kill(-group, sig) == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            && !direct_child_exited
         {
             libc::kill(group, sig);
         }
     };
     #[cfg(unix)]
-    signal(libc::SIGTERM, direct_child_exited);
+    signal(libc::SIGTERM);
     #[cfg(not(unix))]
     if !kill_tree(child.id()) {
         let _ = child.kill();
@@ -133,19 +122,17 @@ pub(crate) fn terminate_group(child: &mut Child, grace: Duration) -> CtxResult<(
 
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
-        let direct_child_exited = child.try_wait()?.is_some();
-        #[cfg(unix)]
-        let tree_exited = !group_alive();
-        #[cfg(not(unix))]
-        let tree_exited = direct_child_exited;
-        if direct_child_exited && tree_exited {
+        if child.try_wait()?.is_some() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(25));
     }
 
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
     #[cfg(unix)]
-    signal(libc::SIGKILL, child.try_wait()?.is_some());
+    signal(libc::SIGKILL);
     #[cfg(not(unix))]
     let _ = child.kill();
     let _ = child.wait();
@@ -1079,6 +1066,51 @@ mod tests {
         let mut child = spawn(sh("exit 0")).expect("spawn");
         let _ = child.wait();
         terminate(&mut child, Duration::from_millis(50)).expect("terminate must be idempotent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_does_not_signal_a_group_after_reaping_its_child() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        for already_reaped in [true, false] {
+            let mut command = sh("read line");
+            isolate_process_tree(&mut command);
+            let mut child = command.stdin(Stdio::piped()).spawn().expect("leader");
+            let mut member = sh("trap '' TERM; echo ready; exec sleep 30")
+                .process_group(child.id() as i32)
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("group member");
+            let mut ready = String::new();
+            std::io::BufReader::new(member.stdout.take().expect("stdout"))
+                .read_line(&mut ready)
+                .expect("member ready");
+            assert_eq!(ready.trim(), "ready");
+            if already_reaped {
+                drop(child.stdin.take());
+                child.wait().expect("reap leader");
+            }
+            terminate(&mut child, Duration::from_millis(100)).expect("terminate");
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let member_exited = loop {
+                if member.try_wait().expect("member status").is_some() {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let _ = member.kill();
+            member.wait().expect("reap member");
+            assert!(child.try_wait().expect("leader status").is_some());
+            assert!(
+                !member_exited,
+                "signalled a group after reaping its child (already_reaped={already_reaped})"
+            );
+        }
     }
 
     /// `terminate_pid` is `terminate`'s bare-pid counterpart -- `zirv ctx

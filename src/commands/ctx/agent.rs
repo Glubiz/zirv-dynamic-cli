@@ -1174,7 +1174,7 @@ pub(crate) fn evaluate_report(
             .map(str::to_string)
             .collect::<Vec<_>>();
         let output = std::process::Command::new("git")
-            .args(["status", "--porcelain", "-z"])
+            .args(["status", "--porcelain", "-z", "--untracked-files=all"])
             .current_dir(workdir)
             .output()
             .map_err(|e| vec![format!("deliverable audit: git status failed: {e}")])?;
@@ -6096,6 +6096,21 @@ mod tests {
             ["deliverable missing: absent"]
         );
         assert_eq!(undeclared, ["Cargo.lock", "declared"]);
+    }
+
+    #[test]
+    fn report_audit_lists_individual_files_in_untracked_directories() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert!(git_init(repo.path()));
+        std::fs::create_dir(repo.path().join("new_dir")).expect("new directory");
+        for file in ["file.rs", "extra.rs"] {
+            std::fs::write(repo.path().join("new_dir").join(file), "content").expect("write");
+        }
+        let schema = result_schema::built_in("implement").expect("schema");
+        let mut undeclared = Vec::new();
+        let report = r#"{"status":"done","changed_files":["new_dir/file.rs"]}"#;
+        assert!(evaluate_report(&schema, report, repo.path(), &mut undeclared).is_ok());
+        assert_eq!(undeclared, ["new_dir/extra.rs"]);
     }
 
     #[test]
