@@ -2316,6 +2316,18 @@ fn rewrite_bare_git_log(command: &str) -> Option<String> {
     if trimmed.contains(['|', '>', ';']) || trimmed.contains("&&") || trimmed.contains("||") {
         return None;
     }
+    // Review finding F5: a bare `git log` needs none of `#` (a shell
+    // comment -- appending ` -n 50` after one lands INSIDE the comment,
+    // leaving the actually-executed command unbounded), a backtick or `$`
+    // (command/variable substitution), `\` (line continuation or escaping),
+    // a quote (the "whole command" the whitespace split below sees is not
+    // necessarily the whole command a shell would run), or `(`/`{` (a
+    // subshell or brace group). Any of these means this is not the simple,
+    // literal invocation this rewrite is safe for, so it is left alone
+    // exactly like a pipe or `&&` above.
+    if trimmed.contains(['#', '`', '$', '\\', '\'', '"', '(', '{']) {
+        return None;
+    }
     let mut tokens = trimmed.split_whitespace();
     if tokens.next() != Some("git") || tokens.next() != Some("log") {
         return None;
@@ -7640,6 +7652,30 @@ mod tests {
         assert!(
             out.is_empty(),
             "a compound command is not picked apart to rewrite one piece of it: {out:?}"
+        );
+    }
+
+    /// Review finding F5: a trailing shell comment on an otherwise-bare
+    /// `git log` must never be rewritten -- appending ` -n 50` after a `#`
+    /// lands INSIDE the comment, so the command a shell actually runs stays
+    /// exactly as unbounded as before the "fix".
+    #[test]
+    fn run_pretool_leaves_a_commented_git_log_alone() {
+        let repo = orchestrator_repo();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(
+                &repo.path().display().to_string(),
+                "git log # include all history",
+            ),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a trailing `#` comment must never be rewritten: {out:?}"
         );
     }
 
