@@ -2313,6 +2313,7 @@ mod tests {
             // still beats the raw byte count, not whether they fit a small
             // cap.
             20_000,
+            CompactionScope::Generic,
         )
         .expect("capture");
         assert!(
@@ -2355,9 +2356,16 @@ mod tests {
             ("some-tool --report", generic, Some(1)),
             ("gh api /repos/x/y/issues", json_array, Some(0)),
         ] {
-            let (_, summary) =
-                capture_text(&state, &repo, &[command.to_string()], exit_code, &raw, 4096)
-                    .unwrap_or_else(|e| panic!("{command}: {e}"));
+            let (_, summary) = capture_text(
+                &state,
+                &repo,
+                &[command.to_string()],
+                exit_code,
+                &raw,
+                4096,
+                CompactionScope::Generic,
+            )
+            .unwrap_or_else(|e| panic!("{command}: {e}"));
             if let Some(summary) = summary {
                 assert!(
                     summary.len() < raw.len(),
@@ -2539,6 +2547,7 @@ mod tests {
             Some(0),
             &raw,
             4096,
+            CompactionScope::Generic,
         )
         .expect("capture");
         let summary = summary.expect("a structural summary");
@@ -2555,8 +2564,16 @@ mod tests {
         let (_tmp, state, repo, _home) = capture_rig();
 
         let raw = serde_json::json!({"ok": true, "count": 3, "name": "small"}).to_string();
-        let (_, summary) =
-            capture_text(&state, &repo, &["gh".to_string()], Some(0), &raw, 4096).expect("capture");
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["gh".to_string()],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Generic,
+        )
+        .expect("capture");
         assert!(
             summary.is_none(),
             "a tiny document must not gain a summary: {raw}"
@@ -2572,8 +2589,16 @@ mod tests {
         let mut raw = String::from("cargo build\n");
         raw.push('\0');
         raw.push_str(&"line ".repeat(2000));
-        let (_, summary) = capture_text(&state, &repo, &["cat".to_string()], Some(0), &raw, 4096)
-            .expect("capture");
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["cat".to_string()],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Generic,
+        )
+        .expect("capture");
         assert!(summary.is_none(), "binary output must never be summarized");
     }
 }
