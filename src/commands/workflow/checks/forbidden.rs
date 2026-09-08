@@ -82,6 +82,9 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "fallback.small_task_max_tool_calls",
     "fallback.unknown_headroom_pct",
     "handoff.timeout_secs",
+    // #406: a SCOPE knob on an advisory-only probe that never denies a
+    // write -- listing a prefix can only make the reuse guard say less.
+    "hooks.reuse_exclude",
     "mail.keep",
     "mail.max_message_bytes",
     "optimize.enabled",
@@ -298,6 +301,16 @@ mod tests {
         super::super::write_manifest(repo, "zirv");
         std::fs::create_dir_all(repo.join("src/commands/ctx")).unwrap();
         std::fs::write(repo.join("src/commands/ctx/config.rs"), body).unwrap();
+    }
+
+    /// Issue #406: the reuse probe's own scope knob is repo-settable, so it
+    /// has to be classified here rather than in `REPO_FORBIDDEN`.
+    #[test]
+    fn the_allowlist_classifies_the_reuse_probe_scope_key() {
+        assert!(
+            NARROW_ONLY_ALLOWLIST.contains(&"hooks.reuse_exclude"),
+            "got {NARROW_ONLY_ALLOWLIST:?}"
+        );
     }
 
     #[test]

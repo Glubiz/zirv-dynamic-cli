@@ -338,6 +338,26 @@ impl Default for SuperviseConfig {
     }
 }
 
+/// `[hooks]` -- knobs for the PreToolUse hooks themselves, alongside
+/// `[supervise] orchestrator_writes` above (the other decision
+/// `hook::run_pretool` makes on the same event).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HooksConfig {
+    /// Issue #406: repository-relative path prefixes the pre-write reuse
+    /// probe (`hook::run_pretool` -> `reuse::evaluate`) neither scans nor
+    /// advises on -- generated code, a vendored tree, a directory whose
+    /// duplication is deliberate. Empty by default, so the whole checkout is
+    /// in scope.
+    ///
+    /// NOT `REPO_FORBIDDEN` (it is on `workflow::checks::forbidden::
+    /// NARROW_ONLY_ALLOWLIST` instead): this is a SCOPE knob on an
+    /// advisory-only probe that never denies a write, so a repository
+    /// listing a prefix here can only make zirv say LESS, never widen what
+    /// the session is allowed to do.
+    pub reuse_exclude: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HandoffConfig {
@@ -1898,6 +1918,7 @@ pub struct CtxConfig {
     pub score: ScoreConfig,
     pub wrap: WrapConfig,
     pub supervise: SuperviseConfig,
+    pub hooks: HooksConfig,
     pub handoff: HandoffConfig,
     pub pace: PaceConfig,
     pub price: PriceConfig,
@@ -8155,6 +8176,35 @@ mod tests {
             err.contains("ZIRV_CTX_DASH_WORKDIR_ROOTS"),
             "names the operator escape hatch: {err}"
         );
+    }
+
+    /// Issue #233: `workflow.check_env_passthrough` is operator-only, the
+    /// identical widening-only asymmetry `repo_layer_cannot_add_sandbox_
+    /// extra_allow_entries` above pins for `sandbox.extra_allow` -- a repo
+    /// checkout naming a variable here would let its own `verify.toml`
+    /// checks read it out of the operator's process environment.
+    /// Issue #406: `hooks.reuse_exclude` is empty by default -- the whole
+    /// checkout is in the reuse probe's scope until someone narrows it --
+    /// and a REPO layer may narrow it, unlike every operator-only key below.
+    #[test]
+    fn a_repo_layer_may_set_hooks_reuse_exclude() {
+        assert!(
+            CtxConfig::default().hooks.reuse_exclude.is_empty(),
+            "the default must probe the whole checkout"
+        );
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[hooks]\nreuse_exclude = [\"src/generated\"]\n",
+        )
+        .expect("write");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("a repo may narrow the reuse probe's own scope");
+        assert_eq!(cfg.hooks.reuse_exclude, vec!["src/generated".to_string()]);
     }
 
     /// Issue #233: `workflow.check_env_passthrough` is operator-only, the

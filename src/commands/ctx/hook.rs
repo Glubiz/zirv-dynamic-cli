@@ -1855,6 +1855,27 @@ pub struct PreToolInput {
     pub file_path: String,
     /// `NotebookEdit`'s own target path (issue #334).
     pub notebook_path: String,
+    /// `Write`'s own incoming file content (issue #406): the text whose
+    /// added definitions the reuse probe looks for in the repository.
+    pub content: String,
+    /// `Edit`'s replacement text (issue #406).
+    pub new_string: String,
+    /// `Edit`'s replaced text (issue #406) -- a definition present in BOTH
+    /// halves is not something this edit adds.
+    pub old_string: String,
+    /// `MultiEdit`'s own list of edits (issue #406), each with the same
+    /// `old_string`/`new_string` pair a single `Edit` carries.
+    pub edits: Vec<PreToolEdit>,
+}
+
+/// One entry of `MultiEdit`'s `edits` array (issue #406). `#[serde(default)]`
+/// throughout for the same reason [`PreToolInput`] is: a payload that fails
+/// to parse is a hook that silently stops guarding.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PreToolEdit {
+    pub old_string: String,
+    pub new_string: String,
 }
 
 impl PreToolPayload {
@@ -2233,16 +2254,19 @@ fn pretool_advise_output(note: &str) -> String {
     .to_string()
 }
 
-/// Runs two independent guards against the same payload: the expensive-seat
+/// Runs three independent guards against the same payload: the expensive-seat
 /// subagent guard above (gated on `SEAT_MODEL_ENV`) and the orchestrator-
 /// write guard below (gated on `SEAT_ROLE_ENV`, issue #334) -- an
 /// orchestrator seat launched on a cheap model still carries no
 /// `SEAT_MODEL_ENV` (`seat_model_env` only ever exports it for an expensive
 /// tier), but must still be technically unable to edit repository files, so
 /// the second guard cannot be nested inside the first's own early return.
+/// The third, issue #406's reuse probe (`reuse_advice`), is gated on nothing
+/// at all -- every seat that writes a file gets it -- and is advisory only:
+/// it can add a note to an `allow` envelope and can never deny.
 ///
 /// Fails open on every path: no seat env, an unparseable payload, a tool
-/// either guard knows nothing about, an unresolvable `cwd`, and any internal
+/// no guard knows anything about, an unresolvable `cwd`, and any internal
 /// error all exit 0 with nothing on stdout, which claude reads as "no
 /// decision, use the normal permission flow". Nothing here may `unwrap`,
 /// `expect` or return `Err` -- the release profile is `panic = "abort"`, and
@@ -2273,28 +2297,45 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     let role = env(adapters::SEAT_ROLE_ENV);
     let cfg = cfg_or_operator_only_gate(&cwd, env);
     let posture = orchestrator_write_posture(&cfg);
-    let Some(outcome) = orchestrator_write_decision(role.as_deref(), &payload, &cwd, env, posture)
-    else {
-        return Ok(0);
-    };
-
     let session = super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+
+    // Issue #406: the reuse probe is independent of the write guard below --
+    // every seat gets it, not only an orchestrator's -- so it is resolved
+    // before that guard's own "outside my scope" early return.
+    let reuse_note = reuse_advice(&payload, &cwd, &cfg, env, &session);
+
+    let outcome = orchestrator_write_decision(role.as_deref(), &payload, &cwd, env, posture);
     match &outcome {
-        OrchestratorWriteOutcome::Deny(reason) => {
+        // The deny path is untouched by the reuse probe: a refused write has
+        // nothing to reuse yet, and an advisory riding along on a denial
+        // would only dilute the reason.
+        Some(OrchestratorWriteOutcome::Deny(reason)) => {
             let _ = writeln!(w, "{}", pretool_output(reason));
         }
-        OrchestratorWriteOutcome::Advise(note) => {
-            if orchestrator_advisory_should_surface(env, &session) {
-                let _ = writeln!(w, "{}", pretool_advise_output(note));
+        other => {
+            let advisory = match other {
+                Some(OrchestratorWriteOutcome::Advise(note))
+                    if orchestrator_advisory_should_surface(env, &session) =>
+                {
+                    Some(note.as_str())
+                }
+                _ => None,
+            };
+            // One envelope, however many notes: claude reads a single
+            // `additionalContext` per hook, so a second `writeln!` would
+            // throw one of them away.
+            if let Some(note) = join_advisory_notes(advisory, reuse_note.as_deref()) {
+                let _ = writeln!(w, "{}", pretool_advise_output(&note));
             }
         }
-        OrchestratorWriteOutcome::Allow => {}
     }
 
     // Best-effort: a block record that fails to write costs an operator one
     // audit-log row, never a hook failure -- the decision above already
     // stands regardless.
-    if let Ok(state) = StateDir::resolve(env) {
+    if let Some(outcome) = &outcome
+        && let Ok(state) = StateDir::resolve(env)
+    {
         let target = normalized_write_target(&payload, &cwd).unwrap_or_default();
         let _ = log::append_orchestrator_block(
             &state,
@@ -2309,6 +2350,59 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
         );
     }
     Ok(0)
+}
+
+/// The two non-blocking notes `run_pretool` can produce, joined into the one
+/// `additionalContext` string claude reads -- `None` when neither fired.
+fn join_advisory_notes(orchestrator: Option<&str>, reuse: Option<&str>) -> Option<String> {
+    match (orchestrator, reuse) {
+        (None, None) => None,
+        (Some(note), None) | (None, Some(note)) => Some(note.to_string()),
+        (Some(first), Some(second)) => Some(format!("{first}\n{second}")),
+    }
+}
+
+/// Issue #406 layer 1: the pre-write reuse probe's own note, or `None` when
+/// there is nothing to say. Resolves the write target and the repository it
+/// sits in exactly as the orchestrator-write guard does, then hands the
+/// decision to `reuse::evaluate`; one decision-log row records a fire or a
+/// budget skip, best-effort like every other log write on this path.
+///
+/// Never denies and never fails: an unresolvable target, a target in no git
+/// repository, or a probe that runs out of budget all return `None`.
+fn reuse_advice(
+    payload: &PreToolPayload,
+    cwd: &Path,
+    cfg: &CtxConfig,
+    env: EnvLookup<'_>,
+    session: &str,
+) -> Option<String> {
+    let target = normalized_write_target(payload, cwd)?;
+    let repo = repo_root_for_target(&target)?;
+    let (action, detail, note) =
+        match super::reuse::evaluate(&repo, &target, payload, &cfg.hooks.reuse_exclude) {
+            super::reuse::Outcome::Nothing => return None,
+            super::reuse::Outcome::Skipped(reason) => ("reuse-probe-skipped", reason, None),
+            super::reuse::Outcome::Advice(note) => {
+                ("reuse-probe", target.display().to_string(), Some(note))
+            }
+        };
+    if let Ok(state) = StateDir::resolve(env) {
+        let _ = log::append(
+            &state,
+            &log::Decision {
+                ts: now_secs(),
+                session,
+                verb: "hook",
+                verdict: "n/a",
+                score: 0,
+                action,
+                detail: &detail,
+                observed_at: None,
+            },
+        );
+    }
+    note
 }
 
 // -- PostToolUse: compact output (issue #326) ------------------------------
@@ -6732,6 +6826,122 @@ mod tests {
         let rows = log::read_orchestrator_blocks(&state);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].outcome, "advised");
+    }
+
+    // -- PreToolUse: the reuse probe (issue #406) --------------------------
+
+    /// A checkout that already defines `foo_bar`, so the probe has something
+    /// real to find.
+    fn reuse_repo() -> tempfile::TempDir {
+        let repo = orchestrator_repo();
+        std::fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        std::fs::write(
+            repo.path().join("src/x.rs"),
+            "// header\npub fn foo_bar() -> u8 {\n    0\n}\n",
+        )
+        .expect("write x.rs");
+        repo
+    }
+
+    fn write_payload_stdin(repo: &Path, relative_target: &str, content: &str) -> String {
+        orchestrator_pretool_stdin(
+            &repo.display().to_string(),
+            "claude-session-id",
+            "Write",
+            serde_json::json!({
+                "file_path": repo.join(relative_target).display().to_string(),
+                "content": content,
+            }),
+        )
+    }
+
+    /// `run_pretool` on a plain (non-orchestrator) seat with an empty home,
+    /// so only the reuse probe can print anything at all.
+    fn run_pretool_stdout(stdin: &str, state_dir: &Path) -> String {
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state_dir.display().to_string(),
+        )]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(&mut out, stdin, &|k| env.get(k).cloned()).expect("never errors");
+        assert_eq!(code, 0);
+        String::from_utf8(out).expect("utf8")
+    }
+
+    /// End to end: a `Write` that re-declares an existing `fn` is ALLOWED,
+    /// with the existing definition's own `path:line` in
+    /// `additionalContext`.
+    #[test]
+    fn run_pretool_names_an_existing_definition_a_write_re_adds() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = reuse_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+
+        let printed = run_pretool_stdout(
+            &write_payload_stdin(
+                repo.path(),
+                "src/y.rs",
+                "pub fn foo_bar() -> u8 {\n    1\n}\n",
+            ),
+            state_dir.path(),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        let note = parsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            note.contains("src/x.rs:") && note.contains("foo_bar"),
+            "got {parsed}"
+        );
+    }
+
+    /// A genuinely new name is not a duplication, so nothing is printed --
+    /// the probe stays silent rather than reporting that it looked.
+    #[test]
+    fn run_pretool_says_nothing_about_a_genuinely_new_definition() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = reuse_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+
+        let printed = run_pretool_stdout(
+            &write_payload_stdin(
+                repo.path(),
+                "src/y.rs",
+                "pub fn quux_widget() -> u8 {\n    1\n}\n",
+            ),
+            state_dir.path(),
+        );
+        assert!(printed.is_empty(), "expected silence, got {printed}");
+    }
+
+    /// `hooks.reuse_exclude` narrows the probe's own scope: a write under an
+    /// excluded prefix is neither probed nor advised on.
+    #[test]
+    fn run_pretool_skips_a_write_under_an_excluded_prefix() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = reuse_repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("zirv dir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[hooks]\nreuse_exclude = [\"src\"]\n",
+        )
+        .expect("write ctx.toml");
+        let state_dir = tempfile::tempdir().expect("state dir");
+
+        let printed = run_pretool_stdout(
+            &write_payload_stdin(
+                repo.path(),
+                "src/y.rs",
+                "pub fn foo_bar() -> u8 {\n    1\n}\n",
+            ),
+            state_dir.path(),
+        );
+        assert!(printed.is_empty(), "expected silence, got {printed}");
     }
 
     /// `OrchestratorWrites::Allow`: the write is silent (nothing printed at

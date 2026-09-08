@@ -2610,8 +2610,8 @@ const DEFAULT_REVIEWER_TOOL_CALL_GUIDANCE: u32 = 40;
 
 /// The prompt text sent to an independent reviewer for `package`, split out
 /// from `launch_reviewer` so its exact wording (in particular the #238
-/// baseline-waiver guidance) is unit-testable without spawning a real
-/// reviewer process.
+/// baseline-waiver guidance and issue #406's `reuse-and-simplicity`
+/// dimension) is unit-testable without spawning a real reviewer process.
 fn build_reviewer_prompt(
     package: &ReviewPackage,
     budget_tokens: Option<u64>,
@@ -2668,6 +2668,20 @@ fn build_reviewer_prompt(
     } else {
         ""
     };
+    // Issue #406 layer 2: the `reuse-and-simplicity` dimension. The pre-write
+    // probe (`ctx::reuse`) only sees one write at a time and only sees
+    // NAMES; a reviewer sees the whole diff and can judge whether an
+    // addition duplicates something spelled differently, or is simply
+    // larger than the requirement needs. Stated as a per-added-item
+    // obligation with a citation or the literal words `none found`, so an
+    // unchecked item is visible as a missing citation rather than silent.
+    let reuse_notice = "One review dimension is `reuse-and-simplicity`. For EVERY item this diff \
+         ADDS -- function, struct, module, file, script, config key, flag -- state two things: \
+         whether an existing item already covers it, and whether a smaller design would meet the \
+         same requirement. Support each with a `path:line` citation, or the literal words `none \
+         found` when you looked and there was nothing. Raise a finding ONLY for a duplication or \
+         an oversized design you actually confirmed, never for a suspicion, and prefix its \
+         `summary` with `reuse:` so it is recognisable when dispositions are applied.\n\n";
     // #229/#232: earlier prompt text showed one example value per field and
     // left the reviewer to guess the rest of the enum, which produced
     // variants like `blocker` and `needs-confirmation` that a strict parser
@@ -2677,7 +2691,7 @@ fn build_reviewer_prompt(
     // `normalize_disposition`) is a safety net for this prompt, not a
     // substitute for it.
     Ok(format!(
-        "{bound_notice}{delta_notice}{accepted_spec_notice}Review the following compact Zirv review package. Do not modify files. \
+        "{bound_notice}{delta_notice}{accepted_spec_notice}{reuse_notice}Review the following compact Zirv review package. Do not modify files. \
          In the package's `verification` field, `passed:false` together with \
          `passed_with_baseline_waiver:true` means every failing test is in the operator's \
          recorded baseline (`waived_failing_tests`) and the gate passed -- treat it as \
@@ -5300,6 +5314,26 @@ checksum = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f80"
         assert!(
             prompt.contains("passed_with_baseline_waiver")
                 && prompt.contains("operator-acknowledged"),
+            "got: {prompt}"
+        );
+    }
+
+    /// Issue #406 layer 2: the reviewer is told to judge every ADDED item
+    /// for reuse and for size, with a citation or the literal `none found`,
+    /// and to prefix a confirmed finding with `reuse:` so dispositions can
+    /// recognise it.
+    #[test]
+    fn the_reviewer_prompt_states_the_reuse_and_simplicity_dimension() {
+        let repo = git_repo();
+        let state_dir = StateDir::from_root(tempdir().unwrap().path().to_path_buf());
+        let state = running_review_state(repo.path(), "HEAD");
+        let package = package(&state_dir, &state, None).expect("package");
+
+        let prompt = build_reviewer_prompt(&package, None, None).expect("prompt");
+        assert!(prompt.contains("reuse-and-simplicity"), "got: {prompt}");
+        assert!(prompt.contains("none found"), "got: {prompt}");
+        assert!(
+            prompt.contains("prefix its `summary` with `reuse:`"),
             "got: {prompt}"
         );
     }
