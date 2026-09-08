@@ -1590,8 +1590,8 @@ mod tests {
 
     /// Codex's descriptors come from the repo's recorded facts
     /// (docs/superpowers/notes/2026-07-31-codex-cli-facts.md), not from a live
-    /// CLI -- codex is not runnable on this machine. `--sandbox read-only` is
-    /// verified to exist, but the repo's own notes record that it scopes what
+    /// CLI -- codex is not runnable on this machine. The read-only sandbox
+    /// and state-dir write profile scope what
     /// an executed shell command may touch rather than which of codex's tools
     /// may run, so every stance it carries is `Degraded`, never `Enforced`.
     #[test]
@@ -1628,7 +1628,7 @@ mod tests {
                     adapters::LaunchMode::Headless,
                 )
                 .mechanism
-                .contains("--sandbox read-only")
+                .contains("-c sandbox_mode=\"read-only\" plus the zirv-read-only permissions profile (writes allowed only to the zirv state directory)")
         );
     }
 

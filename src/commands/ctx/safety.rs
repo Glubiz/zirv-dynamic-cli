@@ -1942,8 +1942,8 @@ fn envelope_write_targets_confined(
     let roots = envelope
         .paths
         .iter()
-        .map(|root| resolve(&root.0))
-        .collect::<Option<Vec<_>>>()?;
+        .filter_map(|root| resolve(&root.0))
+        .collect::<Vec<_>>();
     let mut confined = true;
     let mut saw_any_target = false;
     for segment in normalize_segments(&sanitized) {
@@ -15373,6 +15373,33 @@ mod tests {
                 "{scope}: {target}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unresolvable_envelope_root_does_not_disable_write_confinement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cwd = temp.path();
+        std::fs::create_dir(cwd.join("allowed")).expect("allowed root");
+        std::os::unix::fs::symlink(cwd.join("missing"), cwd.join("dangling"))
+            .expect("dangling root");
+        let mut envelope = safety_test_envelope();
+        envelope.paths.push(envelope::PathScope::new("dangling"));
+        for (command, confined) in [
+            ("echo x > allowed/new-file", true),
+            ("echo x > outside", false),
+        ] {
+            assert_eq!(
+                envelope_write_targets_confined(command, &envelope, Some(cwd)),
+                Some(confined),
+                "{command}"
+            );
+        }
+        envelope.paths = vec![envelope::PathScope::new("dangling")];
+        assert_eq!(
+            envelope_write_targets_confined("echo x > outside", &envelope, Some(cwd)),
+            Some(false)
+        );
     }
 
     #[test]
