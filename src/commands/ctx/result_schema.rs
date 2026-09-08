@@ -11,6 +11,61 @@
 //! Pure module: no fs/clock/env/net. `built_in` reads its four shipped
 //! shapes via `include_str!` at compile time, not from disk at runtime.
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DeliverableAudit {
+    pub missing: Vec<String>,
+    pub undeclared: Vec<String>,
+}
+
+/// Compare reported paths with porcelain v1's NUL-separated records. Renames
+/// encode the destination first, followed by a separate source-path record.
+pub fn audit_deliverables(
+    claimed: &[String],
+    porcelain_z: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> DeliverableAudit {
+    let normalize = |path: &str| {
+        let path = path.replace('\\', "/");
+        path.strip_prefix("./").unwrap_or(&path).to_string()
+    };
+    let claimed: BTreeSet<String> = claimed.iter().map(|p| normalize(p)).collect();
+    let mut changed = BTreeSet::new();
+    let mut removed = BTreeSet::new();
+    let mut records = porcelain_z.split('\0');
+    while let Some(record) = records.next() {
+        let Some(path) = record.get(3..) else {
+            continue;
+        };
+        let status = &record.as_bytes()[..2];
+        let path = normalize(path);
+        if status.contains(&b'D') {
+            removed.insert(path.clone());
+        }
+        if status != b"!!" {
+            changed.insert(path);
+        }
+        if (status.contains(&b'R') || status.contains(&b'C'))
+            && let Some(source) = records.next()
+            && status.contains(&b'R')
+        {
+            let source = normalize(source);
+            removed.insert(source.clone());
+            changed.insert(source);
+        }
+    }
+    DeliverableAudit {
+        missing: claimed
+            .iter()
+            .filter(|p| !removed.contains(*p) && !exists(Path::new(p)))
+            .cloned()
+            .collect(),
+        undeclared: changed.difference(&claimed).cloned().collect(),
+    }
+}
+
 /// One field's shape inside a [`Schema`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Field {
@@ -605,6 +660,66 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn deliverables_accept_existing_claims() {
+        assert_eq!(
+            audit_deliverables(&["src/a.rs".into()], " M src/a.rs\0", |p| p
+                == Path::new("src/a.rs")),
+            DeliverableAudit::default()
+        );
+    }
+
+    #[test]
+    fn deliverables_accept_deleted_claims() {
+        assert_eq!(
+            audit_deliverables(&["gone".into()], " D gone\0", |_| false),
+            DeliverableAudit::default()
+        );
+    }
+
+    #[test]
+    fn deliverables_report_absent_claims() {
+        let audit = audit_deliverables(&["missing".into()], "", |_| false);
+        assert_eq!(audit.missing, ["missing"]);
+        assert!(audit.undeclared.is_empty());
+    }
+
+    #[test]
+    fn deliverables_report_all_undeclared_changes() {
+        let audit = audit_deliverables(
+            &[],
+            "?? new file\0 M Cargo.lock\0A  added\0D  deleted\0",
+            |_| false,
+        );
+        assert_eq!(
+            audit.undeclared,
+            ["Cargo.lock", "added", "deleted", "new file"]
+        );
+    }
+
+    #[test]
+    fn deliverables_normalize_prefix_and_separators() {
+        assert_eq!(
+            audit_deliverables(&["./src\\file".into()], " M src/file\0", |p| p
+                == Path::new("src/file")),
+            DeliverableAudit::default()
+        );
+    }
+
+    #[test]
+    fn deliverables_accept_rename_source_and_declare_both_paths() {
+        assert_eq!(
+            audit_deliverables(
+                &["old name".into(), "new name".into()],
+                "R  new name\0old name\0",
+                |p| p == Path::new("new name")
+            ),
+            DeliverableAudit::default()
+        );
+        let audit = audit_deliverables(&[], " R new\0old\0", |_| false);
+        assert_eq!(audit.undeclared, ["new", "old"]);
+    }
 
     fn str_field(name: &str, required: bool) -> Field {
         Field {

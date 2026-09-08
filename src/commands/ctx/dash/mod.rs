@@ -3137,6 +3137,7 @@ fn enforce_pane_deadlines(
 /// requester, carrying the same fields the inline supervised path writes.
 fn account_reaped_pane_spend(pane: &Pane, cfg: &CtxConfig, state: &StateDir, exit_code: i32) {
     let usage = pane_transcript_usage(pane, cfg).unwrap_or_default();
+    let exit_code = super::agent::recorded_contract_exit(state, pane.short(), exit_code);
     if let Some(facts) = pane.delegation() {
         let _ = super::log::append_delegation(
             state,
@@ -6680,6 +6681,10 @@ fn fulfill_spawn_request(
     // path validates against.
     if let Some(schema) = &req.result_schema {
         turn_env.push((super::agent::RESULT_SCHEMA_ENV.to_string(), schema.clone()));
+        turn_env.push((
+            super::agent::RESULT_WORKDIR_ENV.to_string(),
+            spawn_cwd.display().to_string(),
+        ));
     }
     // Issue #262: `child_envelope` was already narrowed (and, on a widening
     // request, this function already returned `Err` before ever reaching

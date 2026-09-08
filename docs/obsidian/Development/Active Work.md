@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-07
+last-verified: 2026-09-08
 ---
 
 # Active Work
@@ -73,6 +73,10 @@ Entries use the format:
 **Next:** maintainer review; mark PR #78 ready and merge the top stack PR when desired.
 
 ## Recently Completed
+
+### Worker deliverable truth and doc-drift residue (`fix/kka2-deliverable-truth`, 2026-09-08)
+**Status (2026-09-08):** KKA part 2 items 1/5b: git-backed deliverable audit on headless and pane reports, contract-failure exit 82 and delegation outcomes, plus reserved-name/schema/flag docs and exit-code inventory coverage. Verification results are in the implementation worker report.
+
 
 ### 3.30.0 -- shared dashboard tick budget, seat-vs-worker scheduling posture, self-update checksum verification (`fix/3.30.0-input-latency-defender`, 2026-09-07, v3.30.0)
 **Status (2026-09-07):** Three commits addressing two operator-reported bugs plus one carried-over hardening item. Dashboard input latency: `FactsRefresher` moves the machine-wide facts (mail, memory count, `sessions::list`, work groups) off the UI thread onto a background `zirv-dash-facts` thread publishing on the existing `FACTS_THROTTLE` (1s) cadence, swapped in non-blocking by the tick; spawn-request intake drops to a 250ms poll (forced when no panes remain); `DRAIN_BUDGET_BYTES` becomes one 256 KiB budget shared across the whole tick (focused pane first, then round-robin) instead of 256 KiB per pane; `KeyLog`'s `TICK` line gains `dur=<ms>` and a `(slow)` marker at >=100ms. Seat-vs-worker scheduling: new `ctx::priority` module raises the interactive seat's own threads (`wrap`'s stdin/pty-output threads, the dashboard UI thread, each pane's reader thread) to `THREAD_PRIORITY_ABOVE_NORMAL` on Windows, and lowers every delegated worker's whole process class one notch (`BELOW_NORMAL_PRIORITY_CLASS`/nice `+5`) so its cargo children inherit it for free -- `exec`/`loop`/`agent`/script `agent:` steps stamp themselves at CLI entry, dashboard worker panes are stamped by pid (`apply_to_child`) since they're spawned by the UI process itself. No config knob, by design. Windows Defender false-positive mitigation (issue #326, carried from the prior release's own audit): `build.rs` embeds a `VERSIONINFO` resource via the new `winresource` build-dependency; `.github/workflows/cd.yaml` publishes a `.sha256` per release artifact; `zirv update`/`install.sh` verify the digest before replacing the running binary and fail closed on a release with no published checksum.

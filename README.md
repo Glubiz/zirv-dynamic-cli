@@ -760,7 +760,7 @@ Supported schemas are YAML, JSON, and TOML. Below are examples of each:
 name: Example Config
 description: An example script.
 params:
-  - param1
+  - user
 commands:
   - command: "echo Welcome, ${user}"
     capture: welcome_msg
@@ -1597,6 +1597,7 @@ begin with `-` or to look like a flag is still just a prompt.
 | `79` | the provider account ran out of credits or quota; the run stops without retrying |
 | `80` | a writing delegation was refused because the tree already has a live writer; retry after it finishes or use `--worktree` |
 | `81` | progress stalled after a steering nudge and its grace period, and the restart budget was spent |
+| `82` | the worker report failed its result contract or claimed deliverables that do not exist |
 <!-- zchk-doc-exit-codes:end -->
 
 The code names the reason, not which limit ran out: `75` means rot and `76`

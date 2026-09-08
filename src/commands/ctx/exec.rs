@@ -63,6 +63,10 @@ pub const EXIT_WRITER_BUSY: i32 = 80;
 /// class rather than folding it into `crash`.
 pub const EXIT_STALLED: i32 = 81;
 
+/// The worker exited cleanly but its final report failed the result contract or named
+/// deliverables that do not exist.
+pub const EXIT_CONTRACT_FAILED: i32 = 82;
+
 /// Supervisor-owned exit codes, shared with the README completeness check.
 pub(crate) const EXIT_CODES: &[(i32, &str)] = &[
     (EXIT_ROT_EXHAUSTED, "EXIT_ROT_EXHAUSTED"),
@@ -72,6 +76,7 @@ pub(crate) const EXIT_CODES: &[(i32, &str)] = &[
     (EXIT_ACCOUNT_EXHAUSTED, "EXIT_ACCOUNT_EXHAUSTED"),
     (EXIT_WRITER_BUSY, "EXIT_WRITER_BUSY"),
     (EXIT_STALLED, "EXIT_STALLED"),
+    (EXIT_CONTRACT_FAILED, "EXIT_CONTRACT_FAILED"),
 ];
 
 /// The supervisor reports its own outcomes through the same `i32` an agent's
@@ -101,6 +106,7 @@ pub fn describe_exit(code: i32) -> String {
              pass --worktree for an isolated one"
                 .to_string()
         }
+        EXIT_CONTRACT_FAILED => "the worker report failed its result contract".to_string(),
         EXIT_STALLED => {
             "no progress was observed after a steering nudge and the restart budget ran out"
                 .to_string()
@@ -1251,6 +1257,10 @@ fn run_with_clock_inner<W: Write>(
         // against the identical contract the headless retry path enforces.
         if let Some(schema) = env(super::agent::RESULT_SCHEMA_ENV).filter(|s| !s.is_empty()) {
             turn_env.push((super::agent::RESULT_SCHEMA_ENV.to_string(), schema));
+            turn_env.push((
+                super::agent::RESULT_WORKDIR_ENV.to_string(),
+                repo.display().to_string(),
+            ));
         }
         turn_env
     };
@@ -3636,6 +3646,28 @@ pub fn run<W: Write>(args: &ExecArgs, w: &mut W) -> CtxResult<i32> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn every_declared_exit_constant_is_in_exit_codes() {
+        let mut declared = Vec::new();
+        for line in include_str!("exec.rs").lines() {
+            let Some(rest) = line.trim().strip_prefix("pub const EXIT_") else {
+                continue;
+            };
+            let (suffix, value) = rest.split_once(": i32 = ").expect("exit constant shape");
+            let code = value
+                .trim_end_matches(';')
+                .parse::<i32>()
+                .expect("exit code");
+            let name = format!("EXIT_{suffix}");
+            assert!(
+                EXIT_CODES.contains(&(code, name.as_str())),
+                "{name} missing from EXIT_CODES"
+            );
+            declared.push(name);
+        }
+        assert_eq!(declared.len(), EXIT_CODES.len());
+    }
 
     fn fixture(name: &str) -> PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
