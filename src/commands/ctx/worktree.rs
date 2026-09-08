@@ -1,9 +1,9 @@
 //! Issue #319: proof-required worktree reclaim, archive, startup GC, and the
 //! `zirv ctx worktree` operator verbs. No worker worktree is ever removed
 //! without affirmative proof that nothing is lost: untracked content is
-//! archived, never destroyed, and a tree with any unpushed commit, any
-//! dirty tracked file, or any cherry-unmatched commit is left in place with
-//! a named reason.
+//! archived, including ignored content except named regenerable build output.
+//! A tree with any unpushed commit, any dirty tracked file, or any
+//! cherry-unmatched commit is left in place with a named reason.
 //!
 //! [`decide`] mirrors `rot.rs`'s own purity contract: it reads only what
 //! [`probe`] already pulled from git as plain strings, never the
@@ -62,33 +62,55 @@ pub fn ahead_count(rev_list_output: &str) -> Result<u64, ParseError> {
     })
 }
 
-/// The tracked/untracked split of a `git status --porcelain` reading. A
-/// worktree with `tracked: true` (any line not `?? ...`) is never a
-/// candidate for `ArchiveThenRemove` -- only its untracked-only counterpart
-/// is (see [`decide`]).
+const IGNORED_BUILD_OUTPUT: &[&str] = &[
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "out",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".cache",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    "coverage",
+];
+
+/// The tracked/untracked/ignored split of `git status --porcelain --ignored`.
+/// Any tracked change prevents removal (see [`decide`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Dirty {
     pub tracked: bool,
     pub untracked: Vec<PathBuf>,
+    pub ignored: Vec<PathBuf>,
 }
 
-/// Pure: classifies every non-empty `git status --porcelain` line. Porcelain
-/// v1's untracked marker is exactly `"?? "` (two question marks, one
-/// space) followed by the path; everything else -- staged, unstaged,
-/// renamed, conflicted -- counts as tracked dirt, since none of those are
-/// safe to silently discard.
+/// Pure: classifies porcelain v1's untracked (`??`) and ignored (`!!`)
+/// entries; all other non-empty lines count as tracked changes.
 pub fn is_dirty(porcelain_output: &str) -> Dirty {
     let mut dirty = Dirty::default();
     for line in porcelain_output.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        match line.strip_prefix("?? ") {
-            Some(rest) => dirty.untracked.push(PathBuf::from(rest)),
-            None => dirty.tracked = true,
+        if let Some(rest) = line.strip_prefix("?? ") {
+            dirty.untracked.push(PathBuf::from(rest));
+        } else if let Some(rest) = line.strip_prefix("!! ") {
+            dirty.ignored.push(PathBuf::from(rest));
+        } else if !line.is_empty() {
+            dirty.tracked = true;
         }
     }
     dirty
+}
+
+fn is_ignored_build_output(path: &Path) -> bool {
+    path.components().next().is_some_and(|name| {
+        IGNORED_BUILD_OUTPUT
+            .iter()
+            .any(|output| name.as_os_str() == *output)
+    })
 }
 
 /// Pure: counts `git cherry <base>`'s own `+` lines -- commits in `HEAD`
@@ -125,13 +147,12 @@ pub struct InspectionFailed {
 
 /// [`decide`]'s verdict. `Remove` and `ArchiveThenRemove` are both
 /// affirmative proof the tree carries nothing that would be lost;
-/// `ArchiveThenRemove` additionally requires the caller to copy `Vec<PathBuf>`
-/// (paths relative to the worktree root, exactly as `git status --porcelain`
-/// reported them) somewhere durable before removing anything.
+/// `ArchiveThenRemove` requires archiving untracked and ignored paths relative
+/// to the worktree root, except explicitly skipped regenerable build output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PruneDecision {
     Remove,
-    ArchiveThenRemove(Vec<PathBuf>),
+    ArchiveThenRemove(Dirty),
     Keep(InspectionFailed),
 }
 
@@ -139,8 +160,8 @@ pub enum PruneDecision {
 /// commit ahead of base, any tracked dirt, or any cherry-unmatched commit
 /// refuses the prune -- named by the FIRST such condition in probe order,
 /// never a merged summary. Only when all three probes came back clean AND
-/// clean-of-tracked-dirt does untracked-only content route to
-/// `ArchiveThenRemove`; a genuinely clean tree (no untracked content either)
+/// clean-of-tracked-dirt does untracked or ignored content route to
+/// `ArchiveThenRemove`; a genuinely clean tree (neither kind of content)
 /// routes to `Remove`.
 pub fn decide(probes: &Probes) -> PruneDecision {
     let ahead = match &probes.ahead {
@@ -188,8 +209,8 @@ pub fn decide(probes: &Probes) -> PruneDecision {
             note: format!("{unmatched} commit(s) not equivalent to anything upstream of base"),
         });
     }
-    if !dirty.untracked.is_empty() {
-        return PruneDecision::ArchiveThenRemove(dirty.untracked.clone());
+    if !dirty.untracked.is_empty() || !dirty.ignored.is_empty() {
+        return PruneDecision::ArchiveThenRemove(dirty.clone());
     }
     PruneDecision::Remove
 }
@@ -239,7 +260,7 @@ pub fn probe(path: &Path, base_commit: &str) -> Probes {
             message: e.0,
         })
     });
-    let dirty = run_git(path, &["status", "--porcelain"])
+    let dirty = run_git(path, &["status", "--porcelain", "--ignored"])
         .map(|out| is_dirty(&out))
         .map_err(|message| ProbeFailure {
             probe: "dirty",
@@ -282,17 +303,17 @@ fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Copies every path in `untracked` (relative to `path`, exactly as
+/// Copies every path in `paths` (relative to `path`, exactly as
 /// `git status --porcelain` reported them) into a fresh directory under
 /// `state.worktree_archive()`, and returns that directory only once EVERY
 /// copy has succeeded. A failure partway through leaves whatever was already
 /// copied on disk (harmless -- it is a copy, the originals are untouched)
 /// and returns `Err`; the caller must treat that as `InspectionFailed`, not
 /// remove anything.
-pub fn archive_untracked(
+pub fn archive_content(
     state: &StateDir,
     path: &Path,
-    untracked: &[PathBuf],
+    paths: &[PathBuf],
 ) -> Result<PathBuf, String> {
     let slug = path
         .file_name()
@@ -303,7 +324,7 @@ pub fn archive_untracked(
         .join(format!("{slug}-{}", now_secs()));
     create_private_dir_all(&dest)
         .map_err(|e| format!("could not create archive directory {}: {e}", dest.display()))?;
-    for rel in untracked {
+    for rel in paths {
         let src = path.join(rel);
         let dst = dest.join(rel);
         copy_path(&src, &dst).map_err(|e| format!("could not archive {}: {e}", src.display()))?;
@@ -424,7 +445,13 @@ pub fn update_status(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PruneOutcome {
     Removed,
-    Archived(PathBuf),
+    RemovedWithSkipped(Vec<PathBuf>),
+    Archived {
+        dest: PathBuf,
+        untracked: usize,
+        ignored: usize,
+        skipped: Vec<PathBuf>,
+    },
     Kept(InspectionFailed),
     Failed(String),
 }
@@ -465,7 +492,7 @@ fn remove_worktree(repo: &Path, path: &Path, force: bool) -> Result<(), String> 
 }
 
 /// The full proof-required prune of one worktree: [`probe`] against
-/// `base_commit`, then [`decide`], archiving untracked-only content first
+/// `base_commit`, then [`decide`], archiving untracked and ignored content first
 /// when required, removing only once every prerequisite has succeeded, and
 /// always leaving the ownership record reflecting the outcome. Shared by
 /// [`gc`], the `prune` verb (`run_prune`), and
@@ -485,26 +512,43 @@ pub fn prune_one(
             Ok(()) => PruneOutcome::Removed,
             Err(reason) => PruneOutcome::Failed(reason),
         },
-        PruneDecision::ArchiveThenRemove(untracked) => {
-            match archive_untracked(state, path, &untracked) {
-                // `--force`: the untracked content `git worktree remove`
-                // would otherwise refuse to discard has already been copied
-                // to `dest`, above -- see `remove_worktree`'s own doc
-                // comment.
-                Ok(dest) => match remove_worktree(repo, path, true) {
-                    Ok(()) => PruneOutcome::Archived(dest),
+        PruneDecision::ArchiveThenRemove(dirty) => {
+            let (skipped, ignored): (Vec<_>, Vec<_>) = dirty
+                .ignored
+                .into_iter()
+                .partition(|path| is_ignored_build_output(path));
+            let untracked_count = dirty.untracked.len();
+            let ignored_count = ignored.len();
+            let paths: Vec<_> = dirty.untracked.into_iter().chain(ignored).collect();
+            if paths.is_empty() {
+                match remove_worktree(repo, path, false) {
+                    Ok(()) => PruneOutcome::RemovedWithSkipped(skipped),
                     Err(reason) => PruneOutcome::Failed(reason),
-                },
-                Err(reason) => PruneOutcome::Kept(InspectionFailed {
-                    probe: "archive",
-                    note: reason,
-                }),
+                }
+            } else {
+                match archive_content(state, path, &paths) {
+                    Ok(dest) => match remove_worktree(repo, path, untracked_count > 0) {
+                        Ok(()) => PruneOutcome::Archived {
+                            dest,
+                            untracked: untracked_count,
+                            ignored: ignored_count,
+                            skipped,
+                        },
+                        Err(reason) => PruneOutcome::Failed(reason),
+                    },
+                    Err(reason) => PruneOutcome::Kept(InspectionFailed {
+                        probe: "archive",
+                        note: reason,
+                    }),
+                }
             }
         }
         PruneDecision::Keep(reason) => PruneOutcome::Kept(reason),
     };
     let (status, note) = match &outcome {
-        PruneOutcome::Removed | PruneOutcome::Archived(_) => (WorktreeStatus::Removed, None),
+        PruneOutcome::Removed
+        | PruneOutcome::RemovedWithSkipped(_)
+        | PruneOutcome::Archived { .. } => (WorktreeStatus::Removed, None),
         PruneOutcome::Kept(reason) => (
             WorktreeStatus::InspectionFailed,
             Some(format!("{}: {}", reason.probe, reason.note)),
@@ -788,6 +832,22 @@ pub fn run_finalize<W: Write>(
     Ok(0)
 }
 
+fn write_skipped<W: Write>(w: &mut W, skipped: &[PathBuf]) -> CtxResult<()> {
+    if !skipped.is_empty() {
+        write!(
+            w,
+            "; skipped build output: {}",
+            skipped
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+    }
+    writeln!(w)?;
+    Ok(())
+}
+
 pub fn run_prune<W: Write>(
     state: &StateDir,
     repo: &Path,
@@ -823,12 +883,24 @@ pub fn run_prune<W: Write>(
         let outcome = prune_one(state, repo, &repo_slug, &path, &record.base_commit);
         match &outcome {
             PruneOutcome::Removed => writeln!(w, "{}: removed (clean)", record.path)?,
-            PruneOutcome::Archived(dest) => writeln!(
-                w,
-                "{}: untracked content archived to {}, then removed",
-                record.path,
-                dest.display()
-            )?,
+            PruneOutcome::RemovedWithSkipped(skipped) => {
+                write!(w, "{}: removed", record.path)?;
+                write_skipped(w, skipped)?;
+            }
+            PruneOutcome::Archived {
+                dest,
+                untracked,
+                ignored,
+                skipped,
+            } => {
+                write!(
+                    w,
+                    "{}: archived {untracked} untracked, {ignored} ignored to {}, then removed",
+                    record.path,
+                    dest.display()
+                )?;
+                write_skipped(w, skipped)?;
+            }
             PruneOutcome::Kept(reason) => {
                 any_kept = true;
                 writeln!(
@@ -979,6 +1051,7 @@ mod tests {
             dirty: Ok(Dirty {
                 tracked: true,
                 untracked: Vec::new(),
+                ignored: Vec::new(),
             }),
             ..clean_probes()
         };
@@ -1006,12 +1079,16 @@ mod tests {
             dirty: Ok(Dirty {
                 tracked: false,
                 untracked: vec![PathBuf::from("scratch.txt")],
+                ignored: Vec::new(),
             }),
             ..clean_probes()
         };
         assert_eq!(
             decide(&probes),
-            PruneDecision::ArchiveThenRemove(vec![PathBuf::from("scratch.txt")])
+            PruneDecision::ArchiveThenRemove(Dirty {
+                untracked: vec![PathBuf::from("scratch.txt")],
+                ..Dirty::default()
+            })
         );
     }
 
@@ -1024,6 +1101,7 @@ mod tests {
             dirty: Ok(Dirty {
                 tracked: true,
                 untracked: Vec::new(),
+                ignored: Vec::new(),
             }),
             unmatched: Ok(3),
         };
@@ -1111,6 +1189,20 @@ mod tests {
     }
 
     #[test]
+    fn probe_dirty_reports_ignored_content_in_the_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, base) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        std::fs::write(repo.join(".git/info/exclude"), "*.local\n").expect("write ignore");
+        std::fs::write(worktree.join("valuable.local"), "valuable\n").expect("write");
+
+        let dirty = probe(&worktree, &base).dirty.expect("status must succeed");
+        assert!(!dirty.tracked);
+        assert!(dirty.untracked.is_empty());
+        assert_eq!(dirty.ignored, vec![PathBuf::from("valuable.local")]);
+    }
+
+    #[test]
     fn probe_cherry_reports_zero_for_a_commit_already_equivalent_upstream() {
         if !git_available() {
             eprintln!("skipping: git not found on PATH");
@@ -1155,10 +1247,10 @@ mod tests {
         assert_eq!(probes.unmatched, Ok(1));
     }
 
-    // -- archive_untracked --------------------------------------------------
+    // -- archive_content --------------------------------------------------
 
     #[test]
-    fn archive_untracked_copies_files_and_whole_directories() {
+    fn archive_content_copies_files_and_whole_directories() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let worktree = tmp.path().join("wt");
@@ -1166,7 +1258,7 @@ mod tests {
         std::fs::write(worktree.join("scratch.txt"), "not committed\n").expect("write");
         std::fs::write(worktree.join("subdir/nested.txt"), "also not committed\n").expect("write");
 
-        let dest = archive_untracked(
+        let dest = archive_content(
             &state,
             &worktree,
             &[PathBuf::from("scratch.txt"), PathBuf::from("subdir/")],
@@ -1188,13 +1280,13 @@ mod tests {
     }
 
     #[test]
-    fn archive_untracked_fails_without_touching_anything_when_a_source_is_missing() {
+    fn archive_content_fails_without_touching_anything_when_a_source_is_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let worktree = tmp.path().join("wt");
         std::fs::create_dir_all(&worktree).expect("mkdir");
 
-        let result = archive_untracked(&state, &worktree, &[PathBuf::from("missing.txt")]);
+        let result = archive_content(&state, &worktree, &[PathBuf::from("missing.txt")]);
         assert!(result.is_err(), "archiving a nonexistent path must fail");
     }
 
@@ -1383,7 +1475,7 @@ mod tests {
 
         let outcome = prune_one(&state, &repo, &repo_slug, &worktree, &base);
         match outcome {
-            PruneOutcome::Archived(dest) => {
+            PruneOutcome::Archived { dest, .. } => {
                 assert_eq!(
                     std::fs::read_to_string(dest.join("scratch.txt")).expect("read archived"),
                     "not committed\n"
@@ -1397,6 +1489,52 @@ mod tests {
         );
         let record = latest_for_path(&state, &repo_slug, &worktree).expect("record");
         assert_eq!(record.status, WorktreeStatus::Removed);
+    }
+
+    #[test]
+    fn prune_one_archives_ignored_content_then_removes_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, base) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        let repo_slug = super::super::state::repo_slug(&repo);
+        std::fs::write(repo.join(".git/info/exclude"), "*.local\n").expect("write ignore");
+        std::fs::write(worktree.join("valuable.local"), "valuable\n").expect("write");
+
+        match prune_one(&state, &repo, &repo_slug, &worktree, &base) {
+            PruneOutcome::Archived {
+                dest,
+                untracked,
+                ignored,
+                skipped,
+            } => {
+                assert_eq!(
+                    std::fs::read_to_string(dest.join("valuable.local")).expect("read archived"),
+                    "valuable\n"
+                );
+                assert_eq!((untracked, ignored), (0, 1));
+                assert!(skipped.is_empty());
+            }
+            other => panic!("expected Archived, got {other:?}"),
+        }
+        assert!(!worktree.exists(), "ignored content must not block removal");
+        assert_eq!(
+            latest_for_path(&state, &repo_slug, &worktree)
+                .expect("record")
+                .status,
+            WorktreeStatus::Removed
+        );
+    }
+
+    #[test]
+    fn ignored_build_output_matches_only_exact_top_level_names() {
+        for name in IGNORED_BUILD_OUTPUT {
+            assert!(is_ignored_build_output(Path::new(name)));
+            assert!(is_ignored_build_output(&Path::new(name).join("file")));
+            assert!(!is_ignored_build_output(&Path::new("notes").join(name)));
+            assert!(!is_ignored_build_output(Path::new(&format!(
+                "{name}.local"
+            ))));
+        }
     }
 
     #[test]
@@ -1550,7 +1688,89 @@ mod tests {
         .expect("run_prune");
         assert_eq!(code, 0);
         assert!(!worktree.exists());
-        assert!(String::from_utf8_lossy(&out).contains("removed"));
+        assert!(String::from_utf8_lossy(&out).contains("removed (clean)"));
+    }
+
+    #[test]
+    fn run_prune_skips_ignored_target_and_names_it_in_the_report() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, _) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        std::fs::write(repo.join(".git/info/exclude"), "target/\n").expect("write ignore");
+        std::fs::create_dir(worktree.join("target")).expect("mkdir");
+        std::fs::write(worktree.join("target/output"), "regenerable\n").expect("write");
+
+        let mut out = Vec::new();
+        let code = run_prune(
+            &state,
+            &repo,
+            &mut out,
+            &PruneArgs {
+                id_or_path: Some("wt".to_string()),
+                all: false,
+            },
+        )
+        .expect("run_prune");
+        assert_eq!(code, 0);
+        assert!(!worktree.exists());
+        assert!(!state.worktree_archive().exists());
+        let report = String::from_utf8_lossy(&out);
+        assert!(
+            report.contains("removed; skipped build output: target/"),
+            "{report}"
+        );
+        assert!(!report.contains("removed (clean)"));
+    }
+
+    #[test]
+    fn run_prune_reports_archived_untracked_and_ignored_content_with_skipped_output() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let (repo, worktree, _) = repo_with_recorded_worktree(tmp.path(), &state, None);
+        std::fs::write(repo.join(".git/info/exclude"), "target/\n*.local\n").expect("write ignore");
+        std::fs::create_dir(worktree.join("target")).expect("mkdir");
+        std::fs::write(worktree.join("target/output"), "regenerable\n").expect("write");
+        std::fs::write(worktree.join("valuable.local"), "valuable\n").expect("write");
+        std::fs::write(worktree.join("scratch.txt"), "scratch\n").expect("write");
+
+        let mut out = Vec::new();
+        assert_eq!(
+            run_prune(
+                &state,
+                &repo,
+                &mut out,
+                &PruneArgs {
+                    id_or_path: Some("wt".to_string()),
+                    all: false,
+                }
+            )
+            .expect("run_prune"),
+            0
+        );
+        assert!(!worktree.exists());
+        let archives: Vec<_> = std::fs::read_dir(state.worktree_archive())
+            .expect("archives")
+            .map(|entry| entry.expect("archive").path())
+            .collect();
+        assert_eq!(archives.len(), 1);
+        assert!(!archives[0].join("target").exists());
+        assert_eq!(
+            std::fs::read_to_string(archives[0].join("valuable.local")).expect("read"),
+            "valuable\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(archives[0].join("scratch.txt")).expect("read"),
+            "scratch\n"
+        );
+        let report = String::from_utf8_lossy(&out);
+        assert!(
+            report.contains("archived 1 untracked, 1 ignored to "),
+            "{report}"
+        );
+        assert!(
+            report.contains("then removed; skipped build output: target/"),
+            "{report}"
+        );
     }
 
     #[test]
