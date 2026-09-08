@@ -1,0 +1,345 @@
+==> building native extension
+cc -O2 -Wall -c src/native/file_1.c -o build/obj/file_1.o
+cc -O2 -Wall -c src/native/file_2.c -o build/obj/file_2.o
+cc -O2 -Wall -c src/native/file_3.c -o build/obj/file_3.o
+cc -O2 -Wall -c src/native/file_4.c -o build/obj/file_4.o
+cc -O2 -Wall -c src/native/file_5.c -o build/obj/file_5.o
+cc -O2 -Wall -c src/native/file_6.c -o build/obj/file_6.o
+cc -O2 -Wall -c src/native/file_7.c -o build/obj/file_7.o
+cc -O2 -Wall -c src/native/file_8.c -o build/obj/file_8.o
+cc -O2 -Wall -c src/native/file_9.c -o build/obj/file_9.o
+cc -O2 -Wall -c src/native/file_10.c -o build/obj/file_10.o
+cc -O2 -Wall -c src/native/file_11.c -o build/obj/file_11.o
+cc -O2 -Wall -c src/native/file_12.c -o build/obj/file_12.o
+cc -O2 -Wall -c src/native/file_13.c -o build/obj/file_13.o
+cc -O2 -Wall -c src/native/file_14.c -o build/obj/file_14.o
+cc -O2 -Wall -c src/native/file_15.c -o build/obj/file_15.o
+cc -O2 -Wall -c src/native/file_16.c -o build/obj/file_16.o
+cc -O2 -Wall -c src/native/file_17.c -o build/obj/file_17.o
+cc -O2 -Wall -c src/native/file_18.c -o build/obj/file_18.o
+cc -O2 -Wall -c src/native/file_19.c -o build/obj/file_19.o
+cc -O2 -Wall -c src/native/file_20.c -o build/obj/file_20.o
+cc -O2 -Wall -c src/native/file_21.c -o build/obj/file_21.o
+cc -O2 -Wall -c src/native/file_22.c -o build/obj/file_22.o
+cc -O2 -Wall -c src/native/file_23.c -o build/obj/file_23.o
+cc -O2 -Wall -c src/native/file_24.c -o build/obj/file_24.o
+cc -O2 -Wall -c src/native/file_25.c -o build/obj/file_25.o
+cc -O2 -Wall -c src/native/file_26.c -o build/obj/file_26.o
+cc -O2 -Wall -c src/native/file_27.c -o build/obj/file_27.o
+cc -O2 -Wall -c src/native/file_28.c -o build/obj/file_28.o
+cc -O2 -Wall -c src/native/file_29.c -o build/obj/file_29.o
+cc -O2 -Wall -c src/native/file_30.c -o build/obj/file_30.o
+cc -O2 -Wall -c src/native/file_31.c -o build/obj/file_31.o
+cc -O2 -Wall -c src/native/file_32.c -o build/obj/file_32.o
+cc -O2 -Wall -c src/native/file_33.c -o build/obj/file_33.o
+cc -O2 -Wall -c src/native/file_34.c -o build/obj/file_34.o
+cc -O2 -Wall -c src/native/file_35.c -o build/obj/file_35.o
+cc -O2 -Wall -c src/native/file_36.c -o build/obj/file_36.o
+cc -O2 -Wall -c src/native/file_37.c -o build/obj/file_37.o
+cc -O2 -Wall -c src/native/file_38.c -o build/obj/file_38.o
+cc -O2 -Wall -c src/native/file_39.c -o build/obj/file_39.o
+cc -O2 -Wall -c src/native/file_40.c -o build/obj/file_40.o
+cc -O2 -Wall -c src/native/file_41.c -o build/obj/file_41.o
+cc -O2 -Wall -c src/native/file_42.c -o build/obj/file_42.o
+cc -O2 -Wall -c src/native/file_43.c -o build/obj/file_43.o
+cc -O2 -Wall -c src/native/file_44.c -o build/obj/file_44.o
+cc -O2 -Wall -c src/native/file_45.c -o build/obj/file_45.o
+cc -O2 -Wall -c src/native/file_46.c -o build/obj/file_46.o
+cc -O2 -Wall -c src/native/file_47.c -o build/obj/file_47.o
+cc -O2 -Wall -c src/native/file_48.c -o build/obj/file_48.o
+cc -O2 -Wall -c src/native/file_49.c -o build/obj/file_49.o
+cc -O2 -Wall -c src/native/file_50.c -o build/obj/file_50.o
+cc -O2 -Wall -c src/native/file_51.c -o build/obj/file_51.o
+cc -O2 -Wall -c src/native/file_52.c -o build/obj/file_52.o
+cc -O2 -Wall -c src/native/file_53.c -o build/obj/file_53.o
+cc -O2 -Wall -c src/native/file_54.c -o build/obj/file_54.o
+cc -O2 -Wall -c src/native/file_55.c -o build/obj/file_55.o
+cc -O2 -Wall -c src/native/file_56.c -o build/obj/file_56.o
+cc -O2 -Wall -c src/native/file_57.c -o build/obj/file_57.o
+cc -O2 -Wall -c src/native/file_58.c -o build/obj/file_58.o
+cc -O2 -Wall -c src/native/file_59.c -o build/obj/file_59.o
+cc -O2 -Wall -c src/native/file_60.c -o build/obj/file_60.o
+cc -O2 -Wall -c src/native/file_61.c -o build/obj/file_61.o
+cc -O2 -Wall -c src/native/file_62.c -o build/obj/file_62.o
+cc -O2 -Wall -c src/native/file_63.c -o build/obj/file_63.o
+cc -O2 -Wall -c src/native/file_64.c -o build/obj/file_64.o
+cc -O2 -Wall -c src/native/file_65.c -o build/obj/file_65.o
+cc -O2 -Wall -c src/native/file_66.c -o build/obj/file_66.o
+cc -O2 -Wall -c src/native/file_67.c -o build/obj/file_67.o
+cc -O2 -Wall -c src/native/file_68.c -o build/obj/file_68.o
+cc -O2 -Wall -c src/native/file_69.c -o build/obj/file_69.o
+cc -O2 -Wall -c src/native/file_70.c -o build/obj/file_70.o
+cc -O2 -Wall -c src/native/file_71.c -o build/obj/file_71.o
+cc -O2 -Wall -c src/native/file_72.c -o build/obj/file_72.o
+cc -O2 -Wall -c src/native/file_73.c -o build/obj/file_73.o
+cc -O2 -Wall -c src/native/file_74.c -o build/obj/file_74.o
+cc -O2 -Wall -c src/native/file_75.c -o build/obj/file_75.o
+cc -O2 -Wall -c src/native/file_76.c -o build/obj/file_76.o
+cc -O2 -Wall -c src/native/file_77.c -o build/obj/file_77.o
+cc -O2 -Wall -c src/native/file_78.c -o build/obj/file_78.o
+cc -O2 -Wall -c src/native/file_79.c -o build/obj/file_79.o
+cc -O2 -Wall -c src/native/file_80.c -o build/obj/file_80.o
+cc -O2 -Wall -c src/native/file_81.c -o build/obj/file_81.o
+cc -O2 -Wall -c src/native/file_82.c -o build/obj/file_82.o
+cc -O2 -Wall -c src/native/file_83.c -o build/obj/file_83.o
+cc -O2 -Wall -c src/native/file_84.c -o build/obj/file_84.o
+cc -O2 -Wall -c src/native/file_85.c -o build/obj/file_85.o
+cc -O2 -Wall -c src/native/file_86.c -o build/obj/file_86.o
+cc -O2 -Wall -c src/native/file_87.c -o build/obj/file_87.o
+cc -O2 -Wall -c src/native/file_88.c -o build/obj/file_88.o
+cc -O2 -Wall -c src/native/file_89.c -o build/obj/file_89.o
+cc -O2 -Wall -c src/native/file_90.c -o build/obj/file_90.o
+cc -O2 -Wall -c src/native/file_91.c -o build/obj/file_91.o
+cc -O2 -Wall -c src/native/file_92.c -o build/obj/file_92.o
+cc -O2 -Wall -c src/native/file_93.c -o build/obj/file_93.o
+cc -O2 -Wall -c src/native/file_94.c -o build/obj/file_94.o
+cc -O2 -Wall -c src/native/file_95.c -o build/obj/file_95.o
+cc -O2 -Wall -c src/native/file_96.c -o build/obj/file_96.o
+cc -O2 -Wall -c src/native/file_97.c -o build/obj/file_97.o
+cc -O2 -Wall -c src/native/file_98.c -o build/obj/file_98.o
+cc -O2 -Wall -c src/native/file_99.c -o build/obj/file_99.o
+cc -O2 -Wall -c src/native/file_100.c -o build/obj/file_100.o
+cc -O2 -Wall -c src/native/file_101.c -o build/obj/file_101.o
+cc -O2 -Wall -c src/native/file_102.c -o build/obj/file_102.o
+cc -O2 -Wall -c src/native/file_103.c -o build/obj/file_103.o
+cc -O2 -Wall -c src/native/file_104.c -o build/obj/file_104.o
+cc -O2 -Wall -c src/native/file_105.c -o build/obj/file_105.o
+cc -O2 -Wall -c src/native/file_106.c -o build/obj/file_106.o
+cc -O2 -Wall -c src/native/file_107.c -o build/obj/file_107.o
+cc -O2 -Wall -c src/native/file_108.c -o build/obj/file_108.o
+cc -O2 -Wall -c src/native/file_109.c -o build/obj/file_109.o
+cc -O2 -Wall -c src/native/file_110.c -o build/obj/file_110.o
+cc -O2 -Wall -c src/native/file_111.c -o build/obj/file_111.o
+cc -O2 -Wall -c src/native/file_112.c -o build/obj/file_112.o
+cc -O2 -Wall -c src/native/file_113.c -o build/obj/file_113.o
+cc -O2 -Wall -c src/native/file_114.c -o build/obj/file_114.o
+cc -O2 -Wall -c src/native/file_115.c -o build/obj/file_115.o
+cc -O2 -Wall -c src/native/file_116.c -o build/obj/file_116.o
+cc -O2 -Wall -c src/native/file_117.c -o build/obj/file_117.o
+cc -O2 -Wall -c src/native/file_118.c -o build/obj/file_118.o
+cc -O2 -Wall -c src/native/file_119.c -o build/obj/file_119.o
+cc -O2 -Wall -c src/native/file_120.c -o build/obj/file_120.o
+cc -O2 -Wall -c src/native/file_121.c -o build/obj/file_121.o
+cc -O2 -Wall -c src/native/file_122.c -o build/obj/file_122.o
+cc -O2 -Wall -c src/native/file_123.c -o build/obj/file_123.o
+cc -O2 -Wall -c src/native/file_124.c -o build/obj/file_124.o
+cc -O2 -Wall -c src/native/file_125.c -o build/obj/file_125.o
+cc -O2 -Wall -c src/native/file_126.c -o build/obj/file_126.o
+cc -O2 -Wall -c src/native/file_127.c -o build/obj/file_127.o
+cc -O2 -Wall -c src/native/file_128.c -o build/obj/file_128.o
+cc -O2 -Wall -c src/native/file_129.c -o build/obj/file_129.o
+cc -O2 -Wall -c src/native/file_130.c -o build/obj/file_130.o
+cc -O2 -Wall -c src/native/file_131.c -o build/obj/file_131.o
+cc -O2 -Wall -c src/native/file_132.c -o build/obj/file_132.o
+cc -O2 -Wall -c src/native/file_133.c -o build/obj/file_133.o
+cc -O2 -Wall -c src/native/file_134.c -o build/obj/file_134.o
+cc -O2 -Wall -c src/native/file_135.c -o build/obj/file_135.o
+cc -O2 -Wall -c src/native/file_136.c -o build/obj/file_136.o
+cc -O2 -Wall -c src/native/file_137.c -o build/obj/file_137.o
+cc -O2 -Wall -c src/native/file_138.c -o build/obj/file_138.o
+cc -O2 -Wall -c src/native/file_139.c -o build/obj/file_139.o
+cc -O2 -Wall -c src/native/file_140.c -o build/obj/file_140.o
+cc -O2 -Wall -c src/native/file_141.c -o build/obj/file_141.o
+cc -O2 -Wall -c src/native/file_142.c -o build/obj/file_142.o
+cc -O2 -Wall -c src/native/file_143.c -o build/obj/file_143.o
+cc -O2 -Wall -c src/native/file_144.c -o build/obj/file_144.o
+cc -O2 -Wall -c src/native/file_145.c -o build/obj/file_145.o
+cc -O2 -Wall -c src/native/file_146.c -o build/obj/file_146.o
+cc -O2 -Wall -c src/native/file_147.c -o build/obj/file_147.o
+cc -O2 -Wall -c src/native/file_148.c -o build/obj/file_148.o
+cc -O2 -Wall -c src/native/file_149.c -o build/obj/file_149.o
+cc -O2 -Wall -c src/native/file_150.c -o build/obj/file_150.o
+cc -O2 -Wall -c src/native/file_151.c -o build/obj/file_151.o
+cc -O2 -Wall -c src/native/file_152.c -o build/obj/file_152.o
+cc -O2 -Wall -c src/native/file_153.c -o build/obj/file_153.o
+cc -O2 -Wall -c src/native/file_154.c -o build/obj/file_154.o
+cc -O2 -Wall -c src/native/file_155.c -o build/obj/file_155.o
+cc -O2 -Wall -c src/native/file_156.c -o build/obj/file_156.o
+cc -O2 -Wall -c src/native/file_157.c -o build/obj/file_157.o
+cc -O2 -Wall -c src/native/file_158.c -o build/obj/file_158.o
+cc -O2 -Wall -c src/native/file_159.c -o build/obj/file_159.o
+cc -O2 -Wall -c src/native/file_160.c -o build/obj/file_160.o
+cc -O2 -Wall -c src/native/file_161.c -o build/obj/file_161.o
+cc -O2 -Wall -c src/native/file_162.c -o build/obj/file_162.o
+cc -O2 -Wall -c src/native/file_163.c -o build/obj/file_163.o
+cc -O2 -Wall -c src/native/file_164.c -o build/obj/file_164.o
+cc -O2 -Wall -c src/native/file_165.c -o build/obj/file_165.o
+cc -O2 -Wall -c src/native/file_166.c -o build/obj/file_166.o
+cc -O2 -Wall -c src/native/file_167.c -o build/obj/file_167.o
+cc -O2 -Wall -c src/native/file_168.c -o build/obj/file_168.o
+cc -O2 -Wall -c src/native/file_169.c -o build/obj/file_169.o
+cc -O2 -Wall -c src/native/file_170.c -o build/obj/file_170.o
+cc -O2 -Wall -c src/native/file_171.c -o build/obj/file_171.o
+cc -O2 -Wall -c src/native/file_172.c -o build/obj/file_172.o
+cc -O2 -Wall -c src/native/file_173.c -o build/obj/file_173.o
+cc -O2 -Wall -c src/native/file_174.c -o build/obj/file_174.o
+cc -O2 -Wall -c src/native/file_175.c -o build/obj/file_175.o
+cc -O2 -Wall -c src/native/file_176.c -o build/obj/file_176.o
+cc -O2 -Wall -c src/native/file_177.c -o build/obj/file_177.o
+cc -O2 -Wall -c src/native/file_178.c -o build/obj/file_178.o
+cc -O2 -Wall -c src/native/file_179.c -o build/obj/file_179.o
+cc -O2 -Wall -c src/native/file_180.c -o build/obj/file_180.o
+cc -O2 -Wall -c src/native/file_181.c -o build/obj/file_181.o
+cc -O2 -Wall -c src/native/file_182.c -o build/obj/file_182.o
+cc -O2 -Wall -c src/native/file_183.c -o build/obj/file_183.o
+cc -O2 -Wall -c src/native/file_184.c -o build/obj/file_184.o
+cc -O2 -Wall -c src/native/file_185.c -o build/obj/file_185.o
+cc -O2 -Wall -c src/native/file_186.c -o build/obj/file_186.o
+cc -O2 -Wall -c src/native/file_187.c -o build/obj/file_187.o
+cc -O2 -Wall -c src/native/file_188.c -o build/obj/file_188.o
+cc -O2 -Wall -c src/native/file_189.c -o build/obj/file_189.o
+cc -O2 -Wall -c src/native/file_190.c -o build/obj/file_190.o
+cc -O2 -Wall -c src/native/file_191.c -o build/obj/file_191.o
+cc -O2 -Wall -c src/native/file_192.c -o build/obj/file_192.o
+cc -O2 -Wall -c src/native/file_193.c -o build/obj/file_193.o
+cc -O2 -Wall -c src/native/file_194.c -o build/obj/file_194.o
+cc -O2 -Wall -c src/native/file_195.c -o build/obj/file_195.o
+cc -O2 -Wall -c src/native/file_196.c -o build/obj/file_196.o
+cc -O2 -Wall -c src/native/file_197.c -o build/obj/file_197.o
+cc -O2 -Wall -c src/native/file_198.c -o build/obj/file_198.o
+cc -O2 -Wall -c src/native/file_199.c -o build/obj/file_199.o
+cc -O2 -Wall -c src/native/file_200.c -o build/obj/file_200.o
+cc -O2 -Wall -c src/native/file_201.c -o build/obj/file_201.o
+cc -O2 -Wall -c src/native/file_202.c -o build/obj/file_202.o
+cc -O2 -Wall -c src/native/file_203.c -o build/obj/file_203.o
+cc -O2 -Wall -c src/native/file_204.c -o build/obj/file_204.o
+cc -O2 -Wall -c src/native/file_205.c -o build/obj/file_205.o
+cc -O2 -Wall -c src/native/file_206.c -o build/obj/file_206.o
+cc -O2 -Wall -c src/native/file_207.c -o build/obj/file_207.o
+cc -O2 -Wall -c src/native/file_208.c -o build/obj/file_208.o
+cc -O2 -Wall -c src/native/file_209.c -o build/obj/file_209.o
+cc -O2 -Wall -c src/native/file_210.c -o build/obj/file_210.o
+cc -O2 -Wall -c src/native/file_211.c -o build/obj/file_211.o
+cc -O2 -Wall -c src/native/file_212.c -o build/obj/file_212.o
+cc -O2 -Wall -c src/native/file_213.c -o build/obj/file_213.o
+cc -O2 -Wall -c src/native/file_214.c -o build/obj/file_214.o
+cc -O2 -Wall -c src/native/file_215.c -o build/obj/file_215.o
+cc -O2 -Wall -c src/native/file_216.c -o build/obj/file_216.o
+cc -O2 -Wall -c src/native/file_217.c -o build/obj/file_217.o
+cc -O2 -Wall -c src/native/file_218.c -o build/obj/file_218.o
+cc -O2 -Wall -c src/native/file_219.c -o build/obj/file_219.o
+cc -O2 -Wall -c src/native/file_220.c -o build/obj/file_220.o
+cc -O2 -Wall -c src/native/file_221.c -o build/obj/file_221.o
+cc -O2 -Wall -c src/native/file_222.c -o build/obj/file_222.o
+cc -O2 -Wall -c src/native/file_223.c -o build/obj/file_223.o
+cc -O2 -Wall -c src/native/file_224.c -o build/obj/file_224.o
+cc -O2 -Wall -c src/native/file_225.c -o build/obj/file_225.o
+cc -O2 -Wall -c src/native/file_226.c -o build/obj/file_226.o
+cc -O2 -Wall -c src/native/file_227.c -o build/obj/file_227.o
+cc -O2 -Wall -c src/native/file_228.c -o build/obj/file_228.o
+cc -O2 -Wall -c src/native/file_229.c -o build/obj/file_229.o
+cc -O2 -Wall -c src/native/file_230.c -o build/obj/file_230.o
+cc -O2 -Wall -c src/native/file_231.c -o build/obj/file_231.o
+cc -O2 -Wall -c src/native/file_232.c -o build/obj/file_232.o
+cc -O2 -Wall -c src/native/file_233.c -o build/obj/file_233.o
+cc -O2 -Wall -c src/native/file_234.c -o build/obj/file_234.o
+cc -O2 -Wall -c src/native/file_235.c -o build/obj/file_235.o
+cc -O2 -Wall -c src/native/file_236.c -o build/obj/file_236.o
+cc -O2 -Wall -c src/native/file_237.c -o build/obj/file_237.o
+cc -O2 -Wall -c src/native/file_238.c -o build/obj/file_238.o
+cc -O2 -Wall -c src/native/file_239.c -o build/obj/file_239.o
+cc -O2 -Wall -c src/native/file_240.c -o build/obj/file_240.o
+cc -O2 -Wall -c src/native/file_241.c -o build/obj/file_241.o
+cc -O2 -Wall -c src/native/file_242.c -o build/obj/file_242.o
+cc -O2 -Wall -c src/native/file_243.c -o build/obj/file_243.o
+cc -O2 -Wall -c src/native/file_244.c -o build/obj/file_244.o
+cc -O2 -Wall -c src/native/file_245.c -o build/obj/file_245.o
+cc -O2 -Wall -c src/native/file_246.c -o build/obj/file_246.o
+cc -O2 -Wall -c src/native/file_247.c -o build/obj/file_247.o
+cc -O2 -Wall -c src/native/file_248.c -o build/obj/file_248.o
+cc -O2 -Wall -c src/native/file_249.c -o build/obj/file_249.o
+cc -O2 -Wall -c src/native/file_250.c -o build/obj/file_250.o
+cc -O2 -Wall -c src/native/file_251.c -o build/obj/file_251.o
+cc -O2 -Wall -c src/native/file_252.c -o build/obj/file_252.o
+cc -O2 -Wall -c src/native/file_253.c -o build/obj/file_253.o
+cc -O2 -Wall -c src/native/file_254.c -o build/obj/file_254.o
+cc -O2 -Wall -c src/native/file_255.c -o build/obj/file_255.o
+cc -O2 -Wall -c src/native/file_256.c -o build/obj/file_256.o
+cc -O2 -Wall -c src/native/file_257.c -o build/obj/file_257.o
+cc -O2 -Wall -c src/native/file_258.c -o build/obj/file_258.o
+cc -O2 -Wall -c src/native/file_259.c -o build/obj/file_259.o
+cc -O2 -Wall -c src/native/file_260.c -o build/obj/file_260.o
+cc -O2 -Wall -c src/native/file_261.c -o build/obj/file_261.o
+cc -O2 -Wall -c src/native/file_262.c -o build/obj/file_262.o
+cc -O2 -Wall -c src/native/file_263.c -o build/obj/file_263.o
+cc -O2 -Wall -c src/native/file_264.c -o build/obj/file_264.o
+cc -O2 -Wall -c src/native/file_265.c -o build/obj/file_265.o
+cc -O2 -Wall -c src/native/file_266.c -o build/obj/file_266.o
+cc -O2 -Wall -c src/native/file_267.c -o build/obj/file_267.o
+cc -O2 -Wall -c src/native/file_268.c -o build/obj/file_268.o
+cc -O2 -Wall -c src/native/file_269.c -o build/obj/file_269.o
+cc -O2 -Wall -c src/native/file_270.c -o build/obj/file_270.o
+cc -O2 -Wall -c src/native/file_271.c -o build/obj/file_271.o
+cc -O2 -Wall -c src/native/file_272.c -o build/obj/file_272.o
+cc -O2 -Wall -c src/native/file_273.c -o build/obj/file_273.o
+cc -O2 -Wall -c src/native/file_274.c -o build/obj/file_274.o
+cc -O2 -Wall -c src/native/file_275.c -o build/obj/file_275.o
+cc -O2 -Wall -c src/native/file_276.c -o build/obj/file_276.o
+cc -O2 -Wall -c src/native/file_277.c -o build/obj/file_277.o
+cc -O2 -Wall -c src/native/file_278.c -o build/obj/file_278.o
+cc -O2 -Wall -c src/native/file_279.c -o build/obj/file_279.o
+cc -O2 -Wall -c src/native/file_280.c -o build/obj/file_280.o
+cc -O2 -Wall -c src/native/file_281.c -o build/obj/file_281.o
+cc -O2 -Wall -c src/native/file_282.c -o build/obj/file_282.o
+cc -O2 -Wall -c src/native/file_283.c -o build/obj/file_283.o
+cc -O2 -Wall -c src/native/file_284.c -o build/obj/file_284.o
+cc -O2 -Wall -c src/native/file_285.c -o build/obj/file_285.o
+cc -O2 -Wall -c src/native/file_286.c -o build/obj/file_286.o
+cc -O2 -Wall -c src/native/file_287.c -o build/obj/file_287.o
+cc -O2 -Wall -c src/native/file_288.c -o build/obj/file_288.o
+cc -O2 -Wall -c src/native/file_289.c -o build/obj/file_289.o
+cc -O2 -Wall -c src/native/file_290.c -o build/obj/file_290.o
+cc -O2 -Wall -c src/native/file_291.c -o build/obj/file_291.o
+cc -O2 -Wall -c src/native/file_292.c -o build/obj/file_292.o
+cc -O2 -Wall -c src/native/file_293.c -o build/obj/file_293.o
+cc -O2 -Wall -c src/native/file_294.c -o build/obj/file_294.o
+cc -O2 -Wall -c src/native/file_295.c -o build/obj/file_295.o
+cc -O2 -Wall -c src/native/file_296.c -o build/obj/file_296.o
+cc -O2 -Wall -c src/native/file_297.c -o build/obj/file_297.o
+cc -O2 -Wall -c src/native/file_298.c -o build/obj/file_298.o
+cc -O2 -Wall -c src/native/file_299.c -o build/obj/file_299.o
+cc -O2 -Wall -c src/native/file_300.c -o build/obj/file_300.o
+error: undefined reference to `legacy_hash_init`
+collect2: error: ld returned 1 exit status
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+gyp warn install got an error, rolling back install
+make: *** [Makefile:88: build/native.so] Error 1
+==> build-all.sh: FAILED after 41.2s

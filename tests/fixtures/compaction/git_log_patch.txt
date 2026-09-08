@@ -1,0 +1,840 @@
+commit 0000000000000000000000000000000000000001
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 2 12:01:00 2026 +0000
+
+    fix: adjust behaviour in module 1
+
+diff --git a/src/feature_1.rs b/src/feature_1.rs
+index aaaa1..bbbb1 100644
+--- a/src/feature_1.rs
++++ b/src/feature_1.rs
+@@ -1,8 +1,9 @@ fn feature_1() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000002
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 3 12:02:00 2026 +0000
+
+    fix: adjust behaviour in module 2
+
+diff --git a/src/feature_2.rs b/src/feature_2.rs
+index aaaa2..bbbb2 100644
+--- a/src/feature_2.rs
++++ b/src/feature_2.rs
+@@ -2,8 +2,9 @@ fn feature_2() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000003
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 4 12:03:00 2026 +0000
+
+    fix: adjust behaviour in module 3
+
+diff --git a/src/feature_3.rs b/src/feature_3.rs
+index aaaa3..bbbb3 100644
+--- a/src/feature_3.rs
++++ b/src/feature_3.rs
+@@ -3,8 +3,9 @@ fn feature_3() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000004
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 5 12:04:00 2026 +0000
+
+    fix: adjust behaviour in module 4
+
+diff --git a/src/feature_4.rs b/src/feature_4.rs
+index aaaa4..bbbb4 100644
+--- a/src/feature_4.rs
++++ b/src/feature_4.rs
+@@ -4,8 +4,9 @@ fn feature_4() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000005
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 6 12:05:00 2026 +0000
+
+    fix: adjust behaviour in module 5
+
+diff --git a/src/feature_5.rs b/src/feature_5.rs
+index aaaa5..bbbb5 100644
+--- a/src/feature_5.rs
++++ b/src/feature_5.rs
+@@ -5,8 +5,9 @@ fn feature_5() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000006
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 7 12:06:00 2026 +0000
+
+    fix: adjust behaviour in module 6
+
+diff --git a/src/feature_6.rs b/src/feature_6.rs
+index aaaa6..bbbb6 100644
+--- a/src/feature_6.rs
++++ b/src/feature_6.rs
+@@ -6,8 +6,9 @@ fn feature_6() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000007
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 8 12:07:00 2026 +0000
+
+    fix: adjust behaviour in module 7
+
+diff --git a/src/feature_7.rs b/src/feature_7.rs
+index aaaa7..bbbb7 100644
+--- a/src/feature_7.rs
++++ b/src/feature_7.rs
+@@ -7,8 +7,9 @@ fn feature_7() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000008
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 9 12:08:00 2026 +0000
+
+    fix: adjust behaviour in module 8
+
+diff --git a/src/feature_8.rs b/src/feature_8.rs
+index aaaa8..bbbb8 100644
+--- a/src/feature_8.rs
++++ b/src/feature_8.rs
+@@ -8,8 +8,9 @@ fn feature_8() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000009
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 10 12:09:00 2026 +0000
+
+    fix: adjust behaviour in module 9
+
+diff --git a/src/feature_9.rs b/src/feature_9.rs
+index aaaa9..bbbb9 100644
+--- a/src/feature_9.rs
++++ b/src/feature_9.rs
+@@ -9,8 +9,9 @@ fn feature_9() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000010
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 11 12:00:00 2026 +0000
+
+    fix: adjust behaviour in module 10
+
+diff --git a/src/feature_10.rs b/src/feature_10.rs
+index aaaa10..bbbb10 100644
+--- a/src/feature_10.rs
++++ b/src/feature_10.rs
+@@ -10,8 +10,9 @@ fn feature_10() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000011
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 12 12:01:00 2026 +0000
+
+    fix: adjust behaviour in module 11
+
+diff --git a/src/feature_11.rs b/src/feature_11.rs
+index aaaa11..bbbb11 100644
+--- a/src/feature_11.rs
++++ b/src/feature_11.rs
+@@ -11,8 +11,9 @@ fn feature_11() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000012
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 13 12:02:00 2026 +0000
+
+    fix: adjust behaviour in module 12
+
+diff --git a/src/feature_12.rs b/src/feature_12.rs
+index aaaa12..bbbb12 100644
+--- a/src/feature_12.rs
++++ b/src/feature_12.rs
+@@ -12,8 +12,9 @@ fn feature_12() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000013
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 14 12:03:00 2026 +0000
+
+    fix: adjust behaviour in module 13
+
+diff --git a/src/feature_13.rs b/src/feature_13.rs
+index aaaa13..bbbb13 100644
+--- a/src/feature_13.rs
++++ b/src/feature_13.rs
+@@ -13,8 +13,9 @@ fn feature_13() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000014
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 15 12:04:00 2026 +0000
+
+    fix: adjust behaviour in module 14
+
+diff --git a/src/feature_14.rs b/src/feature_14.rs
+index aaaa14..bbbb14 100644
+--- a/src/feature_14.rs
++++ b/src/feature_14.rs
+@@ -14,8 +14,9 @@ fn feature_14() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000015
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 16 12:05:00 2026 +0000
+
+    fix: adjust behaviour in module 15
+
+diff --git a/src/feature_15.rs b/src/feature_15.rs
+index aaaa15..bbbb15 100644
+--- a/src/feature_15.rs
++++ b/src/feature_15.rs
+@@ -15,8 +15,9 @@ fn feature_15() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000016
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 17 12:06:00 2026 +0000
+
+    fix: adjust behaviour in module 16
+
+diff --git a/src/feature_16.rs b/src/feature_16.rs
+index aaaa16..bbbb16 100644
+--- a/src/feature_16.rs
++++ b/src/feature_16.rs
+@@ -16,8 +16,9 @@ fn feature_16() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000017
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 18 12:07:00 2026 +0000
+
+    fix: adjust behaviour in module 17
+
+diff --git a/src/feature_17.rs b/src/feature_17.rs
+index aaaa17..bbbb17 100644
+--- a/src/feature_17.rs
++++ b/src/feature_17.rs
+@@ -17,8 +17,9 @@ fn feature_17() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000018
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 19 12:08:00 2026 +0000
+
+    fix: adjust behaviour in module 18
+
+diff --git a/src/feature_18.rs b/src/feature_18.rs
+index aaaa18..bbbb18 100644
+--- a/src/feature_18.rs
++++ b/src/feature_18.rs
+@@ -18,8 +18,9 @@ fn feature_18() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000019
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 20 12:09:00 2026 +0000
+
+    fix: adjust behaviour in module 19
+
+diff --git a/src/feature_19.rs b/src/feature_19.rs
+index aaaa19..bbbb19 100644
+--- a/src/feature_19.rs
++++ b/src/feature_19.rs
+@@ -19,8 +19,9 @@ fn feature_19() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+
+commit 0000000000000000000000000000000000000020
+Author: Test User <testuser@example.com>
+Date:   Mon Sep 21 12:00:00 2026 +0000
+
+    fix: adjust behaviour in module 20
+
+diff --git a/src/feature_20.rs b/src/feature_20.rs
+index aaaa20..bbbb20 100644
+--- a/src/feature_20.rs
++++ b/src/feature_20.rs
+@@ -20,8 +20,9 @@ fn feature_20() {
++    updated_step(1);
+     retained_step(2);
+     retained_step(3);
+     retained_step(4);
+-    legacy_step(5);
++    updated_step(6);
+     retained_step(7);
+     retained_step(8);
+     retained_step(9);
+-    legacy_step(10);
++    updated_step(11);
+     retained_step(12);
+     retained_step(13);
+     retained_step(14);
+-    legacy_step(15);
++    updated_step(16);
+     retained_step(17);
+     retained_step(18);
+     retained_step(19);
+-    legacy_step(20);
++    updated_step(21);
+     retained_step(22);
+     retained_step(23);
+     retained_step(24);
+-    legacy_step(25);
++    updated_step(26);
+     retained_step(27);
+     retained_step(28);
+     retained_step(29);
+-    legacy_step(30);
+

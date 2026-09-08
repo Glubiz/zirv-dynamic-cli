@@ -3240,4 +3240,110 @@ mod tests {
             "an unparseable ls -l body must fail open to verbatim: {summary:?}"
         );
     }
+
+    /// Issue #426: a compaction-ratio regression test over realistic fixture
+    /// outputs (`tests/fixtures/compaction/`). Drives the exact engine
+    /// `hook::run_posttool` drives for a captured Bash result --
+    /// `classify_compaction` then `capture_text` (which is
+    /// `summarize_stored` plus persistence) -- with the DEFAULT `[output]`
+    /// config, so a change that quietly regresses the achieved compression
+    /// on real-shaped output fails here before it ships. Run with
+    /// `--nocapture` to see the per-fixture ratio table. See
+    /// `tests/fixtures/compaction/README.md` for the floor-raising rule.
+    #[test]
+    fn compaction_ratio_never_regresses_below_the_fixture_floor() {
+        let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compaction");
+        let floor: f64 = std::fs::read_to_string(fixtures_dir.join("floor.txt"))
+            .expect("tests/fixtures/compaction/floor.txt must exist")
+            .trim()
+            .parse()
+            .expect("floor.txt must hold a bare float, e.g. 0.60");
+
+        let (_tmp, state, repo, _home) = capture_rig();
+        let max_summary_bytes =
+            crate::commands::ctx::config::OutputConfig::default().max_summary_bytes;
+
+        let mut fixtures: Vec<PathBuf> = std::fs::read_dir(&fixtures_dir)
+            .expect("fixtures dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|ext| ext == "txt")
+                    && p.file_name().is_some_and(|name| name != "floor.txt")
+            })
+            .collect();
+        fixtures.sort();
+        assert!(
+            fixtures.len() >= 8,
+            "expected at least 8 fixtures under {}, found {}",
+            fixtures_dir.display(),
+            fixtures.len()
+        );
+
+        let mut total_in: u64 = 0;
+        let mut total_out: u64 = 0;
+        println!(
+            "{:<28} {:>10} {:>10} {:>8}",
+            "fixture", "bytes_in", "bytes_out", "ratio"
+        );
+        for fixture in &fixtures {
+            let stem = fixture
+                .file_stem()
+                .expect("stem")
+                .to_string_lossy()
+                .to_string();
+            let cmd_path = fixture.with_extension("cmd");
+            let command = std::fs::read_to_string(&cmd_path)
+                .unwrap_or_else(|e| panic!("{}: missing sibling .cmd ({e})", cmd_path.display()))
+                .trim()
+                .to_string();
+            let content = std::fs::read_to_string(fixture)
+                .unwrap_or_else(|e| panic!("{}: {e}", fixture.display()));
+            let bytes_in = content.len() as u64;
+
+            let scope = classify_compaction(&command, &[], false);
+            let (_, summary) = capture_text(
+                &state,
+                &repo,
+                std::slice::from_ref(&command),
+                None,
+                &content,
+                max_summary_bytes,
+                scope,
+            )
+            .unwrap_or_else(|e| panic!("{stem}: capture_text failed: {e}"));
+            let summary = summary.unwrap_or_else(|| {
+                panic!("{stem}: no summary was produced at all (scope {scope:?})")
+            });
+            let bytes_out = summary.len() as u64;
+
+            assert!(
+                bytes_out < bytes_in,
+                "{stem}: summary ({bytes_out} bytes) did not shrink the fixture ({bytes_in} bytes)"
+            );
+
+            println!(
+                "{:<28} {:>10} {:>10} {:>7.1}%",
+                stem,
+                bytes_in,
+                bytes_out,
+                100.0 * bytes_out as f64 / bytes_in as f64
+            );
+            total_in += bytes_in;
+            total_out += bytes_out;
+        }
+
+        let aggregate_reduction = 1.0 - (total_out as f64 / total_in as f64);
+        println!(
+            "aggregate: {total_in} -> {total_out} bytes ({:.1}% reduction, floor {:.2})",
+            aggregate_reduction * 100.0,
+            floor
+        );
+        assert!(
+            aggregate_reduction >= floor,
+            "aggregate reduction {aggregate_reduction:.4} fell below the floor {floor:.2} in \
+             tests/fixtures/compaction/floor.txt -- if this is a deliberate regression, see that \
+             file's README for the Decision Log requirement before lowering it"
+        );
+    }
 }
