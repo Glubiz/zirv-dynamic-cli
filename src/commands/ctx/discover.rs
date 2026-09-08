@@ -180,7 +180,7 @@ fn extract_bash_results(jsonl: &str, min_bytes: u64) -> Vec<RawResult> {
 /// this function calls "would compact today" is one `run_posttool` really
 /// would replace under the current config.
 fn estimate_reason(command: &str, bytes: u64, cfg: &CtxConfig) -> String {
-    let scope = classify_compaction(command, &cfg.output.verbatim);
+    let scope = classify_compaction(command, &cfg.output.verbatim, cfg.output.compact_search);
     match scope {
         CompactionScope::Verbatim => "verbatim reader".to_string(),
         CompactionScope::Known if bytes < cfg.output.compact_min_bytes as u64 => {
@@ -191,6 +191,9 @@ fn estimate_reason(command: &str, bytes: u64, cfg: &CtxConfig) -> String {
         }
         CompactionScope::Diff if bytes < cfg.output.diff_max_bytes as u64 => {
             "below diff threshold".to_string()
+        }
+        CompactionScope::Shape if bytes < cfg.output.compact_generic_min_bytes as u64 => {
+            "below generic threshold".to_string()
         }
         // Today's config would compact this, yet nothing was ever recorded
         // for it -- the likely explanations are exactly these two.
@@ -264,9 +267,10 @@ fn reason_label(c: &RowProvenance) -> String {
 /// itself: this command only ever reports.
 fn hint_for_reason(reason: &str) -> Option<&'static str> {
     match reason {
-        "estimated: verbatim reader" | "measured: verbatim" => {
-            Some("readers are never compacted regardless of size -- expected, no action needed.")
-        }
+        "estimated: verbatim reader" | "measured: verbatim" => Some(
+            "readers are never compacted regardless of size -- expected; for rg/grep/find/ls \
+             results, `output.compact_search = true` opts them into a grouped shape.",
+        ),
         "estimated: below known threshold" => Some(
             "lower `output.compact_min_bytes` if these known-shape results are worth compacting sooner.",
         ),
