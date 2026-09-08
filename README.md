@@ -1987,8 +1987,11 @@ unknown. Force-push, hard reset, local ref/stash/reflog/worktree loss, recursive
 registry mutation, remote HTTP mutations, infrastructure destruction and
 device/partition tools ask interactively. Generated-directory cleanup,
 downloads, loopback requests and dry runs stay silent. Irreversible package or
-release publication/deletion, credential-file access or upload, privilege
+release publication/deletion, credential-store access, secret-file uploads, privilege
 escalation, download-to-shell pipelines, and attacks on zirv itself are denied.
+Local reads or copies of project secret files (`.env`, `.env.*`, `*.pem`, `*.key`)
+ask; `.env.example`, `.env.sample`, `.env.template`, `.env.dist`, and `.env.test`
+templates stay silent.
 The structural/semantic result is identical for Unix, `cmd.exe`, and
 PowerShell spellings (including `.exe`/`.cmd` wrappers). This classifier is a
 tripwire layered with the harness sandbox, not a claim that finite command
