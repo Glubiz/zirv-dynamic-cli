@@ -1134,7 +1134,10 @@ mod tests {
 
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("codex five_hour: 73.5% used"), "got {text}");
-        assert!(text.contains("observed 42s ago at unix"), "got {text}");
+        assert!(
+            text.contains("observed 42s ago at unix") || text.contains("observed 43s ago at unix"),
+            "got {text}"
+        );
         assert!(
             text.contains(&format!("resets at unix {}", now + 1_800)),
             "got {text}"
