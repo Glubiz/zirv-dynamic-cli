@@ -60,13 +60,26 @@
 //!   every time that message is mutated (`recordToolCalls` attaching tool
 //!   calls, `recordMessageTokens` attaching token counts after the text was
 //!   already recorded) -- so one logical exchange can appear as 2-3 rows
-//!   sharing one `id` before the next exchange begins. Both [`parse_events`]
-//!   and [`transcript_usage`] below fold consecutive same-`id` `"gemini"`
-//!   rows into one logical turn, keeping the LATEST non-null token/content
-//!   reading for that id (see their own doc comments) -- correct for the
-//!   common single-pass case, with a documented residual if a chunk boundary
-//!   ever splits between two of that run's rows (mirrors
-//!   `CodexAdapter::parse_events`'s own accepted `last_tokens` residual).
+//!   sharing one `id` before the next exchange begins. `AgentAdapter::
+//!   parse_events` must stay line-local (`IncrementalScorer::poll`,
+//!   `score.rs`, feeds it only the bytes newly appended each poll cycle, so
+//!   two rows of the same re-appended `id` can land in two different polls),
+//!   so [`parse_events`], [`structural_context`] and [`transcript_usage`]
+//!   below do NOT fold rows across `id`s at all -- each row is handled
+//!   entirely on its own. A null-`tokens` `"gemini"` row (the text-only or
+//!   tool-calls-attached re-append) only ever contributes an
+//!   `AssistantFirstText` candidate when it carries non-empty text --
+//!   `NormalizedEvent::AssistantFirstText`'s own doc comment already allows
+//!   more than one of these per turn. The row that carries non-null `tokens`
+//!   (`recordMessageTokens`, verified to fire exactly once per turn, after
+//!   the text was already written into that same row) is the sole source of
+//!   that turn's `AssistantFinal` text/tokens and its counted
+//!   `structural_context`/`transcript_usage` contribution. This assumes (per
+//!   the verified single `recordMessageTokens` call site) that at most one
+//!   row per `id` ever carries non-null `tokens`; if that assumption were
+//!   ever violated, `transcript_usage` would double-count that id's tokens
+//!   rather than silently keep only the latest, since there is no longer any
+//!   cross-row state to prefer one over the other.
 //! - **Project directory resolution**: `chunk-FQCNOBUR.js`'s `Storage`/
 //!   `ProjectRegistry` classes show the CLI no longer names a project
 //!   directory after a bare `sha256(cwd)` (the stale fact
@@ -487,101 +500,50 @@ fn extract_text(value: Option<&Value>) -> String {
     }
 }
 
-/// One buffered, not-yet-flushed `"gemini"` row -- the accumulator both
-/// [`fold_gemini_rows`] callers below share, so `parse_events` and
-/// `transcript_usage` fold the exact same consecutive-same-`id` runs into
-/// one logical turn identically. See this module's own doc comment
-/// ("Important residual") for why a run of duplicate `id`s exists at all,
-/// and why keeping the LATEST reading is correct.
-struct PendingTurn {
-    id: Option<String>,
-    at_ms: Option<u64>,
-    text: String,
-    tokens: Option<GeminiTokens>,
-    model: Option<String>,
+/// One parsed `"gemini"` or `"user"` row from a session-file line, with the
+/// fields [`parse_events`]/[`structural_context`]/[`transcript_usage`] each
+/// need -- deliberately NOT folded across rows sharing one `id` (this
+/// module's own doc comment, "Important residual"): every caller below
+/// handles each row entirely on its own so a poll boundary landing between
+/// two re-appends of the same `id` can never split one logical event across
+/// two `parse_events` calls.
+enum ParsedRow {
+    User {
+        at_ms: Option<u64>,
+        text: String,
+    },
+    Gemini {
+        at_ms: Option<u64>,
+        text: String,
+        tokens: Option<GeminiTokens>,
+        model: Option<String>,
+    },
 }
 
-/// One logical row [`fold_gemini_rows`] has finished folding: either a
-/// `"user"` row (never re-appended, so it needs no folding of its own) or a
-/// fully-folded [`PendingTurn`] for a run of one or more `"gemini"` rows
-/// sharing one `id`.
-enum FoldedRow {
-    User { at_ms: Option<u64>, text: String },
-    Turn(PendingTurn),
-}
-
-/// Parses `jsonl` row by row and folds consecutive `"gemini"` rows that
-/// share one `id` into a single [`PendingTurn`] (keeping the latest
-/// non-empty `text`/`tokens`/`model` seen for that id) -- see this module's
-/// own doc comment ("Important residual") for why that folding exists at
-/// all. Returns one [`FoldedRow`] per logical turn, in file order. Shared by
-/// [`parse_events`], [`structural_context`] and [`transcript_usage`] so none
-/// of the three can ever disagree about where one logical turn ends and the
-/// next begins.
-fn fold_gemini_rows(jsonl: &str) -> Vec<FoldedRow> {
-    let mut rows = Vec::new();
-    let mut pending: Option<PendingTurn> = None;
-    for line in jsonl.lines() {
-        let Ok(row) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        let Some(kind) = row.get("type").and_then(Value::as_str) else {
-            // The first-line metadata record and any `$set` update record
-            // carry no `type` field at all -- neither is a chat turn.
-            continue;
-        };
-        let at_ms = row
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(super::super::window::parse_iso8601_utc_ms);
-        match kind {
-            "user" => {
-                if let Some(turn) = pending.take() {
-                    rows.push(FoldedRow::Turn(turn));
-                }
-                rows.push(FoldedRow::User {
-                    at_ms,
-                    text: extract_text(row.get("content")),
-                });
-            }
-            "gemini" => {
-                let id = row.get("id").and_then(Value::as_str).map(str::to_string);
-                let continues_pending =
-                    id.is_some() && pending.as_ref().and_then(|p| p.id.as_ref()) == id.as_ref();
-                if !continues_pending {
-                    if let Some(turn) = pending.take() {
-                        rows.push(FoldedRow::Turn(turn));
-                    }
-                    pending = Some(PendingTurn {
-                        id,
-                        at_ms,
-                        text: String::new(),
-                        tokens: None,
-                        model: None,
-                    });
-                }
-                let turn = pending.as_mut().expect("just inserted above");
-                let text = extract_text(row.get("content"));
-                if !text.trim().is_empty() {
-                    turn.text = text;
-                }
-                if let Some(tokens) = extract_tokens(&row) {
-                    turn.tokens = Some(tokens);
-                }
-                if let Some(model) = row.get("model").and_then(Value::as_str) {
-                    turn.model = Some(model.to_string());
-                }
-                if turn.at_ms.is_none() {
-                    turn.at_ms = at_ms;
-                }
-            }
-            _ => {}
-        }
+/// Parses one `jsonl` line into a [`ParsedRow`], or `None` for a line that is
+/// not itself a chat turn (unparseable JSON, or the first-line metadata
+/// record / a `$set` update record, neither of which carries a `type`
+/// field).
+fn parse_row(line: &str) -> Option<ParsedRow> {
+    let row: Value = serde_json::from_str(line.trim()).ok()?;
+    let kind = row.get("type").and_then(Value::as_str)?;
+    let at_ms = row
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(super::super::window::parse_iso8601_utc_ms);
+    match kind {
+        "user" => Some(ParsedRow::User {
+            at_ms,
+            text: extract_text(row.get("content")),
+        }),
+        "gemini" => Some(ParsedRow::Gemini {
+            at_ms,
+            text: extract_text(row.get("content")),
+            tokens: extract_tokens(&row),
+            model: row.get("model").and_then(Value::as_str).map(str::to_string),
+        }),
+        _ => None,
     }
-    if let Some(turn) = pending.take() {
-        rows.push(FoldedRow::Turn(turn));
-    }
-    rows
 }
 
 impl AgentAdapter for GeminiAdapter {
@@ -674,19 +636,23 @@ impl AgentAdapter for GeminiAdapter {
     /// `--admin-policy <path>` naming [`READ_ONLY_POLICY_TOML`] -- see this
     /// module's own doc comment ("Read-only enforcement") for the full
     /// verification trail on why this, and not `--approval-mode=plan` or
-    /// `tools.exclude`, is the structural deny mechanism. The write is
-    /// best-effort: on failure (e.g. a read-only filesystem) this still
-    /// returns the argv naming the intended path, since gemini-cli's own
-    /// behavior against a missing `--admin-policy` file is unverified either
-    /// way, and a silently-permissive empty return would be the worse
-    /// failure mode for a caller that only ever asks for this to keep a
-    /// judgment child from writing.
+    /// `tools.exclude`, is the structural deny mechanism. The write goes
+    /// through `state::create_private_dir_all`/`state::write_private`
+    /// (atomic temp-then-rename, private perms), exactly like
+    /// [`GeminiAdapter::pinned_session_file`]'s own pin write in this same
+    /// file, rather than a bare `std::fs::write` to a path under the shared
+    /// zirv state root. Best-effort either way: on failure (e.g. a read-only
+    /// filesystem) this still returns the argv naming the intended path,
+    /// since gemini-cli's own behavior against a missing `--admin-policy`
+    /// file is unverified either way, and a silently-permissive empty return
+    /// would be the worse failure mode for a caller that only ever asks for
+    /// this to keep a judgment child from writing.
     fn read_only_args(&self) -> Vec<String> {
         let path = self.read_only_policy_path();
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = super::super::state::create_private_dir_all(parent);
         }
-        let _ = std::fs::write(&path, READ_ONLY_POLICY_TOML);
+        let _ = super::super::state::write_private(&path, READ_ONLY_POLICY_TOML);
         vec!["--admin-policy".to_string(), path.display().to_string()]
     }
 
@@ -721,18 +687,23 @@ impl AgentAdapter for GeminiAdapter {
             ))
     }
 
-    /// See this module's own doc comment ("Important residual") for the
-    /// consecutive-same-`id` folding [`fold_gemini_rows`] performs, and why
-    /// it is correct for the common single-pass case. `TurnStart`/`UserText`
-    /// come from `"user"` rows; `AssistantFirstText`/`AssistantFinal`/
-    /// `ModelId` come from each flushed `"gemini"` turn. Tool calls/results
-    /// are deliberately not modeled (this module's own doc comment,
+    /// See this module's own doc comment ("Important residual") for why this
+    /// is fully line-local with no cross-row folding. `TurnStart`/`UserText`
+    /// come from `"user"` rows. For a `"gemini"` row: non-empty text always
+    /// contributes an `AssistantFirstText` candidate (possibly more than one
+    /// per turn, which `NormalizedEvent::AssistantFirstText`'s own doc
+    /// comment allows); `AssistantFinal`/`ModelId` are emitted ONLY from a
+    /// row that carries non-null `tokens` -- a null-`tokens` row (the
+    /// text-only or tool-calls-attached re-append) never produces a final,
+    /// so the duplicate `id` re-append this harness performs can never
+    /// flush two finals for the same turn. Tool calls/results are
+    /// deliberately not modeled (this module's own doc comment,
     /// "Deliberately UNSUPPORTED").
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent> {
         let mut events = Vec::new();
-        for row in fold_gemini_rows(jsonl) {
+        for row in jsonl.lines().filter_map(parse_row) {
             match row {
-                FoldedRow::User { at_ms, text } => {
+                ParsedRow::User { at_ms, text } => {
                     events.push(NormalizedEvent::TurnStart { at_ms });
                     if !text.trim().is_empty() {
                         events.push(NormalizedEvent::UserText {
@@ -740,17 +711,24 @@ impl AgentAdapter for GeminiAdapter {
                         });
                     }
                 }
-                FoldedRow::Turn(turn) => {
-                    if !turn.text.trim().is_empty() {
-                        events.push(NormalizedEvent::AssistantFirstText { at_ms: turn.at_ms });
+                ParsedRow::Gemini {
+                    at_ms,
+                    text,
+                    tokens,
+                    model,
+                } => {
+                    if !text.trim().is_empty() {
+                        events.push(NormalizedEvent::AssistantFirstText { at_ms });
                     }
-                    events.push(NormalizedEvent::AssistantFinal {
-                        text: turn.text,
-                        input_tokens: turn.tokens.map(|t| t.input).unwrap_or(0),
-                        at_ms: turn.at_ms,
-                    });
-                    if let Some(model) = turn.model {
-                        events.push(NormalizedEvent::ModelId { id: model });
+                    if let Some(tokens) = tokens {
+                        events.push(NormalizedEvent::AssistantFinal {
+                            text,
+                            input_tokens: tokens.input,
+                            at_ms,
+                        });
+                        if let Some(model) = model {
+                            events.push(NormalizedEvent::ModelId { id: model });
+                        }
                     }
                 }
             }
@@ -768,13 +746,21 @@ impl AgentAdapter for GeminiAdapter {
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext {
         let mut user_messages = Vec::new();
         let mut assistant_texts = Vec::new();
-        for row in fold_gemini_rows(jsonl) {
+        for row in jsonl.lines().filter_map(parse_row) {
             match row {
-                FoldedRow::User { text, .. } if !text.trim().is_empty() => {
+                ParsedRow::User { text, .. } if !text.trim().is_empty() => {
                     user_messages.push(text);
                 }
-                FoldedRow::Turn(turn) if !turn.text.trim().is_empty() => {
-                    assistant_texts.push(turn.text);
+                // Only the row carrying non-null `tokens` counts, mirroring
+                // `parse_events`'s `AssistantFinal` rule exactly -- otherwise
+                // the duplicate `id` re-append would double this turn's text
+                // into the list.
+                ParsedRow::Gemini {
+                    text,
+                    tokens: Some(_),
+                    ..
+                } if !text.trim().is_empty() => {
+                    assistant_texts.push(text);
                 }
                 _ => {}
             }
@@ -791,9 +777,9 @@ impl AgentAdapter for GeminiAdapter {
 
     /// The most recent `"gemini"` row's own `model` field, scanned from the
     /// end -- mirrors `CodexAdapter::model_hint`'s own `.rev()` approach.
-    /// Deliberately reads raw rows rather than [`fold_gemini_rows`]: this
-    /// only ever wants the single latest value, and a reverse scan finds it
-    /// in one pass without needing to fold a whole run first.
+    /// Deliberately reads raw rows rather than [`parse_row`]: this only ever
+    /// wants the single latest value, and a reverse scan finds it in one
+    /// pass without needing to parse every row's other fields too.
     fn model_hint(&self, jsonl: &str) -> Option<String> {
         jsonl.lines().rev().find_map(|line| {
             let row = serde_json::from_str::<Value>(line.trim()).ok()?;
@@ -804,30 +790,34 @@ impl AgentAdapter for GeminiAdapter {
         })
     }
 
-    /// Sums each logical turn's `tokens` exactly once, using
-    /// [`fold_gemini_rows`]'s own consecutive-`id` folding -- summing every
-    /// raw `"gemini"` row instead would double- or triple-count a turn that
-    /// was re-appended by `recordToolCalls`/`recordMessageTokens` (this
-    /// module's own doc comment). `cache_creation_input_tokens` is always
-    /// `0`: gemini's own token breakdown has no separate cache-WRITE class,
-    /// only `cached` (tokens served FROM cache), which maps to
+    /// Sums each `"gemini"` row's `tokens` when present. This counts each
+    /// logical turn exactly once WITHOUT needing to fold consecutive same-
+    /// `id` rows: the verified `recordMessageTokens` call site (this
+    /// module's own doc comment, "Important residual") fires exactly once
+    /// per turn, so at most one re-appended row per `id` ever carries
+    /// non-null `tokens` -- the null-`tokens` re-appends this loop also sees
+    /// contribute nothing. `cache_creation_input_tokens` is always `0`:
+    /// gemini's own token breakdown has no separate cache-WRITE class, only
+    /// `cached` (tokens served FROM cache), which maps to
     /// `cache_read_input_tokens` -- an honest zero, never a guessed class,
     /// the same choice `CodexAdapter::transcript_usage` makes for its own
     /// missing cache fields.
     fn transcript_usage(&self, jsonl: &str) -> Option<TranscriptUsage> {
         let mut usage = TranscriptUsage::default();
         let mut observed = false;
-        for row in fold_gemini_rows(jsonl) {
-            let FoldedRow::Turn(turn) = row else {
+        for row in jsonl.lines().filter_map(parse_row) {
+            let ParsedRow::Gemini {
+                tokens: Some(tokens),
+                ..
+            } = row
+            else {
                 continue;
             };
-            if let Some(tokens) = turn.tokens {
-                usage.input_tokens = usage.input_tokens.saturating_add(tokens.input);
-                usage.output_tokens = usage.output_tokens.saturating_add(tokens.output);
-                usage.cache_read_input_tokens =
-                    usage.cache_read_input_tokens.saturating_add(tokens.cached);
-                observed = true;
-            }
+            usage.input_tokens = usage.input_tokens.saturating_add(tokens.input);
+            usage.output_tokens = usage.output_tokens.saturating_add(tokens.output);
+            usage.cache_read_input_tokens =
+                usage.cache_read_input_tokens.saturating_add(tokens.cached);
+            observed = true;
         }
         observed.then_some(usage)
     }
@@ -1178,12 +1168,16 @@ mod tests {
         };
         assert_eq!(
             *input_tokens, 340,
-            "the second turn's own later tokens value wins"
+            "only the row that actually carries non-null tokens produces a final"
         );
     }
 
     #[test]
-    fn parse_events_folds_the_duplicate_id_re_append_into_one_turn() {
+    fn parse_events_never_flushes_two_finals_for_one_duplicate_id() {
+        // The fixture's `m1`/`m2` ids are each re-appended once (a null-
+        // tokens row, then the real-tokens row) -- exactly two finals total,
+        // not four, proves the null-tokens re-append never produces its own
+        // `AssistantFinal`.
         let jsonl = fixture_jsonl();
         let events = adapter().parse_events(&jsonl);
         let model_ids: Vec<&str> = events
@@ -1194,6 +1188,40 @@ mod tests {
             })
             .collect();
         assert!(model_ids.contains(&"gemini-2.5-pro"));
+    }
+
+    #[test]
+    fn parse_events_is_line_local_across_a_split_chunk() {
+        // The incremental scoring path (`IncrementalScorer::poll`, `score.rs`)
+        // feeds `parse_events` only the bytes newly appended each poll cycle
+        // -- a whole-file parse must equal the concatenation of piecewise
+        // parses no matter where the cut falls. This deliberately cuts
+        // RIGHT BETWEEN the fixture's `m1` null-tokens row and its
+        // real-tokens re-append: the exact poll boundary this fix closes,
+        // since that used to flush a zero-token `AssistantFinal` from the
+        // first half and a second `AssistantFinal` from the second half.
+        let whole = fixture_jsonl();
+        let lines: Vec<&str> = whole.lines().collect();
+        let split_at = lines
+            .iter()
+            .position(|line| line.contains("\"tokens\":{\"input\":120"))
+            .expect("fixture carries the m1 real-tokens row");
+        let first_half = lines[..split_at].join("\n");
+        let second_half = lines[split_at..].join("\n");
+
+        let mut piecewise = adapter().parse_events(&first_half);
+        piecewise.extend(adapter().parse_events(&second_half));
+        let whole_parse = adapter().parse_events(&whole);
+        assert_eq!(piecewise, whole_parse);
+
+        // And the same must hold for the plain midpoint split every sibling
+        // adapter's own version of this test checks.
+        let mid = lines.len() / 2;
+        let first_half = lines[..mid].join("\n");
+        let second_half = lines[mid..].join("\n");
+        let mut piecewise = adapter().parse_events(&first_half);
+        piecewise.extend(adapter().parse_events(&second_half));
+        assert_eq!(piecewise, whole_parse);
     }
 
     #[test]

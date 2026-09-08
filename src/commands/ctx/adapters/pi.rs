@@ -410,13 +410,27 @@ impl AgentAdapter for PiAdapter {
     /// file by its id suffix ([`find_session_file`]). The fallback (a file
     /// that has never existed) is the same honest "not found yet" shape
     /// `codex::CodexAdapter::transcript_path`'s own final fallback uses.
+    /// `find_session_file` only ever compares `session.id` as a filename
+    /// SUFFIX against `dir`'s own listed entries, so it stays safe no matter
+    /// what the id contains -- but the fallback JOINS it into a path, so
+    /// [`SessionId::is_safe_path_segment`] gates that join: an
+    /// operator-supplied hostile id (`../..`, an embedded separator) falls
+    /// back to a [`sessions::short_id`](super::super::sessions::short_id)-keyed
+    /// pending name instead, never a path escaping `dir`.
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
         let dir = self.session_dir(&session.cwd);
         let suffix = format!("_{}.jsonl", session.id);
         if let Some(found) = find_session_file(&dir, &suffix) {
             return found;
         }
-        dir.join(format!("pending{suffix}"))
+        if session.id.is_safe_path_segment() {
+            dir.join(format!("pending{suffix}"))
+        } else {
+            dir.join(format!(
+                "pending_{}.jsonl",
+                super::super::sessions::short_id(session.id.as_str())
+            ))
+        }
     }
 
     /// Maps the verified `type: "message"` entry shape (this module's own
@@ -943,6 +957,23 @@ mod tests {
         std::fs::write(&real, "").expect("write session file");
 
         assert_eq!(adapter.transcript_path(&session), real);
+    }
+
+    #[test]
+    fn transcript_path_never_joins_a_traversal_session_id_verbatim() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let adapter = PiAdapter::new(None).with_home(home.path().to_path_buf());
+        let session = SessionRef {
+            id: SessionId::parse("../../evil"),
+            cwd: PathBuf::from("/work/repo"),
+        };
+        let resolved = adapter.transcript_path(&session);
+        let dir = adapter.session_dir(&session.cwd);
+        assert!(
+            resolved.starts_with(&dir),
+            "a hostile session id must never escape the session dir: {resolved:?}"
+        );
+        assert!(!resolved.to_string_lossy().contains(".."));
     }
 
     fn fixture_jsonl() -> String {

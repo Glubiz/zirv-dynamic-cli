@@ -98,6 +98,26 @@ impl SessionId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether this id is safe to join verbatim as a single filesystem path
+    /// segment: every character is an ASCII letter/digit/`.`/`_`/`-`, and the
+    /// id never contains a `..` traversal component. `SessionId::parse`
+    /// accepts any raw string -- including an operator-supplied
+    /// `--session-id`/resume value -- so an adapter that builds a transcript
+    /// path by joining the id directly (`copilot::CopilotAdapter`,
+    /// `qwen::QwenAdapter`, `pi::PiAdapter`) must check this first and fall
+    /// back to its own default/unresolved path rather than ever join an
+    /// unchecked id; see each adapter's own `transcript_path` doc comment.
+    /// A real minted id (`new_v4`'s hyphenated uuid, or any harness's own
+    /// alphanumeric session id) always passes.
+    pub fn is_safe_path_segment(&self) -> bool {
+        !self.0.is_empty()
+            && !self.0.contains("..")
+            && self
+                .0
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    }
 }
 
 impl std::fmt::Display for SessionId {
@@ -679,6 +699,40 @@ mod tests {
         assert_ne!(a.as_str(), b.as_str());
         assert_eq!(a.as_str().len(), 36, "canonical hyphenated uuid");
         assert_eq!(a.to_string(), a.as_str());
+    }
+
+    #[test]
+    fn a_minted_uuid_is_always_a_safe_path_segment() {
+        assert!(SessionId::new_v4().is_safe_path_segment());
+    }
+
+    #[test]
+    fn a_traversal_id_is_never_a_safe_path_segment() {
+        for hostile in [
+            "../../etc/passwd",
+            "..",
+            "foo/../bar",
+            "foo\\..\\bar",
+            "a/b",
+            "a\\b",
+            "",
+        ] {
+            assert!(
+                !SessionId::parse(hostile).is_safe_path_segment(),
+                "{hostile:?} must never be treated as a safe path segment"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_alphanumeric_session_id_is_safe() {
+        for benign in [
+            "abc123",
+            "session-2026-09-07_00-00",
+            "11111111-2222-4333-8444-555555555555",
+        ] {
+            assert!(SessionId::parse(benign).is_safe_path_segment());
+        }
     }
 
     #[test]

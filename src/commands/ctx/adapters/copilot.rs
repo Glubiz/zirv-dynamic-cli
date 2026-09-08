@@ -420,12 +420,25 @@ impl AgentAdapter for CopilotAdapter {
     /// why, unlike every sibling multi-step adapter, this is a plain join
     /// with no pin-file or registry lookup: `--session-id` (always pinned by
     /// [`headless_cmd`]/[`session_pin_args`]) makes the directory name
-    /// zirv's own uuid, not one copilot mints unpredictably.
+    /// zirv's own uuid, not one copilot mints unpredictably. `session.id` can
+    /// also come straight from an operator-supplied `--session-id`/resume
+    /// value (`SessionId::parse`), so [`SessionId::is_safe_path_segment`] is
+    /// checked before joining it verbatim -- a hostile id (`../..`, an
+    /// embedded separator) instead falls back to the same
+    /// [`sessions::short_id`](super::super::sessions::short_id)-keyed
+    /// "unresolved" naming `gemini::GeminiAdapter::transcript_path`'s own
+    /// final fallback uses, never a path escaping `session-state/`.
     fn transcript_path(&self, session: &SessionRef) -> PathBuf {
-        self.copilot_home()
-            .join("session-state")
-            .join(session.id.as_str())
-            .join("events.jsonl")
+        let root = self.copilot_home().join("session-state");
+        let dir = if session.id.is_safe_path_segment() {
+            root.join(session.id.as_str())
+        } else {
+            root.join(format!(
+                "unresolved-{}",
+                super::super::sessions::short_id(session.id.as_str())
+            ))
+        };
+        dir.join("events.jsonl")
     }
 
     /// Maps the two independently-verified event shapes (this module's own
@@ -921,6 +934,22 @@ mod tests {
                 .join("11111111-2222-4333-8444-555555555555")
                 .join("events.jsonl")
         );
+    }
+
+    #[test]
+    fn transcript_path_never_joins_a_traversal_session_id_verbatim() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let a = adapter().with_home(home.path().to_path_buf());
+        let session = SessionRef {
+            id: SessionId::parse("../../evil"),
+            cwd: PathBuf::from("/work/repo"),
+        };
+        let resolved = a.transcript_path(&session);
+        assert!(
+            resolved.starts_with(home.path().join("session-state")),
+            "a hostile session id must never escape session-state/: {resolved:?}"
+        );
+        assert!(!resolved.to_string_lossy().contains(".."));
     }
 
     #[test]
