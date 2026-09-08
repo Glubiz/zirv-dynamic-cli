@@ -40,6 +40,7 @@ pub mod objective;
 pub mod optimize;
 pub mod output;
 pub(crate) mod output_diff;
+pub(crate) mod output_shape;
 pub mod pace;
 pub(crate) mod pathutil;
 pub mod permissions;

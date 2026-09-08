@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::output_shape;
 use super::state::{self, StateDir};
 use crate::commands::workflow::verification::{
     MAX_FAILURE_OUTPUT_BYTES, read_capped_tail_and_scan, scrub_output,
@@ -477,10 +478,15 @@ pub(crate) fn render_summary(
             body.push_str("  ... [more failing tests in the full output]\n");
         }
     }
+    // Issue #408: repeated diagnostics that share a signature collapse to
+    // one `[x N]` line before rendering, but only when doing so actually
+    // shrinks the section -- a handful of already-distinct blocks render
+    // exactly as `scan_for_display` collected them.
+    let failure_blocks = output_shape::shaped_diagnostic_blocks(&scan.failures);
     push_blocks(
         &mut body,
         "failures:",
-        &scan.failures,
+        &failure_blocks,
         scan.failures_truncated,
     );
 
@@ -545,11 +551,12 @@ pub(crate) fn render_summary(
         body.push_str(&note);
     }
 
+    let warning_blocks = output_shape::shaped_diagnostic_blocks(&scan.warnings);
     let mut warnings = String::new();
     push_blocks(
         &mut warnings,
         "warnings:",
-        &scan.warnings,
+        &warning_blocks,
         scan.warnings_truncated,
     );
     if !warnings.is_empty() && body.len() + warnings.len() <= budget {
@@ -2282,5 +2289,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Issue #408: diagnostic grouping -----------------------------------
+
+    /// Forty occurrences of the same clippy warning at different locations
+    /// spend one line, not forty.
+    #[test]
+    fn forty_identical_warnings_group_into_one_line_within_budget() {
+        let warnings: Vec<Vec<String>> = (0..40)
+            .map(|i| {
+                vec![
+                    "warning: unused variable: `x`".to_string(),
+                    format!("  --> src/file{i}.rs:{i}:5"),
+                ]
+            })
+            .collect();
+        let scan = DisplayScan {
+            total_lines: 200,
+            total_bytes: 200_000,
+            warnings,
+            ..DisplayScan::default()
+        };
+        let summary = render_summary(
+            "id1",
+            "cargo clippy",
+            Some(0),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(
+            summary.contains("[x 40] warning: unused variable: `x`"),
+            "{summary}"
+        );
+        assert!(summary.len() <= 4096, "{} bytes", summary.len());
+    }
+
+    /// Three genuinely distinct errors are never folded into each other.
+    #[test]
+    fn three_distinct_errors_all_appear_in_the_rendered_summary() {
+        let scan = DisplayScan {
+            total_lines: 10,
+            total_bytes: 1000,
+            failures: vec![
+                vec![
+                    "error[E0308]: mismatched types".to_string(),
+                    "  --> a.rs:1:1".to_string(),
+                ],
+                vec![
+                    "error[E0502]: cannot borrow".to_string(),
+                    "  --> b.rs:2:2".to_string(),
+                ],
+                vec!["error: linking failed".to_string()],
+            ],
+            ..DisplayScan::default()
+        };
+        let summary = render_summary(
+            "id1",
+            "cargo build",
+            Some(101),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        for needle in ["error[E0308]", "error[E0502]", "error: linking failed"] {
+            assert!(summary.contains(needle), "{summary}");
+        }
+        assert!(
+            !summary.contains("[x "),
+            "distinct errors must never be grouped: {summary}"
+        );
     }
 }
