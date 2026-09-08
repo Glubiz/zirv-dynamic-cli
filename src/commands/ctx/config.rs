@@ -890,16 +890,25 @@ impl Default for SearchConfig {
 /// result has to be before that is worth doing, and the hard ceiling on the
 /// summary itself.
 ///
-/// All three are `REPO_FORBIDDEN`. `max_summary_bytes` is the same trust
-/// asymmetry as every other byte cap in this file: a checked-out repository
-/// raising the cap on text that lands directly in a supervised session's
-/// context window is exactly the flooding these caps exist to prevent.
-/// `compact` and `compact_min_bytes` are forbidden in BOTH directions, unlike
-/// the narrowing-only switches elsewhere: turning compaction *on* lets a
-/// repository decide that what its own build prints reaches the session only
-/// through a summary zirv wrote, and turning it *off* (or raising the
-/// threshold past anything it ever emits) lets a repository that floods on
-/// purpose opt itself out of being compacted. Neither is the checkout's call.
+/// `compact`, `compact_min_bytes`, `compact_generic_min_bytes`, `verbatim`
+/// (additive-only) and `max_summary_bytes` are all `REPO_FORBIDDEN`.
+/// `max_summary_bytes` is the same trust asymmetry as every other byte cap in
+/// this file: a checked-out repository raising the cap on text that lands
+/// directly in a supervised session's context window is exactly the flooding
+/// these caps exist to prevent. `compact` and `compact_min_bytes` are
+/// forbidden in BOTH directions, unlike the narrowing-only switches
+/// elsewhere: turning compaction *on* lets a repository decide that what its
+/// own build prints reaches the session only through a summary zirv wrote,
+/// and turning it *off* (or raising the threshold past anything it ever
+/// emits) lets a repository that floods on purpose opt itself out of being
+/// compacted. Neither is the checkout's call.
+///
+/// `diff_max_bytes` (issue #412) is different: narrow-only, the same
+/// "repo may only make it stricter" shape as `supervise.loop_backoff_ceiling_
+/// secs` (see `narrow_diff_max_bytes`) -- a repo checkout may lower the size
+/// at which its own `git diff`/`show`/`log -p`/`format-patch` output gets
+/// replaced by a bounded per-file listing, never raise it past the
+/// operator's own ceiling.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
@@ -935,6 +944,17 @@ pub struct OutputConfig {
     /// failures. Default `4096`; [`MIN_MAX_SUMMARY_BYTES`] is the floor
     /// `CtxConfig::load` enforces.
     pub max_summary_bytes: usize,
+    /// Bytes of combined stdout+stderr a `git diff`/`show`/`log -p`/
+    /// `format-patch` result (`output::CompactionScope::Diff`) may reach
+    /// before the `PostToolUse` hook replaces it with a bounded per-file
+    /// listing (`output_diff::render_diff_summary`) instead of a head/tail --
+    /// never a partial hunk, since a diff's middle is exactly the part a
+    /// model is about to edit against. Narrow-only, protective like
+    /// `supervise.loop_backoff_ceiling_secs`: a repo checkout may LOWER this,
+    /// never raise it past the operator's own ceiling (see
+    /// `narrow_diff_max_bytes`). Generous default `65536` (64 KiB): most
+    /// diffs a supervised session produces never reach it.
+    pub diff_max_bytes: usize,
 }
 
 /// The smallest `[output] max_summary_bytes` that can hold a header, a
@@ -952,6 +972,7 @@ impl Default for OutputConfig {
             compact_generic_min_bytes: 16384,
             verbatim: Vec::new(),
             max_summary_bytes: 4096,
+            diff_max_bytes: 65536,
         }
     }
 }
@@ -2423,6 +2444,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES",
+        &["output", "diff_max_bytes"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
         &["workflow", "telemetry_enabled"],
         EnvKind::Bool,
@@ -2973,6 +2999,15 @@ fn narrow_compact_advisory_window_fraction(home: f64, repo: Option<f64>) -> f64 
 /// (folds in as `u64::MAX`, which `min` never picks over a real `home`
 /// value).
 fn narrow_loop_backoff_ceiling_secs(home: u64, repo: Option<u64>) -> u64 {
+    home.min(repo.unwrap_or(u64::MAX))
+}
+
+/// Issue #412: the repo-narrowing fold for `output.diff_max_bytes` -- lower
+/// is stricter (a diff is replaced by a bounded listing sooner), the
+/// identical shape as `narrow_loop_backoff_ceiling_secs`: `repo` absent
+/// contributes nothing (folds in as `u64::MAX`, which `min` never picks over
+/// a real `home` value).
+fn narrow_diff_max_bytes(home: u64, repo: Option<u64>) -> u64 {
     home.min(repo.unwrap_or(u64::MAX))
 }
 
@@ -4000,6 +4035,11 @@ impl CtxConfig {
             "supervise",
             "loop_backoff_ceiling_secs",
         ));
+        // Issue #412: `output.diff_max_bytes` gets the identical lift-before-
+        // merge treatment -- see `narrow_diff_max_bytes` below for the strict
+        // direction.
+        let home_output_diff_max_bytes =
+            integer_at(take_nested(&mut merged, "output", "diff_max_bytes"));
 
         // Issue #186: every fallback field is lifted before the repo merge.
         // The repo may only narrow automatic vendor steering; see the
@@ -4140,6 +4180,8 @@ impl CtxConfig {
             "supervise",
             "loop_backoff_ceiling_secs",
         ));
+        let repo_output_diff_max_bytes =
+            integer_at(take_nested(&mut repo_layer, "output", "diff_max_bytes"));
         let repo_fallback_enabled = bool_at(take_nested(&mut repo_layer, "fallback", "enabled"));
         let repo_fallback_order =
             string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
@@ -4236,6 +4278,24 @@ impl CtxConfig {
                         .and_then(|v| u64::try_from(v).ok())
                         .unwrap_or(default_supervise.loop_backoff_ceiling_secs),
                     repo_loop_backoff_ceiling.and_then(|v| u64::try_from(v).ok()),
+                ))
+                .unwrap_or(i64::MAX),
+            ),
+        );
+        // Issue #412: `output.diff_max_bytes` gets the identical
+        // re-insertion, narrowed by `narrow_diff_max_bytes`, then still
+        // overwritable by `ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES` (`ENV_MAP`, below)
+        // the same as every other narrow-only key.
+        let default_output = OutputConfig::default();
+        insert_path(
+            &mut merged,
+            &["output", "diff_max_bytes"],
+            toml::Value::Integer(
+                i64::try_from(narrow_diff_max_bytes(
+                    home_output_diff_max_bytes
+                        .and_then(|v| u64::try_from(v).ok())
+                        .unwrap_or(default_output.diff_max_bytes as u64),
+                    repo_output_diff_max_bytes.and_then(|v| u64::try_from(v).ok()),
                 ))
                 .unwrap_or(i64::MAX),
             ),
@@ -5291,6 +5351,45 @@ mod tests {
         let env = env_map(&[("ZIRV_CTX_SUPERVISE_LOOP_BACKOFF_CEILING_SECS", "60")]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.supervise.loop_backoff_ceiling_secs, 60);
+    }
+
+    /// Issue #412: `output.diff_max_bytes` is repo-settable but narrow-only,
+    /// the identical shape as `supervise.loop_backoff_ceiling_secs` above --
+    /// lower is stricter, and an env var still wins over both layers as the
+    /// final word.
+    #[test]
+    fn diff_max_bytes_repo_layer_may_only_lower_it() {
+        assert_eq!(OutputConfig::default().diff_max_bytes, 65536);
+        assert_eq!(narrow_diff_max_bytes(65536, Some(131072)), 65536);
+        assert_eq!(narrow_diff_max_bytes(65536, Some(2048)), 2048);
+        assert_eq!(narrow_diff_max_bytes(65536, None), 65536);
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[output]\ndiff_max_bytes = 999999\n",
+        )
+        .expect("write");
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.output.diff_max_bytes, 65536,
+            "a repo checkout may not raise the ceiling past the operator's own"
+        );
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[output]\ndiff_max_bytes = 4096\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(cfg.output.diff_max_bytes, 4096);
+
+        let env = env_map(&[("ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES", "1024")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.output.diff_max_bytes, 1024);
     }
 
     /// Companion to the test above, for the token gate's own five keys
@@ -9028,6 +9127,7 @@ mod tests {
         assert_eq!(cfg.output.compact_generic_min_bytes, 16384);
         assert!(cfg.output.verbatim.is_empty());
         assert_eq!(cfg.output.max_summary_bytes, 4096);
+        assert_eq!(cfg.output.diff_max_bytes, 65536);
 
         let env = env_map(&[
             ("ZIRV_CTX_OUTPUT_COMPACT", "false"),
@@ -9035,6 +9135,7 @@ mod tests {
             ("ZIRV_CTX_OUTPUT_COMPACT_GENERIC_MIN_BYTES", "65536"),
             ("ZIRV_CTX_OUTPUT_VERBATIM", "mydump,other-tool"),
             ("ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES", "2048"),
+            ("ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES", "8192"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load");
         assert!(!cfg.output.compact);
@@ -9042,6 +9143,7 @@ mod tests {
         assert_eq!(cfg.output.compact_generic_min_bytes, 65536);
         assert_eq!(cfg.output.verbatim, vec!["mydump", "other-tool"]);
         assert_eq!(cfg.output.max_summary_bytes, 2048);
+        assert_eq!(cfg.output.diff_max_bytes, 8192);
 
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         for line in [
@@ -9253,6 +9355,7 @@ mod tests {
         ("output", "compact_generic_min_bytes"),
         ("output", "verbatim"),
         ("output", "max_summary_bytes"),
+        ("output", "diff_max_bytes"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),

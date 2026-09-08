@@ -38,6 +38,7 @@ pub mod memory_optimize;
 pub mod objective;
 pub mod optimize;
 pub mod output;
+pub(crate) mod output_diff;
 pub mod pace;
 pub(crate) mod pathutil;
 pub mod permissions;

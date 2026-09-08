@@ -588,7 +588,18 @@ const VERBATIM_PROGRAMS: &[&str] = &[
 ];
 
 /// `git` subcommands that are reads of content rather than progress logs.
-const VERBATIM_GIT_SUBCOMMANDS: &[&str] = &["diff", "show", "blame", "grep"];
+/// `diff`/`show` moved to [`DIFF_GIT_SUBCOMMANDS`] (issue #412): a bounded,
+/// lossless-shape summary is possible for those because their grammar is
+/// known, unlike `blame`/`grep`, which stay verbatim at any size.
+const VERBATIM_GIT_SUBCOMMANDS: &[&str] = &["blame", "grep"];
+
+/// `git` subcommands whose output is a unified diff: bounded above
+/// [`crate::commands::ctx::config::OutputConfig::diff_max_bytes`] by a
+/// per-file listing (`output_diff::render_diff_summary`) rather than a
+/// head/tail, since a diff's omitted middle is exactly the part a model is
+/// about to edit against (issue #412). `log -p`/`--patch` is caught
+/// separately below, since plain `git log` stays a `Known` progress log.
+const DIFF_GIT_SUBCOMMANDS: &[&str] = &["diff", "show", "format-patch"];
 
 /// Programs whose output shape zirv actually models -- test runners,
 /// compilers, package managers, VCS progress. For these the summary provably
@@ -615,6 +626,13 @@ pub(crate) enum CompactionScope {
     /// Everything else: compacted only past `compact_generic_min_bytes`, and
     /// the summary says explicitly which lines it omitted.
     Generic,
+    /// A unified diff (`git diff`/`show`/`log -p`/`format-patch`, issue
+    /// #412): compacted only past `[output] diff_max_bytes`, and never into a
+    /// head/tail -- the replacement is a bounded per-file `+N -M` listing
+    /// derived from the diff's own grammar (`output_diff::
+    /// render_diff_summary`), which never shows a hunk, partial or
+    /// otherwise.
+    Diff,
 }
 
 /// Global `git` flags that consume a SEPARATE value token (`-C dir`,
@@ -676,6 +694,13 @@ fn bare_program(token: &str) -> String {
 ///   --full`), whose whole purpose is handing back text a summary already
 ///   elided. Compacting THAT produced a second summary, and no `--range`
 ///   could ever reach the original.
+///
+/// `git diff`/`show`/`log -p`/`format-patch` (`DIFF_GIT_SUBCOMMANDS`) are a
+/// second, weaker protection (issue #412): also never shown as a head/tail,
+/// but -- unlike a true reader -- a unified diff's own grammar is known, so a
+/// bounded per-file listing (never a partial hunk) is possible once the
+/// output passes `[output] diff_max_bytes`. `blame`/`grep` stay full
+/// `Verbatim`, since their output has no such bounded shape.
 pub(crate) fn classify_compaction(command: &str, extra_verbatim: &[String]) -> CompactionScope {
     if command.contains('|') || command.contains('>') {
         return CompactionScope::Verbatim;
@@ -725,13 +750,17 @@ pub(crate) fn classify_compaction(command: &str, extra_verbatim: &[String]) -> C
         if program == "git" && sub.is_some_and(|sub| VERBATIM_GIT_SUBCOMMANDS.contains(&sub)) {
             return CompactionScope::Verbatim;
         }
-        // `git log -p` prints patches; every other `git log` is a progress
-        // log the summary handles fine.
+        if program == "git" && sub.is_some_and(|sub| DIFF_GIT_SUBCOMMANDS.contains(&sub)) {
+            return CompactionScope::Diff;
+        }
+        // `git log -p`/`--patch` prints the same unified-diff grammar as
+        // `git diff`/`show` -- issue #412 bounds it the same way, rather than
+        // leaving it verbatim at any size like every other `git log`.
         if program == "git"
             && sub == Some("log")
             && tokens.iter().any(|t| *t == "-p" || *t == "--patch")
         {
-            return CompactionScope::Verbatim;
+            return CompactionScope::Diff;
         }
 
         if KNOWN_PROGRAMS.contains(&program.as_str()) {
@@ -857,12 +886,16 @@ fn reserve_log(dir: &Path, started_at: u64) -> (String, PathBuf) {
     (id, path)
 }
 
-/// Everything that happens AFTER a stored log exists: the two scanning
-/// passes, the sidecar, retention, and the rendered summary. Shared by
+/// Everything that happens AFTER a stored log exists: the scanning pass(es),
+/// the sidecar, retention, and the rendered summary. Shared by
 /// `zirv ctx run --compact` (which fills the log by handing a child both of
 /// its stream handles) and by claude's `PostToolUse` hook (which fills it
-/// with a tool result claude already collected) -- one engine, one store, one
-/// summary shape, so the two surfaces can never drift apart.
+/// with a tool result claude already collected) -- one engine, one store, so
+/// the two surfaces can never drift apart, even though `scope` (issue #412)
+/// now picks between two summary shapes: the generic scan below for
+/// `Known`/`Generic`/`Verbatim` callers, or `output_diff::
+/// render_diff_summary`'s bounded per-file listing for `Diff`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn summarize_stored(
     dir: &Path,
     id: &str,
@@ -871,7 +904,34 @@ pub(crate) fn summarize_stored(
     exit_code: Option<i32>,
     started_at: u64,
     max_summary_bytes: usize,
+    scope: CompactionScope,
 ) -> CtxResult<(OutputRecord, Option<String>)> {
+    if scope == CompactionScope::Diff {
+        let diff_scan = super::output_diff::scan_diff_file(path);
+        let record = OutputRecord {
+            schema_version: OUTPUT_SCHEMA_VERSION,
+            id: id.to_string(),
+            command: command.to_vec(),
+            exit_code,
+            started_at,
+            lines: diff_scan.total_lines,
+            bytes: diff_scan.total_bytes,
+        };
+        let _ = state::write_private(
+            &dir.join(format!("{id}.json")),
+            &serde_json::to_string(&record)?,
+        );
+        prune_outputs(dir, KEEP_NEWEST_OUTPUTS);
+        let summary = super::output_diff::render_diff_summary(
+            id,
+            &command.join(" "),
+            exit_code,
+            &diff_scan,
+            max_summary_bytes,
+        );
+        return Ok((record, summary));
+    }
+
     // Pass 1 -- the SHARED classifier: failing test names and whether a
     // `test result:`/`Summary [...]` line was seen anywhere in the full
     // stream. Never a second implementation of either; see this module's own
@@ -964,6 +1024,7 @@ pub(crate) fn capture_text(
     exit_code: Option<i32>,
     output: &str,
     max_summary_bytes: usize,
+    scope: CompactionScope,
 ) -> CtxResult<(String, Option<String>)> {
     let dir = outputs_dir(state, repo);
     state::create_private_dir_all(&dir)?;
@@ -983,6 +1044,7 @@ pub(crate) fn capture_text(
         exit_code,
         started_at,
         max_summary_bytes,
+        scope,
     )?;
     Ok((id, summary))
 }
@@ -1034,6 +1096,10 @@ pub fn run_with<W: Write>(
     };
     let exit_code = child.wait()?.code().unwrap_or(1);
 
+    // `zirv ctx run --compact` is an explicit ask to compact THIS command's
+    // output, unlike the automatic `PostToolUse` interception -- so it always
+    // used the generic scan, and issue #412 does not change that here: only
+    // `hook::run_posttool`'s own `classify_compaction` call picks `Diff`.
     let (_, summary) = summarize_stored(
         &dir,
         &id,
@@ -1042,6 +1108,7 @@ pub fn run_with<W: Write>(
         Some(exit_code),
         started_at,
         cfg.output.max_summary_bytes,
+        CompactionScope::Generic,
     )?;
 
     if args.full && !args.compact {
@@ -1792,9 +1859,6 @@ mod tests {
             "cat src/lib.rs",
             "sed -n '1,200p' src/lib.rs",
             "rg TODO src",
-            "git diff HEAD~1",
-            "git show HEAD",
-            "git log -p",
             "git blame src/lib.rs",
             "cargo test | tail -5",
             "cargo build > out.txt",
@@ -1806,6 +1870,17 @@ mod tests {
                 classify_compaction(command, &[]),
                 CompactionScope::Verbatim,
                 "{command} must never be compacted"
+            );
+        }
+        // Issue #412: these leave the verbatim list -- a unified diff's
+        // grammar is known, so it gets a bounded per-file listing rather than
+        // being either shown verbatim at any size or head/tail scanned.
+        // `git grep` stays fully `Verbatim` alongside `git blame` above.
+        for command in ["git diff HEAD~1", "git show HEAD", "git log -p"] {
+            assert_eq!(
+                classify_compaction(command, &[]),
+                CompactionScope::Diff,
+                "{command} must be bounded, never a head/tail scan"
             );
         }
         for command in [
@@ -1849,7 +1924,7 @@ mod tests {
         for command in ["git -C some/dir diff", "git --no-pager diff"] {
             assert_eq!(
                 classify_compaction(command, &[]),
-                CompactionScope::Verbatim,
+                CompactionScope::Diff,
                 "{command} must still be recognised as a content-reading git diff"
             );
         }

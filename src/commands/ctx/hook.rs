@@ -2669,13 +2669,18 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // a model reads that output verbatim before editing against it, so a
     // head/tail summary would silently corrupt the edit rather than merely
     // cost tokens.
-    let threshold =
-        match super::output::classify_compaction(&payload.tool_input.command, &cfg.output.verbatim)
-        {
-            super::output::CompactionScope::Verbatim => return Ok(0),
-            super::output::CompactionScope::Known => cfg.output.compact_min_bytes,
-            super::output::CompactionScope::Generic => cfg.output.compact_generic_min_bytes,
-        };
+    let scope =
+        super::output::classify_compaction(&payload.tool_input.command, &cfg.output.verbatim);
+    let threshold = match scope {
+        super::output::CompactionScope::Verbatim => return Ok(0),
+        super::output::CompactionScope::Known => cfg.output.compact_min_bytes,
+        super::output::CompactionScope::Generic => cfg.output.compact_generic_min_bytes,
+        // Issue #412: a unified diff gets its own, generous threshold --
+        // `diff_max_bytes` -- rather than either compaction threshold above,
+        // since above it the replacement is a bounded per-file listing, not
+        // the generic head/tail scan.
+        super::output::CompactionScope::Diff => cfg.output.diff_max_bytes,
+    };
     if combined.len() < threshold {
         return Ok(0);
     }
@@ -2694,6 +2699,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         None,
         &combined,
         cfg.output.max_summary_bytes,
+        scope,
     ) else {
         // Nothing was stored, so nothing may be replaced: handing back a
         // summary whose retrieval line names a file that does not exist would
@@ -6122,7 +6128,13 @@ mod tests {
 
     /// Review finding 6: a model reads a READER's output verbatim before
     /// editing against it, so head/tail there does not cost tokens, it
-    /// corrupts the edit. These are never compacted at any size.
+    /// corrupts the edit. `cat`/`sed`/`rg`/piped output are never compacted
+    /// at any size; `git diff`/`show` moved to a bounded `Diff` scope (issue
+    /// #412), so this fixture -- comfortably below the default
+    /// `diff_max_bytes` -- still reaches the model untouched, exercising
+    /// that generous threshold rather than an unconditional exemption. See
+    /// `posttool_compacts_a_diff_only_past_diff_max_bytes` for what happens
+    /// once a diff clears it.
     #[test]
     fn posttool_never_compacts_a_reader_command() {
         let rig = posttool_rig(&[]);
@@ -6194,6 +6206,138 @@ mod tests {
                 "{command} hands back text on purpose: {out}"
             );
         }
+    }
+
+    /// A synthetic unified diff of `file_count` files, each with one hunk of
+    /// `lines_per_file` `+`/`-` pairs -- big enough, at a large `file_count`,
+    /// to comfortably clear both `diff_max_bytes` and `max_summary_bytes`.
+    fn fake_diff(file_count: usize, lines_per_file: usize) -> String {
+        let mut text = String::new();
+        for i in 0..file_count {
+            text.push_str(&format!("diff --git a/src/gen{i}.rs b/src/gen{i}.rs\n"));
+            text.push_str("index 1111111..2222222 100644\n");
+            text.push_str(&format!("--- a/src/gen{i}.rs\n"));
+            text.push_str(&format!("+++ b/src/gen{i}.rs\n"));
+            text.push_str(&format!("@@ -1,{lines_per_file} +1,{lines_per_file} @@\n"));
+            for line in 0..lines_per_file {
+                text.push_str(&format!("-old body line {line} of the generated file\n"));
+                text.push_str(&format!("+new body line {line} of the generated file\n"));
+            }
+        }
+        text
+    }
+
+    /// Issue #412, acceptance criterion: a 20 KB diff is left untouched (its
+    /// bytes are well below the default `diff_max_bytes`), and a diff that
+    /// clears `diff_max_bytes` is replaced with a bounded per-file listing --
+    /// never a head/tail, and never a `@@` hunk header.
+    #[test]
+    fn posttool_compacts_a_diff_only_past_diff_max_bytes() {
+        let rig = posttool_rig(&[]);
+        let small_diff = fake_diff(20, 20);
+        assert!(
+            small_diff.len() < 65536,
+            "fixture must stay below the default diff_max_bytes: {} bytes",
+            small_diff.len()
+        );
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "git diff main...HEAD",
+                serde_json::json!({
+                    "stdout": small_diff,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(
+            out.is_empty(),
+            "a diff well below diff_max_bytes must reach the model untouched: {out}"
+        );
+
+        let big_diff = fake_diff(400, 60);
+        assert!(
+            big_diff.len() > 65536,
+            "fixture must clear the default diff_max_bytes: {} bytes",
+            big_diff.len()
+        );
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "git diff main...HEAD",
+                serde_json::json!({
+                    "stdout": big_diff.clone(),
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let summary = parsed["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .expect("a summary");
+        assert!(!summary.contains("@@"), "{summary}");
+        assert!(summary.contains("totals:"), "{summary}");
+        assert!(summary.contains("400 files changed"), "{summary}");
+        assert!(
+            summary.contains("full output: zirv ctx output show"),
+            "{summary}"
+        );
+        assert!(summary.len() <= 4096, "{} bytes", summary.len());
+
+        // The stored file is still byte-identical to what claude handed the
+        // hook -- the diff's own bytes were never touched, only the summary.
+        let dir = rig
+            .state
+            .join("outputs")
+            .join(crate::commands::ctx::state::repo_slug(&rig.repo));
+        let log = std::fs::read_dir(&dir)
+            .expect("outputs dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "log"))
+            .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .expect("a stored log");
+        assert_eq!(
+            std::fs::read(&log).expect("read log"),
+            big_diff.as_bytes(),
+            "the persisted diff must be byte-identical to the original"
+        );
+    }
+
+    /// The narrow-only operator knob actually gates the hook: lowering
+    /// `diff_max_bytes` compacts a diff that the default would have left
+    /// alone.
+    #[test]
+    fn posttool_honours_a_lowered_diff_max_bytes() {
+        let rig = posttool_rig(&[("ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES", "1024")]);
+        let diff = fake_diff(5, 5);
+        assert!(diff.len() > 1024, "{}", diff.len());
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "git show HEAD",
+                serde_json::json!({
+                    "stdout": diff,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(
+            !out.is_empty(),
+            "a lowered diff_max_bytes must still compact a diff above it"
+        );
     }
 
     /// Review finding 6b/6c: a modelled build/test family is compacted from
