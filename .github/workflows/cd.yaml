@@ -38,7 +38,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Get version
         id: get_version
@@ -50,10 +50,7 @@ jobs:
           echo "version=$VER" >> $GITHUB_OUTPUT
 
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build release
         run: cargo build --release
@@ -130,13 +127,17 @@ jobs:
     name: Create GitHub Release & Upload Assets
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     outputs:
       version: ${{ needs.build.outputs.version }}
       published: ${{ steps.release.outputs.published }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -174,6 +175,11 @@ jobs:
         with:
           name: zirv-macos
           path: artifacts
+
+      - name: Attest Release Assets
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifacts/zirv-${{ needs.build.outputs.version }}-*
 
       - name: Create Release with Assets
         id: release
@@ -215,7 +221,7 @@ jobs:
     environment:
       name: homebrew-release
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -260,7 +266,7 @@ jobs:
       name: chocolatey-release
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
