@@ -266,21 +266,37 @@ fn continues_diagnostic_block(line: &str) -> bool {
 /// [`TAIL_LINES`], the test-runner summary lines, complete FAILURE blocks
 /// (each trigger line plus its continuation lines), and -- separately, so
 /// they can be dropped first when the budget runs short -- warning blocks.
-pub(crate) fn scan_for_display(reader: impl BufRead) -> DisplayScan {
+pub(crate) fn scan_for_display(mut reader: impl BufRead) -> DisplayScan {
     let mut scan = DisplayScan::default();
     let mut open_block: Option<Severity> = None;
-    for chunk in reader.split(b'\n') {
-        let bytes = match chunk {
-            Ok(bytes) => bytes,
+    loop {
+        let mut raw = Vec::new();
+        // `read_until` directly, never `BufRead::split`: its `Ok` count is
+        // the EXACT number of bytes consumed (delimiter included when one
+        // was found), which is what issue #410's never-worse guard compares
+        // a summary's length against. Reconstructing that count from each
+        // chunk's post-strip length (the previous approach) always assumed a
+        // trailing delimiter was present, overcounting by one byte whenever
+        // the captured output did not actually end in a newline.
+        let n = match reader.read_until(b'\n', &mut raw) {
+            Ok(n) => n,
             Err(_) => {
                 scan.read_error = true;
                 break;
             }
         };
-        let line = String::from_utf8_lossy(&bytes);
+        if n == 0 {
+            break;
+        }
+        scan.total_bytes = scan.total_bytes.saturating_add(n as u64);
+        let bytes: &[u8] = if raw.last() == Some(&b'\n') {
+            &raw[..raw.len() - 1]
+        } else {
+            &raw[..]
+        };
+        let line = String::from_utf8_lossy(bytes);
         let line = line.strip_suffix('\r').unwrap_or(&line);
         scan.total_lines += 1;
-        scan.total_bytes = scan.total_bytes.saturating_add(bytes.len() as u64 + 1);
 
         if scan.head.len() < HEAD_LINES {
             scan.head.push(display_line(line));
@@ -429,6 +445,7 @@ pub(crate) fn render_summary(
     // MIN_MAX_SUMMARY_BYTES` keeps a configured cap above it, and this guard
     // makes the invariant local rather than assumed.
     let budget = max_bytes.checked_sub(retrieval.len() + 1)?;
+    let raw_bytes = scan.total_bytes as usize;
 
     let mut body = String::new();
     body.push_str(&match exit_code {
@@ -545,6 +562,14 @@ pub(crate) fn render_summary(
     body.push_str(&retrieval);
     body.push('\n');
     debug_assert!(body.len() <= max_bytes);
+    // Issue #410: the whole point of a summary is to be smaller than what it
+    // replaces. A raw output just above `compact_min_bytes` can still gain
+    // bytes back from section headers and the retrieval line -- if that
+    // happened, there is no honest summary to emit, same as the mandatory
+    // content not fitting the budget at all.
+    if body.len() >= raw_bytes {
+        return None;
+    }
     Some(body)
 }
 
@@ -2138,6 +2163,124 @@ mod tests {
                     && remaining.contains(&format!("{stem}.json")),
                 "a log and its sidecar must be pruned together: {remaining:?}"
             );
+        }
+    }
+
+    /// A temp home/state/repo triple wired for `capture_text`, mirroring the
+    /// setup every `run_with`/`run_post` test above already builds by hand.
+    fn capture_rig() -> (
+        tempfile::TempDir,
+        StateDir,
+        PathBuf,
+        crate::commands::ctx::testenv::HomeGuard,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_path = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let home_guard = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = env_map(&[(
+            crate::commands::ctx::state::STATE_ENV,
+            &state_path.display().to_string(),
+        )]);
+        let state = StateDir::resolve(&|k: &str| env.get(k).cloned()).expect("state dir");
+        (tmp, state, repo, home_guard)
+    }
+
+    // -- Issue #410: never-worse guard ------------------------------------
+
+    /// A small number of long lines mean head AND tail both show every one
+    /// of them (no distinct middle to omit), so a head/tail summary of that
+    /// shape repeats the whole raw output twice, plus its own header and
+    /// retrieval line -- it can never be smaller than what it replaces, so
+    /// none is emitted and the original stands.
+    #[test]
+    fn a_summary_that_would_not_shrink_the_raw_output_is_never_emitted() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let threshold = crate::commands::ctx::config::OutputConfig::default().compact_min_bytes;
+        let mut output = String::new();
+        for i in 0..15u32 {
+            output.push_str(&format!("{i:02} {}", "x".repeat(270)));
+            output.push('\n');
+        }
+        match output.len().cmp(&(threshold + 1)) {
+            std::cmp::Ordering::Less => output.push_str(&"q".repeat(threshold + 1 - output.len())),
+            std::cmp::Ordering::Greater => output.truncate(threshold + 1),
+            std::cmp::Ordering::Equal => {}
+        }
+        assert_eq!(output.len(), threshold + 1, "issue #410's own example size");
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["some-tool".to_string()],
+            // Non-zero: keeps this on the ordinary head/tail path regardless
+            // of exit code semantics later shaping passes might add.
+            Some(1),
+            &output,
+            // A generous `max_summary_bytes` -- large enough that the head
+            // and tail sections both render in full rather than being cut
+            // for budget reasons, so what is left to test is specifically
+            // whether their (near-total) duplication of the raw content
+            // still beats the raw byte count, not whether they fit a small
+            // cap.
+            20_000,
+        )
+        .expect("capture");
+        assert!(
+            summary.is_none(),
+            "a summary that cannot beat its own raw output must not be emitted"
+        );
+    }
+
+    /// A property-style check over several representative shapes (a failing
+    /// build, a docker-style pull, a plain generic transcript, a large JSON
+    /// array): whenever ANY of them produces a summary at all, it must be
+    /// strictly smaller than the raw text it replaces.
+    #[test]
+    fn every_emitted_summary_is_strictly_smaller_than_its_raw_output() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let mut failing_build: String = (1..=400).map(|i| format!("filler line {i}\n")).collect();
+        failing_build.push_str("error[E0308]: mismatched types\n  --> src/lib.rs:42:9\n");
+        failing_build.push_str("failures:\n\n    module::tests::alpha\n\n");
+        failing_build.push_str("test result: FAILED. 1 passed; 1 failed\n");
+
+        let mut docker_pull = String::from("Using default tag: latest\n");
+        for i in 0..40u64 {
+            docker_pull.push_str(&format!("{:012x}: Pull complete\n", 0xabc000000000u64 + i));
+        }
+        docker_pull.push_str("Status: Downloaded newer image for alpine:latest\n");
+
+        let generic: String = (1..=600).map(|i| format!("plain line {i}\n")).collect();
+
+        let json_array = serde_json::to_string(&serde_json::Value::Array(
+            (0..800)
+                .map(|i| serde_json::json!({"id": i, "name": format!("item-{i}")}))
+                .collect(),
+        ))
+        .expect("json");
+
+        for (command, raw, exit_code) in [
+            ("cargo test", failing_build, Some(3)),
+            ("docker pull alpine", docker_pull, Some(1)),
+            ("some-tool --report", generic, Some(1)),
+            ("gh api /repos/x/y/issues", json_array, Some(0)),
+        ] {
+            let (_, summary) =
+                capture_text(&state, &repo, &[command.to_string()], exit_code, &raw, 4096)
+                    .unwrap_or_else(|e| panic!("{command}: {e}"));
+            if let Some(summary) = summary {
+                assert!(
+                    summary.len() < raw.len(),
+                    "{command}: summary ({} bytes) must be smaller than raw ({} bytes): {summary}",
+                    summary.len(),
+                    raw.len()
+                );
+            }
         }
     }
 }
