@@ -191,10 +191,11 @@ impl CommandTypes {
     pub async fn execute(
         &self,
         context: &mut HashMap<String, String>,
+        display_context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
         match self {
-            CommandTypes::Command(cmd) => cmd.execute(context).await,
-            CommandTypes::Agent(agent) => agent.execute(context).await,
+            CommandTypes::Command(cmd) => cmd.execute(context, display_context).await,
+            CommandTypes::Agent(agent) => agent.execute(context, display_context).await,
             CommandTypes::Commands(cmds) => {
                 if cmds.is_empty() {
                     return Ok(None);

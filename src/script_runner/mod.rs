@@ -89,6 +89,19 @@ fn build_context(
     Ok(context)
 }
 
+fn build_display_context(
+    script: &Script,
+    context: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut display_context = context.clone();
+    if let Some(secrets) = &script.secrets {
+        for secret in secrets {
+            display_context.insert(secret.name.clone(), format!("${{{}}}", secret.name));
+        }
+    }
+    display_context
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +140,10 @@ mod tests {
             context.get("commit_password"),
             Some(&"secret123".to_string())
         );
+        let display_context = build_display_context(&script, &context);
+        assert_eq!(display_context["commit_password"], "${commit_password}");
+        assert_eq!(display_context["param1"], "value1");
+        assert_eq!(display_context["param2"], "value2");
     }
 
     fn make_script(params: Vec<String>) -> Script {

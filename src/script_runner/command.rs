@@ -23,12 +23,14 @@ impl Command {
     pub async fn execute(
         &self,
         context: &mut HashMap<String, String>,
+        display_context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
         if self.skipped_for_os() {
             return Ok(Some("Command skipped due to OS filter".to_string()));
         }
 
         let command = self.substituted_command(context);
+        let cmd_display = self.substituted_command(display_context);
         self.check_unresolved_placeholders(context)?;
 
         if let Some(rest) = command.trim_start().strip_prefix("cd ")
@@ -48,15 +50,36 @@ impl Command {
             }
 
             if let Ok(p) = path.canonicalize() {
+                let display_dir = cmd_display
+                    .trim_start()
+                    .strip_prefix("cd ")
+                    .and_then(bare_cd_target);
+                let display_path =
+                    if cmd_display == command && display_context.get("cwd") == context.get("cwd") {
+                        p.to_string_lossy().to_string()
+                    } else {
+                        std::path::Path::new(
+                            display_context
+                                .get("cwd")
+                                .map(String::as_str)
+                                .unwrap_or("."),
+                        )
+                        .join(display_dir.as_deref().unwrap_or(&cmd_display))
+                        .to_string_lossy()
+                        .to_string()
+                    };
+                display_context.insert("cwd".to_string(), display_path);
                 context.insert("cwd".to_string(), p.to_string_lossy().to_string());
             } else {
-                return Err(format!("Failed to change directory to {dir}"));
+                return Err(format!("Failed to change directory: {cmd_display}"));
             }
 
             return Ok(None);
         }
 
-        let invoke = self.invoke(&command, context).await;
+        let invoke = self
+            .invoke(&command, &cmd_display, context, display_context)
+            .await;
 
         // G-7: a fallback that itself fails used to return `Err` straight
         // out of the loop, before `proceed_on_failure` was ever consulted --
@@ -65,14 +88,16 @@ impl Command {
         // command plus fallback) is tracked instead, and `proceed_on_failure`
         // always gets the final say over whether it is fatal.
         if let Err(e) = invoke {
-            let mut failure = format!("Command '{}' failed: {}", command, e);
+            let mut failure = format!("Command '{}' failed: {}", cmd_display, e);
             if let Some(options) = &self.options {
                 if let Some(commands) = &options.fallback {
                     for cmd in commands {
-                        if let Err(fallback_error) = cmd.invoke(context).await {
+                        if let Err(fallback_error) = cmd.invoke(context, display_context).await {
                             failure = format!(
                                 "Command '{}' failed and fallback '{}' also failed: {}",
-                                command, cmd.command, fallback_error
+                                cmd_display,
+                                substitute(&cmd.command, display_context),
+                                fallback_error
                             );
                             break;
                         }
@@ -100,7 +125,9 @@ impl Command {
     async fn invoke(
         &self,
         command: &str,
+        cmd_display: &str,
         context: &mut HashMap<String, String>,
+        display_context: &mut HashMap<String, String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut shell = if cfg!(windows) {
             let mut c = TokioCommand::new("powershell");
@@ -130,7 +157,8 @@ impl Command {
         // directory that cannot be resolved must never stop a script from
         // running -- and the guard's `Drop` releases the slot when the child
         // exits, however it exits.
-        let permit = heavy_permit_for(command, context.get("cwd").map(String::as_str)).await;
+        let permit =
+            heavy_permit_for(command, cmd_display, context.get("cwd").map(String::as_str)).await;
 
         if let Some(var) = &self.capture {
             // `Command::output()` would otherwise force these itself; set
@@ -151,11 +179,12 @@ impl Command {
             let out = child.wait_with_output().await?;
             if !out.status.success() {
                 let code = out.status.code().unwrap_or(1);
-                return Err(format!("`{command}` failed with exit code {code}").into());
+                return Err(format!("`{cmd_display}` failed with exit code {code}").into());
             }
 
             let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
+            display_context.insert(var.clone(), val.clone());
             context.insert(var.clone(), val);
 
             Ok(())
@@ -168,7 +197,7 @@ impl Command {
 
             if !status.success() {
                 let code = status.code().unwrap_or(1);
-                return Err(format!("`{command}` failed with exit code {code}").into());
+                return Err(format!("`{cmd_display}` failed with exit code {code}").into());
             }
 
             Ok(())
@@ -224,6 +253,7 @@ impl Command {
 /// anything at all.
 async fn heavy_permit_for(
     command: &str,
+    cmd_display: &str,
     cwd: Option<&str>,
 ) -> Option<crate::commands::ctx::permit::HeavyPermit> {
     use crate::commands::ctx::config::{CtxConfig, SuperviseConfig, env_from_process};
@@ -249,7 +279,7 @@ async fn heavy_permit_for(
     }
 
     let limit = supervise.max_heavy_operations;
-    let label = permit_label(&env, command);
+    let label = permit_label(&env, cmd_display);
     // Refuse-not-queue is right for a *spawn* (issue #133's own gate, now
     // `dash::fulfill_spawn_request`) but wrong for a command the operator
     // already put in a script -- failing `zirv test` outright because a
@@ -260,7 +290,7 @@ async fn heavy_permit_for(
     // simply vanishing back to the pre-#155 ungoverned behavior.
     const POLL_INTERVAL: Duration = Duration::from_millis(500);
     const MAX_WAIT: Duration = Duration::from_secs(600);
-    wait_for_permit(&state, limit, &label, command, POLL_INTERVAL, MAX_WAIT).await
+    wait_for_permit(&state, limit, &label, cmd_display, POLL_INTERVAL, MAX_WAIT).await
 }
 
 /// Emits a warning that `CtxConfig::load` failed and the heavy-operation
@@ -567,7 +597,8 @@ mod tests {
         };
         let mut context = HashMap::new();
 
-        let result = command.execute(&mut context).await;
+        let mut display_context = context.clone();
+        let result = command.execute(&mut context, &mut display_context).await;
         assert!(result.is_ok(), "got {result:?}");
         assert_eq!(context.get("out").map(String::as_str), Some("hi"));
     }
@@ -589,7 +620,8 @@ mod tests {
         };
         let mut context = HashMap::new();
 
-        let result = command.execute(&mut context).await;
+        let mut display_context = context.clone();
+        let result = command.execute(&mut context, &mut display_context).await;
         assert!(result.is_ok(), "got {result:?}");
         let expected = target.canonicalize().expect("canonicalize");
         let got = context.get("cwd").expect("cwd must be set");
@@ -624,7 +656,8 @@ mod tests {
         };
         let mut context = HashMap::new();
 
-        let result = command.execute(&mut context).await;
+        let mut display_context = context.clone();
+        let result = command.execute(&mut context, &mut display_context).await;
         assert!(result.is_ok(), "got {result:?}");
         assert!(result.unwrap().is_some());
     }
@@ -651,12 +684,16 @@ mod tests {
         .expect("resolve state dir");
 
         let permit = heavy_permit_for(
-            "cargo build",
+            "cargo build --token my_secret_password",
+            "cargo build --token ${token}",
             Some(repo.path().to_str().expect("utf8 path")),
         )
         .await
         .expect("a heavy command acquires a permit");
         assert_eq!(crate::commands::ctx::permit::live_count(&state), 1);
+        let records = crate::commands::ctx::permit::live_records(&state);
+        assert!(records[0].label.contains("${token}"));
+        assert!(!records[0].label.contains("my_secret_password"));
 
         drop(permit);
         assert_eq!(crate::commands::ctx::permit::live_count(&state), 0);
@@ -675,8 +712,12 @@ mod tests {
             Some(state_dir.path().to_str().expect("utf8 path")),
         )]);
 
-        let permit =
-            heavy_permit_for("git status", Some(repo.path().to_str().expect("utf8 path"))).await;
+        let permit = heavy_permit_for(
+            "git status",
+            "git status",
+            Some(repo.path().to_str().expect("utf8 path")),
+        )
+        .await;
         assert!(permit.is_none(), "a light command must not hold a permit");
     }
 
@@ -714,6 +755,7 @@ mod tests {
         );
 
         let permit = heavy_permit_for(
+            "cargo build",
             "cargo build",
             Some(repo.path().to_str().expect("utf8 path")),
         )
@@ -761,7 +803,8 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), repo.path().to_string_lossy().to_string());
 
-        let result = command.execute(&mut context).await;
+        let mut display_context = context.clone();
+        let result = command.execute(&mut context, &mut display_context).await;
         assert!(
             result.is_err(),
             "the classified-heavy command must fail as invoked"

@@ -28,13 +28,15 @@ impl FallbackCommand {
     pub async fn invoke(
         &self,
         context: &mut HashMap<String, String>,
+        display_context: &mut HashMap<String, String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let cmd_display = substitute(&self.command, display_context);
         if let Some(options) = &self.options
             && options.skip_for_os()
         {
             crate::output::note(format!(
                 "fallback '{}' skipped due to OS filter",
-                self.command
+                cmd_display
             ));
             return Ok(());
         }
@@ -57,7 +59,7 @@ impl FallbackCommand {
             shell.current_dir(cwd);
         }
 
-        crate::output::warn(format!("fallback: {command}"));
+        crate::output::warn(format!("fallback: {cmd_display}"));
         if let Some(description) = &self.description {
             crate::output::step_description(description);
         }
@@ -77,7 +79,7 @@ impl FallbackCommand {
             if self.options.as_ref().is_some_and(|o| o.proceed_on_failure) {
                 return Ok(());
             }
-            return Err(format!("`{command}` failed").into());
+            return Err(format!("`{cmd_display}` failed").into());
         }
 
         if let Some(options) = &self.options
@@ -114,7 +116,8 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("name".to_string(), "Alice".to_string());
 
-        let result = cmd.invoke(&mut context).await;
+        let mut display_context = context.clone();
+        let result = cmd.invoke(&mut context, &mut display_context).await;
         assert!(
             result.is_ok(),
             "expected the substituted value to satisfy the check: {result:?}"
@@ -133,8 +136,9 @@ mod tests {
         };
         let mut context = HashMap::new();
 
+        let mut display_context = context.clone();
         let err = cmd
-            .invoke(&mut context)
+            .invoke(&mut context, &mut display_context)
             .await
             .expect_err("unresolved placeholder must error");
         assert!(err.to_string().contains("missing"), "got {err}");
@@ -158,7 +162,8 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), tmp.path().to_string_lossy().to_string());
 
-        let result = cmd.invoke(&mut context).await;
+        let mut display_context = context.clone();
+        let result = cmd.invoke(&mut context, &mut display_context).await;
         assert!(result.is_ok(), "got {result:?}");
         assert!(
             tmp.path().join(marker).exists(),
@@ -184,7 +189,8 @@ mod tests {
         };
         let mut context = HashMap::new();
 
-        let result = cmd.invoke(&mut context).await;
+        let mut display_context = context.clone();
+        let result = cmd.invoke(&mut context, &mut display_context).await;
         assert!(
             result.is_ok(),
             "a filtered fallback must be skipped rather than run: {result:?}"
