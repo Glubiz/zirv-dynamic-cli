@@ -1915,7 +1915,24 @@ pub fn run_send_with<W: Write>(
         })?;
         let short = sessions::short_id(&from.session);
         let marker = state.mail().join(format!(".contract-attempt-{short}"));
-        match result_schema::evaluate(&schema, &body) {
+        let workdir = env(super::agent::RESULT_WORKDIR_ENV)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| repo.to_path_buf());
+        let mut undeclared = Vec::new();
+        let evaluation = super::agent::evaluate_report(&schema, &body, &workdir, &mut undeclared);
+        let (validated, errors) = match &evaluation {
+            Ok(value) => (Some(value.clone()), Vec::new()),
+            Err(errors) => (None, vec![errors.clone()]),
+        };
+        super::agent::store_result(
+            &state,
+            &short,
+            &from.harness,
+            &validated,
+            &errors,
+            &undeclared,
+        );
+        match evaluation {
             Ok(_) => {
                 let _ = std::fs::remove_file(&marker);
             }
@@ -1935,6 +1952,9 @@ pub fn run_send_with<W: Write>(
                 let _ = state::write_private(&marker, "");
                 return Ok(1);
             }
+        }
+        if !undeclared.is_empty() {
+            body.push_str(&format!("\nundeclared changes: {}", undeclared.join(", ")));
         }
     }
     let to_agent = args.to.clone().unwrap_or_else(|| "any".to_string());
@@ -3934,6 +3954,86 @@ This is part of the body too.\n";
     /// used by both contract-enforcement tests below.
     fn contract_schema_json() -> &'static str {
         r#"{"fields":[{"name":"status","kind":"enum","values":["done","blocked"],"required":true}]}"#
+    }
+
+    #[test]
+    fn self_report_audits_launch_directory_and_persists_contract_outcome() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tmp.path().join("worker");
+        std::fs::create_dir(&repo).expect("mkdir");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        std::fs::write(repo.join("extra"), "content").expect("write");
+        let state_dir = tmp.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let target = sessions::Record::new(
+            "target01-2222-4333-8444-555555555555",
+            "claude",
+            &repo,
+            sessions::Verb::Exec,
+        );
+        let target_short = target.short.clone();
+        let _guard = sessions::SessionGuard::register(&state, target);
+        let schema = result_schema::built_in("implement")
+            .expect("schema")
+            .to_canonical_json();
+        let env = env_map(&[
+            (
+                super::super::state::STATE_ENV,
+                state_dir.to_str().expect("utf8"),
+            ),
+            (SESSION_ENV, "sender01-2222-4333-8444-555555555555"),
+            (super::super::agent::RESULT_SCHEMA_ENV, &schema),
+            (
+                super::super::agent::RESULT_WORKDIR_ENV,
+                repo.to_str().expect("utf8"),
+            ),
+        ]);
+        let args = SendArgs {
+            to_session: Some(target_short),
+            message: Some(r#"{"status":"done","changed_files":["claimed"]}"#.into()),
+            ..SendArgs::default()
+        };
+        let send = || {
+            run_send_with(
+                &args,
+                &mut Vec::new(),
+                tmp.path(),
+                &|k| env.get(k).cloned(),
+                &mut std::io::empty(),
+            )
+            .expect("send")
+        };
+        assert_eq!(send(), 1);
+        assert_eq!(send(), 0);
+        assert_eq!(
+            super::super::agent::recorded_contract_exit(&state, "sender01", 0),
+            super::super::exec::EXIT_CONTRACT_FAILED
+        );
+        let messages = list(&state, &repo_slug(&repo), None, None).expect("list");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].1.body.contains("deliverable missing: claimed"));
+        assert!(messages[0].1.body.contains("undeclared changes: extra"));
+        std::fs::write(repo.join("claimed"), "content").expect("write");
+        assert_eq!(send(), 0);
+        assert_eq!(
+            super::super::agent::recorded_contract_exit(&state, "sender01", 0),
+            0
+        );
+        let record: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(state.logs().join("delegation-results/sender01.json"))
+                .expect("read"),
+        )
+        .expect("json");
+        assert_eq!(record["undeclared_changes"], serde_json::json!(["extra"]));
     }
 
     /// A worker's first self-report that fails the declared OUTPUT CONTRACT

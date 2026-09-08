@@ -1151,6 +1151,104 @@ fn result_schema_env<'a>(
     }
 }
 
+/// The launch directory used to audit a worker's self-report, even if it sends
+/// mail after changing its shell's current directory.
+pub const RESULT_WORKDIR_ENV: &str = "ZIRV_CTX_RESULT_WORKDIR";
+
+/// Validate structure first; only a changed_files array triggers git/filesystem I/O.
+pub(crate) fn evaluate_report(
+    schema: &Schema,
+    text: &str,
+    workdir: &Path,
+    undeclared: &mut Vec<String>,
+) -> Result<serde_json::Value, Vec<String>> {
+    undeclared.clear();
+    let value = result_schema::evaluate(schema, text)?;
+    if let Some(files) = value
+        .get("changed_files")
+        .and_then(serde_json::Value::as_array)
+    {
+        let claimed = files
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let output = std::process::Command::new("git")
+            .args(["status", "--porcelain", "-z"])
+            .current_dir(workdir)
+            .output()
+            .map_err(|e| vec![format!("deliverable audit: git status failed: {e}")])?;
+        if !output.status.success() {
+            return Err(vec![format!(
+                "deliverable audit: git status failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )]);
+        }
+        let audit = result_schema::audit_deliverables(
+            &claimed,
+            &String::from_utf8_lossy(&output.stdout),
+            |path| workdir.join(path).exists(),
+        );
+        *undeclared = audit.undeclared;
+        if !audit.missing.is_empty() {
+            return Err(audit
+                .missing
+                .into_iter()
+                .map(|path| format!("deliverable missing: {path}"))
+                .collect());
+        }
+    }
+    Ok(value)
+}
+
+pub(crate) fn store_result(
+    state: &super::state::StateDir,
+    session: &str,
+    agent: &str,
+    validated: &Option<serde_json::Value>,
+    errors: &[Vec<String>],
+    undeclared: &[String],
+) {
+    let results_dir = state.logs().join("delegation-results");
+    let _ = super::state::create_private_dir_all(&results_dir);
+    let mut record = serde_json::json!({
+        "outcome": if validated.is_some() { "validated" } else { "contract_failed" },
+        "result": validated,
+        "errors": errors,
+        "agent": agent,
+        "ts": super::state::now_secs(),
+    });
+    if !undeclared.is_empty() {
+        record["undeclared_changes"] = serde_json::json!(undeclared);
+    }
+    let _ = super::state::write_private(
+        &results_dir.join(format!("{session}.json")),
+        &serde_json::to_string_pretty(&record).unwrap_or_default(),
+    );
+}
+
+pub(crate) fn recorded_contract_exit(
+    state: &super::state::StateDir,
+    session: &str,
+    code: i32,
+) -> i32 {
+    let path = state
+        .logs()
+        .join("delegation-results")
+        .join(format!("{session}.json"));
+    let record = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    if record
+        .as_ref()
+        .is_some_and(|r| r["outcome"] == "contract_failed")
+    {
+        exec::EXIT_CONTRACT_FAILED
+    } else {
+        code
+    }
+}
+
 /// Issue #262: the child's own env key for the canonical JSON of the
 /// [`envelope::WorkerEnvelope`] this delegation narrowed for it -- read back
 /// by a nested `zirv agent` as ITS OWN parent envelope
@@ -1892,6 +1990,7 @@ pub(crate) fn delegation_outcome(code: i32) -> &'static str {
         exec::EXIT_ACCOUNT_EXHAUSTED => "account-exhausted",
         // Issue #267.
         exec::EXIT_WRITER_BUSY => "writer-busy",
+        exec::EXIT_CONTRACT_FAILED => "contract_failed",
         _ => "failed",
     }
 }
@@ -3645,55 +3744,34 @@ pub fn run_with<W: Write>(
     // permanently burn the group's admission slot for a child that never
     // ran. `state` is the same handle resolved above for the spawn gate,
     // unused since; reused here rather than re-resolved.
-    let (code, execution_report) = match exec::run_with_report(&exec_args, w, &launch_repo, &env) {
-        Ok(result) => result,
-        Err(e) => {
-            if let Some(id) = &args.group {
-                super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
+    let (mut code, execution_report) =
+        match exec::run_with_report(&exec_args, w, &launch_repo, &env) {
+            Ok(result) => result,
+            Err(e) => {
+                if let Some(id) = &args.group {
+                    super::group::rollback_admission(&state, id, reserved_ceiling.unwrap_or(0));
+                }
+                if let Some(reservation_id) = &reservation_id {
+                    let _ = super::reservation::release(&state, provider, reservation_id);
+                }
+                // Finding 4: with the admission rolled back the group is pristine
+                // again, so a group this invocation minted for a launch that
+                // never happened is removed rather than left open forever.
+                discard_minted_group();
+                // Issue #317: the worker never actually ran -- same "never
+                // Done, always crash/respawn-guarded" treatment as any other
+                // run that reached completion but failed.
+                finish_task_card(
+                    &state,
+                    repo,
+                    args,
+                    super::task::ExitKind::Crash,
+                    "launch failed",
+                    super::state::now_secs(),
+                );
+                return Err(e);
             }
-            if let Some(reservation_id) = &reservation_id {
-                let _ = super::reservation::release(&state, provider, reservation_id);
-            }
-            // Finding 4: with the admission rolled back the group is pristine
-            // again, so a group this invocation minted for a launch that
-            // never happened is removed rather than left open forever.
-            discard_minted_group();
-            // Issue #317: the worker never actually ran -- same "never
-            // Done, always crash/respawn-guarded" treatment as any other
-            // run that reached completion but failed.
-            finish_task_card(
-                &state,
-                repo,
-                args,
-                super::task::ExitKind::Crash,
-                "launch failed",
-                super::state::now_secs(),
-            );
-            return Err(e);
-        }
-    };
-    // Issue #267: the tree frees the moment the run is actually done, not
-    // whenever this whole function happens to return -- the accounting/mail
-    // bookkeeping below needs no exclusive hold on the checkout.
-    drop(writer_permit);
-    // Review finding (2026-09): `--worktree` allocated a linked worktree at
-    // `<repo>/.zirv/worktrees/<short>` (see `allocate_worktree`) but nothing
-    // ever removed it -- best-effort reclamation here, after the worker's
-    // child has exited, so a clean tree does not pile up on disk forever. A
-    // dirty tree (uncommitted/untracked changes) is left in place -- never
-    // `--force`d clean -- for the operator to inspect. Failures here never
-    // change this delegation's own exit code; only a single stderr line
-    // either way.
-    if args.worktree
-        && let Some(path) = canonical_workdir.as_deref()
-    {
-        reclaim_worktree_and_report(&state, repo, path);
-    }
-    // Review finding (2026-09), finding 2b: reclaimed above already (when
-    // `--worktree` was used) -- disarm so `worktree_guard`'s own `Drop`,
-    // whenever this function eventually returns, never attempts a second,
-    // redundant reclaim of an already-removed directory.
-    worktree_guard.disarm();
+        };
     // Issue #170: this delegation's scope is done -- successfully or not --
     // the moment its supervised run exits. The free-text completion contract
     // remains reviewer-checked; token spend is rolled up below. Closes the
@@ -3711,13 +3789,6 @@ pub fn run_with<W: Write>(
         let _ = super::group::close(&state, id, super::state::now_secs());
     }
     let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    announcer.emit(&Event::DelegatedFinish {
-        agent: args.name.clone(),
-        meaning: exec::describe_exit(code),
-    });
-    if let Some(note) = exit_note(code) {
-        eprintln!("zirv ctx agent: {note}");
-    }
 
     // Best effort throughout: a delegation that ran must never fail because
     // its accounting could not be written (issue #155, Phase 2). Issue #186
@@ -3726,7 +3797,6 @@ pub fn run_with<W: Write>(
     // wrong agent nor omitted from the cost tree.
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
-        let outcome = delegation_outcome(code);
         // Issue #317: `--task`'s own completion signal. Without a declared
         // `--result-schema`, a plain exit 0 is the only success evidence this
         // function has, so it is treated as `Reported`; a schema declared
@@ -3792,13 +3862,14 @@ pub fn run_with<W: Write>(
             let mut attempts: Vec<Vec<String>> = Vec::new();
             let mut last_candidate = String::new();
             let mut validated: Option<serde_json::Value> = None;
+            let mut undeclared = Vec::new();
 
             let first_text = read_last_text(&transcript_path);
             if let Some(text) = first_text.as_deref() {
                 last_candidate = result_schema::extract_json_candidate(text).unwrap_or_default();
             }
             match first_text.as_deref() {
-                Some(text) => match result_schema::evaluate(schema, text) {
+                Some(text) => match evaluate_report(schema, text, &launch_repo, &mut undeclared) {
                     Ok(value) => validated = Some(value),
                     Err(errors) => attempts.push(errors),
                 },
@@ -3847,10 +3918,12 @@ pub fn run_with<W: Write>(
                                 .unwrap_or(last_candidate);
                         }
                         match second_text.as_deref() {
-                            Some(text) => match result_schema::evaluate(schema, text) {
-                                Ok(value) => validated = Some(value),
-                                Err(errors) => attempts.push(errors),
-                            },
+                            Some(text) => {
+                                match evaluate_report(schema, text, &launch_repo, &mut undeclared) {
+                                    Ok(value) => validated = Some(value),
+                                    Err(errors) => attempts.push(errors),
+                                }
+                            }
                             None => attempts.push(vec![
                                 "no JSON object found in the worker's final message".to_string(),
                             ]),
@@ -3860,6 +3933,9 @@ pub fn run_with<W: Write>(
                 }
             }
 
+            if validated.is_none() {
+                code = exec::EXIT_CONTRACT_FAILED;
+            }
             task_exit_kind = Some(if validated.is_some() {
                 super::task::ExitKind::Reported
             } else {
@@ -3899,6 +3975,9 @@ pub fn run_with<W: Write>(
                     cap_bytes(&last_candidate, 2048)
                 ));
             }
+            if !undeclared.is_empty() {
+                body.push_str(&format!("\nundeclared changes: {}", undeclared.join(", ")));
+            }
             let to_session = super::mail::session_identity(&env)
                 .filter(|id| super::prompt::is_addressable_short(id));
             let msg = super::mail::Message {
@@ -3911,18 +3990,13 @@ pub fn run_with<W: Write>(
             };
             let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
 
-            let results_dir = state_dir.logs().join("delegation-results");
-            let _ = super::state::create_private_dir_all(&results_dir);
-            let record = serde_json::json!({
-                "outcome": if validated.is_some() { "validated" } else { "contract_failed" },
-                "result": validated,
-                "errors": attempts,
-                "agent": args.name,
-                "ts": super::state::now_secs(),
-            });
-            let _ = super::state::write_private(
-                &results_dir.join(format!("{worker_session}.json")),
-                &serde_json::to_string_pretty(&record).unwrap_or_default(),
+            store_result(
+                &state_dir,
+                &worker_session,
+                &args.name,
+                &validated,
+                &attempts,
+                &undeclared,
             );
         } else if code != 0
             && let Some(parent_short) = super::mail::session_identity(&env)
@@ -3951,6 +4025,7 @@ pub fn run_with<W: Write>(
             let repo_slug = super::state::repo_slug(repo);
             let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
         }
+        let outcome = delegation_outcome(code);
         let envelope_sha256 = envelope::digest(&child_envelope).ok();
         // Issue #317: closes (or respawn-guards) `--task`'s own card now that
         // this delegation's real outcome is known -- see `finish_task_card`'s
@@ -4043,6 +4118,23 @@ pub fn run_with<W: Write>(
             },
         );
     }
+
+    announcer.emit(&Event::DelegatedFinish {
+        agent: args.name.clone(),
+        meaning: exec::describe_exit(code),
+    });
+    if let Some(note) = exit_note(code) {
+        eprintln!("zirv ctx agent: {note}");
+    }
+
+    // Keep the checkout and writer permit through contract auditing and retry.
+    drop(writer_permit);
+    if args.worktree
+        && let Some(path) = canonical_workdir.as_deref()
+    {
+        reclaim_worktree_and_report(&state, repo, path);
+    }
+    worktree_guard.disarm();
 
     // Issue #230 item 3: the delegator captures `zirv agent`'s synchronous
     // stdout result, so each warning rides here with capability, mechanism
@@ -4140,6 +4232,10 @@ mod tests {
     /// failed" and "zirv gave up on the worker" cost very different things.
     #[test]
     fn a_delegation_outcome_names_the_supervisors_own_failures() {
+        assert_eq!(
+            delegation_outcome(exec::EXIT_CONTRACT_FAILED),
+            "contract_failed"
+        );
         assert_eq!(delegation_outcome(0), "ok");
         assert_eq!(
             delegation_outcome(exec::EXIT_ROT_EXHAUSTED),
@@ -5980,6 +6076,62 @@ mod tests {
             vec!["--model".to_string(), "sonnet".to_string()],
             "claude still gets its own worker-model default; only the sandbox prefix is gone"
         );
+    }
+
+    #[test]
+    fn report_audit_checks_the_worker_git_directory() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert!(git_init(repo.path()));
+        std::fs::write(repo.path().join("declared"), "content").expect("write");
+        std::fs::write(repo.path().join("Cargo.lock"), "content").expect("write");
+        let schema = result_schema::built_in("implement").expect("schema");
+        let mut undeclared = Vec::new();
+        let report = r#"{"status":"done","changed_files":["./declared"]}"#;
+        assert!(evaluate_report(&schema, report, repo.path(), &mut undeclared).is_ok());
+        assert_eq!(undeclared, ["Cargo.lock"]);
+        let report = r#"{"status":"done","changed_files":["absent"]}"#;
+        assert_eq!(
+            evaluate_report(&schema, report, repo.path(), &mut undeclared)
+                .expect_err("missing deliverable"),
+            ["deliverable missing: absent"]
+        );
+        assert_eq!(undeclared, ["Cargo.lock", "declared"]);
+    }
+
+    #[test]
+    fn pane_result_record_controls_contract_exit_and_keeps_undeclared_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(tmp.path().to_path_buf());
+        assert_eq!(recorded_contract_exit(&state, "worker01", 0), 0);
+        store_result(
+            &state,
+            "worker01",
+            "claude",
+            &None,
+            &[vec!["deliverable missing: absent".into()]],
+            &["Cargo.lock".into()],
+        );
+        let code = recorded_contract_exit(&state, "worker01", 0);
+        assert_eq!(code, exec::EXIT_CONTRACT_FAILED);
+        assert_eq!(delegation_outcome(code), "contract_failed");
+        let record: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(state.logs().join("delegation-results/worker01.json"))
+                .expect("read"),
+        )
+        .expect("json");
+        assert_eq!(
+            record["undeclared_changes"],
+            serde_json::json!(["Cargo.lock"])
+        );
+        store_result(
+            &state,
+            "worker01",
+            "claude",
+            &Some(serde_json::json!({"status":"done"})),
+            &[],
+            &[],
+        );
+        assert_eq!(recorded_contract_exit(&state, "worker01", 0), 0);
     }
 
     /// Issue #252: `dash::worker_pane_extra_args` has always appended these
@@ -7899,8 +8051,8 @@ mod tests {
         }
         assert_eq!(
             code.expect("runs"),
-            0,
-            "the supervised run itself still exits clean"
+            exec::EXIT_CONTRACT_FAILED,
+            "a clean child exit cannot hide a failed contract"
         );
         let printed = String::from_utf8_lossy(&out);
         assert!(printed.contains("result: contract_failed"), "got {printed}");
@@ -7930,6 +8082,13 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(files[0].path()).expect("read"))
                 .expect("json");
         assert_eq!(record["outcome"], "contract_failed");
+        let rows = super::super::log::read_delegations(&state_dir, usize::MAX);
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|row| row.outcome == "contract_failed"
+                && row.exit_code == exec::EXIT_CONTRACT_FAILED)
+        );
+
         assert!(record["result"].is_null());
         let errors = record["errors"].as_array().expect("errors array");
         assert_eq!(
