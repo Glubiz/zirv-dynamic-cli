@@ -6,8 +6,8 @@
 //! provider-specific prompt/tool names.
 
 use clap::{Parser, Subcommand};
-use std::process::{Child, Command};
-use std::time::{Duration, Instant};
+use std::process::Child;
+use std::time::Duration;
 
 use super::ctx::CtxResult;
 
@@ -156,67 +156,11 @@ fn announce_unreadable_config(reason: &str) {
     );
 }
 
-/// Put a shell-backed workflow command in its own process group on Unix so a
-/// timeout can stop descendants as well as the shell. Windows uses
-/// `taskkill /T` in [`terminate_process_tree`] instead.
-pub(crate) fn isolate_process_tree(_command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        _command.process_group(0);
-    }
-}
+pub(crate) use crate::commands::ctx::supervise::isolate_process_tree;
 
 /// Terminate a child and every process it spawned, then reap the direct child.
 pub(crate) fn terminate_process_tree(child: &mut Child) -> CtxResult<()> {
-    let direct_child_exited = child.try_wait()?.is_some();
-    #[cfg(not(unix))]
-    if direct_child_exited {
-        return Ok(());
-    }
-
-    #[cfg(unix)]
-    let process_group = child.id() as libc::pid_t;
-    #[cfg(unix)]
-    let tree_exited = unsafe { libc::kill(-process_group, 0) != 0 };
-    #[cfg(unix)]
-    if direct_child_exited && tree_exited {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    unsafe {
-        // The child was spawned with `process_group(0)`, so its pid is also
-        // its process-group id. A negative pid addresses the whole group.
-        libc::kill(-process_group, libc::SIGTERM);
-    }
-    #[cfg(not(unix))]
-    if !crate::commands::ctx::supervise::kill_tree(child.id()) {
-        let _ = child.kill();
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let direct_child_exited = child.try_wait()?.is_some();
-        #[cfg(unix)]
-        let tree_exited = unsafe { libc::kill(-process_group, 0) != 0 };
-        #[cfg(not(unix))]
-        let tree_exited = direct_child_exited;
-        if direct_child_exited && tree_exited {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-process_group, libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-    Ok(())
+    crate::commands::ctx::supervise::terminate_group(child, Duration::from_secs(5))
 }
 
 #[derive(Debug, Parser)]

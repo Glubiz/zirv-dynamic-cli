@@ -172,6 +172,7 @@ fn sessions_lines(
             // shade of live: being gone outranks being unreachable.
             let liveness_word = match (liveness, record.reachable) {
                 (Liveness::Stale, _) => "dead",
+                (Liveness::Crashed, _) => "crashed",
                 (Liveness::Live, true) => "live",
                 (Liveness::Live, false) => "unreachable",
             };
@@ -200,6 +201,14 @@ fn sessions_lines(
                 style::paint(liveness_word, liveness_tone, colour),
                 style::paint(&record.repo_slug, Tone::Muted, colour),
             );
+            if *liveness == Liveness::Crashed
+                && let Some(in_flight) = &record.in_flight
+            {
+                line.push_str(&format!(
+                    " (in-flight {} turn {})",
+                    in_flight.verb, in_flight.turn
+                ));
+            }
             // Issue #139: named here, not just silently folded into the
             // stricter verdict a hook prompt would show -- an operator
             // reading `status` has no other way to learn a live session is

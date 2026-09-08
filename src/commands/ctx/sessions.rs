@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::state::StateDir;
+use super::state::{self, StateDir};
 
 /// Mirrors `StateDir::socket_for`'s own derivation exactly: the first eight
 /// ASCII-alphanumeric characters of the session id. Duplicated rather than
@@ -862,6 +862,7 @@ impl Drop for SessionGuard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Liveness {
     Live,
+    Crashed,
     Stale,
 }
 
@@ -1199,13 +1200,16 @@ fn interrupted_record(state: &StateDir, repo: &Path) -> Option<(PathBuf, Record)
 }
 
 /// Every record currently on disk, alongside whether its own process is
-/// still alive. A stale record (its process is gone) is swept -- its file
+/// still alive. Crash witnesses survive until consumed or past the dashboard
+/// restore horizon. A stale record (its process is gone) is swept -- its file
 /// removed -- as a side effect of this read, but is still reported in the
 /// returned list so a caller can say what it just cleaned up. A file that
 /// fails to parse is skipped outright: one malformed record must never fail
 /// the whole listing.
 pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
     let mut found = Vec::new();
+    let now = state::now_secs();
+    let retention = super::config::DashConfig::default().roster_max_age_secs;
     // Issue #99 (2026-08-23): an absent `sessions/` directory used to make
     // this whole function return immediately, before `sweep_orphan_endpoints`
     // below ever ran. That is exactly the state a fresh install, or a
@@ -1228,6 +1232,12 @@ pub fn list(state: &StateDir) -> Vec<(Record, Liveness)> {
             };
             if record_is_alive(&record) {
                 found.push((record, Liveness::Live));
+            } else if record
+                .in_flight
+                .as_ref()
+                .is_some_and(|in_flight| now.saturating_sub(in_flight.since) <= retention)
+            {
+                found.push((record, Liveness::Crashed));
             } else {
                 let _ = std::fs::remove_file(&path);
                 found.push((record, Liveness::Stale));
@@ -2582,6 +2592,42 @@ mod tests {
             !path.exists(),
             "a stale record is swept from disk as a side effect of listing"
         );
+    }
+
+    #[test]
+    fn listing_keeps_crash_witnesses_until_consumed_or_past_retention() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let mut record = record_for(
+            "33333333-2222-4333-8444-555555555555",
+            tmp.path(),
+            Verb::Exec,
+        );
+        record.pid = dead_pid();
+        record.in_flight = Some(InFlight {
+            verb: "exec".into(),
+            turn: 2,
+            since: state::now_secs(),
+        });
+        let path = record_path(&state, &record.short);
+        write_record(&state, &record);
+        assert_eq!(list(&state)[0].1, Liveness::Crashed);
+        assert_eq!(list(&state)[0].0.in_flight, record.in_flight);
+        assert!(path.exists());
+        launch_consuming_interrupted(&state, tmp.path(), || Ok(())).expect("resume");
+        assert_eq!(list(&state)[0].1, Liveness::Stale);
+        assert!(!path.exists());
+
+        record.in_flight.as_mut().expect("witness").since =
+            state::now_secs() - super::super::config::DashConfig::default().roster_max_age_secs - 1;
+        write_record(&state, &record);
+        assert_eq!(list(&state)[0].1, Liveness::Stale);
+        assert!(!path.exists());
+
+        record.in_flight = None;
+        write_record(&state, &record);
+        assert_eq!(list(&state)[0].1, Liveness::Stale);
+        assert!(!path.exists());
     }
 
     #[test]

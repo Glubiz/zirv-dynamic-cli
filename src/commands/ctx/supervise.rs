@@ -43,6 +43,7 @@ pub const FINAL_DRAIN_BUDGET: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 pub fn spawn(mut command: Command) -> CtxResult<Child> {
+    isolate_process_tree(&mut command);
     Ok(command
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -52,8 +53,8 @@ pub fn spawn(mut command: Command) -> CtxResult<Child> {
 
 /// Polls the child, calling `on_tick` at every interval. Stops on child exit,
 /// on the deadline, or when a tick asks to stop; in the last two cases it
-/// terminates the child. On Windows that means the whole process tree rooted
-/// at the child, not just the direct child: a shim launch (`cmd.exe /c
+/// terminates the Unix process group or the Windows process tree rooted
+/// at the child: a shim launch (`cmd.exe /c
 /// claude.cmd`) runs the real agent as a `node` grandchild, and killing only
 /// cmd.exe would leave that grandchild alive to run alongside a freshly
 /// spawned replacement -- two live sessions on one repo. See `terminate`.
@@ -79,42 +80,73 @@ pub fn supervise_child(
     }
 }
 
-/// SIGTERM, then SIGKILL after the grace period. Safe to call on a child that
-/// already exited.
-pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-
+/// Isolate a headless child so Unix signals can reach all its descendants.
+pub(crate) fn isolate_process_tree(_command: &mut Command) {
     #[cfg(unix)]
     {
-        // SAFETY: `kill` with a pid this process owns and a valid signal number.
-        unsafe {
-            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
-        }
+        use std::os::unix::process::CommandExt;
+        _command.process_group(0);
     }
+}
+
+/// Terminate the process tree, escalating after the grace period.
+pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
+    terminate_group(child, grace)
+}
+
+/// SIGTERM then SIGKILL for the Unix process group; Windows keeps its tree
+/// kill. Reap the direct child even when descendants outlive it.
+pub(crate) fn terminate_group(child: &mut Child, grace: Duration) -> CtxResult<()> {
+    let direct_child_exited = child.try_wait()?.is_some();
     #[cfg(not(unix))]
-    {
-        // TerminateProcess (what `child.kill()` calls) kills only the direct
-        // child. On an npm-installed agent that child is `cmd.exe /c
-        // claude.cmd`, which runs `node`; killing cmd.exe leaves the node
-        // grandchild alive (there is no Job Object). `taskkill /T` terminates
-        // the whole tree rooted at the pid instead. Its arguments are fixed
-        // flags plus a decimal pid, so there is no cmd.exe-reparse exposure.
-        // Falls back to a direct kill if taskkill cannot be run.
-        if !kill_tree(child.id()) {
-            let _ = child.kill();
+    if direct_child_exited {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let group = child.id() as libc::pid_t;
+    #[cfg(unix)]
+    let group_alive = || unsafe {
+        libc::kill(-group, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    };
+    #[cfg(unix)]
+    if direct_child_exited && !group_alive() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let signal = |sig, direct_child_exited: bool| unsafe {
+        // The isolated child's pid is its pgid. A legacy, ungrouped child
+        // needs a direct signal when no such group exists.
+        if libc::kill(-group, sig) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            && !direct_child_exited
+        {
+            libc::kill(group, sig);
         }
+    };
+    #[cfg(unix)]
+    signal(libc::SIGTERM, direct_child_exited);
+    #[cfg(not(unix))]
+    if !kill_tree(child.id()) {
+        let _ = child.kill();
     }
 
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
+        let direct_child_exited = child.try_wait()?.is_some();
+        #[cfg(unix)]
+        let tree_exited = !group_alive();
+        #[cfg(not(unix))]
+        let tree_exited = direct_child_exited;
+        if direct_child_exited && tree_exited {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(25));
     }
 
+    #[cfg(unix)]
+    signal(libc::SIGKILL, child.try_wait()?.is_some());
+    #[cfg(not(unix))]
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
@@ -124,8 +156,7 @@ pub fn terminate(child: &mut Child, grace: Duration) -> CtxResult<()> {
 /// not own as a `Child` -- `zirv ctx kill` resolves a session's pid from the
 /// on-disk registry in an entirely different process, so unlike `terminate`
 /// above there is no `Child` handle to call, only the pid itself. Mirrors
-/// `terminate`'s own escalation exactly; the two differ only in what they
-/// have a handle to. Returns whether the pid was confirmed dead by the end of
+/// `terminate`'s grace ladder, but addresses only this pid. Returns whether the pid was confirmed dead by the end of
 /// the grace period plus a brief settle window after the final signal --
 /// best-effort, like every other piece of state-dir housekeeping in this
 /// codebase, since a pid that ignores even `SIGKILL` (a zombie stuck on an
@@ -819,6 +850,7 @@ pub fn spawn_tapped(
     // through here, so this is their single chokepoint for the cmd.exe
     // argv-reparse guard. A no-op off Windows and for any non-shim program.
     guard_cmd_shim_reparse(&command)?;
+    isolate_process_tree(&mut command);
     let stdin_mode = if stdin_text.is_some() {
         Stdio::piped()
     } else {
@@ -984,6 +1016,36 @@ mod tests {
             ticks >= 3,
             "expected several ticks before exit, got {ticks}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_reaps_the_headless_child_and_stops_its_grandchild() {
+        let (mut child, tap, _guard) =
+            spawn_tapped(sh("sleep 30 & echo $!; wait"), None).expect("spawn");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            if let Some(line) = tap.try_lines().first() {
+                break line.trim().parse::<libc::pid_t>().expect("grandchild pid");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell did not publish its child pid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let grace = Duration::from_secs(2);
+        let deadline = Instant::now() + grace;
+        terminate(&mut child, grace).expect("terminate group");
+        loop {
+            let result = unsafe { libc::kill(grandchild, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "grandchild survived termination");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(child.try_wait().expect("reaped child").is_some());
     }
 
     #[test]

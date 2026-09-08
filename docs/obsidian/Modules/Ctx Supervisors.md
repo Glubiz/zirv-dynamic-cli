@@ -1,8 +1,12 @@
 ---
-last-verified: 2026-09-07
+last-verified: 2026-09-08
 ---
 
 # Ctx Supervisors
+
+Dead session records carrying `in_flight` remain visible as crashed until resumed or GC'd past the existing seven-day dashboard restore horizon (fixed 2026-09-08).
+
+Headless `exec`/`loop` children run in their own process group on Unix; termination signals the whole group with SIGTERM, then SIGKILL after grace, through the same helper as workflow commands (fixed 2026-09-08).
 
 ## Quick Reference
 
