@@ -5,10 +5,11 @@
 //! comes back as `additionalContext` naming the existing `path:line`.
 //!
 //! Advisory only, by construction: nothing here ever denies a write, and a
-//! probe that cannot finish inside its own byte/wall-clock budget says
-//! nothing at all rather than delaying the tool call. Every failure -- an
-//! unreadable file, non-UTF-8 bytes, a directory that will not open -- is
-//! skipped, never propagated.
+//! probe that cannot finish inside its budget -- an oversized payload, a
+//! spent wall-clock deadline, a tree bigger than the byte allowance -- says
+//! nothing at all rather than delaying the tool call or answering partially.
+//! Every failure -- an unreadable file, non-UTF-8 bytes, a directory that
+//! will not open -- is skipped, never propagated.
 //!
 //! CLAUDE-ONLY: the probe hangs off claude's `PreToolUse` contract
 //! (`hook::run_pretool`), and codex exposes no PreToolUse seam at all (see
@@ -37,13 +38,27 @@ const SOURCE_EXTENSIONS: [&str; 13] = [
 
 /// Directory names never descended into. Every dot-prefixed directory
 /// (`.git`, `.zirv` and therefore `.zirv/work`, ...) is skipped by the
-/// leading-dot rule in [`collect_sources`] rather than by name.
+/// leading-dot rule in [`Scan::walk`] rather than by name.
 const SKIPPED_DIRS: [&str; 2] = ["target", "node_modules"];
 
 /// Bytes of source this probe may read before it gives up. 16 MiB covers
 /// this repository whole with room to spare; a monorepo that exceeds it gets
 /// a logged skip, never a slow tool call.
 pub const MAX_SCANNED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest single file the scan will open. A file above this is skipped
+/// WITHOUT being charged to the budget: a generated bundle or a checked-in
+/// blob is not where a hand-written definition lives, and letting one of
+/// them consume the whole allowance would end the scan for every real file
+/// behind it.
+pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Largest incoming payload whose definitions are extracted at all. The
+/// extraction runs a regex over every line of the text a `Write`/`Edit`
+/// carries, so an unbounded payload is unbounded work on a hook hot path.
+/// Beyond this the probe SKIPS rather than truncating: a partial candidate
+/// list silently under-reports, which is worse than saying nothing.
+pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// Wall-clock ceiling on one probe. The hook runs in front of every write,
 /// so the ceiling is what keeps a cold page cache or a network filesystem
@@ -64,13 +79,18 @@ const MAX_CANDIDATES: usize = 10;
 /// something in every repository and prove nothing.
 const MIN_NAME_LEN: usize = 3;
 
-/// Names so common that an existing definition says nothing about reuse --
-/// every module has its own `run`, `new`, `parse`. Compared in normalized
-/// form ([`normalize`]), so `New`/`_new` are covered too.
-const GENERIC_NAMES: [&str; 24] = [
+/// Names so common that a definition under one says nothing about reuse:
+/// the trait methods every type implements (`new`, `default`, `fmt`,
+/// `from`, `into`, `drop`, `clone`, `eq`, `hash`, `len`, `is_empty`) and the
+/// entry points every module has (`run`, `main`, `parse`). Compared in
+/// normalized form ([`normalize`]), so `New`/`_new` are covered too, and
+/// applied to BOTH sides of a comparison -- to the names a payload adds and
+/// to the definitions found in the repository -- so neither half can raise
+/// a match on one.
+const GENERIC_NAMES: [&str; 27] = [
     "new", "default", "main", "run", "fmt", "from", "into", "test", "tests", "mod", "build",
-    "parse", "get", "set", "init", "drop", "clone", "next", "len", "name", "path", "value", "data",
-    "args",
+    "parse", "get", "set", "init", "drop", "clone", "next", "len", "isempty", "eq", "hash", "name",
+    "path", "value", "data", "args",
 ];
 
 /// One definition-site pattern. `kind` is `None` when the regex captures the
@@ -85,6 +105,15 @@ struct DefPattern {
 /// is matched against ONE line, so `^` anchors to that line and a match
 /// carries its own line number for free).
 ///
+/// Every pattern anchors at COLUMN 0, and that is the whole scope model:
+/// this probe compares bare names, with no notion of the type or block a
+/// name belongs to, so an indented definition -- a method inside an `impl`
+/// or a `class`, a nested helper, a body-local `const` -- would be matched
+/// scope-blind and reported as though a free function of that name already
+/// existed. Only top-level definitions are comparable on name alone, so
+/// only top-level definitions count, on the incoming side and the
+/// repository side alike.
+///
 /// Built with `Regex::new(...).ok()` rather than `expect`: this runs inside
 /// a `PreToolUse` hook under `panic = "abort"`, where a panic takes the tool
 /// call with it. A pattern that somehow failed to compile disables itself
@@ -95,24 +124,22 @@ static DEF_PATTERNS: LazyLock<Vec<DefPattern>> = LazyLock::new(|| {
         // modifier chain is ordered as the languages spell it: `pub async
         // unsafe fn`, `pub unsafe extern "C" fn`, `export default class`.
         (
-            r#"^[ \t]*(?:pub(?:\([^()]*\))?[ \t]+)?(?:export[ \t]+)?(?:default[ \t]+)?(?:async[ \t]+)?(?:unsafe[ \t]+)?(?:extern[ \t]+"[^"]*"[ \t]+)?(fn|struct|enum|trait|type|mod|class|def|function|interface)[ \t]+([A-Za-z_$][A-Za-z0-9_$-]*)"#,
+            r#"^(?:pub(?:\([^()]*\))?[ \t]+)?(?:export[ \t]+)?(?:default[ \t]+)?(?:async[ \t]+)?(?:unsafe[ \t]+)?(?:extern[ \t]+"[^"]*"[ \t]+)?(fn|struct|enum|trait|type|mod|class|def|function|interface)[ \t]+([A-Za-z_$][A-Za-z0-9_$-]*)"#,
             None,
         ),
-        // `const`/`static` declarations, deliberately UNINDENTED only: an
-        // indented `const` is a body-local binding in every language here,
-        // and probing for locals would fire on almost every edit.
+        // `const`/`static` declarations.
         (
             r"^(?:pub(?:\([^()]*\))?[ \t]+)?(?:export[ \t]+)?(const|static)[ \t]+(?:mut[ \t]+)?([A-Za-z_$][A-Za-z0-9_$]*)",
             None,
         ),
         // Go, with or without a receiver.
         (
-            r"^[ \t]*func[ \t]+(?:\([^()]*\)[ \t]*)?([A-Za-z_][A-Za-z0-9_]*)",
+            r"^func[ \t]+(?:\([^()]*\)[ \t]*)?([A-Za-z_][A-Za-z0-9_]*)",
             Some("func"),
         ),
         // POSIX shell `name() {`.
         (
-            r"^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*\([ \t]*\)[ \t]*\{",
+            r"^([A-Za-z_][A-Za-z0-9_]*)[ \t]*\([ \t]*\)[ \t]*\{",
             Some("function"),
         ),
     ]
@@ -124,7 +151,10 @@ static DEF_PATTERNS: LazyLock<Vec<DefPattern>> = LazyLock::new(|| {
 /// Line prefixes that can possibly begin a declaration. A cheap byte-level
 /// gate in front of [`DEF_PATTERNS`]: the overwhelming majority of lines in
 /// any file start with none of these, and skipping the regexes for them is
-/// what keeps a whole-repository scan inside [`PROBE_DEADLINE`].
+/// what keeps a whole-repository scan inside [`PROBE_DEADLINE`]. Tested
+/// against the RAW line, never a trimmed one, so it rejects every indented
+/// line up front for the same reason the patterns themselves anchor at
+/// column 0.
 const DECL_STARTS: [&str; 19] = [
     "pub ",
     "export ",
@@ -148,8 +178,7 @@ const DECL_STARTS: [&str; 19] = [
 ];
 
 fn may_declare(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    DECL_STARTS.iter().any(|start| trimmed.starts_with(start)) || trimmed.contains("() {")
+    DECL_STARTS.iter().any(|start| line.starts_with(start)) || line.contains("() {")
 }
 
 /// The declaring keyword a group-1 capture names, or `None` for a capture
@@ -172,7 +201,10 @@ fn kind_word(captured: Option<&str>) -> Option<&'static str> {
     })
 }
 
-/// Every `(kind, name)` declared on one line, in pattern order.
+/// Every `(kind, name)` declared on one line, in pattern order, filtered by
+/// [`is_probeworthy`] so a name too short or too generic to prove anything
+/// is dropped on BOTH sides of a comparison rather than only on the
+/// incoming one.
 fn definitions_on_line(line: &str) -> Vec<(&'static str, String)> {
     if !may_declare(line) {
         return Vec::new();
@@ -191,7 +223,9 @@ fn definitions_on_line(line: &str) -> Vec<(&'static str, String)> {
                 (kind, captures.get(2))
             }
         };
-        if let Some(name) = name {
+        if let Some(name) = name
+            && is_probeworthy(name.as_str())
+        {
             out.push((kind, name.as_str().to_string()));
         }
     }
@@ -212,7 +246,7 @@ pub fn added_definitions(added_text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in added_text.lines() {
         for (_, name) in definitions_on_line(line) {
-            if is_probeworthy(&name) && seen.insert(name.clone()) {
+            if seen.insert(name.clone()) {
                 out.push(name);
             }
         }
@@ -337,39 +371,134 @@ pub fn is_excluded(repo: &Path, path: &Path, exclude: &[String]) -> bool {
     })
 }
 
-/// Every scannable source file under `repo`, sorted for a deterministic
-/// walk. Symlinks (files and directories both), dot-prefixed directories,
-/// [`SKIPPED_DIRS`] and excluded prefixes are never descended into or
-/// returned; a directory that will not open is skipped, never an error.
-fn collect_sources(dir: &Path, repo: &Path, exclude: &[String], out: &mut Vec<PathBuf>) {
-    if is_symlink(dir) {
-        return;
+/// Why a walk stopped before it ran out of tree. `Deadline`/`Bytes` are the
+/// two budget halves and become a [`ProbeOutcome::Skipped`]; `Enough` means
+/// [`MAX_MATCHES`] were already found, which is a complete answer, not a
+/// truncated one.
+enum Halt {
+    Deadline,
+    Bytes,
+    Enough,
+}
+
+/// One probe in progress. The walk is LAZY -- it descends and scans in the
+/// same pass, checking the deadline on every entry -- so a tree far larger
+/// than the budget costs one directory listing per level visited before the
+/// deadline stops it, never a full recursive file list built up front.
+struct Scan<'a> {
+    repo: &'a Path,
+    target_file: &'a Path,
+    exclude: &'a [String],
+    /// Each incoming name with its own [`variants`] set, precomputed once.
+    wanted: &'a [(String, BTreeSet<String>)],
+    budget: Budget,
+    started: Instant,
+    scanned: usize,
+    /// Incoming names already reported, so one duplication is named once.
+    reported: BTreeSet<String>,
+    matches: Vec<Match>,
+}
+
+impl Scan<'_> {
+    /// Whether the wall-clock half of the budget is spent. Checked per
+    /// directory entry -- the finest granularity that costs nothing -- so
+    /// an over-large tree stops mid-walk rather than after it.
+    fn out_of_time(&self) -> bool {
+        self.started.elapsed() > self.budget.deadline
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-    paths.sort();
-    for path in paths {
-        if is_symlink(&path) || is_excluded(repo, &path, exclude) {
-            continue;
+
+    /// Descends one directory. Symlinks (files and directories both),
+    /// dot-prefixed directories (`.git`, `.zirv`, ...), [`SKIPPED_DIRS`] and
+    /// excluded prefixes are never entered; a directory that will not open
+    /// is skipped, never an error. Entries are sorted so a walk is
+    /// deterministic, one directory at a time.
+    fn walk(&mut self, dir: &Path) -> Result<(), Halt> {
+        if is_symlink(dir) {
+            return Ok(());
         }
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        if path.is_dir() {
-            if name.starts_with('.') || SKIPPED_DIRS.contains(&name) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(());
+        };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        for path in paths {
+            if self.out_of_time() {
+                return Err(Halt::Deadline);
+            }
+            if is_symlink(&path) || is_excluded(self.repo, &path, self.exclude) {
                 continue;
             }
-            collect_sources(&path, repo, exclude, out);
-        } else if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
-        {
-            out.push(path);
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if path.is_dir() {
+                if name.starts_with('.') || SKIPPED_DIRS.contains(&name) {
+                    continue;
+                }
+                self.walk(&path)?;
+            } else if path != self.target_file
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
+            {
+                self.scan_file(&path)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Scans one file. Its SIZE is read from the directory metadata and
+    /// charged to the budget BEFORE any content is read, so the cap cannot
+    /// be overshot by the one file that crosses it; a file above
+    /// [`MAX_FILE_BYTES`] is skipped outright and charged nothing.
+    /// Unreadable files and non-UTF-8 bytes are skipped.
+    fn scan_file(&mut self, file: &Path) -> Result<(), Halt> {
+        let Ok(metadata) = std::fs::metadata(file) else {
+            return Ok(());
+        };
+        if metadata.len() > MAX_FILE_BYTES {
+            return Ok(());
+        }
+        let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+        if self.scanned.saturating_add(size) > self.budget.max_bytes {
+            return Err(Halt::Bytes);
+        }
+        self.scanned = self.scanned.saturating_add(size);
+
+        let Ok(bytes) = std::fs::read(file) else {
+            return Ok(());
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            return Ok(());
+        };
+        let Some(path) = repo_relative(self.repo, file) else {
+            return Ok(());
+        };
+        for (number, line) in text.lines().enumerate() {
+            for (kind, existing) in definitions_on_line(line) {
+                let existing_variants: BTreeSet<String> = variants(&existing).into_iter().collect();
+                for (name, candidate_variants) in self.wanted {
+                    if self.reported.contains(name)
+                        || candidate_variants.is_disjoint(&existing_variants)
+                    {
+                        continue;
+                    }
+                    self.reported.insert(name.clone());
+                    self.matches.push(Match {
+                        kind,
+                        name: existing.clone(),
+                        path: path.clone(),
+                        line: number + 1,
+                    });
+                }
+            }
+            if self.matches.len() >= MAX_MATCHES {
+                return Err(Halt::Enough);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -388,7 +517,6 @@ pub fn probe(
     exclude: &[String],
     budget: Budget,
 ) -> ProbeOutcome {
-    let started = Instant::now();
     let wanted: Vec<(String, BTreeSet<String>)> = names
         .iter()
         .map(|name| (name.clone(), variants(name).into_iter().collect()))
@@ -397,61 +525,47 @@ pub fn probe(
         return ProbeOutcome::Matches(Vec::new());
     }
 
-    let mut files = Vec::new();
-    collect_sources(repo, repo, exclude, &mut files);
-
-    let mut matches: Vec<Match> = Vec::new();
-    let mut reported: BTreeSet<String> = BTreeSet::new();
-    let mut scanned = 0usize;
-    for file in files {
-        if file == target_file {
-            continue;
-        }
-        if started.elapsed() > budget.deadline {
-            return ProbeOutcome::Skipped(format!(
-                "probe deadline of {} ms exceeded",
-                budget.deadline.as_millis()
-            ));
-        }
-        let Ok(bytes) = std::fs::read(&file) else {
-            continue;
-        };
-        scanned = scanned.saturating_add(bytes.len());
-        if scanned > budget.max_bytes {
-            return ProbeOutcome::Skipped(format!(
-                "probe byte budget of {} exceeded",
-                budget.max_bytes
-            ));
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
-        };
-        let Some(path) = repo_relative(repo, &file) else {
-            continue;
-        };
-        for (number, line) in text.lines().enumerate() {
-            for (kind, existing) in definitions_on_line(line) {
-                let existing_variants: BTreeSet<String> = variants(&existing).into_iter().collect();
-                for (name, candidate_variants) in &wanted {
-                    if reported.contains(name) || candidate_variants.is_disjoint(&existing_variants)
-                    {
-                        continue;
-                    }
-                    reported.insert(name.clone());
-                    matches.push(Match {
-                        kind,
-                        name: existing.clone(),
-                        path: path.clone(),
-                        line: number + 1,
-                    });
-                }
-            }
-            if matches.len() >= MAX_MATCHES {
-                return ProbeOutcome::Matches(matches);
-            }
-        }
+    let mut scan = Scan {
+        repo,
+        target_file,
+        exclude,
+        wanted: &wanted,
+        budget,
+        started: Instant::now(),
+        scanned: 0,
+        reported: BTreeSet::new(),
+        matches: Vec::new(),
+    };
+    match scan.walk(repo) {
+        Err(Halt::Deadline) => ProbeOutcome::Skipped(format!(
+            "probe deadline of {} ms exceeded",
+            budget.deadline.as_millis()
+        )),
+        Err(Halt::Bytes) => ProbeOutcome::Skipped(format!(
+            "probe byte budget of {} exceeded",
+            budget.max_bytes
+        )),
+        Err(Halt::Enough) | Ok(()) => ProbeOutcome::Matches(scan.matches),
     }
-    ProbeOutcome::Matches(matches)
+}
+
+/// Bytes of payload text [`candidate_names`] would examine for `tool_name`.
+/// Counted before any of it is scanned, so the cap in [`evaluate`] bounds
+/// the work rather than reporting it afterwards.
+fn payload_text_bytes(tool_name: &str, input: &PreToolInput) -> usize {
+    match tool_name {
+        "Write" => input.content.len(),
+        "Edit" => input
+            .old_string
+            .len()
+            .saturating_add(input.new_string.len()),
+        "MultiEdit" => input.edits.iter().fold(0, |total, edit| {
+            total
+                .saturating_add(edit.old_string.len())
+                .saturating_add(edit.new_string.len())
+        }),
+        _ => 0,
+    }
 }
 
 /// Definitions `new_string` declares that `old_string` did not.
@@ -534,8 +648,9 @@ fn advice_note(matches: &[Match]) -> String {
 
 /// The whole layer-1 decision for one already-resolved write: the tool has
 /// to be one this probe understands, the target must not sit under an
-/// excluded prefix, and the payload must actually add a definition worth
-/// looking for -- otherwise nothing is scanned at all.
+/// excluded prefix, the payload has to fit inside [`MAX_PAYLOAD_BYTES`], and
+/// it must actually add a definition worth looking for -- otherwise nothing
+/// is scanned at all.
 pub fn evaluate(
     repo: &Path,
     target: &Path,
@@ -547,6 +662,9 @@ pub fn evaluate(
     }
     if is_excluded(repo, target, exclude) {
         return Outcome::Nothing;
+    }
+    if payload_text_bytes(&payload.tool_name, &payload.tool_input) > MAX_PAYLOAD_BYTES {
+        return Outcome::Skipped("payload too large".to_string());
     }
     let names = candidate_names(&payload.tool_name, target, &payload.tool_input);
     if names.is_empty() {
@@ -719,6 +837,111 @@ mod tests {
         };
         assert_eq!(matches.len(), 1, "{matches:?}");
         assert_eq!(matches[0].path, "src/x.rs");
+    }
+
+    /// Issue #406 review: this probe compares bare names with no notion of
+    /// scope, so an indented definition -- a method inside an `impl`, where
+    /// `fn parse_widget` means "on this type", not "in this crate" -- is not
+    /// a definition on either side of the comparison.
+    #[test]
+    fn an_indented_method_is_not_a_definition_on_either_side() {
+        assert!(
+            added_definitions("impl Widget {\n    fn parse_widget() {}\n    fn new() {}\n}\n")
+                .is_empty(),
+            "an impl block declares nothing this probe can compare by name"
+        );
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join("src")).expect("src dir");
+        std::fs::write(
+            repo.path().join("src/x.rs"),
+            "impl Widget {\n    fn parse_widget() {}\n}\n",
+        )
+        .expect("write x.rs");
+        let outcome = probe(
+            repo.path(),
+            &repo.path().join("src/y.rs"),
+            &["parse_widget".to_string()],
+            &[],
+            Budget::default(),
+        );
+        assert_eq!(outcome, ProbeOutcome::Matches(Vec::new()));
+    }
+
+    /// Issue #406 review: a file above [`MAX_FILE_BYTES`] is skipped and
+    /// charged NOTHING -- were it charged, the 1 MiB blob sorted ahead of
+    /// `src/x.rs` here would exhaust the budget and the real match behind it
+    /// would never be reached.
+    #[test]
+    fn probe_skips_an_oversized_file_without_charging_the_budget() {
+        let repo = probe_repo();
+        std::fs::write(
+            repo.path().join("src/big.rs"),
+            "a".repeat(usize::try_from(MAX_FILE_BYTES).expect("cap fits") + 1),
+        )
+        .expect("write big.rs");
+        let outcome = probe(
+            repo.path(),
+            &repo.path().join("src/other.rs"),
+            &["foo_bar".to_string()],
+            &[],
+            Budget {
+                max_bytes: 4096,
+                ..Budget::default()
+            },
+        );
+        let ProbeOutcome::Matches(matches) = outcome else {
+            panic!("the oversized file must not end the scan, got {outcome:?}");
+        };
+        assert_eq!(matches.len(), 1, "{matches:?}");
+        assert_eq!(matches[0].path, "src/x.rs");
+    }
+
+    /// Issue #406 review: the walk is lazy, so a spent deadline stops it
+    /// mid-tree -- it never collects the file list first and then discovers
+    /// it had no time to scan it.
+    #[test]
+    fn probe_stops_walking_a_deep_tree_once_the_deadline_is_spent() {
+        let repo = probe_repo();
+        let mut dir = repo.path().join("src");
+        for level in 0..6 {
+            dir = dir.join(format!("level{level}"));
+            std::fs::create_dir_all(&dir).expect("nested dir");
+            std::fs::write(dir.join("m.rs"), "pub fn foo_bar() {}\n").expect("write m.rs");
+        }
+        let outcome = probe(
+            repo.path(),
+            &repo.path().join("src/other.rs"),
+            &["foo_bar".to_string()],
+            &[],
+            Budget {
+                deadline: Duration::ZERO,
+                ..Budget::default()
+            },
+        );
+        let ProbeOutcome::Skipped(reason) = outcome else {
+            panic!("a spent deadline must skip, got {outcome:?}");
+        };
+        assert!(reason.contains("deadline"), "got {reason}");
+    }
+
+    /// Issue #406 review: an oversized payload is skipped whole rather than
+    /// truncated -- a partial candidate list would under-report silently.
+    #[test]
+    fn evaluate_skips_an_oversized_payload() {
+        let repo = probe_repo();
+        let payload = PreToolPayload {
+            tool_name: "Write".to_string(),
+            tool_input: PreToolInput {
+                content: "x".repeat(MAX_PAYLOAD_BYTES + 1),
+                ..PreToolInput::default()
+            },
+            ..PreToolPayload::default()
+        };
+        assert_eq!(
+            evaluate(repo.path(), &repo.path().join("src/y.rs"), &payload, &[]),
+            Outcome::Skipped("payload too large".to_string())
+        );
     }
 
     #[test]
