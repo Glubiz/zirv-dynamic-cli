@@ -28,7 +28,7 @@ commands: [...]                      # required
 ```
 
 - **`params`**: positional CLI arguments, mapped by position onto these names. A trailing `?` marks a parameter optional; all optional params must come after all required ones, and duplicate names (after stripping `?`) are rejected at run time. An omitted optional parameter's value is the empty string.
-- **`secrets`**: each entry pulls `env_var` from the process environment and inserts it into the context under `name`; a missing environment variable is a hard error naming both the secret name and the variable. There is no separate secret-masking — the value is substituted into command strings like any other context variable, so it can appear in `--dry-run` output or process listings.
+- **`secrets`**: each entry pulls `env_var` from the process environment and inserts it into the context under `name`; a missing environment variable is a hard error naming both the secret name and the variable. Runner output, including `--dry-run` and errors, shows `${name}` in place of each secret; the real value is still passed to the shell, so it can appear in process listings or the child's own output.
 - **`commands`**: the ordered list of steps described below. Steps are executed in order except concurrent blocks (see below), which spawn and do not block the script.
 
 ## Command steps

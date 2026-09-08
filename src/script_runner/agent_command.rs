@@ -79,6 +79,7 @@ impl AgentCommand {
     pub async fn execute(
         &self,
         context: &mut HashMap<String, String>,
+        display_context: &mut HashMap<String, String>,
     ) -> Result<Option<String>, String> {
         // Validation first: a misconfigured step must fail the same way on
         // every machine, not pass silently wherever the OS filter skips it.
@@ -103,10 +104,12 @@ impl AgentCommand {
             if let Some(options) = &self.options {
                 if let Some(commands) = &options.fallback {
                     for cmd in commands {
-                        if let Err(fallback_error) = cmd.invoke(context).await {
+                        if let Err(fallback_error) = cmd.invoke(context, display_context).await {
                             failure = format!(
                                 "Agent '{}' failed and fallback '{}' also failed: {}",
-                                self.agent, cmd.command, fallback_error
+                                self.agent,
+                                substitute(&cmd.command, display_context),
+                                fallback_error
                             );
                             break;
                         }
@@ -299,8 +302,9 @@ mod tests {
     async fn unresolved_prompt_placeholder_is_a_hard_error() {
         let cmd = agent_step("Fix ${missing}");
         let mut context = HashMap::new();
+        let mut display_context = context.clone();
         let err = cmd
-            .execute(&mut context)
+            .execute(&mut context, &mut display_context)
             .await
             .expect_err("unresolved placeholder must error");
         assert!(err.contains("missing"), "got {err}");
@@ -311,8 +315,9 @@ mod tests {
         let mut cmd = agent_step("go");
         cmd.capture = Some("out".to_string());
         let mut context = HashMap::new();
+        let mut display_context = context.clone();
         let err = cmd
-            .execute(&mut context)
+            .execute(&mut context, &mut display_context)
             .await
             .expect_err("capture is unsupported");
         assert!(err.contains("capture"), "got {err}");
@@ -326,8 +331,9 @@ mod tests {
             ..Default::default()
         });
         let mut context = HashMap::new();
+        let mut display_context = context.clone();
         let err = cmd
-            .execute(&mut context)
+            .execute(&mut context, &mut display_context)
             .await
             .expect_err("interactive is unsupported");
         assert!(err.contains("interactive"), "got {err}");
@@ -346,8 +352,9 @@ mod tests {
             ..Default::default()
         });
         let mut context = HashMap::new();
+        let mut display_context = context.clone();
         let result = cmd
-            .execute(&mut context)
+            .execute(&mut context, &mut display_context)
             .await
             .expect("skip is not an error");
         assert!(result.is_some(), "expected a skip message");
@@ -366,7 +373,11 @@ mod tests {
         cmd.agent = "codex".to_string();
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), tmp.path().display().to_string());
-        let result = cmd.execute(&mut context).await.expect("codex is supported");
+        let mut display_context = context.clone();
+        let result = cmd
+            .execute(&mut context, &mut display_context)
+            .await
+            .expect("codex is supported");
         assert!(
             result.is_none(),
             "a successful agent step has no skip message"
@@ -399,8 +410,9 @@ mod tests {
 
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), tmp.path().display().to_string());
+        let mut display_context = context.clone();
         let err = cmd
-            .execute(&mut context)
+            .execute(&mut context, &mut display_context)
             .await
             .expect_err("a disabled agent must fail at execution");
         assert!(err.contains("claude"), "got {err}");
@@ -422,7 +434,8 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), tmp.path().display().to_string());
 
-        let result = cmd.execute(&mut context).await;
+        let mut display_context = context.clone();
+        let result = cmd.execute(&mut context, &mut display_context).await;
 
         assert!(result.is_ok(), "expected success, got {result:?}");
     }
@@ -442,7 +455,8 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), tmp.path().display().to_string());
 
-        let result = cmd.execute(&mut context).await;
+        let mut display_context = context.clone();
+        let result = cmd.execute(&mut context, &mut display_context).await;
 
         let err = result.expect_err("a nonzero exit must fail the step");
         assert!(err.contains("claude"), "got {err}");
@@ -478,7 +492,8 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), tmp.path().display().to_string());
 
-        let result = cmd.execute(&mut context).await;
+        let mut display_context = context.clone();
+        let result = cmd.execute(&mut context, &mut display_context).await;
 
         assert!(
             result.expect("proceed_on_failure must not error").is_some(),
@@ -505,7 +520,8 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("cwd".to_string(), tmp.path().display().to_string());
 
-        let result = cmd.execute(&mut context).await;
+        let mut display_context = context.clone();
+        let result = cmd.execute(&mut context, &mut display_context).await;
 
         assert!(
             result.expect("proceed_on_failure must not error").is_some(),

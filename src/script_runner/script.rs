@@ -47,9 +47,10 @@ impl Script {
         context: &mut HashMap<String, String>,
         dry_run: bool,
     ) -> Result<(), String> {
+        let mut display_context = super::build_display_context(self, context);
         let total = self.commands.len();
         for (index, step) in self.commands.iter().enumerate() {
-            let cmd_display = step.display(context);
+            let cmd_display = step.display(&display_context);
             if dry_run {
                 crate::output::dry_run(index, total, &cmd_display);
                 // A-2/D-4: a dry run that reports success for a script the
@@ -74,6 +75,7 @@ impl Script {
                 // knows a value it cannot have.
                 if let Some(var) = step.captured_var() {
                     context.insert(var.to_string(), format!("<capture:{var}>"));
+                    display_context.insert(var.to_string(), format!("<capture:{var}>"));
                 }
                 continue;
             }
@@ -81,7 +83,7 @@ impl Script {
             if let Some(desc) = step.description() {
                 crate::output::step_description(&desc);
             }
-            match step.execute(context).await {
+            match step.execute(context, &mut display_context).await {
                 Ok(Some(output)) => {
                     crate::output::skipped(&output);
                 }
@@ -227,32 +229,162 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_script_run_with_secrets() {
-        let script = Script {
+    fn script_with_secret(command: &str) -> Script {
+        Script {
             name: "Secret Script".to_string(),
-            description: Some("A script that uses secrets".to_string()),
+            description: None,
             params: None,
             secrets: Some(vec![Secret {
-                name: "commit_password".to_string(),
-                env_var: "COMMIT_PASSWORD".to_string(),
+                name: "token".to_string(),
+                env_var: "API_TOKEN".to_string(),
             }]),
             commands: vec![CommandTypes::Command(Command {
-                command: "echo $COMMIT_PASSWORD".to_string(),
-                capture: None,
-                description: Some("Prints the commit password".to_string()),
+                command: command.to_string(),
+                capture: Some("result".to_string()),
+                description: None,
                 options: None,
             })],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_script_run_with_secrets() {
+        let script = script_with_secret("echo '${token}'");
+        let mut context = HashMap::from([("token".to_string(), "my_secret_password".to_string())]);
+
+        script.run(&mut context, false).await.unwrap();
+
+        assert_eq!(context["result"], "my_secret_password");
+    }
+
+    #[test]
+    fn step_display_masks_secrets_and_preserves_params_and_captured_values() {
+        let mut script = script_with_secret("echo '${token}' ${param} ${captured}");
+        let context = HashMap::from([
+            ("token".to_string(), "secret-${param}".to_string()),
+            ("param".to_string(), "value-${token}".to_string()),
+            ("captured".to_string(), "child-output".to_string()),
+        ]);
+        script.commands.push(CommandTypes::Agent(AgentCommand {
+            agent: "claude".to_string(),
+            prompt: "use ${token} with ${param} ${captured}".to_string(),
+            flags: None,
+            description: None,
+            options: None,
+            capture: None,
+        }));
+        let display_context = super::super::build_display_context(&script, &context);
+
+        for step in &script.commands {
+            let display = step.display(&display_context);
+            assert!(display.contains("${token}"), "{display}");
+            assert!(!display.contains(&context["token"]), "{display}");
+            assert!(display.contains("value-${token}"), "{display}");
+            assert!(display.contains("child-output"), "{display}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_display_masks_secrets_and_keeps_capture_stand_ins() {
+        let mut script = script_with_secret("echo '${token}'");
+        script.commands.push(CommandTypes::Command(Command {
+            command: "echo '${token}' ${result}".to_string(),
+            capture: None,
+            description: None,
+            options: None,
+        }));
+        let mut context = HashMap::from([("token".to_string(), "my_secret_password".to_string())]);
+
+        script.run(&mut context, true).await.unwrap();
+        let display_context = super::super::build_display_context(&script, &context);
+        let display = script.commands[1].display(&display_context);
+
+        assert_eq!(display, "echo '${token}' <capture:result>");
+        assert!(!display.contains(&context["token"]));
+        assert_eq!(context["token"], "my_secret_password");
+    }
+
+    #[tokio::test]
+    async fn command_failure_masks_secrets_with_and_without_capture() {
+        for capture in [None, Some("result".to_string())] {
+            let mut script = script_with_secret("echo '${token}'; exit 1");
+            let CommandTypes::Command(command) = &mut script.commands[0] else {
+                unreachable!()
+            };
+            command.capture = capture;
+            let mut context =
+                HashMap::from([("token".to_string(), "my_secret_password".to_string())]);
+
+            let error = script.run(&mut context, false).await.unwrap_err();
+
+            assert!(error.contains("echo '${token}'; exit 1"), "{error}");
+            assert!(error.contains("exit code 1"), "{error}");
+            assert!(!error.contains(&context["token"]), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_failure_masks_secrets_in_both_commands() {
+        let mut script = script_with_secret("echo '${token}'; exit 1");
+        let CommandTypes::Command(command) = &mut script.commands[0] else {
+            unreachable!()
         };
+        command.options = Some(super::super::options::Options {
+            fallback: Some(vec![super::super::fallback_command::FallbackCommand {
+                command: "echo '${token}'; exit 2".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let mut context = HashMap::from([("token".to_string(), "my_secret_password".to_string())]);
 
-        let mut context = HashMap::new();
-        context.insert(
-            "COMMIT_PASSWORD".to_string(),
-            "my_secret_password".to_string(),
+        let error = script.run(&mut context, false).await.unwrap_err();
+
+        assert!(
+            error.contains("fallback 'echo '${token}'; exit 2' also failed"),
+            "{error}"
         );
+        assert!(!error.contains(&context["token"]), "{error}");
+    }
 
-        let result = script.run(&mut context, false).await;
-        assert!(result.is_ok());
+    #[tokio::test]
+    async fn failed_directory_change_masks_the_secret_directory() {
+        let script = script_with_secret("cd ${token}");
+        let mut context = HashMap::from([(
+            "token".to_string(),
+            "nonexistent-secret-directory".to_string(),
+        )]);
+
+        let error = script.run(&mut context, false).await.unwrap_err();
+
+        assert!(error.contains("${token}"), "{error}");
+        assert!(!error.contains(&context["token"]), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_secret_directory_stays_masked_when_referenced_as_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret_dir = tmp.path().join("secret-directory");
+        std::fs::create_dir(&secret_dir).unwrap();
+        let script = script_with_secret("cd ${token}");
+        let mut context = HashMap::from([(
+            "token".to_string(),
+            secret_dir.to_string_lossy().to_string(),
+        )]);
+        let mut display_context = super::super::build_display_context(&script, &context);
+
+        script.commands[0]
+            .execute(&mut context, &mut display_context)
+            .await
+            .unwrap();
+        let display = super::super::command::substitute("echo ${cwd}", &display_context);
+
+        assert!(display.contains("${token}"), "{display}");
+        assert!(!display.contains("secret-directory"), "{display}");
+        assert_eq!(
+            context["cwd"],
+            secret_dir.canonicalize().unwrap().to_string_lossy()
+        );
     }
 
     #[tokio::test]
