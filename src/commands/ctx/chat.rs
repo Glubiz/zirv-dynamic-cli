@@ -199,11 +199,31 @@ fn resolve_adapter(
 }
 
 /// Every known harness in registry order, alongside whether the gate
-/// currently enables it -- the banner's own harness list.
+/// currently enables it -- the banner's own harness list. A disabled harness
+/// still gets a `(name, false)` entry (its glyph tells the operator it is
+/// there but off); an *enabled* harness whose binary is confirmed absent
+/// (`adapters::adapter_liveness`, the same issue #298 probe the injected
+/// roster gates on) is omitted outright rather than rendered `false` --
+/// absence, not a green light this session cannot actually use. `ready()`
+/// failing, or a probe that cannot reach a confident verdict, both still
+/// count as present: the same fail-open posture `harness_roster_lines`
+/// already holds to.
 fn harness_list(cfg: &CtxConfig) -> Vec<(String, bool)> {
     adapters::ADAPTERS
         .iter()
-        .map(|(name, _)| ((*name).to_string(), cfg.agents.is_enabled(name)))
+        .filter_map(|(name, _)| {
+            let enabled = cfg.agents.is_enabled(name);
+            if enabled {
+                let present = match adapters::adapter_liveness(cfg, name, None) {
+                    Ok((_, verdict)) => verdict.emits_line(),
+                    Err(_) => true,
+                };
+                if !present {
+                    return None;
+                }
+            }
+            Some(((*name).to_string(), enabled))
+        })
         .collect()
 }
 
@@ -2200,6 +2220,68 @@ mod tests {
         assert!(
             msg.contains("agent-bin") || msg.contains("Z:"),
             "expected the failure to name the configured (nonexistent) binary: {msg}"
+        );
+    }
+
+    /// Bug: the welcome banner used to mark every registered adapter live
+    /// off `cfg.agents.is_enabled` alone, with no check that the binary
+    /// exists -- on a machine with only a couple of harnesses installed,
+    /// every other adapter still rendered a green `\u{25cf}`. `harness_list`
+    /// now reuses `adapters::adapter_liveness` (the same issue #298 probe
+    /// the injected roster gates on), so an enabled adapter confirmed absent
+    /// is omitted entirely, while a disabled adapter still gets its
+    /// `(name, false)` entry -- the banner keeps showing operators what they
+    /// turned off, just not what they never installed.
+    #[test]
+    fn harness_list_omits_a_confirmed_absent_adapter_but_keeps_a_disabled_one() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/.settings.toml"),
+            "[agents.droid]\nenabled = false\n",
+        )
+        .expect("write settings");
+        let settings_home = tempfile::tempdir().expect("tempdir");
+        let cfg = {
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(settings_home.path());
+            let empty: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            CtxConfig {
+                agents: crate::settings::AgentGate::load(repo.path(), &|k| empty.get(k).cloned())
+                    .expect("load"),
+                ..CtxConfig::default()
+            }
+        };
+
+        // Every adapter except codex gets a stub on `PATH`, and `HOME` moves
+        // to a fresh temp dir so `adapters::known_install_roots`'s widened
+        // codex search (see that function's own doc comment) cannot find a
+        // real binary either -- codex is confirmed absent by construction.
+        let path_dir = tempfile::tempdir().expect("tempdir");
+        for (name, _) in adapters::ADAPTERS {
+            if *name != "codex" {
+                std::fs::write(path_dir.path().join(name), "").expect("write stub");
+            }
+        }
+        let _path_guard = crate::commands::ctx::testenv::VarGuard::set(&[(
+            "PATH",
+            Some(path_dir.path().to_str().expect("utf8 tempdir path")),
+        )]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let harnesses = harness_list(&cfg);
+
+        assert!(
+            !harnesses.iter().any(|(name, _)| name == "codex"),
+            "codex is confirmed absent, so it must be omitted entirely: {harnesses:?}"
+        );
+        assert!(
+            harnesses.contains(&("droid".to_string(), false)),
+            "droid is disabled (not absent), so it must still be listed as off: {harnesses:?}"
+        );
+        assert!(
+            harnesses.contains(&("claude".to_string(), true)),
+            "claude is enabled and present, so it must still be listed as live: {harnesses:?}"
         );
     }
 }

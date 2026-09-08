@@ -150,7 +150,9 @@ pub struct BannerFacts {
     pub rule: HarnessRule,
     pub session: String,
     /// Every known harness, in registry order, alongside whether the gate
-    /// currently enables it.
+    /// currently enables it -- except an enabled harness whose binary is
+    /// confirmed absent, which `chat::harness_list` omits outright rather
+    /// than including with a `false` (see that function's own doc comment).
     pub harnesses: Vec<(String, bool)>,
     /// `Some` names where the resumed handoff came from (a short human
     /// description, not a path) when `--resume` folded one into this launch.
@@ -364,8 +366,10 @@ fn banner_legacy(facts: &BannerFacts) -> String {
 }
 
 /// The banner's per-harness roster segment, shared by the box and compact
-/// tiers: `{name} ●` for an enabled harness, `{name} ○ disabled` for a
-/// disabled one, one space between entries.
+/// tiers: `{name} ●` for an enabled and present harness, `{name} ○ disabled`
+/// for a disabled one, one space between entries. A confirmed-absent
+/// enabled harness never reaches here at all -- see `BannerFacts.harnesses`'
+/// own doc comment.
 fn harness_roster_segments(harnesses: &[(String, bool)]) -> Segments {
     let mut segments = Vec::new();
     for (index, (name, enabled)) in harnesses.iter().enumerate() {
