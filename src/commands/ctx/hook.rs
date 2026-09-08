@@ -6591,9 +6591,15 @@ mod tests {
             "an unrecognised 5 KB result stays verbatim: {unknown}"
         );
 
-        let twenty_kb: String = (1..=1000)
+        // One `warning:` line keeps this fixture out of issue #409b's
+        // clean-run one-liner (this hook path has no exit code of its own,
+        // so "nothing flagged at all" is what that shape looks for) -- this
+        // test is about the omitted-range message a non-clean generic
+        // summary states, not about the clean path.
+        let mut twenty_kb: String = (1..=1000)
             .map(|i| format!("some tool output line {i}\n"))
             .collect();
+        twenty_kb.push_str("warning: something noteworthy happened\n");
         assert!(twenty_kb.len() > 16384);
         let big_unknown = run_post(
             &rig,

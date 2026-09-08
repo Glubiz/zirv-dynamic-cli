@@ -448,6 +448,36 @@ pub(crate) fn render_summary(
     let budget = max_bytes.checked_sub(retrieval.len() + 1)?;
     let raw_bytes = scan.total_bytes as usize;
 
+    // Issue #409b: nothing flagged at all -- no failure/warning block, no
+    // test-runner summary line, no named failing test -- and an exit code
+    // that is either a clean `0` or altogether absent (the `PostToolUse`
+    // path: claude's own tool result carries no status of its own, so "no
+    // diagnostic of any kind" is the only signal available there). A clean
+    // run costs one line instead of a head, a tail and a retrieval line.
+    // Never on a non-zero exit code: a scanner false negative must not hide
+    // a real failure behind "nothing flagged".
+    let clean = !scan.read_error
+        && scan.failures.is_empty()
+        && scan.warnings.is_empty()
+        && scan.summaries.is_empty()
+        && failures.is_empty()
+        && matches!(exit_code, Some(0) | None);
+    if clean {
+        let mut clean_body = format!(
+            "{}: ok ({} lines, nothing flagged)\n",
+            display_line(command),
+            scan.total_lines
+        );
+        clean_body.push_str(&retrieval);
+        clean_body.push('\n');
+        if clean_body.len() <= max_bytes && clean_body.len() < raw_bytes {
+            return Some(clean_body);
+        }
+        // Falls through to the ordinary rendering below when the one-liner
+        // itself does not fit or does not beat the raw byte count (e.g. an
+        // almost-empty capture) -- #410's never-worse guard still governs.
+    }
+
     let mut body = String::new();
     body.push_str(&match exit_code {
         // The PostToolUse path (`hook::run_posttool`) has no exit code of its
@@ -506,14 +536,20 @@ pub(crate) fn render_summary(
 
     let mut optional = String::new();
     if tail_lines > 0 {
+        let raw_tail: Vec<String> = scan
+            .tail
+            .iter()
+            .skip(scan.tail.len() - tail_lines)
+            .cloned()
+            .collect();
+        // Issue #409a: near-identical lines (docker layer progress, a
+        // timestamped log tail) that differ only by an id/timestamp/counter
+        // collapse to one `[x N]` entry, again only when smaller.
+        let shaped_tail = output_shape::shaped_noise_lines(&raw_tail);
         push_section(
             &mut optional,
             &format!("tail ({tail_lines} of {}):", scan.total_lines),
-            scan.tail
-                .iter()
-                .skip(scan.tail.len() - tail_lines)
-                .cloned()
-                .collect::<Vec<_>>(),
+            shaped_tail,
         );
     }
     let tail_pushed = body.len() + optional.len() <= budget;
@@ -523,10 +559,11 @@ pub(crate) fn render_summary(
 
     if head_lines > 0 {
         let mut head = String::new();
+        let shaped_head = output_shape::shaped_noise_lines(&scan.head[..head_lines]);
         push_section(
             &mut head,
             &format!("head ({head_lines} of {}):", scan.total_lines),
-            scan.head.clone(),
+            shaped_head,
         );
         if body.len() + head.len() <= budget {
             // The head goes ABOVE the tail when both are shown, so the
@@ -1686,7 +1723,14 @@ mod tests {
             total_lines: 100,
             total_bytes: 100_000,
             head: (0..5).map(|i| format!("h{i}")).collect(),
-            tail: (0..TAIL_LINES).map(|_| "x".repeat(60)).collect(),
+            // Each line carries its own index so #409a's noise dedup (lines
+            // that normalize identically collapse to one `[x N]` entry) has
+            // nothing to collapse here -- this fixture needs the tail
+            // section to stay genuinely too big to fit, which an
+            // accidentally-deduped single line would no longer be.
+            tail: (0..TAIL_LINES)
+                .map(|i| format!("{i:03} {}", "x".repeat(57)))
+                .collect(),
             ..DisplayScan::default()
         };
         let retrieval = retrieval_line("id1");
@@ -1699,7 +1743,12 @@ mod tests {
         let summary = render_summary(
             "id1",
             "gen",
-            None,
+            // Non-zero and non-`None`: #409b's clean-run one-liner also
+            // applies when nothing was flagged and the exit code is `None`
+            // (the hook path), which this scan otherwise qualifies for --
+            // `Some(1)` keeps this test on the ordinary head/tail path it
+            // means to exercise.
+            Some(1),
             &scan,
             &BTreeSet::new(),
             false,
@@ -2008,7 +2057,10 @@ mod tests {
         let summary = render_summary(
             "id1",
             "some-tool",
-            Some(0),
+            // Non-zero: this scan has nothing flagged, so a `0` here would
+            // hit #409b's clean-run one-liner instead of the omitted-range
+            // rendering this test means to exercise.
+            Some(1),
             &scan,
             &BTreeSet::new(),
             false,
@@ -2105,7 +2157,10 @@ mod tests {
         let generic = render_summary(
             "id1",
             "some-tool",
-            Some(0),
+            // Non-zero, for the same reason as the omitted-range test above:
+            // this scan has nothing flagged, so `Some(0)` would collapse to
+            // #409b's one-liner instead of the head/tail this test checks.
+            Some(1),
             &scan,
             &BTreeSet::new(),
             false,
@@ -2364,5 +2419,72 @@ mod tests {
             !summary.contains("[x "),
             "distinct errors must never be grouped: {summary}"
         );
+    }
+
+    // -- Issue #409: normalized dedup + clean one-liner ---------------------
+
+    /// Thirty docker-style layer completion lines, each with a different hex
+    /// digest, collapse to one counted tail line.
+    #[test]
+    fn docker_style_repeated_layer_lines_collapse_in_the_rendered_tail() {
+        let mut tail: VecDeque<String> = VecDeque::new();
+        for i in 0..30u64 {
+            tail.push_back(format!("{:012x}: Pull complete", 0xabc000000000u64 + i));
+        }
+        tail.push_back("Status: Downloaded newer image for alpine:latest".to_string());
+        let scan = DisplayScan {
+            total_lines: 31,
+            total_bytes: 2000,
+            tail,
+            ..DisplayScan::default()
+        };
+        let summary = render_summary(
+            "id1",
+            "docker pull alpine",
+            Some(1),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(summary.contains("[x 30]"), "{summary}");
+        assert!(summary.contains("Status: Downloaded"), "{summary}");
+    }
+
+    /// A clean run (no diagnostics, exit 0) collapses to one line; the same
+    /// scan with a failing exit code renders the ordinary full summary.
+    #[test]
+    fn a_clean_run_collapses_to_one_line_and_a_failing_one_does_not() {
+        let text: String = (1..=200)
+            .map(|i| format!("Compiling crate{i} v0.1.0\n"))
+            .collect();
+        let scan = scan_for_display(std::io::BufReader::new(text.as_bytes()));
+
+        let clean = render_summary(
+            "id1",
+            "cargo build",
+            Some(0),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(clean.contains("ok (200 lines, nothing flagged)"), "{clean}");
+        assert!(!clean.contains("Compiling crate1 "), "{clean}");
+
+        let failing = render_summary(
+            "id1",
+            "cargo build",
+            Some(101),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(!failing.contains("nothing flagged"), "{failing}");
+        assert!(failing.contains("Compiling"), "{failing}");
     }
 }

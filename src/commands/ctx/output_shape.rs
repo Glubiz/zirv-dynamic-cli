@@ -1,6 +1,6 @@
-//! Issue #408: shaping passes `output.rs`'s `render_summary` applies on top
-//! of the head/tail/diagnostic scan ([`super::output::scan_for_display`])
-//! before a summary is ever printed.
+//! Issues #408/#409: shaping passes `output.rs`'s `render_summary` applies
+//! on top of the head/tail/diagnostic scan
+//! ([`super::output::scan_for_display`]) before a summary is ever printed.
 //!
 //! Every pass here is subject to the same never-worse discipline as #410's
 //! guard in `output.rs`: a pass that does not actually shrink what it is
@@ -155,6 +155,99 @@ pub(crate) fn shaped_diagnostic_blocks(blocks: &[Vec<String>]) -> Vec<Vec<String
     }
 }
 
+// ---------------------------------------------------------------------
+// #409a: normalized dedup of noisy repeated lines
+// ---------------------------------------------------------------------
+
+static TIMESTAMP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?")
+        .expect("regex")
+});
+static UUID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").expect("regex")
+});
+static HEX_RUN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b[0-9a-f]{8,}\b").expect("regex"));
+static LONG_INT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{6,}\b").expect("regex"));
+
+/// Replaces every match of `re` in `line` with `token`, EXCEPT an occurrence
+/// directly touching a path separator -- issue #409's "paths untouched": a
+/// version or line number embedded in a file path is part of what makes two
+/// lines genuinely different, not noise to collapse away.
+fn mask_matches(line: &str, re: &Regex, token: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    for m in re.find_iter(line) {
+        let touches_path =
+            line[..m.start()].ends_with(['/', '\\']) || line[m.end()..].starts_with(['/', '\\']);
+        if touches_path {
+            continue;
+        }
+        out.push_str(&line[last..m.start()]);
+        out.push_str(token);
+        last = m.end();
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
+/// The key two lines share when they differ only in a timestamp, a UUID, a
+/// hex id (a docker layer digest, a commit SHA) or a long counter -- never
+/// applied to a path, so two genuinely different file references still key
+/// apart.
+fn normalize_noise_line(line: &str) -> String {
+    let masked = mask_matches(line, &TIMESTAMP_RE, "<ts>");
+    let masked = mask_matches(&masked, &UUID_RE, "<uuid>");
+    let masked = mask_matches(&masked, &HEX_RUN_RE, "<hex>");
+    mask_matches(&masked, &LONG_INT_RE, "<n>")
+}
+
+/// Collapses lines whose normalized form (see [`normalize_noise_line`])
+/// occurs more than twice into one `[x N] <first line>` entry at the
+/// position of its first occurrence, dropping the later occurrences
+/// entirely; a form seen once or twice is left exactly as it was -- two
+/// coincidentally-similar lines are not a run of noise.
+fn dedupe_noise_lines(lines: &[String]) -> Vec<String> {
+    let keys: Vec<String> = lines.iter().map(|l| normalize_noise_line(l)).collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut first_seen: HashMap<&str, usize> = HashMap::new();
+    for (i, key) in keys.iter().enumerate() {
+        *counts.entry(key.as_str()).or_insert(0) += 1;
+        first_seen.entry(key.as_str()).or_insert(i);
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for (i, (line, key)) in lines.iter().zip(keys.iter()).enumerate() {
+        let count = counts[key.as_str()];
+        if count > 2 {
+            if first_seen[key.as_str()] == i {
+                out.push(format!("[x {count}] {line}"));
+            }
+        } else {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
+fn lines_render_len(lines: &[String]) -> usize {
+    lines.iter().map(|l| l.len() + 3).sum()
+}
+
+/// #409a: collapses near-identical noisy lines, but only when the result is
+/// actually smaller -- never-worse applies per pass, same as
+/// [`shaped_diagnostic_blocks`].
+pub(crate) fn shaped_noise_lines(lines: &[String]) -> Vec<String> {
+    if lines.len() < 3 {
+        return lines.to_vec();
+    }
+    let deduped = dedupe_noise_lines(lines);
+    if deduped.len() < lines.len() && lines_render_len(&deduped) < lines_render_len(lines) {
+        deduped
+    } else {
+        lines.to_vec()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +325,54 @@ mod tests {
         ];
         let shaped = shaped_diagnostic_blocks(&blocks);
         assert_eq!(shaped, blocks, "no merge happened, so nothing may change");
+    }
+
+    // -- #409a: normalized noise dedup -----------------------------------
+
+    #[test]
+    fn docker_style_layer_lines_collapse_to_one_counted_line() {
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("Using default tag: latest".to_string());
+        for i in 0..30 {
+            lines.push(format!(
+                "{:012x}: Pull complete",
+                0xabc000000000u64 + i as u64
+            ));
+        }
+        lines.push("Status: Downloaded newer image for alpine:latest".to_string());
+        let shaped = shaped_noise_lines(&lines);
+        assert!(
+            shaped.len() < lines.len(),
+            "30 layer lines must collapse: {shaped:?}"
+        );
+        assert!(shaped.iter().any(|l| l.starts_with("[x 30]")), "{shaped:?}");
+    }
+
+    #[test]
+    fn a_form_seen_twice_is_left_alone() {
+        let lines: Vec<String> = vec![
+            "Compiling foo v0.1.0".to_string(),
+            "Compiling foo v0.1.0".to_string(),
+            "Compiling bar v0.2.0".to_string(),
+        ];
+        let shaped = shaped_noise_lines(&lines);
+        assert_eq!(shaped, lines, "two occurrences is not a run of noise");
+    }
+
+    #[test]
+    fn dedup_is_skipped_when_it_is_not_smaller() {
+        let lines: Vec<String> = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let shaped = shaped_noise_lines(&lines);
+        assert_eq!(shaped, lines);
+    }
+
+    #[test]
+    fn numbers_embedded_in_a_path_are_left_alone() {
+        let a = normalize_noise_line("/build/v1.2024681/output.log");
+        let b = normalize_noise_line("/build/v1.2024682/output.log");
+        assert_ne!(
+            a, b,
+            "a number touching a path separator must not be masked away"
+        );
     }
 }
