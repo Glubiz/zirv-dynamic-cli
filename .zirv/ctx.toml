@@ -251,6 +251,7 @@ model = "fable"
 # compact_generic_min_bytes = 16384  # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_COMPACT_GENERIC_MIN_BYTES): the same threshold for a command whose output shape zirv does not recognise. Default: 16384.
 # verbatim = []                      # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_VERBATIM): extra program names NEVER compacted, added to the built-in reader set (cat, sed, grep, git diff, ...). Additive only. Default: [].
 # max_summary_bytes = 4096           # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES): hard cap on one compact summary. The `zirv ctx output show <id>` retrieval line always survives it. Default: 4096.
+# diff_max_bytes = 65536             # narrow-only (ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES): bytes a `git diff`/`show`/`log -p`/`format-patch` result may reach before it is replaced by a bounded per-file listing, never a partial hunk. A repo may only LOWER it, never raise it. Default: 65536 (issue #412).
 
 # [policy]                           # zirv's own canonical permissions policy (src/commands/ctx/policy.rs).
 # Not REPO-FORBIDDEN, and the ONE table here that does NOT deep-merge:

@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::output_shape;
 use super::state::{self, StateDir};
 use crate::commands::workflow::verification::{
     MAX_FAILURE_OUTPUT_BYTES, read_capped_tail_and_scan, scrub_output,
@@ -177,7 +178,7 @@ pub(crate) struct DisplayScan {
 /// controlled text on its way to an operator's terminal, exactly the threat
 /// `verification::scrub_output` already handles) and capped, so no single
 /// line can dominate the summary.
-fn display_line(raw: &str) -> String {
+pub(crate) fn display_line(raw: &str) -> String {
     let scrubbed = scrub_output(raw).replace(['\n', '\t'], " ");
     let trimmed = scrubbed.trim_end();
     if trimmed.len() <= MAX_LINE_BYTES {
@@ -266,21 +267,37 @@ fn continues_diagnostic_block(line: &str) -> bool {
 /// [`TAIL_LINES`], the test-runner summary lines, complete FAILURE blocks
 /// (each trigger line plus its continuation lines), and -- separately, so
 /// they can be dropped first when the budget runs short -- warning blocks.
-pub(crate) fn scan_for_display(reader: impl BufRead) -> DisplayScan {
+pub(crate) fn scan_for_display(mut reader: impl BufRead) -> DisplayScan {
     let mut scan = DisplayScan::default();
     let mut open_block: Option<Severity> = None;
-    for chunk in reader.split(b'\n') {
-        let bytes = match chunk {
-            Ok(bytes) => bytes,
+    loop {
+        let mut raw = Vec::new();
+        // `read_until` directly, never `BufRead::split`: its `Ok` count is
+        // the EXACT number of bytes consumed (delimiter included when one
+        // was found), which is what issue #410's never-worse guard compares
+        // a summary's length against. Reconstructing that count from each
+        // chunk's post-strip length (the previous approach) always assumed a
+        // trailing delimiter was present, overcounting by one byte whenever
+        // the captured output did not actually end in a newline.
+        let n = match reader.read_until(b'\n', &mut raw) {
+            Ok(n) => n,
             Err(_) => {
                 scan.read_error = true;
                 break;
             }
         };
-        let line = String::from_utf8_lossy(&bytes);
+        if n == 0 {
+            break;
+        }
+        scan.total_bytes = scan.total_bytes.saturating_add(n as u64);
+        let bytes: &[u8] = if raw.last() == Some(&b'\n') {
+            &raw[..raw.len() - 1]
+        } else {
+            &raw[..]
+        };
+        let line = String::from_utf8_lossy(bytes);
         let line = line.strip_suffix('\r').unwrap_or(&line);
         scan.total_lines += 1;
-        scan.total_bytes = scan.total_bytes.saturating_add(bytes.len() as u64 + 1);
 
         if scan.head.len() < HEAD_LINES {
             scan.head.push(display_line(line));
@@ -429,6 +446,44 @@ pub(crate) fn render_summary(
     // MIN_MAX_SUMMARY_BYTES` keeps a configured cap above it, and this guard
     // makes the invariant local rather than assumed.
     let budget = max_bytes.checked_sub(retrieval.len() + 1)?;
+    let raw_bytes = scan.total_bytes as usize;
+
+    // Issue #409b: nothing flagged at all -- no failure/warning block, no
+    // test-runner summary line, no named failing test -- and an exit code
+    // that is either a clean `0` or altogether absent (the `PostToolUse`
+    // path: claude's own tool result carries no status of its own, so "no
+    // diagnostic of any kind" is the only signal available there). A clean
+    // run costs one line instead of a head, a tail and a retrieval line.
+    // Never on a non-zero exit code: a scanner false negative must not hide
+    // a real failure behind "nothing flagged". Review finding F4: nor when
+    // the command itself claims to be a `cargo test`/pytest/vitest/jest/go
+    // test run and no family extraction confirmed anything -- "nothing
+    // flagged" here would already have to be a confirmed green marker to
+    // reach this point (a confirmed family always pushes its own summary
+    // line into `scan.summaries`, which is required empty above), so silence
+    // from an argv that claims to be a test run is ambiguity, not a pass.
+    let clean = !scan.read_error
+        && scan.failures.is_empty()
+        && scan.warnings.is_empty()
+        && scan.summaries.is_empty()
+        && failures.is_empty()
+        && matches!(exit_code, Some(0) | None)
+        && !super::testrun::matches_known_family(command);
+    if clean {
+        let mut clean_body = format!(
+            "{}: ok ({} lines, nothing flagged)\n",
+            display_line(command),
+            scan.total_lines
+        );
+        clean_body.push_str(&retrieval);
+        clean_body.push('\n');
+        if clean_body.len() <= max_bytes && clean_body.len() < raw_bytes {
+            return Some(clean_body);
+        }
+        // Falls through to the ordinary rendering below when the one-liner
+        // itself does not fit or does not beat the raw byte count (e.g. an
+        // almost-empty capture) -- #410's never-worse guard still governs.
+    }
 
     let mut body = String::new();
     body.push_str(&match exit_code {
@@ -460,10 +515,15 @@ pub(crate) fn render_summary(
             body.push_str("  ... [more failing tests in the full output]\n");
         }
     }
+    // Issue #408: repeated diagnostics that share a signature collapse to
+    // one `[x N]` line before rendering, but only when doing so actually
+    // shrinks the section -- a handful of already-distinct blocks render
+    // exactly as `scan_for_display` collected them.
+    let failure_blocks = output_shape::shaped_diagnostic_blocks(&scan.failures);
     push_blocks(
         &mut body,
         "failures:",
-        &scan.failures,
+        &failure_blocks,
         scan.failures_truncated,
     );
 
@@ -483,14 +543,20 @@ pub(crate) fn render_summary(
 
     let mut optional = String::new();
     if tail_lines > 0 {
+        let raw_tail: Vec<String> = scan
+            .tail
+            .iter()
+            .skip(scan.tail.len() - tail_lines)
+            .cloned()
+            .collect();
+        // Issue #409a: near-identical lines (docker layer progress, a
+        // timestamped log tail) that differ only by an id/timestamp/counter
+        // collapse to one `[x N]` entry, again only when smaller.
+        let shaped_tail = output_shape::shaped_noise_lines(&raw_tail);
         push_section(
             &mut optional,
             &format!("tail ({tail_lines} of {}):", scan.total_lines),
-            scan.tail
-                .iter()
-                .skip(scan.tail.len() - tail_lines)
-                .cloned()
-                .collect::<Vec<_>>(),
+            shaped_tail,
         );
     }
     let tail_pushed = body.len() + optional.len() <= budget;
@@ -500,10 +566,11 @@ pub(crate) fn render_summary(
 
     if head_lines > 0 {
         let mut head = String::new();
+        let shaped_head = output_shape::shaped_noise_lines(&scan.head[..head_lines]);
         push_section(
             &mut head,
             &format!("head ({head_lines} of {}):", scan.total_lines),
-            scan.head.clone(),
+            shaped_head,
         );
         if body.len() + head.len() <= budget {
             // The head goes ABOVE the tail when both are shown, so the
@@ -528,11 +595,12 @@ pub(crate) fn render_summary(
         body.push_str(&note);
     }
 
+    let warning_blocks = output_shape::shaped_diagnostic_blocks(&scan.warnings);
     let mut warnings = String::new();
     push_blocks(
         &mut warnings,
         "warnings:",
-        &scan.warnings,
+        &warning_blocks,
         scan.warnings_truncated,
     );
     if !warnings.is_empty() && body.len() + warnings.len() <= budget {
@@ -545,6 +613,14 @@ pub(crate) fn render_summary(
     body.push_str(&retrieval);
     body.push('\n');
     debug_assert!(body.len() <= max_bytes);
+    // Issue #410: the whole point of a summary is to be smaller than what it
+    // replaces. A raw output just above `compact_min_bytes` can still gain
+    // bytes back from section headers and the retrieval line -- if that
+    // happened, there is no honest summary to emit, same as the mandatory
+    // content not fitting the budget at all.
+    if body.len() >= raw_bytes {
+        return None;
+    }
     Some(body)
 }
 
@@ -588,7 +664,18 @@ const VERBATIM_PROGRAMS: &[&str] = &[
 ];
 
 /// `git` subcommands that are reads of content rather than progress logs.
-const VERBATIM_GIT_SUBCOMMANDS: &[&str] = &["diff", "show", "blame", "grep"];
+/// `diff`/`show` moved to [`DIFF_GIT_SUBCOMMANDS`] (issue #412): a bounded,
+/// lossless-shape summary is possible for those because their grammar is
+/// known, unlike `blame`/`grep`, which stay verbatim at any size.
+const VERBATIM_GIT_SUBCOMMANDS: &[&str] = &["blame", "grep"];
+
+/// `git` subcommands whose output is a unified diff: bounded above
+/// [`crate::commands::ctx::config::OutputConfig::diff_max_bytes`] by a
+/// per-file listing (`output_diff::render_diff_summary`) rather than a
+/// head/tail, since a diff's omitted middle is exactly the part a model is
+/// about to edit against (issue #412). `log -p`/`--patch` is caught
+/// separately below, since plain `git log` stays a `Known` progress log.
+const DIFF_GIT_SUBCOMMANDS: &[&str] = &["diff", "show", "format-patch"];
 
 /// Programs whose output shape zirv actually models -- test runners,
 /// compilers, package managers, VCS progress. For these the summary provably
@@ -615,6 +702,13 @@ pub(crate) enum CompactionScope {
     /// Everything else: compacted only past `compact_generic_min_bytes`, and
     /// the summary says explicitly which lines it omitted.
     Generic,
+    /// A unified diff (`git diff`/`show`/`log -p`/`format-patch`, issue
+    /// #412): compacted only past `[output] diff_max_bytes`, and never into a
+    /// head/tail -- the replacement is a bounded per-file `+N -M` listing
+    /// derived from the diff's own grammar (`output_diff::
+    /// render_diff_summary`), which never shows a hunk, partial or
+    /// otherwise.
+    Diff,
 }
 
 /// Global `git` flags that consume a SEPARATE value token (`-C dir`,
@@ -650,7 +744,9 @@ fn git_subcommand_index(tokens: &[&str]) -> usize {
     i
 }
 
-fn bare_program(token: &str) -> String {
+/// `pub(crate)`: also reused by `ledger.rs`/`hook::run_posttool` to name the
+/// `program` column of one compaction-ledger row (issue #422).
+pub(crate) fn bare_program(token: &str) -> String {
     let bare = token.rsplit(['/', '\\']).next().unwrap_or(token);
     bare.to_ascii_lowercase()
         .trim_end_matches(".exe")
@@ -676,6 +772,13 @@ fn bare_program(token: &str) -> String {
 ///   --full`), whose whole purpose is handing back text a summary already
 ///   elided. Compacting THAT produced a second summary, and no `--range`
 ///   could ever reach the original.
+///
+/// `git diff`/`show`/`log -p`/`format-patch` (`DIFF_GIT_SUBCOMMANDS`) are a
+/// second, weaker protection (issue #412): also never shown as a head/tail,
+/// but -- unlike a true reader -- a unified diff's own grammar is known, so a
+/// bounded per-file listing (never a partial hunk) is possible once the
+/// output passes `[output] diff_max_bytes`. `blame`/`grep` stay full
+/// `Verbatim`, since their output has no such bounded shape.
 pub(crate) fn classify_compaction(command: &str, extra_verbatim: &[String]) -> CompactionScope {
     if command.contains('|') || command.contains('>') {
         return CompactionScope::Verbatim;
@@ -725,13 +828,17 @@ pub(crate) fn classify_compaction(command: &str, extra_verbatim: &[String]) -> C
         if program == "git" && sub.is_some_and(|sub| VERBATIM_GIT_SUBCOMMANDS.contains(&sub)) {
             return CompactionScope::Verbatim;
         }
-        // `git log -p` prints patches; every other `git log` is a progress
-        // log the summary handles fine.
+        if program == "git" && sub.is_some_and(|sub| DIFF_GIT_SUBCOMMANDS.contains(&sub)) {
+            return CompactionScope::Diff;
+        }
+        // `git log -p`/`--patch` prints the same unified-diff grammar as
+        // `git diff`/`show` -- issue #412 bounds it the same way, rather than
+        // leaving it verbatim at any size like every other `git log`.
         if program == "git"
             && sub == Some("log")
             && tokens.iter().any(|t| *t == "-p" || *t == "--patch")
         {
-            return CompactionScope::Verbatim;
+            return CompactionScope::Diff;
         }
 
         if KNOWN_PROGRAMS.contains(&program.as_str()) {
@@ -857,12 +964,16 @@ fn reserve_log(dir: &Path, started_at: u64) -> (String, PathBuf) {
     (id, path)
 }
 
-/// Everything that happens AFTER a stored log exists: the two scanning
-/// passes, the sidecar, retention, and the rendered summary. Shared by
+/// Everything that happens AFTER a stored log exists: the scanning pass(es),
+/// the sidecar, retention, and the rendered summary. Shared by
 /// `zirv ctx run --compact` (which fills the log by handing a child both of
 /// its stream handles) and by claude's `PostToolUse` hook (which fills it
-/// with a tool result claude already collected) -- one engine, one store, one
-/// summary shape, so the two surfaces can never drift apart.
+/// with a tool result claude already collected) -- one engine, one store, so
+/// the two surfaces can never drift apart, even though `scope` (issue #412)
+/// now picks between two summary shapes: the generic scan below for
+/// `Known`/`Generic`/`Verbatim` callers, or `output_diff::
+/// render_diff_summary`'s bounded per-file listing for `Diff`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn summarize_stored(
     dir: &Path,
     id: &str,
@@ -871,12 +982,50 @@ pub(crate) fn summarize_stored(
     exit_code: Option<i32>,
     started_at: u64,
     max_summary_bytes: usize,
+    scope: CompactionScope,
 ) -> CtxResult<(OutputRecord, Option<String>)> {
+    if scope == CompactionScope::Diff {
+        let diff_scan = super::output_diff::scan_diff_file(path);
+        let record = OutputRecord {
+            schema_version: OUTPUT_SCHEMA_VERSION,
+            id: id.to_string(),
+            command: command.to_vec(),
+            exit_code,
+            started_at,
+            lines: diff_scan.total_lines,
+            bytes: diff_scan.total_bytes,
+        };
+        let _ = state::write_private(
+            &dir.join(format!("{id}.json")),
+            &serde_json::to_string(&record)?,
+        );
+        prune_outputs(dir, KEEP_NEWEST_OUTPUTS);
+
+        // Issue #411 (review F1): binary safety comes first here too -- a
+        // `git show`/`git diff` capture can still be a binary blob (a PNG
+        // added or changed in the diff), and the per-file listing below is
+        // built from a lossy UTF-8 decode that a NUL-bearing blob would
+        // corrupt silently. Same rule as the generic path below: no summary
+        // at all for binary content.
+        if output_shape::sniff_is_binary(path) {
+            return Ok((record, None));
+        }
+
+        let summary = super::output_diff::render_diff_summary(
+            id,
+            &command.join(" "),
+            exit_code,
+            &diff_scan,
+            max_summary_bytes,
+        );
+        return Ok((record, summary));
+    }
+
     // Pass 1 -- the SHARED classifier: failing test names and whether a
     // `test result:`/`Summary [...]` line was seen anywhere in the full
     // stream. Never a second implementation of either; see this module's own
     // doc comment.
-    let (_, read_errored, failures, summary_seen, _) = match std::fs::File::open(path) {
+    let (_tail_bytes, read_errored, failures, summary_seen, _) = match std::fs::File::open(path) {
         Ok(file) => read_capped_tail_and_scan(file, MAX_FAILURE_OUTPUT_BYTES),
         Err(_) => (
             Vec::new(),
@@ -896,6 +1045,49 @@ pub(crate) fn summarize_stored(
     };
     scan.read_error |= read_errored;
 
+    // Issue #413: a known test family's own structural shape (a pytest
+    // `FAILED path::test - message` line, a jest/vitest bullet, a go
+    // `--- FAIL:` block) merges into the generic diagnostic blocks above with
+    // exact failing-test names and locations. Review finding F4: run as a
+    // bounded streaming scan over the FULL stored file (`extract_streaming`),
+    // never just the capped tail Pass 1 kept for display -- a failure earlier
+    // than the last `MAX_FAILURE_OUTPUT_BYTES` of a chatty run must still be
+    // found. Declines (leaving `scan.failures` untouched) for anything that
+    // is not a confirmed match, so an unrecognised producer or a compile
+    // error before any test ran still gets the generic scan's own answer.
+    if scope == CompactionScope::Known
+        && let Some(family) = super::testrun::extract_streaming(&command.join(" "), path)
+    {
+        let family_blocks = family.failure_blocks();
+        if !family_blocks.is_empty() {
+            // Review finding F3: a confirmed family extraction only MERGES
+            // with the generic scan's own diagnostic blocks -- family blocks
+            // first (the failing test names/locations this family
+            // recognises), then any generic block not already covered (e.g.
+            // an `error: linker command failed` block a test-family marker
+            // has nothing to do with) -- never a wholesale replace, which
+            // used to let a confirmed family extraction silently drop a real
+            // failure the generic scan had already found.
+            let mut truncated = family.truncated || scan.failures_truncated;
+            let mut merged = family_blocks;
+            for block in std::mem::take(&mut scan.failures) {
+                if merged.len() >= MAX_FAILURE_BLOCKS {
+                    truncated = true;
+                    break;
+                }
+                if !merged.contains(&block) {
+                    merged.push(block);
+                }
+            }
+            scan.failures = merged;
+            scan.failures_truncated = truncated;
+        }
+        // A green family marker (no failure blocks recovered) leaves
+        // `scan.failures`/`failures_truncated` untouched: whatever the
+        // generic scan already found (e.g. a non-test error) still stands.
+        scan.summaries.push(family.summary_line(&failures));
+    }
+
     let record = OutputRecord {
         schema_version: OUTPUT_SCHEMA_VERSION,
         id: id.to_string(),
@@ -910,6 +1102,29 @@ pub(crate) fn summarize_stored(
         &serde_json::to_string(&record)?,
     );
     prune_outputs(dir, KEEP_NEWEST_OUTPUTS);
+
+    // Issue #411: binary safety comes first, ahead of every shaping pass --
+    // a NUL byte or a mostly-replacement-character decode means these are
+    // not text at all, and no summary (line-based or JSON) is ever built
+    // from them.
+    if output_shape::sniff_is_binary(path) {
+        return Ok((record, None));
+    }
+
+    // Issue #411: a bracket-shaped stored output is tried as JSON before the
+    // line-based scan -- a minified document is one line, so head/tail is
+    // the wrong shape for it. Falls through to the ordinary summary on
+    // anything that is not this shape, does not parse, or does not fit.
+    if let Some(summary) = output_shape::try_json_summary(
+        id,
+        &command.join(" "),
+        exit_code,
+        path,
+        scan.total_lines,
+        max_summary_bytes,
+    ) {
+        return Ok((record, Some(summary)));
+    }
 
     let summary = render_summary(
         id,
@@ -964,6 +1179,7 @@ pub(crate) fn capture_text(
     exit_code: Option<i32>,
     output: &str,
     max_summary_bytes: usize,
+    scope: CompactionScope,
 ) -> CtxResult<(String, Option<String>)> {
     let dir = outputs_dir(state, repo);
     state::create_private_dir_all(&dir)?;
@@ -983,6 +1199,7 @@ pub(crate) fn capture_text(
         exit_code,
         started_at,
         max_summary_bytes,
+        scope,
     )?;
     Ok((id, summary))
 }
@@ -1034,6 +1251,10 @@ pub fn run_with<W: Write>(
     };
     let exit_code = child.wait()?.code().unwrap_or(1);
 
+    // `zirv ctx run --compact` is an explicit ask to compact THIS command's
+    // output, unlike the automatic `PostToolUse` interception -- so it always
+    // used the generic scan, and issue #412 does not change that here: only
+    // `hook::run_posttool`'s own `classify_compaction` call picks `Diff`.
     let (_, summary) = summarize_stored(
         &dir,
         &id,
@@ -1042,6 +1263,7 @@ pub fn run_with<W: Write>(
         Some(exit_code),
         started_at,
         cfg.output.max_summary_bytes,
+        CompactionScope::Generic,
     )?;
 
     if args.full && !args.compact {
@@ -1568,7 +1790,14 @@ mod tests {
             total_lines: 100,
             total_bytes: 100_000,
             head: (0..5).map(|i| format!("h{i}")).collect(),
-            tail: (0..TAIL_LINES).map(|_| "x".repeat(60)).collect(),
+            // Each line carries its own index so #409a's noise dedup (lines
+            // that normalize identically collapse to one `[x N]` entry) has
+            // nothing to collapse here -- this fixture needs the tail
+            // section to stay genuinely too big to fit, which an
+            // accidentally-deduped single line would no longer be.
+            tail: (0..TAIL_LINES)
+                .map(|i| format!("{i:03} {}", "x".repeat(57)))
+                .collect(),
             ..DisplayScan::default()
         };
         let retrieval = retrieval_line("id1");
@@ -1581,7 +1810,12 @@ mod tests {
         let summary = render_summary(
             "id1",
             "gen",
-            None,
+            // Non-zero and non-`None`: #409b's clean-run one-liner also
+            // applies when nothing was flagged and the exit code is `None`
+            // (the hook path), which this scan otherwise qualifies for --
+            // `Some(1)` keeps this test on the ordinary head/tail path it
+            // means to exercise.
+            Some(1),
             &scan,
             &BTreeSet::new(),
             false,
@@ -1792,9 +2026,6 @@ mod tests {
             "cat src/lib.rs",
             "sed -n '1,200p' src/lib.rs",
             "rg TODO src",
-            "git diff HEAD~1",
-            "git show HEAD",
-            "git log -p",
             "git blame src/lib.rs",
             "cargo test | tail -5",
             "cargo build > out.txt",
@@ -1806,6 +2037,17 @@ mod tests {
                 classify_compaction(command, &[]),
                 CompactionScope::Verbatim,
                 "{command} must never be compacted"
+            );
+        }
+        // Issue #412: these leave the verbatim list -- a unified diff's
+        // grammar is known, so it gets a bounded per-file listing rather than
+        // being either shown verbatim at any size or head/tail scanned.
+        // `git grep` stays fully `Verbatim` alongside `git blame` above.
+        for command in ["git diff HEAD~1", "git show HEAD", "git log -p"] {
+            assert_eq!(
+                classify_compaction(command, &[]),
+                CompactionScope::Diff,
+                "{command} must be bounded, never a head/tail scan"
             );
         }
         for command in [
@@ -1849,7 +2091,7 @@ mod tests {
         for command in ["git -C some/dir diff", "git --no-pager diff"] {
             assert_eq!(
                 classify_compaction(command, &[]),
-                CompactionScope::Verbatim,
+                CompactionScope::Diff,
                 "{command} must still be recognised as a content-reading git diff"
             );
         }
@@ -1882,7 +2124,10 @@ mod tests {
         let summary = render_summary(
             "id1",
             "some-tool",
-            Some(0),
+            // Non-zero: this scan has nothing flagged, so a `0` here would
+            // hit #409b's clean-run one-liner instead of the omitted-range
+            // rendering this test means to exercise.
+            Some(1),
             &scan,
             &BTreeSet::new(),
             false,
@@ -1979,7 +2224,10 @@ mod tests {
         let generic = render_summary(
             "id1",
             "some-tool",
-            Some(0),
+            // Non-zero, for the same reason as the omitted-range test above:
+            // this scan has nothing flagged, so `Some(0)` would collapse to
+            // #409b's one-liner instead of the head/tail this test checks.
+            Some(1),
             &scan,
             &BTreeSet::new(),
             false,
@@ -2045,5 +2293,574 @@ mod tests {
                 "a log and its sidecar must be pruned together: {remaining:?}"
             );
         }
+    }
+
+    /// A temp home/state/repo triple wired for `capture_text`, mirroring the
+    /// setup every `run_with`/`run_post` test above already builds by hand.
+    fn capture_rig() -> (
+        tempfile::TempDir,
+        StateDir,
+        PathBuf,
+        crate::commands::ctx::testenv::HomeGuard,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_path = tmp.path().join("state");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let home_guard = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let env = env_map(&[(
+            crate::commands::ctx::state::STATE_ENV,
+            &state_path.display().to_string(),
+        )]);
+        let state = StateDir::resolve(&|k: &str| env.get(k).cloned()).expect("state dir");
+        (tmp, state, repo, home_guard)
+    }
+
+    // -- Issue #410: never-worse guard ------------------------------------
+
+    /// A small number of long lines mean head AND tail both show every one
+    /// of them (no distinct middle to omit), so a head/tail summary of that
+    /// shape repeats the whole raw output twice, plus its own header and
+    /// retrieval line -- it can never be smaller than what it replaces, so
+    /// none is emitted and the original stands.
+    #[test]
+    fn a_summary_that_would_not_shrink_the_raw_output_is_never_emitted() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let threshold = crate::commands::ctx::config::OutputConfig::default().compact_min_bytes;
+        let mut output = String::new();
+        for i in 0..15u32 {
+            output.push_str(&format!("{i:02} {}", "x".repeat(270)));
+            output.push('\n');
+        }
+        match output.len().cmp(&(threshold + 1)) {
+            std::cmp::Ordering::Less => output.push_str(&"q".repeat(threshold + 1 - output.len())),
+            std::cmp::Ordering::Greater => output.truncate(threshold + 1),
+            std::cmp::Ordering::Equal => {}
+        }
+        assert_eq!(output.len(), threshold + 1, "issue #410's own example size");
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["some-tool".to_string()],
+            // Non-zero: keeps this on the ordinary head/tail path regardless
+            // of exit code semantics later shaping passes might add.
+            Some(1),
+            &output,
+            // A generous `max_summary_bytes` -- large enough that the head
+            // and tail sections both render in full rather than being cut
+            // for budget reasons, so what is left to test is specifically
+            // whether their (near-total) duplication of the raw content
+            // still beats the raw byte count, not whether they fit a small
+            // cap.
+            20_000,
+            CompactionScope::Generic,
+        )
+        .expect("capture");
+        assert!(
+            summary.is_none(),
+            "a summary that cannot beat its own raw output must not be emitted"
+        );
+    }
+
+    /// A property-style check over several representative shapes (a failing
+    /// build, a docker-style pull, a plain generic transcript, a large JSON
+    /// array): whenever ANY of them produces a summary at all, it must be
+    /// strictly smaller than the raw text it replaces.
+    #[test]
+    fn every_emitted_summary_is_strictly_smaller_than_its_raw_output() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let mut failing_build: String = (1..=400).map(|i| format!("filler line {i}\n")).collect();
+        failing_build.push_str("error[E0308]: mismatched types\n  --> src/lib.rs:42:9\n");
+        failing_build.push_str("failures:\n\n    module::tests::alpha\n\n");
+        failing_build.push_str("test result: FAILED. 1 passed; 1 failed\n");
+
+        let mut docker_pull = String::from("Using default tag: latest\n");
+        for i in 0..40u64 {
+            docker_pull.push_str(&format!("{:012x}: Pull complete\n", 0xabc000000000u64 + i));
+        }
+        docker_pull.push_str("Status: Downloaded newer image for alpine:latest\n");
+
+        let generic: String = (1..=600).map(|i| format!("plain line {i}\n")).collect();
+
+        let json_array = serde_json::to_string(&serde_json::Value::Array(
+            (0..800)
+                .map(|i| serde_json::json!({"id": i, "name": format!("item-{i}")}))
+                .collect(),
+        ))
+        .expect("json");
+
+        for (command, raw, exit_code) in [
+            ("cargo test", failing_build, Some(3)),
+            ("docker pull alpine", docker_pull, Some(1)),
+            ("some-tool --report", generic, Some(1)),
+            ("gh api /repos/x/y/issues", json_array, Some(0)),
+        ] {
+            let (_, summary) = capture_text(
+                &state,
+                &repo,
+                &[command.to_string()],
+                exit_code,
+                &raw,
+                4096,
+                CompactionScope::Generic,
+            )
+            .unwrap_or_else(|e| panic!("{command}: {e}"));
+            if let Some(summary) = summary {
+                assert!(
+                    summary.len() < raw.len(),
+                    "{command}: summary ({} bytes) must be smaller than raw ({} bytes): {summary}",
+                    summary.len(),
+                    raw.len()
+                );
+            }
+        }
+
+        // Review finding F2: a repo-lowered `diff_max_bytes` still leaves
+        // `max_summary_bytes` generous, so a tiny one-file diff must not
+        // come back as a per-file listing that is bigger than the diff it
+        // replaces. Before F2's never-worse guard, `render_diff_summary` had
+        // no such check and happily returned the (larger) listing.
+        let tiny_diff = "diff --git a/a.rs b/a.rs\n\
+                          --- a/a.rs\n\
+                          +++ a/a.rs\n\
+                          @@ -1,1 +1,1 @@\n\
+                          -a\n\
+                          +b\n"
+            .to_string();
+        let (_, tiny_diff_summary) = capture_text(
+            &state,
+            &repo,
+            &["git diff HEAD~1".to_string()],
+            Some(0),
+            &tiny_diff,
+            4096,
+            CompactionScope::Diff,
+        )
+        .expect("capture_text");
+        if let Some(summary) = tiny_diff_summary {
+            assert!(
+                summary.len() < tiny_diff.len(),
+                "diff summary ({} bytes) must be smaller than the raw diff ({} bytes): {summary}",
+                summary.len(),
+                tiny_diff.len()
+            );
+        }
+    }
+
+    /// Review finding F1: `summarize_stored`'s `CompactionScope::Diff` fast
+    /// path used to run before the binary sniff, so a `git show
+    /// HEAD:logo.png`-shaped capture (a binary blob, NUL bytes included) was
+    /// scanned as if it were a unified diff and replaced by a text per-file
+    /// listing instead of being left alone like every other binary capture.
+    #[test]
+    fn diff_scope_binary_capture_never_gets_a_diff_summary() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        // Larger than `output_shape::BINARY_SNIFF_BYTES`-worth of filler,
+        // with NUL bytes mixed in near the front -- the same shape a `git
+        // show HEAD:logo.png` capture would have.
+        let mut raw = vec![0u8; 128];
+        raw.extend(std::iter::repeat_n(b'x', 128 * 1024));
+        let raw = String::from_utf8_lossy(&raw).into_owned();
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["git show HEAD:logo.png".to_string()],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Diff,
+        )
+        .expect("capture_text");
+        assert!(
+            summary.is_none(),
+            "a binary Diff-scope capture must never get a text summary, got: {summary:?}"
+        );
+    }
+
+    /// Review finding F3: a confirmed but GREEN test-family marker
+    /// (`test result: ok.`) must not erase an unrelated failure the generic
+    /// scan already found (`error: linker command failed`) -- the two used
+    /// to be an unconditional replace, so a green family wiped the linker
+    /// error out entirely.
+    #[test]
+    fn a_green_family_marker_never_erases_an_unrelated_generic_failure() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        // Enough filler that the rendered summary comfortably beats the raw
+        // byte count (#410's never-worse guard) even with two failure
+        // blocks and a family summary line in it.
+        let mut raw: String = (1..=400).map(|i| format!("filler line {i}\n")).collect();
+        raw.push_str(
+            "running 3 tests\n\
+             test tests::a ... ok\n\
+             test tests::b ... ok\n\
+             test tests::c ... ok\n\
+             \n\
+             test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+             error: linker `cc` not found\n\
+             error: could not compile `demo` due to previous error\n",
+        );
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["cargo test".to_string()],
+            Some(101),
+            &raw,
+            4096,
+            CompactionScope::Known,
+        )
+        .expect("capture_text");
+        let summary = summary.expect("a summary");
+        assert!(
+            summary.contains("linker"),
+            "the linker error must survive a confirmed green family marker: {summary}"
+        );
+    }
+
+    /// Review finding F8: a failed `#[should_panic]` test prints its own
+    /// `test <name> ... FAILED` line but never a `thread '...' panicked
+    /// at ...:` line (there was no panic -- that is exactly why it failed),
+    /// so `testrun`'s own panic-line-only count used to disagree with
+    /// cargo's `test result: ... 2 failed` line. The family summary line
+    /// must count it too, via the union with Pass 1's own full-stream name
+    /// scan.
+    #[test]
+    fn a_should_panic_failure_with_no_panic_line_is_still_counted() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        let mut raw: String = (1..=400).map(|i| format!("filler line {i}\n")).collect();
+        raw.push_str(
+            "running 2 tests\n\
+             test tests::normal_panic ... FAILED\n\
+             test tests::should_have_panicked ... FAILED\n\
+             \n\
+             failures:\n\
+             \n\
+             ---- tests::normal_panic stdout ----\n\
+             thread 'tests::normal_panic' panicked at src/lib.rs:10:5:\n\
+             assertion failed\n\
+             \n\
+             ---- tests::should_have_panicked stdout ----\n\
+             note: test did not panic as expected\n\
+             \n\
+             failures:\n\
+             \x20   tests::normal_panic\n\
+             \x20   tests::should_have_panicked\n\
+             \n\
+             test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["cargo test".to_string()],
+            Some(101),
+            &raw,
+            4096,
+            CompactionScope::Known,
+        )
+        .expect("capture_text");
+        let summary = summary.expect("a summary");
+        assert!(
+            summary.contains("cargo test: 2 failed"),
+            "the should_panic failure (no panic line) must still be counted, \
+             via Pass 1's full-stream name scan: {summary}"
+        );
+    }
+
+    /// Review finding F4: a `go test` failure earlier than the capped
+    /// display tail (`MAX_FAILURE_OUTPUT_BYTES`, 16 KiB) must still be found
+    /// -- both because the family extractor now streams the full stored
+    /// file, and because the clean one-liner must never fire for a command
+    /// that argv-matches a known test family without a confirmed pass.
+    #[test]
+    fn go_test_failure_before_the_display_tail_still_renders_and_never_the_clean_one_liner() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        let mut raw = String::from(
+            "=== RUN   TestX\n--- FAIL: TestX (0.00s)\n    main_test.go:10: expected 1, got 2\n",
+        );
+        // More than `MAX_FAILURE_OUTPUT_BYTES` (16 KiB) of noise after the
+        // failure -- the capped display tail Pass 1 keeps never reaches back
+        // this far.
+        while raw.len() < 20 * 1024 {
+            raw.push_str("=== RUN   TestNoise\n--- PASS: TestNoise (0.00s)\n");
+        }
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["go test ./...".to_string()],
+            None,
+            &raw,
+            4096,
+            CompactionScope::Known,
+        )
+        .expect("capture_text");
+        let summary = summary.expect("a red run must always get a summary");
+        assert!(
+            summary.contains("TestX"),
+            "the early failure must survive past the display tail: {summary}"
+        );
+        assert!(
+            !summary.contains("ok ("),
+            "a red run must never render the clean one-liner: {summary}"
+        );
+    }
+
+    /// Review finding F4: same shape, for pytest.
+    #[test]
+    fn pytest_failure_before_the_display_tail_still_renders_and_never_the_clean_one_liner() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        let mut raw = String::from("FAILED tests/test_x.py::test_bad - AssertionError: boom\n");
+        while raw.len() < 20 * 1024 {
+            raw.push_str("tests/test_noise.py::test_ok PASSED\n");
+        }
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["pytest -q".to_string()],
+            None,
+            &raw,
+            4096,
+            CompactionScope::Known,
+        )
+        .expect("capture_text");
+        let summary = summary.expect("a red run must always get a summary");
+        assert!(
+            summary.contains("test_bad"),
+            "the early failure must survive past the display tail: {summary}"
+        );
+        assert!(
+            !summary.contains("ok ("),
+            "a red run must never render the clean one-liner: {summary}"
+        );
+    }
+
+    // -- Issue #408: diagnostic grouping -----------------------------------
+
+    /// Forty occurrences of the same clippy warning at different locations
+    /// spend one line, not forty.
+    #[test]
+    fn forty_identical_warnings_group_into_one_line_within_budget() {
+        let warnings: Vec<Vec<String>> = (0..40)
+            .map(|i| {
+                vec![
+                    "warning: unused variable: `x`".to_string(),
+                    format!("  --> src/file{i}.rs:{i}:5"),
+                ]
+            })
+            .collect();
+        let scan = DisplayScan {
+            total_lines: 200,
+            total_bytes: 200_000,
+            warnings,
+            ..DisplayScan::default()
+        };
+        let summary = render_summary(
+            "id1",
+            "cargo clippy",
+            Some(0),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(
+            summary.contains("[x 40] warning: unused variable: `x`"),
+            "{summary}"
+        );
+        assert!(summary.len() <= 4096, "{} bytes", summary.len());
+    }
+
+    /// Three genuinely distinct errors are never folded into each other.
+    #[test]
+    fn three_distinct_errors_all_appear_in_the_rendered_summary() {
+        let scan = DisplayScan {
+            total_lines: 10,
+            total_bytes: 1000,
+            failures: vec![
+                vec![
+                    "error[E0308]: mismatched types".to_string(),
+                    "  --> a.rs:1:1".to_string(),
+                ],
+                vec![
+                    "error[E0502]: cannot borrow".to_string(),
+                    "  --> b.rs:2:2".to_string(),
+                ],
+                vec!["error: linking failed".to_string()],
+            ],
+            ..DisplayScan::default()
+        };
+        let summary = render_summary(
+            "id1",
+            "cargo build",
+            Some(101),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        for needle in ["error[E0308]", "error[E0502]", "error: linking failed"] {
+            assert!(summary.contains(needle), "{summary}");
+        }
+        assert!(
+            !summary.contains("[x "),
+            "distinct errors must never be grouped: {summary}"
+        );
+    }
+
+    // -- Issue #409: normalized dedup + clean one-liner ---------------------
+
+    /// Thirty docker-style layer completion lines, each with a different hex
+    /// digest, collapse to one counted tail line.
+    #[test]
+    fn docker_style_repeated_layer_lines_collapse_in_the_rendered_tail() {
+        let mut tail: VecDeque<String> = VecDeque::new();
+        for i in 0..30u64 {
+            tail.push_back(format!("{:012x}: Pull complete", 0xabc000000000u64 + i));
+        }
+        tail.push_back("Status: Downloaded newer image for alpine:latest".to_string());
+        let scan = DisplayScan {
+            total_lines: 31,
+            total_bytes: 2000,
+            tail,
+            ..DisplayScan::default()
+        };
+        let summary = render_summary(
+            "id1",
+            "docker pull alpine",
+            Some(1),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(summary.contains("[x 30]"), "{summary}");
+        assert!(summary.contains("Status: Downloaded"), "{summary}");
+    }
+
+    /// A clean run (no diagnostics, exit 0) collapses to one line; the same
+    /// scan with a failing exit code renders the ordinary full summary.
+    #[test]
+    fn a_clean_run_collapses_to_one_line_and_a_failing_one_does_not() {
+        let text: String = (1..=200)
+            .map(|i| format!("Compiling crate{i} v0.1.0\n"))
+            .collect();
+        let scan = scan_for_display(std::io::BufReader::new(text.as_bytes()));
+
+        let clean = render_summary(
+            "id1",
+            "cargo build",
+            Some(0),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(clean.contains("ok (200 lines, nothing flagged)"), "{clean}");
+        assert!(!clean.contains("Compiling crate1 "), "{clean}");
+
+        let failing = render_summary(
+            "id1",
+            "cargo build",
+            Some(101),
+            &scan,
+            &BTreeSet::new(),
+            false,
+            4096,
+        )
+        .expect("a summary");
+        assert!(!failing.contains("nothing flagged"), "{failing}");
+        assert!(failing.contains("Compiling"), "{failing}");
+    }
+
+    // -- Issue #411: JSON-aware summary + binary safety ---------------------
+
+    /// A large `gh api`-style JSON array is summarized structurally rather
+    /// than cut as a line-based head/tail, which would hand back an
+    /// unparsable fragment of what is really a single minified line.
+    #[test]
+    fn a_large_json_array_is_captured_as_a_bounded_structural_summary() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let items: Vec<serde_json::Value> = (0..1000)
+            .map(|i| {
+                serde_json::json!({"id": i, "title": format!("issue number {i}"), "state": "open"})
+            })
+            .collect();
+        let raw = serde_json::to_string(&serde_json::Value::Array(items)).expect("json");
+        assert!(raw.len() > 40_000, "{}", raw.len());
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &[
+                "gh".to_string(),
+                "api".to_string(),
+                "/repos/x/y/issues".to_string(),
+            ],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Generic,
+        )
+        .expect("capture");
+        let summary = summary.expect("a structural summary");
+        assert!(summary.len() <= 4096, "{} bytes", summary.len());
+        assert!(summary.contains("json summary:"), "{summary}");
+        assert!(summary.contains("more"), "{summary}");
+        assert!(summary.len() < raw.len(), "{summary}");
+    }
+
+    /// A small JSON document is left untouched -- never-worse applies to the
+    /// JSON path exactly as it does to the line-based one.
+    #[test]
+    fn a_small_json_object_is_captured_untouched() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let raw = serde_json::json!({"ok": true, "count": 3, "name": "small"}).to_string();
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["gh".to_string()],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Generic,
+        )
+        .expect("capture");
+        assert!(
+            summary.is_none(),
+            "a tiny document must not gain a summary: {raw}"
+        );
+    }
+
+    /// Binary output (a NUL byte, as any binary format carries) is never
+    /// replaced with a summary, line-based or structural.
+    #[test]
+    fn binary_output_is_never_replaced_with_a_summary() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let mut raw = String::from("cargo build\n");
+        raw.push('\0');
+        raw.push_str(&"line ".repeat(2000));
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["cat".to_string()],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Generic,
+        )
+        .expect("capture");
+        assert!(summary.is_none(), "binary output must never be summarized");
     }
 }

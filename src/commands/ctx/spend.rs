@@ -299,7 +299,11 @@ fn render_json(rows: &[SpendRow], total: &SpendRow, stale: bool, as_of: &str) ->
 /// `--since` flag that was actually supplied -- silently treating a typo'd
 /// duration as "no time filter" would accept every row instead of the
 /// operator's intended window.
-fn parse_since(text: &str) -> Option<u64> {
+///
+/// `pub(crate)`: `ledger::run_with` (`zirv ctx savings`, issue #422) reuses
+/// this exact parser for its own identically shaped `--since` flag rather
+/// than duplicating it.
+pub(crate) fn parse_since(text: &str) -> Option<u64> {
     let text = text.trim();
     let (digits, multiplier) = match text.strip_suffix('s') {
         Some(d) => (d, 1u64),

@@ -9,7 +9,7 @@ use super::diagnostics;
 use super::event::{NormalizedEvent, input_hash};
 use super::pathutil::canonicalize_with_missing_tail;
 use super::rot::{Score, Verdict};
-use super::state::{StateDir, now_secs};
+use super::state::{StateDir, now_secs, repo_slug};
 use super::supervise::Watcher;
 use super::{CtxResult, log, score, signal};
 use crate::commands::workflow::adoption::{self, AdoptionPolicy, AdoptionSignals};
@@ -1866,6 +1866,12 @@ pub struct PreToolInput {
     /// `MultiEdit`'s own list of edits (issue #406), each with the same
     /// `old_string`/`new_string` pair a single `Edit` carries.
     pub edits: Vec<PreToolEdit>,
+    /// `Bash`'s own command line (issue #419): the text the bare-`git log`
+    /// rewrite reads to build `updatedInput`. Every other tool's `tool_input`
+    /// simply never carries this key, so the zero default is never mistaken
+    /// for a real (empty) `Bash` command -- `run_pretool_bash_rewrite` is
+    /// only ever reached when `payload.tool_name == "Bash"`.
+    pub command: String,
 }
 
 /// One entry of `MultiEdit`'s `edits` array (issue #406). `#[serde(default)]`
@@ -2254,6 +2260,154 @@ fn pretool_advise_output(note: &str) -> String {
     .to_string()
 }
 
+/// The documented PreToolUse rewrite envelope (issue #419): the same `allow`
+/// shape [`pretool_advise_output`] prints, plus `updatedInput` -- claude
+/// replaces its own `tool_input` with this object before running the tool,
+/// rather than the one the model actually proposed. Only ever emitted for a
+/// `Bash` command the safety layer ([`super::safety::evaluate`]) already
+/// classifies as a plain, unconditional `Allow`: never for anything it would
+/// ask about or deny (see `run_pretool_bash_rewrite`'s own call site, the
+/// only place that builds this envelope). `reason` doubles as both channels
+/// a caller might otherwise need: it is the only place this envelope has to
+/// say anything at all, since the guards that produce a separate
+/// `additionalContext` note (the orchestrator-write advisory, the issue
+/// #406 reuse probe) are scoped to [`FILE_MODIFICATION_TOOLS`] and can never
+/// fire on the same `Bash` call this envelope answers.
+fn pretool_rewrite_output(command: &str, reason: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason": reason,
+            "updatedInput": { "command": command }
+        }
+    })
+    .to_string()
+}
+
+// -- PreToolUse: the bare `git log` rewrite (issue #419) -------------------
+
+/// Whether `token` already limits a `git log` invocation: `-n`, `--max-
+/// count`/`--max-count=<N>`, or a bare `-<digits>` count flag (`-3`, `-10`).
+/// `--oneline` and every other formatting flag do NOT count -- issue #419's
+/// bare-`git log` rule is about the absence of a limit, not the absence of
+/// flags altogether.
+fn is_git_log_limit_flag(token: &str) -> bool {
+    token == "-n"
+        || token == "--max-count"
+        || token.starts_with("--max-count=")
+        || (token.len() > 1
+            && token.starts_with('-')
+            && token[1..].bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Issue #419: appends ` -n 50` to `command` when the WHOLE trimmed command
+/// is one bare `git log` invocation -- `git`/`log` as its first two tokens,
+/// no [`is_git_log_limit_flag`] token anywhere in it, and none of `|`, `>`,
+/// `;`, `&&`, `||` at all -- so an orchestrator's habitual unbounded
+/// `git log` does not dump the whole history into a transcript. Returns
+/// `None` for anything else, including a compound command (`cd x && git
+/// log`): deliberately not a general shell splitter -- this codebase
+/// already has two of those (`safety::split_segments`, `safety::
+/// split_segments_with_pipe_marker`) -- a chained or redirected command is
+/// simply left alone rather than picked apart to rewrite one piece of it.
+fn rewrite_bare_git_log(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.contains(['|', '>', ';']) || trimmed.contains("&&") || trimmed.contains("||") {
+        return None;
+    }
+    // Review finding F5: a bare `git log` needs none of `#` (a shell
+    // comment -- appending ` -n 50` after one lands INSIDE the comment,
+    // leaving the actually-executed command unbounded), a backtick or `$`
+    // (command/variable substitution), `\` (line continuation or escaping),
+    // a quote (the "whole command" the whitespace split below sees is not
+    // necessarily the whole command a shell would run), or `(`/`{` (a
+    // subshell or brace group). Any of these means this is not the simple,
+    // literal invocation this rewrite is safe for, so it is left alone
+    // exactly like a pipe or `&&` above.
+    if trimmed.contains(['#', '`', '$', '\\', '\'', '"', '(', '{']) {
+        return None;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    if tokens.next() != Some("git") || tokens.next() != Some("log") {
+        return None;
+    }
+    if tokens.any(is_git_log_limit_flag) {
+        return None;
+    }
+    Some(format!("{trimmed} -n 50"))
+}
+
+/// Issue #419's whole `Bash` decision, independent of every guard above and
+/// below: rewrites exactly one shape (a bare `git log`) via `updatedInput`,
+/// and never denies or advises. `Bash` is not a [`FILE_MODIFICATION_TOOLS`]
+/// entry, so the orchestrator-write guard and the issue #406 reuse probe
+/// never see this call at all -- this function is the entirety of what
+/// `run_pretool` does for `Bash`.
+///
+/// Fails open on every path, matching every other guard in this file: an
+/// empty or unrewritable command, an unresolvable `cwd`, or a command the
+/// safety layer does not classify as a plain, unconditional `Allow` all
+/// print nothing, and the `Bash` call proceeds through claude's ordinary
+/// permission flow untouched. The safety check uses `LaunchMode::Headless`
+/// -- the stricter of the two defaults -- because this payload carries no
+/// `permission_mode` field (that lives only in `safety.rs`'s own hook
+/// payload), so there is no in-band signal here that a human is watching to
+/// answer an `Ask` verdict.
+fn run_pretool_bash_rewrite<W: Write>(
+    w: &mut W,
+    payload: &PreToolPayload,
+    env: EnvLookup<'_>,
+) -> CtxResult<i32> {
+    let command = payload.tool_input.command.trim();
+    if command.is_empty() {
+        return Ok(0);
+    }
+    let Some(rewritten) = rewrite_bare_git_log(command) else {
+        return Ok(0);
+    };
+    let cwd = if !payload.cwd.is_empty() {
+        PathBuf::from(&payload.cwd)
+    } else {
+        let Ok(cwd) = std::env::current_dir() else {
+            return Ok(0);
+        };
+        cwd
+    };
+    let cfg = cfg_or_operator_only_gate(&cwd, env);
+    let outcome =
+        super::safety::evaluate(&cfg.safety, command, super::adapters::LaunchMode::Headless);
+    if outcome.verdict != super::safety::Verdict::Allow {
+        return Ok(0);
+    }
+
+    let reason =
+        format!("zirv rewrite: bare `git log` capped at 50 entries (`{command}` -> `{rewritten}`)");
+    let _ = writeln!(w, "{}", pretool_rewrite_output(&rewritten, &reason));
+
+    // Best-effort, matching every other decision log write on this path: a
+    // row that fails to write costs an operator one audit-log entry, never a
+    // hook failure.
+    if let Ok(state) = StateDir::resolve(env) {
+        let session =
+            super::mail::session_identity(env).unwrap_or_else(|| payload.session_id.clone());
+        let _ = log::append(
+            &state,
+            &log::Decision {
+                ts: now_secs(),
+                session: &session,
+                verb: "hook",
+                verdict: "n/a",
+                score: 0,
+                action: "rewrite",
+                detail: &format!("{command} -> {rewritten}"),
+                observed_at: None,
+            },
+        );
+    }
+    Ok(0)
+}
+
 /// Runs three independent guards against the same payload: the expensive-seat
 /// subagent guard above (gated on `SEAT_MODEL_ENV`) and the orchestrator-
 /// write guard below (gated on `SEAT_ROLE_ENV`, issue #334) -- an
@@ -2281,6 +2435,14 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     {
         let _ = writeln!(w, "{}", pretool_output(&reason));
         return Ok(0);
+    }
+
+    // Issue #419: a `Bash` call gets its own, much narrower treatment --
+    // see `run_pretool_bash_rewrite`'s own doc comment -- and never falls
+    // through to the orchestrator-write guard below, which only ever looks
+    // at `FILE_MODIFICATION_TOOLS` and would not recognize `Bash` anyway.
+    if payload.tool_name == "Bash" {
+        return run_pretool_bash_rewrite(w, &payload, env);
     }
 
     if !FILE_MODIFICATION_TOOLS.contains(&payload.tool_name.as_str()) {
@@ -2418,6 +2580,12 @@ pub struct PostToolPayload {
     pub tool_input: PostToolInput,
     pub tool_response: BashToolOutput,
     pub cwd: String,
+    /// Claude's own session id (issue #422's `ledger` `session` column).
+    pub session_id: String,
+    /// Claude's own tool-call id (issue #422's `ledger` `tool_use_id`
+    /// column), so a savings row can be correlated back to the exact
+    /// `PostToolUse` invocation that produced it.
+    pub tool_use_id: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2483,6 +2651,12 @@ pub(crate) fn posttool_output(summary: &str, interrupted: bool) -> String {
 /// never be the only surviving copy. Nothing here may `unwrap`, `expect` or
 /// return `Err`: the release profile is `panic = "abort"`, and a hook that
 /// aborts takes the tool result with it.
+///
+/// Issue #422: every path from a resolved `cwd`/state dir onward also
+/// records one row to `ledger.rs`'s own `compactions` table (fail-open,
+/// `ledger::record`'s own contract), so `zirv ctx savings` can answer how
+/// much this hook has actually saved without re-deriving it from the raw
+/// output-capture files.
 pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let Ok(payload) = serde_json::from_str::<PostToolPayload>(stdin) else {
         return Ok(0);
@@ -2498,9 +2672,13 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     } else {
         format!("{}\n{}", response.stdout, response.stderr)
     };
-    if already_offloaded(&combined) {
-        return Ok(0);
-    }
+
+    // Issue #422: `cwd`/`state` are resolved once, up front, because every
+    // path below this point records exactly one row to the compaction
+    // ledger before it returns -- a row needs both (`repo` comes from `cwd`,
+    // and the ledger file itself lives under `state`). The two paths that
+    // cannot resolve either (`no cwd`, `no state dir`) are the only ones
+    // that record nothing at all: there is nowhere to key or write a row.
     let cwd = if payload.cwd.is_empty() {
         let Ok(cwd) = std::env::current_dir() else {
             return Ok(0);
@@ -2509,8 +2687,42 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     } else {
         PathBuf::from(&payload.cwd)
     };
+    let Ok(state) = StateDir::resolve(env) else {
+        return Ok(0);
+    };
+    let program = payload
+        .tool_input
+        .command
+        .split_whitespace()
+        .next()
+        .map(super::output::bare_program)
+        .unwrap_or_default();
+    let repo = repo_slug(&cwd);
+    let bytes_in = combined.len() as u64;
+    let record = |outcome: super::ledger::Outcome, bytes_out: u64, retrieval_id: Option<&str>| {
+        super::ledger::record(
+            &state,
+            &super::ledger::CompactionRow {
+                ts: now_secs(),
+                tool_use_id: &payload.tool_use_id,
+                session: &payload.session_id,
+                repo: &repo,
+                program: &program,
+                bytes_in,
+                bytes_out,
+                outcome,
+                retrieval_id,
+            },
+        );
+    };
+
+    if already_offloaded(&combined) {
+        record(super::ledger::Outcome::Offloaded, bytes_in, None);
+        return Ok(0);
+    }
     let cfg = cfg_or_operator_only_gate(&cwd, env);
     if !cfg.output.compact {
+        record(super::ledger::Outcome::Disabled, bytes_in, None);
         return Ok(0);
     }
     // How much of THIS command's output may be replaced at all. A reader --
@@ -2519,35 +2731,43 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // a model reads that output verbatim before editing against it, so a
     // head/tail summary would silently corrupt the edit rather than merely
     // cost tokens.
-    let threshold =
-        match super::output::classify_compaction(&payload.tool_input.command, &cfg.output.verbatim)
-        {
-            super::output::CompactionScope::Verbatim => return Ok(0),
-            super::output::CompactionScope::Known => cfg.output.compact_min_bytes,
-            super::output::CompactionScope::Generic => cfg.output.compact_generic_min_bytes,
-        };
+    let scope =
+        super::output::classify_compaction(&payload.tool_input.command, &cfg.output.verbatim);
+    let threshold = match scope {
+        super::output::CompactionScope::Verbatim => {
+            record(super::ledger::Outcome::Verbatim, bytes_in, None);
+            return Ok(0);
+        }
+        super::output::CompactionScope::Known => cfg.output.compact_min_bytes,
+        super::output::CompactionScope::Generic => cfg.output.compact_generic_min_bytes,
+        // Issue #412: a unified diff gets its own, generous threshold --
+        // `diff_max_bytes` -- rather than either compaction threshold above,
+        // since above it the replacement is a bounded per-file listing, not
+        // the generic head/tail scan.
+        super::output::CompactionScope::Diff => cfg.output.diff_max_bytes,
+    };
     if combined.len() < threshold {
+        record(super::ledger::Outcome::BelowThreshold, bytes_in, None);
         return Ok(0);
     }
-    let Ok(state) = StateDir::resolve(env) else {
-        return Ok(0);
-    };
     let command = if payload.tool_input.command.trim().is_empty() {
         vec!["(bash)".to_string()]
     } else {
         vec![payload.tool_input.command.clone()]
     };
-    let Ok((_, summary)) = super::output::capture_text(
+    let Ok((id, summary)) = super::output::capture_text(
         &state,
         &cwd,
         &command,
         None,
         &combined,
         cfg.output.max_summary_bytes,
+        scope,
     ) else {
         // Nothing was stored, so nothing may be replaced: handing back a
         // summary whose retrieval line names a file that does not exist would
         // turn this from compression into loss.
+        record(super::ledger::Outcome::PersistFailed, bytes_in, None);
         return Ok(0);
     };
     // `None` means the summary could not carry its own MANDATORY failure
@@ -2555,8 +2775,14 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // silently dropped a `fatal:` is strictly worse than not replacing it, so
     // this fails open like every other path in here.
     let Some(summary) = summary else {
+        record(super::ledger::Outcome::PersistFailed, bytes_in, Some(&id));
         return Ok(0);
     };
+    record(
+        super::ledger::Outcome::Compacted,
+        summary.len() as u64,
+        Some(&id),
+    );
     let _ = writeln!(w, "{}", posttool_output(&summary, response.interrupted));
     Ok(0)
 }
@@ -5900,6 +6126,70 @@ mod tests {
         assert!(out.is_empty(), "{out}");
     }
 
+    /// Issue #422: a large `Bash` result that gets replaced also records
+    /// exactly one `compacted` row to the compaction ledger, with `bytes_in`
+    /// the original size and `bytes_out` the (much smaller) summary size.
+    #[test]
+    fn posttool_records_a_compacted_row_in_the_ledger() {
+        let rig = posttool_rig(&[]);
+        let original = noisy_output();
+        run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "cargo test",
+                serde_json::json!({
+                    "stdout": original,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+
+        let state = crate::commands::ctx::state::StateDir::from_root(rig.state.clone());
+        let rows = crate::commands::ctx::ledger::rows_for_test(&state);
+        assert_eq!(rows.len(), 1, "exactly one row, {rows:?}");
+        let (outcome, bytes_in, bytes_out) = &rows[0];
+        assert_eq!(outcome, "compacted");
+        assert_eq!(*bytes_in, original.len() as u64);
+        assert!(
+            *bytes_out < *bytes_in,
+            "a compacted row's bytes_out must be smaller: {bytes_out} vs {bytes_in}"
+        );
+    }
+
+    /// Below-threshold results also get a ledger row -- `below_threshold`,
+    /// with `bytes_out` equal to `bytes_in` since nothing was replaced.
+    #[test]
+    fn posttool_records_a_below_threshold_row_in_the_ledger() {
+        let rig = posttool_rig(&[]);
+        let small = "On branch main\nnothing to commit\n";
+        run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "git status",
+                serde_json::json!({
+                    "stdout": small,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+
+        let state = crate::commands::ctx::state::StateDir::from_root(rig.state.clone());
+        let rows = crate::commands::ctx::ledger::rows_for_test(&state);
+        assert_eq!(rows.len(), 1, "exactly one row, {rows:?}");
+        let (outcome, bytes_in, bytes_out) = &rows[0];
+        assert_eq!(outcome, "below_threshold");
+        assert_eq!(*bytes_in, small.len() as u64);
+        assert_eq!(*bytes_out, *bytes_in);
+    }
+
     /// Every fail-open path: a tool this hook knows nothing about, an image
     /// result, a result claude already offloaded itself, and stdin that is
     /// not the documented payload at all.
@@ -5972,7 +6262,13 @@ mod tests {
 
     /// Review finding 6: a model reads a READER's output verbatim before
     /// editing against it, so head/tail there does not cost tokens, it
-    /// corrupts the edit. These are never compacted at any size.
+    /// corrupts the edit. `cat`/`sed`/`rg`/piped output are never compacted
+    /// at any size; `git diff`/`show` moved to a bounded `Diff` scope (issue
+    /// #412), so this fixture -- comfortably below the default
+    /// `diff_max_bytes` -- still reaches the model untouched, exercising
+    /// that generous threshold rather than an unconditional exemption. See
+    /// `posttool_compacts_a_diff_only_past_diff_max_bytes` for what happens
+    /// once a diff clears it.
     #[test]
     fn posttool_never_compacts_a_reader_command() {
         let rig = posttool_rig(&[]);
@@ -6046,6 +6342,220 @@ mod tests {
         }
     }
 
+    /// A synthetic unified diff of `file_count` files, each with one hunk of
+    /// `lines_per_file` `+`/`-` pairs -- big enough, at a large `file_count`,
+    /// to comfortably clear both `diff_max_bytes` and `max_summary_bytes`.
+    fn fake_diff(file_count: usize, lines_per_file: usize) -> String {
+        let mut text = String::new();
+        for i in 0..file_count {
+            text.push_str(&format!("diff --git a/src/gen{i}.rs b/src/gen{i}.rs\n"));
+            text.push_str("index 1111111..2222222 100644\n");
+            text.push_str(&format!("--- a/src/gen{i}.rs\n"));
+            text.push_str(&format!("+++ b/src/gen{i}.rs\n"));
+            text.push_str(&format!("@@ -1,{lines_per_file} +1,{lines_per_file} @@\n"));
+            for line in 0..lines_per_file {
+                text.push_str(&format!("-old body line {line} of the generated file\n"));
+                text.push_str(&format!("+new body line {line} of the generated file\n"));
+            }
+        }
+        text
+    }
+
+    /// Issue #412, acceptance criterion: a 20 KB diff is left untouched (its
+    /// bytes are well below the default `diff_max_bytes`), and a diff that
+    /// clears `diff_max_bytes` is replaced with a bounded per-file listing --
+    /// never a head/tail, and never a `@@` hunk header.
+    #[test]
+    fn posttool_compacts_a_diff_only_past_diff_max_bytes() {
+        let rig = posttool_rig(&[]);
+        let small_diff = fake_diff(20, 20);
+        assert!(
+            small_diff.len() < 65536,
+            "fixture must stay below the default diff_max_bytes: {} bytes",
+            small_diff.len()
+        );
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "git diff main...HEAD",
+                serde_json::json!({
+                    "stdout": small_diff,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(
+            out.is_empty(),
+            "a diff well below diff_max_bytes must reach the model untouched: {out}"
+        );
+
+        let big_diff = fake_diff(400, 60);
+        assert!(
+            big_diff.len() > 65536,
+            "fixture must clear the default diff_max_bytes: {} bytes",
+            big_diff.len()
+        );
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "git diff main...HEAD",
+                serde_json::json!({
+                    "stdout": big_diff.clone(),
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let summary = parsed["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .expect("a summary");
+        assert!(!summary.contains("@@"), "{summary}");
+        assert!(summary.contains("totals:"), "{summary}");
+        assert!(summary.contains("400 files changed"), "{summary}");
+        assert!(
+            summary.contains("full output: zirv ctx output show"),
+            "{summary}"
+        );
+        assert!(summary.len() <= 4096, "{} bytes", summary.len());
+
+        // The stored file is still byte-identical to what claude handed the
+        // hook -- the diff's own bytes were never touched, only the summary.
+        let dir = rig
+            .state
+            .join("outputs")
+            .join(crate::commands::ctx::state::repo_slug(&rig.repo));
+        let log = std::fs::read_dir(&dir)
+            .expect("outputs dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "log"))
+            .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .expect("a stored log");
+        assert_eq!(
+            std::fs::read(&log).expect("read log"),
+            big_diff.as_bytes(),
+            "the persisted diff must be byte-identical to the original"
+        );
+    }
+
+    /// The narrow-only operator knob actually gates the hook: lowering
+    /// `diff_max_bytes` compacts a diff that the default would have left
+    /// alone.
+    #[test]
+    fn posttool_honours_a_lowered_diff_max_bytes() {
+        let rig = posttool_rig(&[("ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES", "1024")]);
+        let diff = fake_diff(5, 5);
+        assert!(diff.len() > 1024, "{}", diff.len());
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "git show HEAD",
+                serde_json::json!({
+                    "stdout": diff,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        assert!(
+            !out.is_empty(),
+            "a lowered diff_max_bytes must still compact a diff above it"
+        );
+    }
+
+    /// Issue #413 end to end: a `pytest` result over the compaction
+    /// threshold gets the family extractor's exact names and locations
+    /// (`testrun::extract_pytest`), not the generic scan's diagnostic-line
+    /// guesswork.
+    #[test]
+    fn posttool_compacts_a_pytest_failure_with_names_and_locations() {
+        let rig = posttool_rig(&[]);
+        let mut output: String = (1..=400)
+            .map(|i| format!("collecting item {i}\n"))
+            .collect();
+        output.push_str(
+            "=========================== short test summary info ===========================\n",
+        );
+        output.push_str("FAILED test_foo.py::test_alpha - AssertionError: 1 != 2\n");
+        output.push_str(
+            "========================= 1 failed, 400 passed in 1.2s =========================\n",
+        );
+        assert!(output.len() >= 4096, "{}", output.len());
+
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "pytest -q",
+                serde_json::json!({
+                    "stdout": output,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let summary = parsed["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .expect("a summary");
+        assert!(summary.contains("test_foo.py::test_alpha"), "{summary}");
+        assert!(summary.contains("test_foo.py"), "{summary}");
+        assert!(summary.contains("AssertionError: 1 != 2"), "{summary}");
+    }
+
+    /// Issue #413, "green is never red": a clean `pytest` run past the
+    /// compaction threshold must never surface a failure block, even though
+    /// the generic scan's own diagnostic heuristic (`error:`/`warning:`)
+    /// never runs a pytest-specific check to rule that out on its own.
+    #[test]
+    fn posttool_never_reports_a_clean_pytest_run_as_red() {
+        let rig = posttool_rig(&[]);
+        let mut output: String = (1..=400)
+            .map(|i| format!("test_foo.py::test_{i} PASSED\n"))
+            .collect();
+        output.push_str(
+            "============================== 400 passed in 1.2s ===============================\n",
+        );
+        assert!(output.len() >= 4096, "{}", output.len());
+
+        let out = run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "pytest -q",
+                serde_json::json!({
+                    "stdout": output,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let summary = parsed["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .expect("a summary");
+        assert!(
+            !summary.to_ascii_uppercase().contains("FAILED"),
+            "a clean pytest run must never be reported red: {summary}"
+        );
+        assert!(summary.contains("all tests passed"), "{summary}");
+    }
+
     /// Review finding 6b/6c: a modelled build/test family is compacted from
     /// the low threshold, because the summary provably keeps the lines that
     /// matter; an unrecognised producer only past the much higher generic
@@ -6093,9 +6603,15 @@ mod tests {
             "an unrecognised 5 KB result stays verbatim: {unknown}"
         );
 
-        let twenty_kb: String = (1..=1000)
+        // One `warning:` line keeps this fixture out of issue #409b's
+        // clean-run one-liner (this hook path has no exit code of its own,
+        // so "nothing flagged at all" is what that shape looks for) -- this
+        // test is about the omitted-range message a non-clean generic
+        // summary states, not about the clean path.
+        let mut twenty_kb: String = (1..=1000)
             .map(|i| format!("some tool output line {i}\n"))
             .collect();
+        twenty_kb.push_str("warning: something noteworthy happened\n");
         assert!(twenty_kb.len() > 16384);
         let big_unknown = run_post(
             &rig,
@@ -7033,6 +7549,220 @@ mod tests {
             "every write is logged regardless of whether the note surfaced: {rows:?}"
         );
         assert!(rows.iter().all(|row| row.outcome == "advised"));
+    }
+
+    // -- PreToolUse: the bare `git log` rewrite (issue #419) ----------------
+
+    fn bash_pretool_stdin(cwd: &str, command: &str) -> String {
+        orchestrator_pretool_stdin(
+            cwd,
+            "claude-session-id",
+            "Bash",
+            serde_json::json!({"command": command}),
+        )
+    }
+
+    /// End to end: an unlimited `git log` gets `-n 50` appended via
+    /// `updatedInput`, and the reason names the rewrite.
+    #[test]
+    fn run_pretool_rewrites_a_bare_git_log_with_a_cap() {
+        let repo = orchestrator_repo();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.path().display().to_string(), "git log"),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["updatedInput"]["command"],
+            "git log -n 50"
+        );
+        assert!(
+            parsed["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rewrite"),
+            "got {parsed}"
+        );
+    }
+
+    /// A `git log` that already names its own limit -- `-n`, `--max-count=`,
+    /// or a bare `-<digits>` -- is left completely untouched: no output at
+    /// all, since nothing else can fire for a `Bash` call.
+    #[test]
+    fn run_pretool_leaves_an_already_limited_git_log_alone() {
+        let repo = orchestrator_repo();
+        for command in ["git log -n 5", "git log --max-count=3", "git log -3"] {
+            let mut out = Vec::new();
+            let code = run_pretool(
+                &mut out,
+                &bash_pretool_stdin(&repo.path().display().to_string(), command),
+                &|_| None,
+            )
+            .expect("never errors");
+            assert_eq!(code, 0);
+            assert!(
+                out.is_empty(),
+                "{command} already names its own limit, so no updatedInput: {out:?}"
+            );
+        }
+    }
+
+    /// A piped `git log` is left alone entirely -- the author already shaped
+    /// its output, so the whole command is skipped rather than only the
+    /// `git log` part.
+    #[test]
+    fn run_pretool_leaves_a_piped_git_log_alone() {
+        let repo = orchestrator_repo();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.path().display().to_string(), "git log | head"),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a pipe means the author already shaped the output: {out:?}"
+        );
+    }
+
+    /// A compound command is left alone entirely, even when one of its parts
+    /// is a bare `git log` -- the rewrite only ever fires when the WHOLE
+    /// trimmed command is a single `git log` invocation, never a piece of a
+    /// chain.
+    #[test]
+    fn run_pretool_leaves_a_compound_git_log_alone() {
+        let repo = orchestrator_repo();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.path().display().to_string(), "git log && ls"),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a compound command is not picked apart to rewrite one piece of it: {out:?}"
+        );
+    }
+
+    /// Review finding F5: a trailing shell comment on an otherwise-bare
+    /// `git log` must never be rewritten -- appending ` -n 50` after a `#`
+    /// lands INSIDE the comment, so the command a shell actually runs stays
+    /// exactly as unbounded as before the "fix".
+    #[test]
+    fn run_pretool_leaves_a_commented_git_log_alone() {
+        let repo = orchestrator_repo();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(
+                &repo.path().display().to_string(),
+                "git log # include all history",
+            ),
+            &|_| None,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a trailing `#` comment must never be rewritten: {out:?}"
+        );
+    }
+
+    /// A denied command -- the expensive-seat guard's fork denial, and the
+    /// orchestrator-write guard's edit denial -- never carries `updatedInput`
+    /// alongside its deny envelope.
+    #[test]
+    fn run_pretool_never_attaches_updated_input_to_a_denied_command() {
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::adapters::SEAT_MODEL_ENV.to_string(),
+            "fable".to_string(),
+        )]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin(
+                "Agent",
+                serde_json::json!({"subagent_type": "fork", "prompt": "do the thing"}),
+            ),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            parsed["hookSpecificOutput"].get("updatedInput").is_none(),
+            "a fork denial must never carry updatedInput: {parsed}"
+        );
+
+        let repo = orchestrator_repo();
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+                "deny".to_string(),
+            ),
+        ]
+        .into();
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &edit_payload_stdin(repo.path(), "src/x.rs"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        let printed = String::from_utf8(out).expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(printed.trim()).expect("json");
+        assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            parsed["hookSpecificOutput"].get("updatedInput").is_none(),
+            "an orchestrator-write denial must never carry updatedInput: {parsed}"
+        );
+    }
+
+    /// The decision-log row for a rewrite records BOTH the original and the
+    /// rewritten command, action `"rewrite"`.
+    #[test]
+    fn run_pretool_rewrite_logs_the_original_and_rewritten_commands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = orchestrator_repo();
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &bash_pretool_stdin(&repo.path().display().to_string(), "git log"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+        assert!(!out.is_empty());
+
+        let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log written");
+        assert!(log.contains("\"action\":\"rewrite\""), "got {log}");
+        assert!(log.contains("git log -> git log -n 50"), "got {log}");
     }
 
     // -- the seat env the orchestrator exports ------------------------------

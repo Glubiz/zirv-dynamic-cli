@@ -89,6 +89,7 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "mail.max_message_bytes",
     "optimize.enabled",
     "optimize.sessions_sampled",
+    "output.diff_max_bytes", // #412: repo may only lower the diff byte budget (min-merge).
     "pace.enabled",
     "pace.fallback_delay_secs",
     "pace.jitter_secs",

@@ -29,6 +29,7 @@ pub mod handoff;
 pub mod handover;
 pub mod hook;
 pub mod judge;
+pub mod ledger;
 pub mod log;
 pub mod mail;
 pub mod measure;
@@ -38,6 +39,8 @@ pub mod memory_optimize;
 pub mod objective;
 pub mod optimize;
 pub mod output;
+pub(crate) mod output_diff;
+pub(crate) mod output_shape;
 pub mod pace;
 pub(crate) mod pathutil;
 pub mod permissions;
@@ -73,6 +76,7 @@ pub mod supervise;
 pub mod surface;
 pub mod task;
 pub mod term;
+pub(crate) mod testrun;
 pub mod transcript_source;
 pub mod usage;
 pub mod window;
@@ -483,6 +487,10 @@ pub enum CtxVerb {
     Objective(objective::ObjectiveArgs),
     /// Aggregate delegation spend from the cost ledger (issue #264).
     Spend(spend::SpendArgs),
+    /// Report how much `zirv ctx run`'s compact-output hook has actually
+    /// saved: rows, bytes in/out, saved bytes/percent, an outcome breakdown
+    /// and a dollar estimate (issue #422).
+    Savings(ledger::SavingsArgs),
     /// Print a redacted, capped diagnostic-state summary (issue #320).
     Snapshot(snapshot::SnapshotArgs),
     /// Zero-model cross-session recall: rank transcripts, handoffs, work
@@ -623,6 +631,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Compile(a) => compile::run(a, &mut out),
         CtxVerb::Objective(a) => objective::run(a, &mut out),
         CtxVerb::Spend(a) => spend::run(a, &mut out),
+        CtxVerb::Savings(a) => ledger::run(a, &mut out),
         CtxVerb::Snapshot(a) => snapshot::run(a, &mut out),
         CtxVerb::Search(a) => search::run(a, &mut out),
         CtxVerb::Worktree(a) => worktree::run(a, &mut out),
@@ -881,6 +890,30 @@ mod tests {
                 command: output::OutputVerb::List(_)
             })
         ));
+    }
+
+    /// Issue #422: `savings` defaults `--since` to `7d` and parses
+    /// `--project` as a bare flag.
+    #[test]
+    fn savings_verb_parses_with_its_default_since_and_the_project_flag() {
+        let cli = CtxCli::try_parse_from(["zirv ctx", "savings"]).expect("savings should parse");
+        match cli.verb {
+            CtxVerb::Savings(a) => {
+                assert_eq!(a.since, "7d");
+                assert!(!a.project);
+            }
+            other => panic!("expected Savings, got {other:?}"),
+        }
+
+        let cli = CtxCli::try_parse_from(["zirv ctx", "savings", "--since", "24h", "--project"])
+            .expect("savings --since --project should parse");
+        match cli.verb {
+            CtxVerb::Savings(a) => {
+                assert_eq!(a.since, "24h");
+                assert!(a.project);
+            }
+            other => panic!("expected Savings, got {other:?}"),
+        }
     }
 
     /// Issue #267: `--mode` unstated defaults to `Writing` -- a wrong
