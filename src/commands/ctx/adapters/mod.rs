@@ -2222,8 +2222,13 @@ pub fn program_is_present(program: &str) -> bool {
 /// a diagnostic reason for an operator-facing surface (`compile --measure`'s
 /// own note column) only; nothing in this module ever prints it into a
 /// session's own prompt.
+///
+/// `pub(crate)`: also the verdict [`adapter_liveness`] hands back to
+/// `chat::harness_list`, so the chat banner's roster and this module's own
+/// injected roster (`harness_roster_lines`) read the same fail-open rule off
+/// one type instead of each defining its own notion of "live".
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Liveness {
+pub(crate) enum Liveness {
     Live,
     Absent(String),
     Unknown(String),
@@ -2232,7 +2237,7 @@ enum Liveness {
 impl Liveness {
     /// `Live` and `Unknown` both earn a line (fail-open); only a confirmed
     /// `Absent` is omitted. See this type's own doc comment.
-    fn emits_line(&self) -> bool {
+    pub(crate) fn emits_line(&self) -> bool {
         !matches!(self, Liveness::Absent(_))
     }
 }
@@ -2948,12 +2953,54 @@ pub struct HarnessRosterReport {
     pub omitted_bytes: usize,
 }
 
+/// Steps 2-4 of `harness_roster_lines`' own per-adapter loop, isolated so
+/// `chat::harness_list` reaches the identical verdict without
+/// re-implementing the `agent_bin` override handling
+/// (`agent_bin_names_a_different_adapter`) or the issue #298 liveness
+/// probe's own `PATH` walk. Neither caller's enabled-gate check lives here
+/// -- each still gates on `cfg.agents` itself before calling this for a name
+/// it already knows is enabled.
+///
+/// `Ok((adapter, verdict))` when `ready()` succeeds, handing back the built
+/// adapter itself so a caller that also needs `program()`/`capabilities()`
+/// reuses this same instance rather than constructing another. `Err(reason)`
+/// when `ready()` itself fails, carrying its error text -- fail-open,
+/// exactly like `Liveness::Unknown`: the caller still counts the adapter as
+/// present.
+///
+/// `cache: None` runs the probe fresh every call, right for
+/// `chat::harness_list` (a banner rendered once at startup); `harness_
+/// roster_lines` threads its own per-repository `ProbeCache` through
+/// instead, unchanged from before this function existed.
+pub(crate) fn adapter_liveness(
+    cfg: &CtxConfig,
+    name: &str,
+    cache: Option<&mut ProbeCache>,
+) -> Result<(Box<dyn AgentAdapter>, Liveness), String> {
+    let bin = cfg.agent_bin.as_deref();
+    let Some((_, ctor)) = ADAPTERS.iter().find(|(n, _)| *n == name) else {
+        return Err(format!("no adapter registered for '{name}'"));
+    };
+    let names_other = agent_bin_names_a_different_adapter(bin, name).is_some();
+    let adapter = if names_other { ctor(None) } else { ctor(bin) };
+    adapter.ready().map_err(|err| err.to_string())?;
+    let program = adapter.program().to_string();
+    let resolved_bin = if names_other { None } else { bin };
+    let verdict = match cache {
+        Some(cache) => {
+            let key = ProbeCache::key(name, &program, resolved_bin);
+            cache.get_or_probe(&key, || liveness_probe(name, &program))
+        }
+        None => liveness_probe(name, &program),
+    };
+    Ok((adapter, verdict))
+}
+
 fn harness_roster_lines(
     cfg: &CtxConfig,
     current_adapter: &str,
     mut cache: Option<&mut ProbeCache>,
 ) -> HarnessRosterReport {
-    let bin = cfg.agent_bin.as_deref();
     let mut lines: Vec<String> = Vec::new();
     let mut omitted_texts: Vec<String> = Vec::new();
     // Issue #298 review follow-up: every name that earns its own per-adapter
@@ -2964,7 +3011,7 @@ fn harness_roster_lines(
     // liveness verdict already computed (and cached) in this same loop is
     // reused, not recomputed, so the injected prefix stays byte-stable.
     let mut roster_names: Vec<&str> = Vec::new();
-    for (name, ctor) in ADAPTERS {
+    for (name, _) in ADAPTERS {
         let name: &str = name;
         let is_self = name == current_adapter;
         let (enabled, location) = cfg
@@ -2981,19 +3028,8 @@ fn harness_roster_lines(
             continue;
         }
 
-        let names_other = agent_bin_names_a_different_adapter(bin, name).is_some();
-        let adapter = if names_other { ctor(None) } else { ctor(bin) };
-        match adapter.ready() {
-            Ok(()) => {
-                let program = adapter.program();
-                let resolved_bin = if names_other { None } else { bin };
-                let verdict = match cache.as_deref_mut() {
-                    Some(cache) => {
-                        let key = ProbeCache::key(name, program, resolved_bin);
-                        cache.get_or_probe(&key, || liveness_probe(name, program))
-                    }
-                    None => liveness_probe(name, program),
-                };
+        match adapter_liveness(cfg, name, cache.as_deref_mut()) {
+            Ok((adapter, verdict)) => {
                 if let Liveness::Unknown(reason) = &verdict {
                     eprintln!(
                         "zirv ctx: liveness probe for '{name}' inconclusive ({reason}); \
@@ -3002,6 +3038,7 @@ fn harness_roster_lines(
                     );
                 }
                 if !verdict.emits_line() {
+                    let program = adapter.program();
                     omitted_texts.push(format!("- {name}: not installed (no '{program}' found)"));
                     continue;
                 }
@@ -3033,8 +3070,7 @@ fn harness_roster_lines(
                 });
                 roster_names.push(name);
             }
-            Err(err) => {
-                let reason = err.to_string();
+            Err(reason) => {
                 let short = reason.lines().next().unwrap_or(&reason);
                 lines.push(format!("- {name}: installed? not ready ({short})"));
                 roster_names.push(name);
