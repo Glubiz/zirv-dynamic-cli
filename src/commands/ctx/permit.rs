@@ -46,7 +46,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use super::sessions::is_alive;
+use super::sessions;
 use super::state::{self, StateDir};
 
 /// Re-review (2026-08-27) finding 2a: how long an unparseable slot file is
@@ -146,6 +146,8 @@ pub enum WorkerMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermitRecord {
     pub pid: u32,
+    #[serde(default)]
+    pub pid_start_time: Option<u64>,
     /// Finding B5: `pid` above is the script-runner (parent `zirv`) process
     /// that called [`acquire`], not the actual heavy child it goes on to
     /// spawn (`Command::invoke` acquires the permit before `TokioCommand`
@@ -158,6 +160,8 @@ pub struct PermitRecord {
     /// deserializes as `None` rather than failing to parse.
     #[serde(default)]
     pub child_pid: Option<u32>,
+    #[serde(default)]
+    pub child_start_time: Option<u64>,
     pub label: String,
     pub acquired_at: u64,
     /// Issue #267: which pool this record belongs to. `#[serde(default)]`
@@ -284,6 +288,7 @@ impl HeavyPermit {
             return;
         };
         record.child_pid = Some(child_pid);
+        record.child_start_time = sessions::process_start_secs(child_pid);
         if let Ok(json) = serde_json::to_string_pretty(&record) {
             // Atomic temp-then-rename, never a truncating write: other
             // processes read this file concurrently via `live_records_in`,
@@ -303,7 +308,25 @@ impl HeavyPermit {
 /// sweep -- so the rule can never independently drift between the two
 /// (review finding, 2026-09).
 fn permit_record_is_alive(record: &PermitRecord) -> bool {
-    is_alive(record.pid) || record.child_pid.is_some_and(is_alive)
+    permit_record_is_alive_with(
+        record,
+        sessions::process_start_secs(record.pid),
+        record.child_pid.and_then(sessions::process_start_secs),
+    )
+}
+
+fn permit_record_is_alive_with(
+    record: &PermitRecord,
+    parent_start: Option<u64>,
+    child_start: Option<u64>,
+) -> bool {
+    let alive = |pid, recorded, current| {
+        sessions::is_alive(pid) && !sessions::start_time_disambiguates_dead(recorded, current)
+    };
+    alive(record.pid, record.pid_start_time, parent_start)
+        || record
+            .child_pid
+            .is_some_and(|pid| alive(pid, record.child_start_time, child_start))
 }
 
 /// Pure: whether `modified` is more than `grace_secs` older than `now`. Split
@@ -335,23 +358,11 @@ fn slot_file_is_stale(path: &Path, grace_secs: u64) -> bool {
 
 /// Every heavy-operation permit currently held, sweeping (and never
 /// including) any entry whose owning pid is no longer alive -- reusing
-/// `sessions::is_alive`, the bare-pid signal-0 probe, rather than a second,
-/// independently-drifting copy -- so a permit left behind by a killed or
-/// crashed holder never wedges the budget forever. A directory that does not
+/// the same pid/start-time comparison as reservations -- so a permit left
+/// behind by a killed or crashed holder never wedges the budget forever. A directory that does not
 /// exist yet, or a file that fails to read or parse, both read as "not
 /// held": nothing on a fresh machine, and one malformed file must never fail
 /// the whole listing.
-///
-/// Issue #152: `sessions::list`'s own sweep moved on to `sessions::
-/// record_is_alive`, which disambiguates an `EPERM`-read pid by comparing a
-/// `Record`'s stamped `start_time` against a freshly read one. `PermitRecord`
-/// carries no `start_time` and deliberately is not getting one in that same
-/// change -- a permit slot's failure mode is different from a session
-/// record's: it is not offered for restore or addressed by a human-typed
-/// prefix, so a wedged slot merely outlives its holder briefly and then
-/// frees the moment that pid genuinely frees (or `is_alive`'s own `EPERM`
-/// residual applies, same as before). Extending `PermitRecord` to carry a
-/// start time too is a deliberate non-goal of this fix, not an oversight.
 ///
 /// Exposed as records, not just a count (issue #162): `status.rs`'s
 /// occupancy line and `script_runner`'s wait message both need to name WHO
@@ -436,6 +447,8 @@ pub fn live_count(state: &StateDir) -> usize {
 pub fn acquire(state: &StateDir, limit: usize, label: &str) -> Option<HeavyPermit> {
     let record = PermitRecord {
         pid: std::process::id(),
+        pid_start_time: sessions::process_start_secs(std::process::id()),
+        child_start_time: None,
         child_pid: None,
         label: label.to_string(),
         acquired_at: state::now_secs(),
@@ -726,6 +739,8 @@ pub fn acquire_writer(
     let key = tree_key(tree);
     let record = PermitRecord {
         pid: std::process::id(),
+        pid_start_time: sessions::process_start_secs(std::process::id()),
+        child_start_time: None,
         child_pid: None,
         label: label.to_string(),
         acquired_at: state::now_secs(),
@@ -793,11 +808,44 @@ fn claim_is_verified(path: &Path, expected_pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recycled_permit_owners_are_dead_but_legacy_claims_use_bare_pids() {
+        let pid = std::process::id();
+        // Omitted start-time fields model a claim written by an older binary.
+        let mut record: PermitRecord = serde_json::from_value(serde_json::json!({
+            "pid": pid, "label": "writer", "acquired_at": 0, "kind": "writer"
+        }))
+        .expect("legacy claim");
+        let dead_pid = 2_000_000_000;
+        assert!(!sessions::is_alive(dead_pid));
+        for child_owner in [false, true] {
+            record.pid = if child_owner { dead_pid } else { pid };
+            record.child_pid = child_owner.then_some(pid);
+            record.pid_start_time = None;
+            record.child_start_time = None;
+            assert!(permit_record_is_alive_with(&record, Some(4600), Some(4600)));
+            if child_owner {
+                record.child_start_time = Some(1000);
+            } else {
+                record.pid_start_time = Some(1000);
+            }
+            assert!(!permit_record_is_alive_with(
+                &record,
+                Some(4600),
+                Some(4600)
+            ));
+            assert!(permit_record_is_alive_with(&record, Some(1000), Some(1000)));
+            assert!(permit_record_is_alive_with(&record, None, None));
+        }
+    }
+
     fn write_orphan_permit(state: &StateDir, label: &str, pid: u32) {
         let dir = permits_dir(state);
         state::create_private_dir_all(&dir).expect("mkdir");
         let record = PermitRecord {
             pid,
+            pid_start_time: None,
+            child_start_time: None,
             child_pid: None,
             label: label.to_string(),
             acquired_at: state::now_secs(),
@@ -825,6 +873,8 @@ mod tests {
         let path = tmp.path().join("slot-0.json");
         let record = PermitRecord {
             pid: 4242,
+            pid_start_time: None,
+            child_start_time: None,
             child_pid: None,
             label: "cargo build".to_string(),
             acquired_at: state::now_secs(),
@@ -1005,6 +1055,8 @@ mod tests {
         state::create_private_dir_all(&dir).expect("mkdir");
         let record = PermitRecord {
             pid: dead_pid,
+            pid_start_time: None,
+            child_start_time: None,
             child_pid: Some(std::process::id()),
             label: "cargo build".to_string(),
             acquired_at: state::now_secs(),
@@ -1149,6 +1201,8 @@ mod tests {
         let pid = std::process::id();
         let json = serde_json::to_string_pretty(&PermitRecord {
             pid,
+            pid_start_time: None,
+            child_start_time: None,
             child_pid: None,
             label: "cargo build".to_string(),
             acquired_at: state::now_secs(),
@@ -1187,6 +1241,8 @@ mod tests {
         let path = slot_path(&dir, 0);
         let json = serde_json::to_string_pretty(&PermitRecord {
             pid: std::process::id().wrapping_add(1),
+            pid_start_time: None,
+            child_start_time: None,
             child_pid: None,
             label: "someone else's claim".to_string(),
             acquired_at: state::now_secs(),
@@ -1213,6 +1269,8 @@ mod tests {
         let own_pid = std::process::id();
         let json = serde_json::to_string_pretty(&PermitRecord {
             pid: own_pid,
+            pid_start_time: None,
+            child_start_time: None,
             child_pid: None,
             label: "cargo build".to_string(),
             acquired_at: state::now_secs(),
@@ -1417,6 +1475,8 @@ mod tests {
         state::create_private_dir_all(&dir).expect("mkdir");
         let record = PermitRecord {
             pid: dead_pid,
+            pid_start_time: None,
+            child_start_time: None,
             child_pid: None,
             label: "worker-a".to_string(),
             acquired_at: state::now_secs(),
@@ -1515,6 +1575,8 @@ mod tests {
         state::create_private_dir_all(&dir).expect("mkdir");
         let record = PermitRecord {
             pid: dead_pid,
+            pid_start_time: None,
+            child_start_time: None,
             child_pid: None,
             label: "worker-a".to_string(),
             acquired_at: state::now_secs(),
@@ -1597,6 +1659,8 @@ mod tests {
         let key = tree_key(&tree);
         let record = PermitRecord {
             pid: dead_pid,
+            pid_start_time: None,
+            child_start_time: None,
             child_pid: Some(std::process::id()),
             label: "worker-a".to_string(),
             acquired_at: state::now_secs(),
