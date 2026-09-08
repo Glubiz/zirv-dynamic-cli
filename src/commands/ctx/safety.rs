@@ -1906,7 +1906,10 @@ fn envelope_write_targets_confined(
             Some(cwd) => resolve_repo_write_target(path, &cwd.to_string_lossy())?,
             None => path.to_string(),
         };
-        Some(envelope::PathScope::new(path))
+        let path = path.replace('\\', "/");
+        let absolute = path.starts_with('/')
+            || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes().get(2) == Some(&b'/'));
+        Some((envelope::PathScope::new(path), absolute))
     };
     let roots = envelope
         .paths
@@ -1925,8 +1928,11 @@ fn envelope_write_targets_confined(
             if target.contains(['$', '`', '~', '*', '?']) {
                 return None;
             }
-            let scope = resolve(target)?;
-            if !roots.iter().any(|root| scope.is_subset_of(root)) {
+            let (scope, absolute) = resolve(target)?;
+            if !roots
+                .iter()
+                .any(|(root, root_absolute)| absolute == *root_absolute && scope.is_subset_of(root))
+            {
                 confined = false;
             }
         }
@@ -8365,7 +8371,12 @@ fn run_check_hook_mode_with_env<W: Write>(
     });
     let orchestrator_posture = super::hook::orchestrator_write_posture(cfg);
 
-    let cwd = (!payload.cwd.is_empty()).then(|| Path::new(&payload.cwd));
+    let cwd = if payload.cwd.is_empty() {
+        std::env::current_dir().ok()
+    } else {
+        Some(Path::new(&payload.cwd).to_path_buf())
+    };
+    let cwd = cwd.as_deref();
     let evidence = evaluate_with_attestation_evidence(
         &cfg.safety,
         &effective_command,
@@ -15249,32 +15260,31 @@ mod tests {
     #[test]
     fn envelope_write_scopes_resolve_relative_and_absolute_targets_against_the_hook_cwd() {
         let mut envelope = safety_test_envelope();
-        for (scope, target, confined) in [
-            ("allowed", "allowed/out.txt", true),
-            ("allowed", "/w/allowed/out.txt", true),
-            ("allowed", "/allowed/out.txt", false),
-            ("allowed", "../out.txt", false),
-            ("allowed", "allowed/../allowed/out.txt", true),
-            (".", "/w/anything", true),
-            (".", "sub/file", true),
-            (".", "/etc/passwd", false),
+        for (scope, target, cwd, confined) in [
+            ("allowed", "allowed/out.txt", Some("/w"), true),
+            ("allowed", "/w/allowed/out.txt", Some("/w"), true),
+            ("allowed", "/allowed/out.txt", Some("/w"), false),
+            ("allowed", "../out.txt", Some("/w"), false),
+            ("allowed", "allowed/../allowed/out.txt", Some("/w"), true),
+            (".", "/w/anything", Some("/w"), true),
+            (".", "sub/file", Some("/w"), true),
+            (".", "/etc/passwd", Some("/w"), false),
+            ("allowed", "/allowed/out.txt", None, false),
+            ("/allowed", "allowed/out.txt", None, false),
+            ("allowed", "allowed/out.txt", None, true),
+            ("/allowed", "/allowed/out.txt", None, true),
         ] {
             envelope.paths = vec![envelope::PathScope::new(scope)];
             assert_eq!(
                 envelope_write_targets_confined(
                     &format!("echo x > {target}"),
                     &envelope,
-                    Some(Path::new("/w"))
+                    cwd.map(Path::new)
                 ),
                 Some(confined),
                 "{scope}: {target}"
             );
         }
-        envelope.paths = vec![envelope::PathScope::new("allowed")];
-        assert_eq!(
-            envelope_write_targets_confined("echo x > allowed/out", &envelope, None),
-            Some(true)
-        );
     }
 
     #[test]
@@ -15431,6 +15441,38 @@ mod tests {
             "echo x > /allowed/out.txt",
         ] {
             assert_eq!(check(&envelope, command, "default"), "deny", "{command}");
+        }
+    }
+
+    #[test]
+    fn an_empty_hook_cwd_resolves_envelope_paths_against_the_process_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let cfg = CtxConfig::load(repo.path(), &|_| None).unwrap();
+        let envelope = safety_test_envelope();
+        let raw = serde_json::to_string(&envelope).unwrap();
+        let env = |key: &str| (key == super::super::agent::ENVELOPE_ENV).then(|| raw.clone());
+        let cwd = std::env::current_dir().unwrap();
+        let allowed = cwd.join("allowed/out.txt");
+        for (target, decision) in [
+            (allowed.to_str().unwrap(), "allow"),
+            ("/allowed/out.txt", "deny"),
+            ("allowed/out.txt", "allow"),
+        ] {
+            let stdin = serde_json::json!({"tool_name":"Bash", "tool_input":{
+                "command":format!("echo x > {target}")}, "cwd":"", "permission_mode":"default"})
+            .to_string();
+            let mut out = Vec::new();
+            assert_eq!(
+                run_check_hook_mode_with_env(&cfg, &mut out, &stdin, &env).unwrap(),
+                0
+            );
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value["hookSpecificOutput"]["permissionDecision"], decision,
+                "{target}"
+            );
         }
     }
 
