@@ -9,6 +9,7 @@ use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{TranscriptUsage, input_hash};
 use super::group;
 use super::handoff::latest_for_repo;
+use super::ledger;
 use super::mail;
 use super::memory;
 use super::permit;
@@ -1193,6 +1194,13 @@ fn render_report<W: Write>(
             // `spend:` gets, and silent (no line at all) when nothing has
             // ever been blocked -- see `orchestrator_blocks_status_line`.
             if let Some(line) = orchestrator_blocks_status_line(&state, env, colour) {
+                writeln!(w, "{line}")?;
+            }
+            // Issue #422: present in `--brief` too, the same allowance
+            // `spend:`/`orchestrator writes:` get, and silent (no line at
+            // all) when the compaction ledger holds no row from the
+            // trailing 7 days -- see `ledger::status_line`.
+            if let Some(line) = ledger::status_line(&state, now_secs()) {
                 writeln!(w, "{line}")?;
             }
             if cfg.fallback.enabled && !args.brief {
@@ -3942,6 +3950,54 @@ mod tests {
             assert!(text.contains("this 5h window"), "brief={brief}: got {text}");
             assert!(text.contains("prices as of"), "brief={brief}: got {text}");
         }
+    }
+
+    /// Issue #422: the `compaction:` line is silent when the ledger holds no
+    /// row, and names the saved bytes/percent/count once a row exists within
+    /// the trailing 7 days.
+    #[test]
+    fn status_reports_compaction_savings_only_once_the_ledger_has_rows() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        let args = StatusArgs {
+            decisions: 5,
+            brief: false,
+            diff: false,
+            full: false,
+            breakdown: None,
+            json: false,
+        };
+
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned(), false).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("compaction:"), "empty ledger: got {text}");
+
+        ledger::record(
+            &state,
+            &ledger::CompactionRow {
+                ts: crate::commands::ctx::state::now_secs(),
+                tool_use_id: "toolu_1",
+                session: "sess-child",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 10_000,
+                bytes_out: 1_000,
+                outcome: ledger::Outcome::Compacted,
+                retrieval_id: Some("out1"),
+            },
+        );
+
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned(), false).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("compaction: saved"), "got {text}");
+        assert!(text.contains("1 results this week"), "got {text}");
     }
 
     /// Issues #328/#334, posture-aware since issue #358 T8: `orchestrator

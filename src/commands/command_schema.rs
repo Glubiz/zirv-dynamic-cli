@@ -96,6 +96,7 @@ const READ_ONLY: &[&str] = &[
     "zirv ctx group status",
     "zirv ctx compile",
     "zirv ctx spend",
+    "zirv ctx savings",
     "zirv ctx snapshot",
     "zirv ctx search",
     "zirv ctx output show",
