@@ -10,25 +10,30 @@
 //! Precision matters more here than anywhere else in compaction: the calling
 //! agent trusts the summary without ever seeing the raw text.
 //!
-//! [`extract`] picks a family from the command's own argv, then requires
-//! that family's own output markers to confirm the guess before trusting
-//! anything it found -- argv alone is not enough (`npm test` says nothing
-//! about which runner it wraps), and a marker alone is not enough either (a
-//! coincidental `FAILED` substring in unrelated output must not masquerade
-//! as a test failure). `None` means "apply the generic scan unchanged": the
-//! argv suggested no known family, the suggested family's markers were never
-//! seen (a compile error before any test ran, say), or a "some tests
-//! failed" marker was seen with nothing to correlate it to -- in every one
-//! of those cases the generic scan is the more honest answer than a family
-//! extraction with nothing in it.
+//! [`extract_streaming`] picks a family from the command's own argv, then
+//! requires that family's own output markers to confirm the guess before
+//! trusting anything it found -- argv alone is not enough (`npm test` says
+//! nothing about which runner it wraps), and a marker alone is not enough
+//! either (a coincidental `FAILED` substring in unrelated output must not
+//! masquerade as a test failure). `None` means "apply the generic scan
+//! unchanged": the argv suggested no known family, the suggested family's
+//! markers were never seen (a compile error before any test ran, say), or a
+//! "some tests failed" marker was seen with nothing to correlate it to -- in
+//! every one of those cases the generic scan is the more honest answer than
+//! a family extraction with nothing in it.
 //!
-//! Runs over the SAME bounded tail `output::summarize_stored`'s Pass 1
-//! (`workflow::verification::read_capped_tail_and_scan`) already retained --
-//! not a third independent read of a potentially huge log. A test runner's
-//! own failure detail and final summary are clustered near the end of its
-//! output, so the tail already carries what an extractor needs; see this
-//! crate's `output` module doc comment for the same "bounded second pass,
-//! never a second full read" discipline.
+//! Review finding F4: runs as a bounded STREAMING line scan over the FULL
+//! stored file, never only the capped display tail
+//! `output::summarize_stored`'s Pass 1 (`workflow::verification::
+//! read_capped_tail_and_scan`) retains -- a failure earlier than that tail
+//! (a chatty run whose failure scrolled past 16 KiB before the rest of the
+//! output finished) used to be invisible to every extractor here. Memory
+//! stays bounded the way [`workflow::verification::FailureNameScanner`]
+//! bounds its own full-stream cargo scan: at most `MAX_FAMILY_FAILURES`
+//! recovered failures are ever held at once, never a second unbounded
+//! accumulator or a second full read of a potentially huge log (the file is
+//! read once, line by line, discarding each line immediately after it is
+//! observed).
 
 use std::sync::LazyLock;
 
@@ -51,8 +56,8 @@ pub(crate) struct TestFailure {
 const MAX_FAMILY_FAILURES: usize = 20;
 
 /// What one family's extractor recovered. Only ever returned once that
-/// family's own markers were confirmed (see [`extract`]'s own doc comment);
-/// there is no "maybe" state past this point.
+/// family's own markers were confirmed (see [`extract_streaming`]'s own doc
+/// comment); there is no "maybe" state past this point.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FamilyExtraction {
     pub(crate) family: &'static str,
@@ -106,38 +111,349 @@ impl FamilyExtraction {
     /// generic scan's own `test result:`/`Summary [...]` recognition; for
     /// every other family this is the ONLY compact confirmation a green run
     /// gets.
-    pub(crate) fn summary_line(&self) -> String {
+    ///
+    /// `pass1_failures` is `output::summarize_stored`'s Pass 1 (`workflow::
+    /// verification::FailureNameScanner`, run over the full stream regardless
+    /// of family): review finding F8, this extractor's own count comes only
+    /// from `thread '...' panicked at ...:` lines, so a failed
+    /// `#[should_panic]` test -- cargo still prints its own `test <name> ...
+    /// FAILED` line for it, just never a panic line -- was undercounted here
+    /// even though Pass 1 already had its name. The rendered count is the
+    /// UNION of both sources' names, never just this extractor's own,
+    /// smaller one.
+    pub(crate) fn summary_line(
+        &self,
+        pass1_failures: &std::collections::BTreeSet<String>,
+    ) -> String {
         if self.is_green() {
             format!("{}: all tests passed", self.family)
         } else {
+            let mut names: std::collections::BTreeSet<&str> =
+                self.failures.iter().map(|f| f.name.as_str()).collect();
+            names.extend(pass1_failures.iter().map(String::as_str));
             format!(
                 "{}: {} failed{}",
                 self.family,
-                self.failures.len(),
+                names.len(),
                 if self.truncated { " (truncated)" } else { "" }
             )
         }
     }
 }
 
-/// Dispatches to the family `command`'s argv suggests, then confirms it
-/// against `tail` (see the module doc comment for why both checks matter).
-pub(crate) fn extract(command: &str, tail: &str) -> Option<FamilyExtraction> {
+// Argv recognition, factored out once `matches_known_family` (review finding
+// F4) needed the identical family-routing checks `extract`/`extract_streaming`
+// already used -- one source of truth for "does this argv claim to be a
+// `cargo test`/pytest/vitest/jest/go test run" rather than three copies that
+// could drift apart.
+fn is_cargo_family(lower: &str) -> bool {
+    lower.contains("cargo test") || lower.contains("cargo-nextest") || lower.contains("nextest")
+}
+fn is_pytest_family(lower: &str) -> bool {
+    lower.contains("pytest")
+}
+fn is_vitest_jest_family(lower: &str) -> bool {
+    lower.contains("vitest") || lower.contains("jest")
+}
+fn is_go_test_family(lower: &str) -> bool {
+    lower.contains("go test")
+}
+
+/// Review finding F4: the family extractors, run as a bounded streaming line
+/// scan over the FULL stored file at `path` rather than only the capped
+/// display tail (`output::MAX_FAILURE_OUTPUT_BYTES`) --
+/// a `pytest`/`vitest`/`jest`/`go test` failure earlier than the last ~16
+/// KiB of a chatty run must still be found. Memory stays bounded the same
+/// way [`workflow::verification::FailureNameScanner`] bounds its own
+/// full-stream cargo scan: at most [`MAX_FAMILY_FAILURES`] recovered
+/// failures are ever held at once, past which further ones are dropped and
+/// `truncated` is set, never a second unbounded accumulator.
+pub(crate) fn extract_streaming(command: &str, path: &std::path::Path) -> Option<FamilyExtraction> {
     let lower = command.to_ascii_lowercase();
-    if lower.contains("cargo test") || lower.contains("cargo-nextest") || lower.contains("nextest")
-    {
-        return extract_cargo_nextest(tail);
+    if is_cargo_family(&lower) {
+        return extract_cargo_nextest_streaming(path);
     }
-    if lower.contains("pytest") {
-        return extract_pytest(tail);
+    if is_pytest_family(&lower) {
+        return extract_pytest_streaming(path);
     }
-    if lower.contains("vitest") || lower.contains("jest") {
-        return extract_vitest_jest(tail);
+    if is_vitest_jest_family(&lower) {
+        return extract_vitest_jest_streaming(path);
     }
-    if lower.contains("go test") {
-        return extract_go_test(tail);
+    if is_go_test_family(&lower) {
+        return extract_go_test_streaming(path);
     }
     None
+}
+
+/// Whether `command`'s argv identifies one of the test-runner families this
+/// module models, independent of whether that family's own markers were
+/// ever confirmed in its output. Review finding F4: lets
+/// `output::render_summary` refuse to call a run "clean" on ambiguous
+/// silence alone when the command itself claims to be a test run -- an
+/// unconfirmed family extraction (nothing recognisable, or a read error cut
+/// the scan short) is not the same thing as a confirmed green run, and must
+/// fall back to the ordinary head/tail summary instead of a false "ok (...)"
+/// one-liner.
+pub(crate) fn matches_known_family(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    is_cargo_family(&lower)
+        || is_pytest_family(&lower)
+        || is_vitest_jest_family(&lower)
+        || is_go_test_family(&lower)
+}
+
+/// Reads `path` as lines (byte-split on `\n`, lossily decoded, `\r` and the
+/// trailing `\n` stripped -- the same treatment `output::scan_for_display`
+/// gives a stored capture), calling `observe` once per line and discarding
+/// each line immediately afterwards. Never loads the file whole: a
+/// multi-hundred-MiB log costs one line's worth of memory at a time, plus
+/// whatever bounded state `observe`'s closure keeps. Silently stops (rather
+/// than propagating the error) on a read failure or a missing file --
+/// whatever `observe` already collected is used as-is, the same fail-open
+/// discipline `read_capped_tail_and_scan` applies to its own read errors.
+fn stream_lines(path: &std::path::Path, mut observe: impl FnMut(&str)) {
+    use std::io::BufRead as _;
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        let n = match reader.read_until(b'\n', &mut raw) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let bytes: &[u8] = if raw.last() == Some(&b'\n') {
+            &raw[..n - 1]
+        } else {
+            &raw[..n]
+        };
+        let line = String::from_utf8_lossy(bytes);
+        let line = line.strip_suffix('\r').unwrap_or(&line);
+        observe(line);
+    }
+}
+
+fn extract_cargo_nextest_streaming(path: &std::path::Path) -> Option<FamilyExtraction> {
+    let mut prev_trigger: Option<(String, String)> = None;
+    let mut failures: Vec<TestFailure> = Vec::new();
+    let mut truncated = false;
+    let mut has_pass_marker = false;
+    stream_lines(path, |line| {
+        if let Some((name, location)) = prev_trigger.take() {
+            let message = line.trim();
+            if failures.len() < MAX_FAMILY_FAILURES {
+                failures.push(TestFailure {
+                    name,
+                    location: Some(location),
+                    message: message.to_string(),
+                });
+            } else {
+                truncated = true;
+            }
+        }
+        if let Some(caps) = CARGO_PANIC_RE.captures(line.trim_start()) {
+            prev_trigger = Some((caps["name"].to_string(), caps["location"].to_string()));
+        }
+        let t = line.trim_start();
+        if t.starts_with("test result: ok.")
+            || (t.starts_with("Summary [") && !t.contains(" failed"))
+        {
+            has_pass_marker = true;
+        }
+    });
+    // Flush a trailing trigger line that never got a following line (the
+    // capture ended right after it) -- same empty-message fallback
+    // `extract_cargo_nextest`'s `unwrap_or_default()` gives it.
+    if let Some((name, location)) = prev_trigger.take() {
+        if failures.len() < MAX_FAMILY_FAILURES {
+            failures.push(TestFailure {
+                name,
+                location: Some(location),
+                message: String::new(),
+            });
+        } else {
+            truncated = true;
+        }
+    }
+    if !confirmed(&failures, has_pass_marker) {
+        return None;
+    }
+    let mut extraction = FamilyExtraction::new("cargo test", failures);
+    extraction.truncated |= truncated;
+    Some(extraction)
+}
+
+fn extract_pytest_streaming(path: &std::path::Path) -> Option<FamilyExtraction> {
+    let mut failures: Vec<TestFailure> = Vec::new();
+    let mut truncated = false;
+    let mut has_pass_marker = false;
+    stream_lines(path, |line| {
+        let trimmed = line.trim();
+        if let Some(caps) = PYTEST_FAILED_RE.captures(trimmed) {
+            let nodeid = caps["nodeid"].to_string();
+            let location = nodeid.split("::").next().map(|f| f.to_string());
+            let message = caps
+                .name("message")
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
+            if failures.len() < MAX_FAMILY_FAILURES {
+                failures.push(TestFailure {
+                    name: nodeid,
+                    location,
+                    message,
+                });
+            } else {
+                truncated = true;
+            }
+            return;
+        }
+        if trimmed.starts_with("===")
+            && trimmed.ends_with("===")
+            && trimmed.contains(" passed")
+            && !trimmed.contains(" failed")
+        {
+            has_pass_marker = true;
+        }
+    });
+    if !confirmed(&failures, has_pass_marker) {
+        return None;
+    }
+    let mut extraction = FamilyExtraction::new("pytest", failures);
+    extraction.truncated |= truncated;
+    Some(extraction)
+}
+
+/// The streaming counterpart of [`scan_blocks`]: a block starts on every line
+/// `is_start` accepts (finalizing whatever block was open, exactly like
+/// `scan_blocks` implicitly closing one block when the next start line
+/// appears) and grows up to `max_block_lines`. Each finished block is handed
+/// to `finalize` immediately and then dropped -- only the resulting
+/// [`TestFailure`]s accumulate, capped at [`MAX_FAMILY_FAILURES`], so a
+/// pathological log with thousands of tiny blocks still costs O(1) blocks'
+/// worth of memory rather than growing without bound.
+fn stream_blocks(
+    path: &std::path::Path,
+    max_block_lines: usize,
+    mut is_start: impl FnMut(&str) -> bool,
+    mut pass_marker: impl FnMut(&str) -> bool,
+    mut finalize: impl FnMut(&[String]) -> Option<TestFailure>,
+) -> (Vec<TestFailure>, bool, bool) {
+    let mut current: Vec<String> = Vec::new();
+    let mut failures: Vec<TestFailure> = Vec::new();
+    let mut truncated = false;
+    let mut has_pass_marker = false;
+    let finish_current =
+        |current: &mut Vec<String>,
+         failures: &mut Vec<TestFailure>,
+         truncated: &mut bool,
+         finalize: &mut dyn FnMut(&[String]) -> Option<TestFailure>| {
+            if current.is_empty() {
+                return;
+            }
+            if let Some(failure) = finalize(current) {
+                if failures.len() < MAX_FAMILY_FAILURES {
+                    failures.push(failure);
+                } else {
+                    *truncated = true;
+                }
+            }
+            current.clear();
+        };
+    stream_lines(path, |line| {
+        if pass_marker(line) {
+            has_pass_marker = true;
+        }
+        if is_start(line) {
+            finish_current(&mut current, &mut failures, &mut truncated, &mut finalize);
+            current.push(line.to_string());
+        } else if !current.is_empty() && current.len() < max_block_lines {
+            current.push(line.to_string());
+        }
+    });
+    finish_current(&mut current, &mut failures, &mut truncated, &mut finalize);
+    (failures, truncated, has_pass_marker)
+}
+
+fn extract_vitest_jest_streaming(path: &std::path::Path) -> Option<FamilyExtraction> {
+    let is_start = |line: &str| {
+        let t = line.trim_start();
+        t.starts_with("\u{25cf} ") // jest: "● <suite> \u{203a} <test>"
+            || t.starts_with("\u{2717} ") // vitest (older): "✗ <file> > <test>  <dur>"
+            || t.starts_with("\u{d7} ") // vitest (newer): "× <file> > <test>  <dur>"
+    };
+    let pass_marker = |line: &str| {
+        let t = line.trim_start();
+        (t.starts_with("Tests:") || t.starts_with("Test Files") || t.starts_with("Tests "))
+            && t.contains("passed")
+            && !t.contains("failed")
+    };
+    let finalize = |block: &[String]| -> Option<TestFailure> {
+        let header = block[0].trim_start();
+        let name = if let Some(rest) = header.strip_prefix("\u{25cf} ") {
+            rest.trim().to_string()
+        } else {
+            let rest = header.trim_start_matches(['\u{2717}', '\u{d7}']).trim();
+            TRAILING_DURATION_RE.replace(rest, "").trim().to_string()
+        };
+        let refs: Vec<&str> = block.iter().map(String::as_str).collect();
+        Some(TestFailure {
+            name,
+            location: block_location(&refs, 1),
+            message: block_message(&refs, 1),
+        })
+    };
+    let (failures, truncated, has_pass_marker) =
+        stream_blocks(path, 12, is_start, pass_marker, finalize);
+    if !confirmed(&failures, has_pass_marker) {
+        return None;
+    }
+    let mut extraction = FamilyExtraction::new("vitest/jest", failures);
+    extraction.truncated |= truncated;
+    Some(extraction)
+}
+
+fn extract_go_test_streaming(path: &std::path::Path) -> Option<FamilyExtraction> {
+    let is_start = |line: &str| line.trim_start().starts_with("--- FAIL: ");
+    let pass_marker = |line: &str| {
+        let t = line.trim();
+        t == "PASS" || t.starts_with("ok ") || t.starts_with("ok\t")
+    };
+    let finalize = |block: &[String]| -> Option<TestFailure> {
+        let caps = GO_FAIL_HEADER_RE.captures(block[0].trim_start())?;
+        let mut location = None;
+        let mut message = String::new();
+        for line in block.iter().skip(1) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("--- ") || trimmed.starts_with("=== RUN") {
+                break;
+            }
+            if let Some(dcaps) = GO_DETAIL_RE.captures(trimmed) {
+                location = Some(dcaps["location"].to_string());
+                message = dcaps["message"].to_string();
+            } else {
+                message = trimmed.to_string();
+            }
+            break;
+        }
+        Some(TestFailure {
+            name: caps["name"].to_string(),
+            location,
+            message,
+        })
+    };
+    let (failures, truncated, has_pass_marker) =
+        stream_blocks(path, 15, is_start, pass_marker, finalize);
+    if !confirmed(&failures, has_pass_marker) {
+        return None;
+    }
+    let mut extraction = FamilyExtraction::new("go test", failures);
+    extraction.truncated |= truncated;
+    Some(extraction)
 }
 
 /// A trigger line has been confirmed and there is nothing to correlate a
@@ -159,40 +475,6 @@ static CARGO_PANIC_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static cargo panic regex must compile")
 });
 
-fn extract_cargo_nextest(tail: &str) -> Option<FamilyExtraction> {
-    let lines: Vec<&str> = tail.lines().collect();
-    let mut failures = Vec::new();
-    for (i, line) in lines.iter().enumerate() {
-        let Some(caps) = CARGO_PANIC_RE.captures(line.trim_start()) else {
-            continue;
-        };
-        let message = lines
-            .get(i + 1)
-            .map(|l| l.trim())
-            .filter(|m| !m.is_empty())
-            .unwrap_or_default()
-            .to_string();
-        failures.push(TestFailure {
-            name: caps["name"].to_string(),
-            location: Some(caps["location"].to_string()),
-            message,
-        });
-    }
-
-    // `cargo test`'s own "test result: ok./FAILED", and `cargo nextest
-    // run`'s "Summary [...] N tests run: ...": nextest omits the "M failed"
-    // clause entirely when M is zero, so its PRESENCE (not a "0 failed"
-    // needle) is what marks a run red.
-    let has_pass_marker = lines.iter().any(|l| {
-        let t = l.trim_start();
-        t.starts_with("test result: ok.") || (t.starts_with("Summary [") && !t.contains(" failed"))
-    });
-    if !confirmed(&failures, has_pass_marker) {
-        return None;
-    }
-    Some(FamilyExtraction::new("cargo test", failures))
-}
-
 // ---------------------------------------------------------------------
 // pytest -- family #2. Failures are single self-contained lines in the
 // default "short test summary info" section, so no block scan is needed.
@@ -202,77 +484,6 @@ static PYTEST_FAILED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^FAILED (?P<nodeid>\S+)(?: - (?P<message>.+))?$")
         .expect("static pytest FAILED regex must compile")
 });
-
-fn extract_pytest(tail: &str) -> Option<FamilyExtraction> {
-    let mut failures = Vec::new();
-    let mut has_pass_marker = false;
-    for line in tail.lines() {
-        let trimmed = line.trim();
-        if let Some(caps) = PYTEST_FAILED_RE.captures(trimmed) {
-            let nodeid = caps["nodeid"].to_string();
-            let location = nodeid.split("::").next().map(|f| f.to_string());
-            let message = caps
-                .name("message")
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_default();
-            failures.push(TestFailure {
-                name: nodeid,
-                location,
-                message,
-            });
-            continue;
-        }
-        // pytest's final bar, e.g. "==== 5 passed in 0.12s ====" or
-        // "==== 2 failed, 3 passed in 0.12s ====" -- the absence of the word
-        // "failed" is what marks it clean, the same reasoning as nextest's
-        // `Summary [...]` line above.
-        if trimmed.starts_with("===")
-            && trimmed.ends_with("===")
-            && trimmed.contains(" passed")
-            && !trimmed.contains(" failed")
-        {
-            has_pass_marker = true;
-        }
-    }
-    if !confirmed(&failures, has_pass_marker) {
-        return None;
-    }
-    Some(FamilyExtraction::new("pytest", failures))
-}
-
-// ---------------------------------------------------------------------
-// Shared block scanner, factored out once a third family (go test) needed
-// the identical "gather a header line plus the handful of lines under it"
-// walk `extract_vitest_jest` already used -- see the module doc comment on
-// why NOT abstracting from `extract_cargo_nextest`/`extract_pytest` (neither
-// needed it: a panic prints its own message on the very next line, and a
-// pytest failure is one line, period).
-//
-// A new block starts at every line `is_start` accepts; every following line
-// up to `max_block_lines` joins it, so callers doing a short bounded search
-// within `block[1..]` for a location/message line never have to reason
-// about where one block's continuation lines end and the next begins.
-// ---------------------------------------------------------------------
-
-fn scan_blocks<'a>(
-    lines: &[&'a str],
-    is_start: impl Fn(&str) -> bool,
-    max_block_lines: usize,
-) -> Vec<Vec<&'a str>> {
-    let mut blocks: Vec<Vec<&str>> = Vec::new();
-    for &line in lines {
-        if is_start(line) {
-            blocks.push(vec![line]);
-            continue;
-        }
-        if let Some(block) = blocks.last_mut()
-            && block.len() < max_block_lines
-        {
-            block.push(line);
-        }
-    }
-    blocks
-}
 
 /// The first line within `block` (searched from `skip`) that looks like a
 /// source location: jest's `at ... (file:line:col)` or vitest's
@@ -319,48 +530,6 @@ static TRAILING_DURATION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\s*\(?\d+(?:\.\d+)?\s*m?s\)?\s*$").expect("static duration regex must compile")
 });
 
-fn extract_vitest_jest(tail: &str) -> Option<FamilyExtraction> {
-    let lines: Vec<&str> = tail.lines().collect();
-    let is_start = |line: &str| {
-        let t = line.trim_start();
-        t.starts_with("\u{25cf} ") // jest: "● <suite> \u{203a} <test>"
-            || t.starts_with("\u{2717} ") // vitest (older): "✗ <file> > <test>  <dur>"
-            || t.starts_with("\u{d7} ") // vitest (newer): "× <file> > <test>  <dur>"
-    };
-    let blocks = scan_blocks(&lines, is_start, 12);
-
-    let mut failures = Vec::new();
-    for block in &blocks {
-        let header = block[0].trim_start();
-        let name = if let Some(rest) = header.strip_prefix("\u{25cf} ") {
-            rest.trim().to_string()
-        } else {
-            let rest = header.trim_start_matches(['\u{2717}', '\u{d7}']).trim();
-            TRAILING_DURATION_RE.replace(rest, "").trim().to_string()
-        };
-        failures.push(TestFailure {
-            name,
-            location: block_location(block, 1),
-            message: block_message(block, 1),
-        });
-    }
-
-    let has_pass_marker = lines.iter().any(|l| {
-        let t = l.trim_start();
-        // jest: "Tests:       5 passed, 5 total"; vitest: "Test Files  2
-        // passed (2)"/"Tests  8 passed (8)" -- red instead reads
-        // "X failed, Y passed", so the absence of "failed" is what a clean
-        // run's own summary line looks like, the same shape as pytest's bar.
-        (t.starts_with("Tests:") || t.starts_with("Test Files") || t.starts_with("Tests "))
-            && t.contains("passed")
-            && !t.contains("failed")
-    });
-    if !confirmed(&failures, has_pass_marker) {
-        return None;
-    }
-    Some(FamilyExtraction::new("vitest/jest", failures))
-}
-
 // ---------------------------------------------------------------------
 // go test -- family #4.
 // ---------------------------------------------------------------------
@@ -377,58 +546,23 @@ static GO_DETAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static go test detail regex must compile")
 });
 
-fn extract_go_test(tail: &str) -> Option<FamilyExtraction> {
-    let lines: Vec<&str> = tail.lines().collect();
-    let is_start = |line: &str| line.trim_start().starts_with("--- FAIL: ");
-    let blocks = scan_blocks(&lines, is_start, 15);
-
-    let mut failures = Vec::new();
-    for block in &blocks {
-        let Some(caps) = GO_FAIL_HEADER_RE.captures(block[0].trim_start()) else {
-            continue;
-        };
-        let mut location = None;
-        let mut message = String::new();
-        for line in block.iter().skip(1) {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // A line this indented belongs to the NEXT test, not this one's
-            // own detail: `scan_blocks` only closes a block on the next
-            // `--- FAIL:` line, so a `--- PASS:`/`=== RUN` in between still
-            // needs to end the search here.
-            if trimmed.starts_with("--- ") || trimmed.starts_with("=== RUN") {
-                break;
-            }
-            if let Some(dcaps) = GO_DETAIL_RE.captures(trimmed) {
-                location = Some(dcaps["location"].to_string());
-                message = dcaps["message"].to_string();
-            } else {
-                message = trimmed.to_string();
-            }
-            break;
-        }
-        failures.push(TestFailure {
-            name: caps["name"].to_string(),
-            location,
-            message,
-        });
-    }
-
-    let has_pass_marker = lines.iter().any(|l| {
-        let t = l.trim();
-        t == "PASS" || t.starts_with("ok ") || t.starts_with("ok\t")
-    });
-    if !confirmed(&failures, has_pass_marker) {
-        return None;
-    }
-    Some(FamilyExtraction::new("go test", failures))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only shim over [`extract_streaming`] (review finding F4 replaced
+    /// the old tail-scanning `extract` production entry point with the
+    /// full-file streaming one): every fixture below is simplest to write as
+    /// an in-memory string, so this stands it up as a temp file and calls
+    /// the actual production function -- exercising the SAME parsing code
+    /// every other caller exercises, never a second, only-tested-in-theory
+    /// copy of it.
+    fn extract(command: &str, tail: &str) -> Option<FamilyExtraction> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capture.log");
+        std::fs::write(&path, tail).expect("write fixture");
+        extract_streaming(command, &path)
+    }
 
     // -- cargo test / nextest ------------------------------------------
 

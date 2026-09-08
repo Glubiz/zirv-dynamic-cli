@@ -455,13 +455,20 @@ pub(crate) fn render_summary(
     // diagnostic of any kind" is the only signal available there). A clean
     // run costs one line instead of a head, a tail and a retrieval line.
     // Never on a non-zero exit code: a scanner false negative must not hide
-    // a real failure behind "nothing flagged".
+    // a real failure behind "nothing flagged". Review finding F4: nor when
+    // the command itself claims to be a `cargo test`/pytest/vitest/jest/go
+    // test run and no family extraction confirmed anything -- "nothing
+    // flagged" here would already have to be a confirmed green marker to
+    // reach this point (a confirmed family always pushes its own summary
+    // line into `scan.summaries`, which is required empty above), so silence
+    // from an argv that claims to be a test run is ambiguity, not a pass.
     let clean = !scan.read_error
         && scan.failures.is_empty()
         && scan.warnings.is_empty()
         && scan.summaries.is_empty()
         && failures.is_empty()
-        && matches!(exit_code, Some(0) | None);
+        && matches!(exit_code, Some(0) | None)
+        && !super::testrun::matches_known_family(command);
     if clean {
         let mut clean_body = format!(
             "{}: ok ({} lines, nothing flagged)\n",
@@ -993,6 +1000,17 @@ pub(crate) fn summarize_stored(
             &serde_json::to_string(&record)?,
         );
         prune_outputs(dir, KEEP_NEWEST_OUTPUTS);
+
+        // Issue #411 (review F1): binary safety comes first here too -- a
+        // `git show`/`git diff` capture can still be a binary blob (a PNG
+        // added or changed in the diff), and the per-file listing below is
+        // built from a lossy UTF-8 decode that a NUL-bearing blob would
+        // corrupt silently. Same rule as the generic path below: no summary
+        // at all for binary content.
+        if output_shape::sniff_is_binary(path) {
+            return Ok((record, None));
+        }
+
         let summary = super::output_diff::render_diff_summary(
             id,
             &command.join(" "),
@@ -1007,7 +1025,7 @@ pub(crate) fn summarize_stored(
     // `test result:`/`Summary [...]` line was seen anywhere in the full
     // stream. Never a second implementation of either; see this module's own
     // doc comment.
-    let (tail_bytes, read_errored, failures, summary_seen, _) = match std::fs::File::open(path) {
+    let (_tail_bytes, read_errored, failures, summary_seen, _) = match std::fs::File::open(path) {
         Ok(file) => read_capped_tail_and_scan(file, MAX_FAILURE_OUTPUT_BYTES),
         Err(_) => (
             Vec::new(),
@@ -1029,19 +1047,45 @@ pub(crate) fn summarize_stored(
 
     // Issue #413: a known test family's own structural shape (a pytest
     // `FAILED path::test - message` line, a jest/vitest bullet, a go
-    // `--- FAIL:` block) replaces the generic diagnostic blocks above with
-    // exact failing-test names and locations, over the SAME bounded tail
-    // Pass 1 already retained -- never a third read of a potentially huge
-    // log. Declines (leaving `scan.failures` untouched) for anything that is
-    // not a confirmed match, so an unrecognised producer or a compile error
-    // before any test ran still gets the generic scan's own answer.
+    // `--- FAIL:` block) merges into the generic diagnostic blocks above with
+    // exact failing-test names and locations. Review finding F4: run as a
+    // bounded streaming scan over the FULL stored file (`extract_streaming`),
+    // never just the capped tail Pass 1 kept for display -- a failure earlier
+    // than the last `MAX_FAILURE_OUTPUT_BYTES` of a chatty run must still be
+    // found. Declines (leaving `scan.failures` untouched) for anything that
+    // is not a confirmed match, so an unrecognised producer or a compile
+    // error before any test ran still gets the generic scan's own answer.
     if scope == CompactionScope::Known
-        && let Some(family) =
-            super::testrun::extract(&command.join(" "), &String::from_utf8_lossy(&tail_bytes))
+        && let Some(family) = super::testrun::extract_streaming(&command.join(" "), path)
     {
-        scan.failures = family.failure_blocks();
-        scan.failures_truncated = family.truncated;
-        scan.summaries.push(family.summary_line());
+        let family_blocks = family.failure_blocks();
+        if !family_blocks.is_empty() {
+            // Review finding F3: a confirmed family extraction only MERGES
+            // with the generic scan's own diagnostic blocks -- family blocks
+            // first (the failing test names/locations this family
+            // recognises), then any generic block not already covered (e.g.
+            // an `error: linker command failed` block a test-family marker
+            // has nothing to do with) -- never a wholesale replace, which
+            // used to let a confirmed family extraction silently drop a real
+            // failure the generic scan had already found.
+            let mut truncated = family.truncated || scan.failures_truncated;
+            let mut merged = family_blocks;
+            for block in std::mem::take(&mut scan.failures) {
+                if merged.len() >= MAX_FAILURE_BLOCKS {
+                    truncated = true;
+                    break;
+                }
+                if !merged.contains(&block) {
+                    merged.push(block);
+                }
+            }
+            scan.failures = merged;
+            scan.failures_truncated = truncated;
+        }
+        // A green family marker (no failure blocks recovered) leaves
+        // `scan.failures`/`failures_truncated` untouched: whatever the
+        // generic scan already found (e.g. a non-test error) still stands.
+        scan.summaries.push(family.summary_line(&failures));
     }
 
     let record = OutputRecord {
@@ -2375,6 +2419,224 @@ mod tests {
                 );
             }
         }
+
+        // Review finding F2: a repo-lowered `diff_max_bytes` still leaves
+        // `max_summary_bytes` generous, so a tiny one-file diff must not
+        // come back as a per-file listing that is bigger than the diff it
+        // replaces. Before F2's never-worse guard, `render_diff_summary` had
+        // no such check and happily returned the (larger) listing.
+        let tiny_diff = "diff --git a/a.rs b/a.rs\n\
+                          --- a/a.rs\n\
+                          +++ a/a.rs\n\
+                          @@ -1,1 +1,1 @@\n\
+                          -a\n\
+                          +b\n"
+            .to_string();
+        let (_, tiny_diff_summary) = capture_text(
+            &state,
+            &repo,
+            &["git diff HEAD~1".to_string()],
+            Some(0),
+            &tiny_diff,
+            4096,
+            CompactionScope::Diff,
+        )
+        .expect("capture_text");
+        if let Some(summary) = tiny_diff_summary {
+            assert!(
+                summary.len() < tiny_diff.len(),
+                "diff summary ({} bytes) must be smaller than the raw diff ({} bytes): {summary}",
+                summary.len(),
+                tiny_diff.len()
+            );
+        }
+    }
+
+    /// Review finding F1: `summarize_stored`'s `CompactionScope::Diff` fast
+    /// path used to run before the binary sniff, so a `git show
+    /// HEAD:logo.png`-shaped capture (a binary blob, NUL bytes included) was
+    /// scanned as if it were a unified diff and replaced by a text per-file
+    /// listing instead of being left alone like every other binary capture.
+    #[test]
+    fn diff_scope_binary_capture_never_gets_a_diff_summary() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        // Larger than `output_shape::BINARY_SNIFF_BYTES`-worth of filler,
+        // with NUL bytes mixed in near the front -- the same shape a `git
+        // show HEAD:logo.png` capture would have.
+        let mut raw = vec![0u8; 128];
+        raw.extend(std::iter::repeat_n(b'x', 128 * 1024));
+        let raw = String::from_utf8_lossy(&raw).into_owned();
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["git show HEAD:logo.png".to_string()],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Diff,
+        )
+        .expect("capture_text");
+        assert!(
+            summary.is_none(),
+            "a binary Diff-scope capture must never get a text summary, got: {summary:?}"
+        );
+    }
+
+    /// Review finding F3: a confirmed but GREEN test-family marker
+    /// (`test result: ok.`) must not erase an unrelated failure the generic
+    /// scan already found (`error: linker command failed`) -- the two used
+    /// to be an unconditional replace, so a green family wiped the linker
+    /// error out entirely.
+    #[test]
+    fn a_green_family_marker_never_erases_an_unrelated_generic_failure() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        // Enough filler that the rendered summary comfortably beats the raw
+        // byte count (#410's never-worse guard) even with two failure
+        // blocks and a family summary line in it.
+        let mut raw: String = (1..=400).map(|i| format!("filler line {i}\n")).collect();
+        raw.push_str(
+            "running 3 tests\n\
+             test tests::a ... ok\n\
+             test tests::b ... ok\n\
+             test tests::c ... ok\n\
+             \n\
+             test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+             error: linker `cc` not found\n\
+             error: could not compile `demo` due to previous error\n",
+        );
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["cargo test".to_string()],
+            Some(101),
+            &raw,
+            4096,
+            CompactionScope::Known,
+        )
+        .expect("capture_text");
+        let summary = summary.expect("a summary");
+        assert!(
+            summary.contains("linker"),
+            "the linker error must survive a confirmed green family marker: {summary}"
+        );
+    }
+
+    /// Review finding F8: a failed `#[should_panic]` test prints its own
+    /// `test <name> ... FAILED` line but never a `thread '...' panicked
+    /// at ...:` line (there was no panic -- that is exactly why it failed),
+    /// so `testrun`'s own panic-line-only count used to disagree with
+    /// cargo's `test result: ... 2 failed` line. The family summary line
+    /// must count it too, via the union with Pass 1's own full-stream name
+    /// scan.
+    #[test]
+    fn a_should_panic_failure_with_no_panic_line_is_still_counted() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        let mut raw: String = (1..=400).map(|i| format!("filler line {i}\n")).collect();
+        raw.push_str(
+            "running 2 tests\n\
+             test tests::normal_panic ... FAILED\n\
+             test tests::should_have_panicked ... FAILED\n\
+             \n\
+             failures:\n\
+             \n\
+             ---- tests::normal_panic stdout ----\n\
+             thread 'tests::normal_panic' panicked at src/lib.rs:10:5:\n\
+             assertion failed\n\
+             \n\
+             ---- tests::should_have_panicked stdout ----\n\
+             note: test did not panic as expected\n\
+             \n\
+             failures:\n\
+             \x20   tests::normal_panic\n\
+             \x20   tests::should_have_panicked\n\
+             \n\
+             test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out\n",
+        );
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["cargo test".to_string()],
+            Some(101),
+            &raw,
+            4096,
+            CompactionScope::Known,
+        )
+        .expect("capture_text");
+        let summary = summary.expect("a summary");
+        assert!(
+            summary.contains("cargo test: 2 failed"),
+            "the should_panic failure (no panic line) must still be counted, \
+             via Pass 1's full-stream name scan: {summary}"
+        );
+    }
+
+    /// Review finding F4: a `go test` failure earlier than the capped
+    /// display tail (`MAX_FAILURE_OUTPUT_BYTES`, 16 KiB) must still be found
+    /// -- both because the family extractor now streams the full stored
+    /// file, and because the clean one-liner must never fire for a command
+    /// that argv-matches a known test family without a confirmed pass.
+    #[test]
+    fn go_test_failure_before_the_display_tail_still_renders_and_never_the_clean_one_liner() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        let mut raw = String::from(
+            "=== RUN   TestX\n--- FAIL: TestX (0.00s)\n    main_test.go:10: expected 1, got 2\n",
+        );
+        // More than `MAX_FAILURE_OUTPUT_BYTES` (16 KiB) of noise after the
+        // failure -- the capped display tail Pass 1 keeps never reaches back
+        // this far.
+        while raw.len() < 20 * 1024 {
+            raw.push_str("=== RUN   TestNoise\n--- PASS: TestNoise (0.00s)\n");
+        }
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["go test ./...".to_string()],
+            None,
+            &raw,
+            4096,
+            CompactionScope::Known,
+        )
+        .expect("capture_text");
+        let summary = summary.expect("a red run must always get a summary");
+        assert!(
+            summary.contains("TestX"),
+            "the early failure must survive past the display tail: {summary}"
+        );
+        assert!(
+            !summary.contains("ok ("),
+            "a red run must never render the clean one-liner: {summary}"
+        );
+    }
+
+    /// Review finding F4: same shape, for pytest.
+    #[test]
+    fn pytest_failure_before_the_display_tail_still_renders_and_never_the_clean_one_liner() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        let mut raw = String::from("FAILED tests/test_x.py::test_bad - AssertionError: boom\n");
+        while raw.len() < 20 * 1024 {
+            raw.push_str("tests/test_noise.py::test_ok PASSED\n");
+        }
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["pytest -q".to_string()],
+            None,
+            &raw,
+            4096,
+            CompactionScope::Known,
+        )
+        .expect("capture_text");
+        let summary = summary.expect("a red run must always get a summary");
+        assert!(
+            summary.contains("test_bad"),
+            "the early failure must survive past the display tail: {summary}"
+        );
+        assert!(
+            !summary.contains("ok ("),
+            "a red run must never render the clean one-liner: {summary}"
+        );
     }
 
     // -- Issue #408: diagnostic grouping -----------------------------------
