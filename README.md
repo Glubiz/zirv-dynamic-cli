@@ -1344,6 +1344,7 @@ checkout:
 | `output.max_summary_bytes` | `ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES` |
 | `fallback.orchestrator_rollover_headroom_pct` | `ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT` |
 | `fallback.rollover_cooldown_secs` | `ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS` |
+| `fallback.reactive_force_after_secs` | `ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
@@ -1383,7 +1384,7 @@ pick which vendor account gets spent with that guard never in the way.
 nudge/enforce gate (issue #223): a repo checkout must not be able to turn its
 own adoption pressure down to `off`, or up to `enforce` to hold an operator's
 own agent dispatches hostage.
-`fallback.orchestrator_rollover_headroom_pct`/`fallback.rollover_cooldown_secs`
+`fallback.orchestrator_rollover_headroom_pct`/`fallback.rollover_cooldown_secs`/`fallback.reactive_force_after_secs`
 (issue #358) close the same hole for automatic orchestrator-seat rollover: the
 on/off switch (`fallback.auto_orchestrator_rollover`) stays repo-narrowable
 like `fallback.enabled`, but tuning *when* an already-enabled rollover fires
@@ -1744,6 +1745,7 @@ adaptive_delegation = true            # issue #358: route new delegations throug
 auto_orchestrator_rollover = false    # issue #358: let the orchestrator seat itself roll over automatically (off by default)
 orchestrator_rollover_headroom_pct = 20.0  # issue #358: threshold that arms a proactive rollover (defaults to predictive_headroom_pct)
 rollover_cooldown_secs = 600          # issue #358: minimum gap between two automatic rollovers
+reactive_force_after_secs = 120      # issue #401: grace before a confirmed block forces a mid-turn structural handover
 
 [fallback.harness.codex]              # issue #358: per-harness overrides, both optional
 max_active = 3
@@ -1752,8 +1754,8 @@ reserve_headroom_pct = 15.0
 
 A repository checkout may only narrow these values (see [Trust
 boundary](#trust-boundary) above); `ZIRV_CTX_FALLBACK*` environment variables
-are the operator's final override. `orchestrator_rollover_headroom_pct` and
-`rollover_cooldown_secs` are repo-forbidden outright (see the table above) —
+are the operator's final override. `orchestrator_rollover_headroom_pct`,
+`rollover_cooldown_secs`, and `reactive_force_after_secs` are repo-forbidden outright (see the table above) —
 tuning an already-enabled rollover's timing is an operator decision, the same
 as `handoff.model`.
 

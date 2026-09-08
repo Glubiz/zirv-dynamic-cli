@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-07
+last-verified: 2026-09-08
 ---
 
 # Decision Log
@@ -7,6 +7,14 @@ last-verified: 2026-09-07
 **Entry shape (hard cap ~15 lines):**
 
 ```
+### 2026-09-08 -- Issue #401: catalogue tier equivalence, stale weekly destinations, and bounded reactive rollover wait
+**Context:** Claude `fable` seats could not select a Codex equivalent, stale weekly Codex readings were treated as assumptions, and a vendor-blocked seat could remain pending until reset without reaching idle.
+**Decision:** Exact catalogue aliases/ids map to generic tiers by strength relative to the vendor's tier rungs; unknown literals still refuse equivalence. Real stale `seven_day` destination readings are admissible on both rollover paths with measured hysteresis; stale `five_hour` readings remain reactive-only assumptions. A reactive cause preserves its first pending timestamp, retries every 60 seconds, and forces a structural handover after operator-only `fallback.reactive_force_after_secs` (default 120). Proactive/reclaim rollover still requires idle.
+**Supersedes:** Automatic orchestrator rollover defaults to on for a multi-harness roster; a reclaim trigger balances the seat back
+This replaces only the finding #14 absolute "never mid-turn" rollover wait associated with [[Decision Log#2026-09-04 -- Issue #358: a pure allocator plus one router, provider identity from the adapter's own slug, seat fencing by generation, auto-rollover off by default]] and extended by [[Decision Log#2026-09-05 -- Automatic orchestrator rollover defaults to on for a multi-harness roster; a reclaim trigger balances the seat back]]. Their fencing, roster default, and reclaim decisions remain in force.
+**Consequences:** Exhausted seats can leave a blocked vendor after bounded grace. Stale readings only widen destination eligibility; they cannot trigger moving away from an explicitly selected harness (#335/#337/#340). Refusal and exhaustion logs include per-candidate rejection reasons without transcript text.
+**Spec / link:** Issue #401; [[Usage and Pacing]], [[Ctx Supervisors]], [[Untrusted Configuration]].
+
 ### YYYY-MM-DD — Short title
 **Context:** 2–3 sentences on the situation.
 **Decision:** 2–3 sentences on what was chosen.

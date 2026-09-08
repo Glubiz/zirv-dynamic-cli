@@ -1779,6 +1779,9 @@ pub struct FallbackConfig {
     /// operator's seat back and forth. `REPO_FORBIDDEN`, same reasoning as
     /// `orchestrator_rollover_headroom_pct`.
     pub rollover_cooldown_secs: u64,
+    /// Maximum wait for an idle boundary after a confirmed block.
+    /// `REPO_FORBIDDEN`: only the operator may permit a forced seat swap.
+    pub reactive_force_after_secs: u64,
     /// Issue #358: per-harness overrides of the global concurrency/headroom
     /// limits above, keyed by adapter name (`fallback.harness.<name>`). A
     /// repo checkout may only lower `max_active` and only raise
@@ -1801,6 +1804,7 @@ impl Default for FallbackConfig {
             auto_orchestrator_rollover: None,
             orchestrator_rollover_headroom_pct: None,
             rollover_cooldown_secs: 600,
+            reactive_force_after_secs: 120,
             harness: std::collections::BTreeMap::new(),
         }
     }
@@ -2247,6 +2251,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS",
         &["fallback", "rollover_cooldown_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS",
+        &["fallback", "reactive_force_after_secs"],
         EnvKind::Int,
     ),
     ("ZIRV_CTX_OPTIMIZE", &["optimize", "enabled"], EnvKind::Bool),
@@ -3618,7 +3627,7 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // automatic seat rollover fires or how soon another one may follow.
     // `fallback.auto_orchestrator_rollover` itself (the on/off switch) stays
     // narrowing-only, like `fallback.enabled`, because a repo may safely
-    // disable it; only the two keys that tune an ALREADY-enabled rollover's
+    // disable it; only the keys that tune an ALREADY-enabled rollover's
     // timing are forbidden outright.
     (
         &["fallback", "orchestrator_rollover_headroom_pct"],
@@ -3627,6 +3636,10 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["fallback", "rollover_cooldown_secs"],
         "ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS",
+    ),
+    (
+        &["fallback", "reactive_force_after_secs"],
+        "ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS",
     ),
     // Issue #326 B1: without this a repo checkout could simply raise its own
     // parent-outcome budget, making the cap decorative -- same reasoning as
@@ -8997,6 +9010,7 @@ mod tests {
     /// `optimize.max_surface_bytes` and its `recommend_*` siblings), so it
     /// is not a complete key list on its own.
     const ALL_CONFIG_KEYS: &[(&str, &str)] = &[
+        ("fallback", "reactive_force_after_secs"),
         ("", "agent"),
         ("", "agent_bin"),
         ("chat", "model"),
@@ -9535,6 +9549,7 @@ mod tests {
         );
         assert_eq!(cfg.orchestrator_rollover_headroom_pct, None);
         assert_eq!(cfg.rollover_cooldown_secs, 600);
+        assert_eq!(cfg.reactive_force_after_secs, 120);
         assert!(cfg.harness.is_empty());
         assert_eq!(cfg.rollover_headroom_pct(), cfg.predictive_headroom_pct);
         assert_eq!(cfg.harness_limits("codex"), HarnessLimits::default());
@@ -9800,12 +9815,14 @@ mod tests {
                 "12.5",
             ),
             ("ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS", "45"),
+            ("ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS", "75"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert!(cfg.fallback.adaptive_delegation);
         assert_eq!(cfg.fallback.auto_orchestrator_rollover, Some(true));
         assert_eq!(cfg.fallback.orchestrator_rollover_headroom_pct, Some(12.5));
         assert_eq!(cfg.fallback.rollover_cooldown_secs, 45);
+        assert_eq!(cfg.fallback.reactive_force_after_secs, 75);
         assert_eq!(cfg.fallback.rollover_headroom_pct(), 12.5);
     }
 
@@ -9919,5 +9936,24 @@ mod tests {
 
         let empty = env_map(&[]);
         assert!(CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).is_err());
+    }
+    #[test]
+    fn fallback_reactive_force_timeout_is_operator_only() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback]\nreactive_force_after_secs = 0\n",
+        )
+        .expect("write repo");
+        let err = CtxConfig::load(repo.path(), &|_| None)
+            .expect_err("repo cannot force a mid-turn rollover");
+        assert!(is_repo_forbidden(err.as_ref()), "{err}");
+        assert!(
+            err.to_string().contains("reactive_force_after_secs"),
+            "{err}"
+        );
     }
 }

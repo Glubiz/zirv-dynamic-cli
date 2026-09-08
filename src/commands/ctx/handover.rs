@@ -112,16 +112,43 @@ pub fn resolve_model(agent: &str, requested: &str, cfg: &CtxConfig) -> CtxResult
 }
 
 /// Classifies a concrete model id against this harness's configured generic
-/// ladder. This is intentionally exact (case-insensitive) rather than fuzzy:
+/// ladder, then against its vendor's catalogue rungs by strength. This is intentionally exact (case-insensitive) rather than fuzzy:
 /// issue #186 promises not to sacrifice quality during cross-harness routing,
 /// so an operator-pinned model we cannot place on a verified tier is a reason
 /// to decline automatic fallback rather than guess.
 pub fn tier_for_model(agent: &str, model: &str, cfg: &CtxConfig) -> Option<&'static str> {
-    TIERS.into_iter().find(|tier| {
-        resolve_model(agent, tier, cfg)
-            .ok()
-            .is_some_and(|resolved| resolved.eq_ignore_ascii_case(model.trim()))
-    })
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_suffix("[1m]").unwrap_or(&model);
+    TIERS
+        .into_iter()
+        .find(|tier| {
+            resolve_model(agent, tier, cfg)
+                .ok()
+                .is_some_and(|resolved| {
+                    let resolved = resolved.to_ascii_lowercase();
+                    resolved.strip_suffix("[1m]").unwrap_or(&resolved) == model
+                })
+        })
+        .or_else(|| {
+            let (_, ctor) = adapters::ADAPTERS.iter().find(|(name, _)| *name == agent)?;
+            let adapter = ctor(None);
+            let vendor = catalogue::vendor(adapter.provider_for_model(Some(model)))?;
+            // Only exact catalogue aliases/ids establish quality equivalence.
+            let rung = vendor
+                .rungs
+                .iter()
+                .find(|r| r.alias == model || r.id == model)?;
+            for (tier, name) in [
+                (catalogue::Tier::Deep, "deep"),
+                (catalogue::Tier::Standard, "standard"),
+            ] {
+                let threshold = vendor.rungs.iter().find(|r| r.tier == Some(tier))?;
+                if rung.strength >= threshold.strength {
+                    return Some(name);
+                }
+            }
+            Some("cheap")
+        })
 }
 
 /// Resolves the equivalent generic tier on another harness. When the source
@@ -1297,5 +1324,56 @@ mod tests {
             "must fail before writing a request nobody will ever claim"
         );
         drop(guard);
+    }
+    #[test]
+    fn catalogue_rungs_map_by_strength_without_guessing_unknown_literals() {
+        let mut cfg = CtxConfig::default();
+        for target in ["gpt-5.6-sol", "operator-deep"] {
+            if target == "operator-deep" {
+                cfg.handover.codex.deep = Some(target.to_string());
+            }
+            for model in [
+                "fable",
+                "mythos",
+                "claude-fable-5-1[1m]",
+                "opus[1m]",
+                "FABLE",
+                "CLAUDE-MYTHOS-5[1M]",
+            ] {
+                assert_eq!(
+                    equivalent_model("claude", Some(model), true, "codex", &cfg),
+                    Some(target.to_string()),
+                    "{model}"
+                );
+            }
+        }
+        cfg.handover.claude.deep = Some("operator-source[1m]".to_string());
+        assert_eq!(
+            equivalent_model("claude", Some("OPERATOR-SOURCE[1M]"), true, "codex", &cfg),
+            Some("operator-deep".to_string())
+        );
+        assert_eq!(
+            tier_for_model("claude", "claude-sonnet-5", &cfg),
+            Some("standard")
+        );
+        assert_eq!(
+            tier_for_model("claude", "claude-haiku-5", &cfg),
+            Some("cheap")
+        );
+        assert_eq!(
+            equivalent_model("droid", Some("fable"), true, "codex", &cfg),
+            Some("operator-deep".to_string())
+        );
+        assert_eq!(
+            equivalent_model("unknown-agent", Some("fable"), true, "codex", &cfg),
+            None
+        );
+        for model in ["unknown-model", "fable-custom", "not-opus", "gpt-5.6-sol"] {
+            assert_eq!(
+                equivalent_model("claude", Some(model), true, "codex", &cfg),
+                None,
+                "{model}"
+            );
+        }
     }
 }

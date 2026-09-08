@@ -295,3 +295,6 @@ model = "fable"
 # denial_breaker_threshold = 3        # trailing consecutive Ask/Deny verdicts in one session, this decision included, before the hook's reason text stops explaining the policy and tells the agent to stop retrying. 0 disables. Default: 3.
 # identical_command_warn_after = 2    # trailing consecutive failures of the exact same Bash command (from the session transcript) before an Allow verdict also carries a warning in additionalContext. 0 disables. Default: 2.
 # identical_command_refuse_after = 5  # the same identical-failing-command count at which a HEADLESS launch (only) turns the verdict into Deny instead of merely warning; interactive launches never auto-refuse. 0 disables. Default: 5.
+
+# [fallback]
+# reactive_force_after_secs = 120     # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS): wait for idle after a confirmed block before forcing a structural seat handover.

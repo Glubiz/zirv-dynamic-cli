@@ -264,7 +264,7 @@ fn window_budget(window_name: &str, cfg: &CtxConfig) -> u64 {
     }
 }
 
-fn window_projected_headroom(
+pub(super) fn window_projected_headroom(
     window: &WindowReading,
     cfg: &CtxConfig,
     reserved: u64,
