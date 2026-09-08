@@ -297,6 +297,15 @@ pub(crate) fn render_diff_summary(
     body.push_str(&retrieval);
     body.push('\n');
     debug_assert!(body.len() <= max_bytes);
+    // Review finding F2: same never-worse guard as `output::render_summary`
+    // (#410) and `output_shape::render_json_summary` -- a repo-lowered
+    // `diff_max_bytes` can make the per-file listing itself larger than the
+    // raw diff it replaces (e.g. a single small hunk vs. a multi-line
+    // listing plus totals plus the retrieval line). A summary that grew is
+    // not compression.
+    if body.len() >= scan.total_bytes as usize {
+        return None;
+    }
     Some(body)
 }
 
@@ -404,15 +413,27 @@ mod tests {
     /// regardless of what its trailing `\r` does, so the count is exact.
     #[test]
     fn scan_diff_is_not_empty_for_a_crlf_vs_lf_only_change() {
-        let text = "diff --git a/file.txt b/file.txt\n\
-                     index 111..222 100644\n\
-                     --- a/file.txt\n\
-                     +++ b/file.txt\n\
-                     @@ -1,2 +1,2 @@\n\
-                     -line one\n\
-                     -line two\n\
-                     +line one\r\n\
-                     +line two\r\n";
+        let mut text = String::from(
+            "diff --git a/file.txt b/file.txt\n\
+             index 111..222 100644\n\
+             --- a/file.txt\n\
+             +++ b/file.txt\n\
+             @@ -1,2 +1,2 @@\n",
+        );
+        // Review finding F2's never-worse guard means `render_diff_summary`
+        // must beat the raw byte count -- padding with unchanged context
+        // lines (never counted as added/removed) keeps the diff itself tiny
+        // while giving the rendered listing (header, totals, retrieval line)
+        // room to still come out smaller than the raw capture.
+        for i in 0..200 {
+            text.push_str(&format!(" context filler line {i}\n"));
+        }
+        text.push_str(
+            "-line one\n\
+             -line two\n\
+             +line one\r\n\
+             +line two\r\n",
+        );
         let scan = scan_diff(text.as_bytes());
         assert_eq!(scan.files.len(), 1);
         assert_eq!(
@@ -518,18 +539,26 @@ mod tests {
     /// per test.
     #[test]
     fn no_summary_in_this_module_ever_contains_a_hunk_header() {
+        // Review finding F2's never-worse guard means each fixture needs
+        // enough raw bytes (padded with content that never changes
+        // `added`/`removed`: unchanged hunk context lines here, ordinary
+        // furniture lines for the binary fixture) for the rendered listing
+        // to still come out smaller than what it replaces.
+        let mut two_files = String::from("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n");
+        for i in 0..200 {
+            two_files.push_str(&format!(" context filler line {i}\n"));
+        }
+        two_files.push_str("-x\n+y\n");
+
+        let mut binary = String::from("diff --git a/x.png b/x.png\n");
+        for i in 0..200 {
+            binary.push_str(&format!("furniture filler line {i}\n"));
+        }
+        binary.push_str("Binary files a/x.png and b/x.png differ\n");
+
         let fixtures: Vec<(&str, DiffScan)> = vec![
-            (
-                "two files",
-                scan_diff("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-x\n+y\n".as_bytes()),
-            ),
-            (
-                "binary",
-                scan_diff(
-                    "diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n"
-                        .as_bytes(),
-                ),
-            ),
+            ("two files", scan_diff(two_files.as_bytes())),
+            ("binary", scan_diff(binary.as_bytes())),
         ];
         for (name, scan) in fixtures {
             let summary = render_diff_summary("id", "git diff", None, &scan, 4096)
