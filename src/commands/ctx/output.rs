@@ -668,7 +668,9 @@ fn git_subcommand_index(tokens: &[&str]) -> usize {
     i
 }
 
-fn bare_program(token: &str) -> String {
+/// `pub(crate)`: also reused by `ledger.rs`/`hook::run_posttool` to name the
+/// `program` column of one compaction-ledger row (issue #422).
+pub(crate) fn bare_program(token: &str) -> String {
     let bare = token.rsplit(['/', '\\']).next().unwrap_or(token);
     bare.to_ascii_lowercase()
         .trim_end_matches(".exe")

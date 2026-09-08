@@ -93,6 +93,11 @@ impl SlugEntry {
 // Session records embed the slug but are keyed by session id; their callers
 // are listed with the buckets they address. Worktree archives use a basename,
 // and harness transcript directories use the adapter's separate project slug.
+// The compaction ledger (issue #422) embeds the slug as a plain `repo` row
+// value inside one shared `<state>/ledger.sqlite` file rather than as a path
+// component at all -- its "ledger" row below is never a real directory
+// `adopt_legacy_slug_state` can find (so the rename it attempts always no-ops
+// as `NotFound`); it exists only to keep this consumer audit complete.
 const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
     (
         "memory",
@@ -225,6 +230,13 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
         "ctx-measure-baseline",
         SlugEntry::HomeFile(".json"),
         &["commands/ctx/measure.rs"],
+    ),
+    // See this array's own doc comment: `ledger.rs` embeds the slug as a row
+    // value in `<state>/ledger.sqlite`, never a `<state>/ledger/...` path.
+    (
+        "ledger",
+        SlugEntry::File("", ".sqlite"),
+        &["commands/ctx/ledger.rs"],
     ),
 ];
 

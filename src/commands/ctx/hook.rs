@@ -9,7 +9,7 @@ use super::diagnostics;
 use super::event::{NormalizedEvent, input_hash};
 use super::pathutil::canonicalize_with_missing_tail;
 use super::rot::{Score, Verdict};
-use super::state::{StateDir, now_secs};
+use super::state::{StateDir, now_secs, repo_slug};
 use super::supervise::Watcher;
 use super::{CtxResult, log, score, signal};
 use crate::commands::workflow::adoption::{self, AdoptionPolicy, AdoptionSignals};
@@ -2568,6 +2568,12 @@ pub struct PostToolPayload {
     pub tool_input: PostToolInput,
     pub tool_response: BashToolOutput,
     pub cwd: String,
+    /// Claude's own session id (issue #422's `ledger` `session` column).
+    pub session_id: String,
+    /// Claude's own tool-call id (issue #422's `ledger` `tool_use_id`
+    /// column), so a savings row can be correlated back to the exact
+    /// `PostToolUse` invocation that produced it.
+    pub tool_use_id: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2633,6 +2639,12 @@ pub(crate) fn posttool_output(summary: &str, interrupted: bool) -> String {
 /// never be the only surviving copy. Nothing here may `unwrap`, `expect` or
 /// return `Err`: the release profile is `panic = "abort"`, and a hook that
 /// aborts takes the tool result with it.
+///
+/// Issue #422: every path from a resolved `cwd`/state dir onward also
+/// records one row to `ledger.rs`'s own `compactions` table (fail-open,
+/// `ledger::record`'s own contract), so `zirv ctx savings` can answer how
+/// much this hook has actually saved without re-deriving it from the raw
+/// output-capture files.
 pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
     let Ok(payload) = serde_json::from_str::<PostToolPayload>(stdin) else {
         return Ok(0);
@@ -2648,9 +2660,13 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     } else {
         format!("{}\n{}", response.stdout, response.stderr)
     };
-    if already_offloaded(&combined) {
-        return Ok(0);
-    }
+
+    // Issue #422: `cwd`/`state` are resolved once, up front, because every
+    // path below this point records exactly one row to the compaction
+    // ledger before it returns -- a row needs both (`repo` comes from `cwd`,
+    // and the ledger file itself lives under `state`). The two paths that
+    // cannot resolve either (`no cwd`, `no state dir`) are the only ones
+    // that record nothing at all: there is nowhere to key or write a row.
     let cwd = if payload.cwd.is_empty() {
         let Ok(cwd) = std::env::current_dir() else {
             return Ok(0);
@@ -2659,8 +2675,42 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     } else {
         PathBuf::from(&payload.cwd)
     };
+    let Ok(state) = StateDir::resolve(env) else {
+        return Ok(0);
+    };
+    let program = payload
+        .tool_input
+        .command
+        .split_whitespace()
+        .next()
+        .map(super::output::bare_program)
+        .unwrap_or_default();
+    let repo = repo_slug(&cwd);
+    let bytes_in = combined.len() as u64;
+    let record = |outcome: super::ledger::Outcome, bytes_out: u64, retrieval_id: Option<&str>| {
+        super::ledger::record(
+            &state,
+            &super::ledger::CompactionRow {
+                ts: now_secs(),
+                tool_use_id: &payload.tool_use_id,
+                session: &payload.session_id,
+                repo: &repo,
+                program: &program,
+                bytes_in,
+                bytes_out,
+                outcome,
+                retrieval_id,
+            },
+        );
+    };
+
+    if already_offloaded(&combined) {
+        record(super::ledger::Outcome::Offloaded, bytes_in, None);
+        return Ok(0);
+    }
     let cfg = cfg_or_operator_only_gate(&cwd, env);
     if !cfg.output.compact {
+        record(super::ledger::Outcome::Disabled, bytes_in, None);
         return Ok(0);
     }
     // How much of THIS command's output may be replaced at all. A reader --
@@ -2672,7 +2722,10 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     let scope =
         super::output::classify_compaction(&payload.tool_input.command, &cfg.output.verbatim);
     let threshold = match scope {
-        super::output::CompactionScope::Verbatim => return Ok(0),
+        super::output::CompactionScope::Verbatim => {
+            record(super::ledger::Outcome::Verbatim, bytes_in, None);
+            return Ok(0);
+        }
         super::output::CompactionScope::Known => cfg.output.compact_min_bytes,
         super::output::CompactionScope::Generic => cfg.output.compact_generic_min_bytes,
         // Issue #412: a unified diff gets its own, generous threshold --
@@ -2682,17 +2735,15 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         super::output::CompactionScope::Diff => cfg.output.diff_max_bytes,
     };
     if combined.len() < threshold {
+        record(super::ledger::Outcome::BelowThreshold, bytes_in, None);
         return Ok(0);
     }
-    let Ok(state) = StateDir::resolve(env) else {
-        return Ok(0);
-    };
     let command = if payload.tool_input.command.trim().is_empty() {
         vec!["(bash)".to_string()]
     } else {
         vec![payload.tool_input.command.clone()]
     };
-    let Ok((_, summary)) = super::output::capture_text(
+    let Ok((id, summary)) = super::output::capture_text(
         &state,
         &cwd,
         &command,
@@ -2704,6 +2755,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         // Nothing was stored, so nothing may be replaced: handing back a
         // summary whose retrieval line names a file that does not exist would
         // turn this from compression into loss.
+        record(super::ledger::Outcome::PersistFailed, bytes_in, None);
         return Ok(0);
     };
     // `None` means the summary could not carry its own MANDATORY failure
@@ -2711,8 +2763,14 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     // silently dropped a `fatal:` is strictly worse than not replacing it, so
     // this fails open like every other path in here.
     let Some(summary) = summary else {
+        record(super::ledger::Outcome::PersistFailed, bytes_in, Some(&id));
         return Ok(0);
     };
+    record(
+        super::ledger::Outcome::Compacted,
+        summary.len() as u64,
+        Some(&id),
+    );
     let _ = writeln!(w, "{}", posttool_output(&summary, response.interrupted));
     Ok(0)
 }
@@ -6054,6 +6112,70 @@ mod tests {
             ),
         );
         assert!(out.is_empty(), "{out}");
+    }
+
+    /// Issue #422: a large `Bash` result that gets replaced also records
+    /// exactly one `compacted` row to the compaction ledger, with `bytes_in`
+    /// the original size and `bytes_out` the (much smaller) summary size.
+    #[test]
+    fn posttool_records_a_compacted_row_in_the_ledger() {
+        let rig = posttool_rig(&[]);
+        let original = noisy_output();
+        run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "cargo test",
+                serde_json::json!({
+                    "stdout": original,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+
+        let state = crate::commands::ctx::state::StateDir::from_root(rig.state.clone());
+        let rows = crate::commands::ctx::ledger::rows_for_test(&state);
+        assert_eq!(rows.len(), 1, "exactly one row, {rows:?}");
+        let (outcome, bytes_in, bytes_out) = &rows[0];
+        assert_eq!(outcome, "compacted");
+        assert_eq!(*bytes_in, original.len() as u64);
+        assert!(
+            *bytes_out < *bytes_in,
+            "a compacted row's bytes_out must be smaller: {bytes_out} vs {bytes_in}"
+        );
+    }
+
+    /// Below-threshold results also get a ledger row -- `below_threshold`,
+    /// with `bytes_out` equal to `bytes_in` since nothing was replaced.
+    #[test]
+    fn posttool_records_a_below_threshold_row_in_the_ledger() {
+        let rig = posttool_rig(&[]);
+        let small = "On branch main\nnothing to commit\n";
+        run_post(
+            &rig,
+            &posttool_stdin(
+                &rig.repo,
+                "Bash",
+                "git status",
+                serde_json::json!({
+                    "stdout": small,
+                    "stderr": "",
+                    "interrupted": false,
+                    "isImage": false,
+                }),
+            ),
+        );
+
+        let state = crate::commands::ctx::state::StateDir::from_root(rig.state.clone());
+        let rows = crate::commands::ctx::ledger::rows_for_test(&state);
+        assert_eq!(rows.len(), 1, "exactly one row, {rows:?}");
+        let (outcome, bytes_in, bytes_out) = &rows[0];
+        assert_eq!(outcome, "below_threshold");
+        assert_eq!(*bytes_in, small.len() as u64);
+        assert_eq!(*bytes_out, *bytes_in);
     }
 
     /// Every fail-open path: a tool this hook knows nothing about, an image
