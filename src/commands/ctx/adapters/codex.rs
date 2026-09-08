@@ -510,6 +510,27 @@ impl CodexAdapter {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
+    /// Issue #402: the named profile keeps the checkout read-only while
+    /// allowing zirv's mail, contract markers and session wake stamps.
+    /// Verified on macOS with codex-cli 0.153.4; workspace-write roots do
+    /// not apply to the legacy read-only sandbox.
+    fn read_only_sandbox_args(&self) -> Vec<String> {
+        let Some(state) = self.state_dir() else {
+            return vec!["--sandbox".into(), "read-only".into()];
+        };
+        vec![
+            "-c".into(),
+            "sandbox_mode=\"read-only\"".into(),
+            "-c".into(),
+            format!(
+                "permissions.zirv-read-only={{extends=\":read-only\",filesystem={{{}=\"write\"}}}}",
+                toml_quoted_string(&state.root().display().to_string())
+            ),
+            "-c".into(),
+            "default_permissions=\"zirv-read-only\"".into(),
+        ]
+    }
+
     /// The zirv state root this adapter reads the session registry and its
     /// own rollout pins from. `None` -- never a guess at a default -- when no
     /// platform state directory can be resolved at all, which
@@ -1243,7 +1264,7 @@ impl AgentAdapter for CodexAdapter {
         cmd
     }
 
-    /// `--sandbox read-only` plus, when `ignore_flags_supported()` confirms
+    /// The read-only mail profile plus, when `ignore_flags_supported()` confirms
     /// the installed codex-cli documents them, `--ignore-rules
     /// --ignore-user-config` (issue #89). Shared by `distiller_cmd` above
     /// and the workflow reviewer (`workflow::review::reviewer_argv`, via
@@ -1251,7 +1272,7 @@ impl AgentAdapter for CodexAdapter {
     /// this pin get the stronger guarantee together, on the same installed
     /// binary's own verified capability, rather than drifting apart.
     fn read_only_args(&self) -> Vec<String> {
-        let mut args = vec!["--sandbox".to_string(), "read-only".to_string()];
+        let mut args = self.read_only_sandbox_args();
         if self.ignore_flags_supported() {
             args.push("--ignore-rules".to_string());
             args.push("--ignore-user-config".to_string());
@@ -1269,12 +1290,12 @@ impl AgentAdapter for CodexAdapter {
     /// unconditionally whenever `ignore_flags_supported()` (an `exec --help`
     /// probe) said yes, which killed every `--mode read-only` dashboard pane
     /// instantly with "pane exited with code 2", before it ever registered a
-    /// session. This override carries only the one flag that is real on
+    /// session. This override carries the profile supported on
     /// BOTH surfaces -- never the exec-only pair, regardless of what the
     /// exec probe reports, because it is never applicable to this launch
     /// surface in the first place.
     fn interactive_read_only_args(&self) -> Vec<String> {
-        vec!["--sandbox".to_string(), "read-only".to_string()]
+        self.read_only_sandbox_args()
     }
 
     /// Issue #89: names the residual for the operator when the installed
@@ -1288,7 +1309,7 @@ impl AgentAdapter for CodexAdapter {
             return None;
         }
         Some(
-            "codex's report-only sandbox (--sandbox read-only) could not add --ignore-rules \
+            "codex's read-only filesystem policy could not add --ignore-rules \
              --ignore-user-config on this installed codex-cli, so the distiller/reviewer child \
              still reads this repo's .rules execpolicy files and your ~/.codex/config.toml on \
              top of AGENTS.md. Upgrade codex-cli to a version whose `codex exec --help` \
@@ -1393,7 +1414,7 @@ impl AgentAdapter for CodexAdapter {
     ) -> crate::commands::ctx::policy::CapabilityDescriptor {
         use crate::commands::ctx::policy::{Capability, CapabilityDescriptor, Stance};
 
-        const SANDBOX: &str = "--sandbox read-only, which scopes what an executed shell command may write rather \
+        const SANDBOX: &str = "the read-only permissions profile (zirv state writes allowed), which scopes what an executed shell command may write rather \
              than which of codex's own tools may run (recorded facts only -- not verified against \
              a live codex CLI)";
         const WORKSPACE: &str = "--sandbox workspace-write, which keeps writes inside the workspace (documented, not \
@@ -1909,6 +1930,10 @@ impl AgentAdapter for CodexAdapter {
             assistant_texts,
             ..StructuralContext::default()
         }
+    }
+
+    fn final_assistant_message(&self, jsonl: &str) -> Option<String> {
+        super::super::transcript_source::codex_final_assistant_message(jsonl)
     }
 
     fn transcript_usage(&self, jsonl: &str) -> Option<TranscriptUsage> {
@@ -2978,6 +3003,65 @@ mod tests {
             vec!["--sandbox".to_string(), "read-only".to_string()],
             "unaffected either way by the exec-only probe"
         );
+    }
+
+    #[test]
+    fn read_only_launch_grants_only_state_writes_and_selects_the_profile() {
+        use crate::commands::ctx::policy::{EffectivePolicy, Stance};
+        let root = PathBuf::from("/zirv state/operator's ctx");
+        let adapter = CodexAdapter::new(None)
+            .with_state_root(root.clone())
+            .with_ignore_flags_forced(true)
+            .with_exec_ask_for_approval_forced(true);
+        assert!(super::super::flags_pin_policy(&adapter.read_only_args()));
+        for mode in [
+            super::super::LaunchMode::Interactive,
+            super::super::LaunchMode::Headless,
+        ] {
+            let policy = EffectivePolicy {
+                repo_fs_write: Stance::Deny,
+                ..EffectivePolicy::default()
+            };
+            let mut args = adapter.policy_args(&policy, mode);
+            args.extend(["--sandbox".into(), "workspace-write".into()]);
+            super::super::extend_read_only_args(&adapter, &mut args, mode);
+            let once = args.clone();
+            super::super::extend_read_only_args(&adapter, &mut args, mode);
+            assert_eq!(args, once, "applying the floor twice must be idempotent");
+            assert!(
+                !args
+                    .iter()
+                    .any(|arg| arg == "--sandbox" || arg == "workspace-write")
+            );
+            let mut config = toml::Table::new();
+            for pair in args.windows(2).filter(|pair| pair[0] == "-c") {
+                config
+                    .extend(toml::from_str::<toml::Table>(&pair[1]).expect("valid TOML override"));
+            }
+            assert_eq!(
+                config["default_permissions"].as_str(),
+                Some("zirv-read-only")
+            );
+            assert_eq!(config["sandbox_mode"].as_str(), Some("read-only"));
+            let profile = &config["permissions"]["zirv-read-only"];
+            assert_eq!(profile["extends"].as_str(), Some(":read-only"));
+            let filesystem = profile["filesystem"].as_table().expect("filesystem rules");
+            assert_eq!(filesystem.len(), 1, "no checkout or git write grant");
+            assert_eq!(
+                filesystem[&root.display().to_string()].as_str(),
+                Some("write")
+            );
+            if mode.is_interactive() {
+                assert!(
+                    !args
+                        .iter()
+                        .any(|arg| arg == "--ignore-rules" || arg == "--ignore-user-config")
+                );
+            } else {
+                assert!(args.iter().any(|arg| arg == "--ignore-rules"));
+                assert!(args.iter().any(|arg| arg == "--ignore-user-config"));
+            }
+        }
     }
 
     /// Companion of the fix above: `policy_args` under an Interactive mode

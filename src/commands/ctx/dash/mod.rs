@@ -9315,6 +9315,23 @@ fn report_unconfirmed_submission(
 }
 
 fn report_settled_pane(pane: &mut Pane, state: &StateDir, cfg: &CtxConfig, errors: &mut ErrorLog) {
+    report_settled_pane_with(pane, state, cfg, errors, |pane| {
+        let adapter = adapters::select(Some(pane.agent()), &[], cfg).ok()?;
+        let path = adapter.transcript_path(&SessionRef {
+            id: SessionId::parse(pane.session_id()),
+            cwd: pane.cwd().to_path_buf(),
+        });
+        adapter.final_assistant_message(&std::fs::read_to_string(path).ok()?)
+    });
+}
+
+fn report_settled_pane_with(
+    pane: &mut Pane,
+    state: &StateDir,
+    cfg: &CtxConfig,
+    errors: &mut ErrorLog,
+    final_message: impl FnOnce(&Pane) -> Option<String>,
+) {
     if pane.verb() != sessions::Verb::Dash || pane.settled_mail_sent {
         return;
     }
@@ -9328,17 +9345,57 @@ fn report_settled_pane(pane: &mut Pane, state: &StateDir, cfg: &CtxConfig, error
     {
         return;
     }
-    let tail = pane.screen_tail();
+    let recipient_short = sessions::short_id(&recipient);
+    let slug = sessions::load_record(state, &recipient_short)
+        .map(|record| record.repo_slug)
+        .unwrap_or_else(|| super::state::repo_slug(pane.cwd()));
+    if mail::sent_since(
+        state,
+        &slug,
+        pane.short(),
+        &recipient_short,
+        pane.started_at(),
+    ) {
+        pane.settled_mail_sent = true;
+        return;
+    }
+    let recovered = (mail::session_delivery_metrics(state, pane.short(), super::state::now_secs())
+        .recent_out
+        == 0)
+        .then(|| final_message(pane))
+        .flatten()
+        .filter(|text| !text.trim().is_empty());
+    let mut tail = recovered
+        .as_deref()
+        .map(str::to_owned)
+        .unwrap_or_else(|| pane.screen_tail());
+    if recovered.is_some()
+        && let Some(schema) = &pane.result_schema
+    {
+        match super::result_schema::Schema::from_json(schema) {
+            Ok(schema) => {
+                if let Err(errors) = super::result_schema::evaluate(&schema, &tail) {
+                    tail = format!("contract_failed:\n{}\n\n{tail}", errors.join("\n"));
+                }
+            }
+            Err(error) => {
+                tail = format!("contract_failed: invalid result schema: {error}\n\n{tail}")
+            }
+        }
+    }
     let outcome = match pane.state() {
         PaneState::Ended(code) => format!("ended with exit code {code}"),
         _ => "settled".to_string(),
     };
-    let body = format!(
+    let mut body = format!(
         "pane {} ({}, {}) {outcome} with unread output\n\n{tail}",
         pane.short(),
         pane.agent(),
         pane.cwd().display()
     );
+    if recovered.is_some() {
+        body = format!("recovered-from-transcript\n{body}");
+    }
     match store_pane_system_mail(pane, &recipient, body, state, cfg) {
         Ok(()) => pane.settled_mail_sent = true,
         Err(error) => push_error(errors, format!("settled report: {error}")),
@@ -24197,6 +24254,66 @@ mod tests {
         assert!(messages[0].1.body.contains("settled with unread output"));
         assert!(messages[0].1.body.contains("hello"));
         panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn settled_worker_with_zero_outbound_mail_recovers_transcript_report_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        pane.set_report_to(Some("aaaa1111".into()));
+        pane.result_schema = Some(r#"{"fields":[{"name":"status","kind":"str"}]}"#.into());
+        use super::super::attention::{self, Authority, Lifecycle, Observation};
+        let now = super::super::state::now_secs();
+        for lifecycle in [Lifecycle::Working, Lifecycle::Settled] {
+            attention::record(
+                &state,
+                pane.short(),
+                Observation::new(Authority::QuietHeuristic, "worker lifecycle", 50, now)
+                    .with_lifecycle(lifecycle),
+                now,
+            );
+        }
+        let transcript = tmp.path().join("rollout.jsonl");
+        std::fs::write(&transcript, r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"The complete research report."},{"type":"function_call","arguments":"secret tool arguments"}]}}"#).expect("transcript");
+        let mut errors = ErrorLog::default();
+        assert_eq!(
+            mail::session_delivery_metrics(&state, pane.short(), super::super::state::now_secs())
+                .recent_out,
+            0
+        );
+        for _ in 0..2 {
+            report_settled_pane_with(
+                &mut pane,
+                &state,
+                &CtxConfig::default(),
+                &mut errors,
+                |_| {
+                    super::super::transcript_source::codex_final_assistant_message(
+                        &std::fs::read_to_string(&transcript).expect("read transcript"),
+                    )
+                },
+            );
+        }
+        let messages = mail::list(
+            &state,
+            &super::super::state::repo_slug(tmp.path()),
+            None,
+            Some("aaaa1111"),
+        )
+        .expect("mail");
+        assert_eq!(messages.len(), 1);
+        let report = &messages[0].1.body;
+        assert!(report.starts_with("recovered-from-transcript\n"));
+        assert!(report.contains("The complete research report."));
+        assert!(report.contains("contract_failed:"));
+        assert!(!report.contains("secret tool arguments"));
+        assert!(!report.contains("hello"), "screen tail must be replaced");
+        pane.finish_shutdown().expect("shutdown");
     }
 
     #[test]

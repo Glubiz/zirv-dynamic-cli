@@ -327,7 +327,8 @@ pub fn flags_pin_policy(flags: &[String]) -> bool {
         "--dangerously-skip-permissions",
         "--dangerously-bypass-approvals-and-sandbox",
     ];
-    const CODEX_CONFIG_OVERRIDE_KEYS: &[&str] = &["approval_policy", "sandbox_mode"];
+    const CODEX_CONFIG_OVERRIDE_KEYS: &[&str] =
+        &["approval_policy", "sandbox_mode", "default_permissions"];
 
     let names_a_config_override_key = |value: &str| {
         CODEX_CONFIG_OVERRIDE_KEYS
@@ -1446,6 +1447,11 @@ pub trait AgentAdapter: std::fmt::Debug {
     /// last pass, and that is what makes it equal to a full parse.
     fn parse_events(&self, jsonl: &str) -> Vec<NormalizedEvent>;
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext;
+
+    /// Final report text only; structural extraction excludes tool arguments.
+    fn final_assistant_message(&self, jsonl: &str) -> Option<String> {
+        self.structural_context(jsonl, 1).assistant_texts.pop()
+    }
 
     /// The most recently observed live model id inside `jsonl`, or `None`
     /// when this adapter has no per-transcript model signal (the default) or
@@ -2614,8 +2620,8 @@ pub fn read_only_args_for_agent_name(name: &str, mode: LaunchMode) -> Option<Vec
 }
 
 /// Apply a worker's read-only floor at the launch composition seam.
-/// Codex's sandbox option is single-use: replace the earlier choice instead
-/// of appending a second pair. Other adapters retain their own floor argv.
+/// Codex's legacy sandbox selection must not override the named mail profile.
+/// Other adapters retain their own floor argv.
 pub fn extend_read_only_args(
     adapter: &(impl AgentAdapter + ?Sized),
     args: &mut Vec<String>,
@@ -2627,11 +2633,18 @@ pub fn extend_read_only_args(
         adapter.read_only_args()
     };
     if adapter.name() == "codex" {
+        let uses_profile = floor
+            .iter()
+            .any(|arg| arg.starts_with("default_permissions="));
         let mut replaced = false;
         let mut index = 0;
         while index < args.len() {
             let arg = &args[index];
             if arg == "--sandbox" || arg == "-s" {
+                if uses_profile {
+                    args.drain(index..(index + 2).min(args.len()));
+                    continue;
+                }
                 args[index] = "--sandbox".to_string();
                 if index + 1 == args.len() {
                     args.push("read-only".to_string());
@@ -2641,6 +2654,10 @@ pub fn extend_read_only_args(
                 replaced = true;
                 index += 1;
             } else if arg.starts_with("--sandbox=") || (arg.starts_with("-s") && arg.len() > 2) {
+                if uses_profile {
+                    args.remove(index);
+                    continue;
+                }
                 args.splice(
                     index..=index,
                     ["--sandbox".to_string(), "read-only".to_string()],
@@ -2652,6 +2669,15 @@ pub fn extend_read_only_args(
         }
         if replaced {
             floor.drain(..2);
+        }
+        let mut index = 0;
+        while index + 1 < floor.len() {
+            if floor[index] == "-c" && args.windows(2).any(|pair| pair == &floor[index..index + 2])
+            {
+                floor.drain(index..index + 2);
+            } else {
+                index += 1;
+            }
         }
         // A workflow reviewer can already carry the exec-only floor.
         floor.retain(|arg| {

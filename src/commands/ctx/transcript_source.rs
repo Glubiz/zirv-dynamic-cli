@@ -53,6 +53,43 @@ const SHADOW_RETENTION_DAYS: u64 = 30;
 /// [`tail_window`]: ShadowTranscript::tail_window
 const TAIL_READ_BYTES: u64 = 64 * 1024;
 
+/// The last Codex assistant message, never tool arguments/results or commentary.
+/// Rollouts may end without a `task_complete` event when the context is exhausted.
+pub fn codex_final_assistant_message(jsonl: &str) -> Option<String> {
+    for line in jsonl.lines().rev() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let payload = &row["payload"];
+        if row["type"] == "response_item"
+            && payload["type"] == "message"
+            && payload["role"] == "user"
+        {
+            return None;
+        }
+        if row["type"] != "response_item"
+            || payload["type"] != "message"
+            || payload["role"] != "assistant"
+            || payload["phase"] == "commentary"
+        {
+            continue;
+        }
+        let Some(content) = payload["content"].as_array() else {
+            continue;
+        };
+        let text = content
+            .iter()
+            .filter(|item| item["type"] == "output_text")
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
 /// One session's materialized shadow transcript:
 /// `<state>/shadow/<short>.jsonl` holds the JSONL rows the rot engine reads.
 /// A sibling of [`StateDir::rollouts`], with the same short-id derivation
@@ -494,6 +531,29 @@ mod tests {
     use crate::commands::ctx::event::{Capabilities, NormalizedEvent, SessionId};
     use crate::commands::ctx::score::IncrementalScorer;
     use std::process::Command;
+
+    #[test]
+    fn codex_final_message_extracts_only_assistant_output_text() {
+        let jsonl = r#"
+{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"old report"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"output_text","text":"not a report"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"final report"},{"type":"tool_call","arguments":"secret"},{"type":"output_text","text":"second paragraph"}]}}
+{"type":"response_item","payload":{"type":"function_call","arguments":"secret"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"progress only"}]}}
+{"partial":
+"#;
+        assert_eq!(
+            codex_final_assistant_message(jsonl).as_deref(),
+            Some("final report\nsecond paragraph")
+        );
+        assert_eq!(codex_final_assistant_message(""), None);
+        assert_eq!(
+            codex_final_assistant_message(
+                r#"{"type":"response_item","payload":{"type":"function_call","arguments":"secret"}}"#
+            ),
+            None
+        );
+    }
 
     fn session(id: &str) -> SessionRef {
         SessionRef {

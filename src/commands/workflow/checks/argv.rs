@@ -23,10 +23,10 @@ use super::BuiltinCheckResult;
 
 pub const CODEX_ID: &str = "ZCHK-ARGV-CODEX-EXEC";
 const CODEX_PROVES: &str = "codex's headless worker argv still opens with `exec`, still carries \
-     the prompt on argv, and still adds `--sandbox` when EffectivePolicy::shell_exec is Deny";
+     the prompt on argv, and keeps a read-only filesystem policy with only zirv state writable when shell_exec is Deny";
 const CODEX_FIX: &str = "adapters::codex::CodexAdapter::headless_cmd must keep `exec` as its \
      first argv token with the prompt following it, and policy_args must keep adding \
-     `--sandbox` (via read_only_args) whenever shell_exec/repo_fs_write is Deny";
+     the read-only mail profile (via read_only_args) whenever shell_exec/repo_fs_write is Deny";
 const CODEX_ORIGIN: &str = "adapter argv regressions -- Ruflo round-2 audit-codex-integration.mjs \
      precedent (issue #278): 'the orchestrator still builds [\"exec\", \"--sandbox\", ...]'";
 
@@ -71,8 +71,8 @@ fn codex_exec_result(adapter: &CodexAdapter) -> BuiltinCheckResult {
     if !args.iter().any(|arg| arg == prompt) {
         problems.push("the prompt is missing from argv".to_string());
     }
-    if !args.iter().any(|arg| arg == "--sandbox") {
-        problems.push("no --sandbox flag when shell_exec is denied".to_string());
+    if !codex_read_only_policy(&args) {
+        problems.push("missing read-only policy or invalid zirv state write exception".to_string());
     }
 
     if problems.is_empty() {
@@ -92,6 +92,46 @@ fn codex_exec_result(adapter: &CodexAdapter) -> BuiltinCheckResult {
             problems.join("; "),
         )
     }
+}
+
+fn codex_read_only_policy(args: &[String]) -> bool {
+    if args.iter().any(|arg| arg == "--sandbox") {
+        return args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "read-only"]);
+    }
+    let mut config = toml::Table::new();
+    for pair in args.windows(2).filter(|pair| pair[0] == "-c") {
+        if let Ok(overrides) = toml::from_str::<toml::Table>(&pair[1]) {
+            config.extend(overrides);
+        }
+    }
+    let Some(profile) = config
+        .get("permissions")
+        .and_then(|profiles| profiles.get("zirv-read-only"))
+    else {
+        return false;
+    };
+    let state = crate::commands::ctx::state::StateDir::resolve(
+        &crate::commands::ctx::config::env_from_process(),
+    );
+    config
+        .get("default_permissions")
+        .and_then(toml::Value::as_str)
+        == Some("zirv-read-only")
+        && profile.get("extends").and_then(toml::Value::as_str) == Some(":read-only")
+        && profile
+            .get("filesystem")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|rules| {
+                rules.len() == 1
+                    && state.is_ok_and(|state| {
+                        rules
+                            .get(&state.root().display().to_string())
+                            .and_then(toml::Value::as_str)
+                            == Some("write")
+                    })
+            })
 }
 
 pub const CLAUDE_ID: &str = "ZCHK-ARGV-CLAUDE-HEADLESS";
@@ -159,6 +199,35 @@ pub fn run_claude_headless(_repo: &Path) -> BuiltinCheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_read_only_profile_requires_state_grant_and_selection() {
+        let state = crate::commands::ctx::state::StateDir::resolve(
+            &crate::commands::ctx::config::env_from_process(),
+        )
+        .expect("state directory");
+        let adapter = CodexAdapter::new(None)
+            .with_state_root(state.root().to_path_buf())
+            .with_ignore_flags_forced(false);
+        let args = adapter.read_only_args();
+        assert!(codex_read_only_policy(&args));
+        for key in ["default_permissions=", "permissions.zirv-read-only="] {
+            let mut missing = args.clone();
+            let index = missing
+                .iter()
+                .position(|arg| arg.starts_with(key))
+                .expect("override");
+            missing.drain(index - 1..=index);
+            assert!(!codex_read_only_policy(&missing), "must require {key}");
+        }
+        let mut widened = args;
+        let profile = widened
+            .iter_mut()
+            .find(|arg| arg.starts_with("permissions.zirv-read-only="))
+            .expect("profile");
+        *profile = profile.replace(":read-only", ":workspace");
+        assert!(!codex_read_only_policy(&widened));
+    }
     use crate::commands::workflow::checks::BuiltinOutcome;
 
     #[test]
