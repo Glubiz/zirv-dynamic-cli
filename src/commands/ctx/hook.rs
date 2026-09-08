@@ -3120,7 +3120,6 @@ fn run_audit<W: Write>(w: &mut W, since: &str, env: EnvLookup<'_>) -> CtxResult<
     Ok(0)
 }
 
-
 /// Issue #420: `zirv ctx hook status`. Advisory only -- always exits 0,
 /// printing what went wrong inline rather than propagating it, since a
 /// classify/heal failure (e.g. a malformed `settings.json`) must never make
