@@ -427,6 +427,41 @@ fn prune_safety_buckets(dir: &std::path::Path, newest_day: u64) {
     }
 }
 
+/// The owned, deserializable counterpart of [`Decision`] (which borrows and
+/// is serialize-only) -- what `zirv ctx hook audit` and `zirv ctx status`'s
+/// own per-session hook-health line (issue #424) parse the main decision
+/// log back into. Field names/shape mirror `Decision` exactly, the same
+/// borrowed-for-writing/owned-for-reading split every other pair in this
+/// module already uses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DecisionRecord {
+    pub ts: u64,
+    pub session: String,
+    pub verb: String,
+    pub verdict: String,
+    #[allow(dead_code)]
+    pub score: u32,
+    pub action: String,
+    pub detail: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub observed_at: Option<u64>,
+}
+
+/// Reads every parseable line in the main decision log (`decisions.jsonl`),
+/// oldest first -- a missing file is an empty list, not an error, and a
+/// corrupt line is skipped rather than fatal, the same best-effort contract
+/// every other reader in this module gives its own file.
+pub fn read_decisions(state: &StateDir) -> Vec<DecisionRecord> {
+    let path = state.logs().join(LOG_FILE);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
 pub fn tail(state: &StateDir, count: usize) -> CtxResult<Vec<String>> {
     let path = state.logs().join(LOG_FILE);
     if !path.exists() {
@@ -870,6 +905,66 @@ mod tests {
         };
         assert_eq!(mode(&state.logs().join(LOG_FILE)), 0o600);
         assert_eq!(mode(&state.logs()), 0o700);
+    }
+
+    /// Issue #424: every field of a logged decision round-trips back through
+    /// `read_decisions`, oldest first, and a corrupt line landing in the
+    /// middle is skipped rather than fatal -- the same tolerance every other
+    /// reader in this module gives its own file.
+    #[test]
+    fn read_decisions_round_trips_and_skips_a_corrupt_line() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        append(
+            &state,
+            &Decision {
+                ts: 1_700_000_000,
+                session: "sess-1",
+                verb: "hook",
+                verdict: "n/a",
+                score: 0,
+                action: "reuse-probe-skipped",
+                detail: "budget exhausted",
+                observed_at: None,
+            },
+        )
+        .expect("append");
+        {
+            let mut file = super::super::state::open_private_append(&state.logs().join(LOG_FILE))
+                .expect("open");
+            writeln!(file, "not json").expect("write corrupt line");
+        }
+        append(
+            &state,
+            &Decision {
+                ts: 1_700_000_100,
+                session: "sess-2",
+                verb: "hook",
+                verdict: "deny",
+                score: 90,
+                action: "dispatch-denied",
+                detail: "",
+                observed_at: None,
+            },
+        )
+        .expect("append");
+
+        let records = read_decisions(&state);
+        assert_eq!(records.len(), 2, "the corrupt line is skipped: {records:?}");
+        assert_eq!(records[0].session, "sess-1");
+        assert_eq!(records[0].action, "reuse-probe-skipped");
+        assert_eq!(records[0].detail, "budget exhausted");
+        assert_eq!(records[1].session, "sess-2");
+        assert_eq!(records[1].verdict, "deny");
+    }
+
+    /// No file at all is an empty list, not an error -- no hook has ever
+    /// logged a decision on this machine.
+    #[test]
+    fn read_decisions_before_any_exist_is_empty_not_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        assert!(read_decisions(&state).is_empty());
     }
 
     #[test]

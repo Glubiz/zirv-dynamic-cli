@@ -261,6 +261,116 @@ pub(crate) fn rows_for_test(state: &StateDir) -> Vec<(String, u64, u64)> {
         .collect()
 }
 
+/// Outcome string keyed by `tool_use_id`, over every row with `ts >=
+/// since_ts` -- what `discover.rs` (issue #423) joins its own
+/// transcript-derived candidate list against, to tell a MEASURED result (the
+/// hook actually looked at it, and this says what it did) from one it must
+/// ESTIMATE instead by re-running today's `output::classify_compaction`.
+/// Best-effort like every other ledger reader: a resolution failure
+/// degrades to an empty map, never an error. A `tool_use_id` recorded more
+/// than once (should not happen -- `hook::run_posttool` records exactly one
+/// row per `PostToolUse` call) keeps whichever row `ORDER BY ts` visits
+/// last.
+pub fn outcomes_by_tool_use_id(
+    state: &StateDir,
+    since_ts: u64,
+) -> std::collections::HashMap<String, String> {
+    let Ok(conn) = open(state) else {
+        return std::collections::HashMap::new();
+    };
+    let result: rusqlite::Result<Vec<(String, String)>> = conn
+        .prepare(
+            "SELECT tool_use_id, outcome FROM compactions
+             WHERE ts >= ?1 AND tool_use_id IS NOT NULL AND tool_use_id != ''
+             ORDER BY ts",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt
+                .query_map(rusqlite::params![since_ts as i64], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .filter_map(Result::ok)
+                .collect();
+            Ok(rows)
+        });
+    result.unwrap_or_default().into_iter().collect()
+}
+
+/// Row counts by outcome, over every row with `ts >= since_ts` -- what
+/// `zirv ctx hook audit` (issue #424) shows as "ledger outcomes" alongside
+/// its own decision-log/safety-log counts. Best-effort like every other
+/// ledger reader: a resolution failure degrades to an empty map, never an
+/// error.
+pub fn outcome_counts_since(state: &StateDir, since_ts: u64) -> BTreeMap<String, u64> {
+    totals(&read_since(state, since_ts, None)).by_outcome
+}
+
+/// Distinct sessions with at least one row whose `bytes_in >= min_bytes`,
+/// most-recently-active first, capped at `limit` -- what `zirv ctx status`'s
+/// own bounded hook-health check (issue #424) scans instead of every
+/// session the ledger has ever recorded. Best-effort like every other
+/// ledger reader: a resolution failure degrades to an empty list, never an
+/// error.
+pub fn sessions_with_large_results(state: &StateDir, min_bytes: u64, limit: usize) -> Vec<String> {
+    let Ok(conn) = open(state) else {
+        return Vec::new();
+    };
+    let result: rusqlite::Result<Vec<String>> = conn
+        .prepare(
+            "SELECT session FROM compactions WHERE bytes_in >= ?1
+             GROUP BY session ORDER BY MAX(ts) DESC LIMIT ?2",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt
+                .query_map(rusqlite::params![min_bytes as i64, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .filter_map(Result::ok)
+                .collect();
+            Ok(rows)
+        });
+    result.unwrap_or_default()
+}
+
+/// `(compacted, large)` for one session: `large` is every row for `session`
+/// with `bytes_in >= min_bytes`, `compacted` is how many of those carry
+/// outcome `"compacted"` -- what `zirv ctx status`'s own per-session
+/// `compaction: X of Y large results` line (issue #424) reports. `(0, 0)`
+/// for a session with no qualifying rows at all, or on any resolution
+/// failure -- the same "degrade silently, never error" contract every other
+/// ledger reader in this module gives its own read.
+pub fn session_large_result_counts(state: &StateDir, session: &str, min_bytes: u64) -> (u64, u64) {
+    let Ok(conn) = open(state) else {
+        return (0, 0);
+    };
+    let result: rusqlite::Result<(i64, i64)> = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN outcome = 'compacted' THEN 1 ELSE 0 END), 0)
+         FROM compactions WHERE session = ?1 AND bytes_in >= ?2",
+        rusqlite::params![session, min_bytes as i64],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    result
+        .map(|(large, compacted)| (compacted as u64, large as u64))
+        .unwrap_or((0, 0))
+}
+
+/// Whether ANY row at all exists for `session`, regardless of size --
+/// `zirv ctx status` (issue #424) reads this alongside `log::read_decisions`
+/// to tell "the hook never once looked at this session" from "it looked,
+/// but nothing this session ran was ever large enough to compact".
+pub fn session_has_any_row(state: &StateDir, session: &str) -> bool {
+    let Ok(conn) = open(state) else {
+        return false;
+    };
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM compactions WHERE session = ?1)",
+        rusqlite::params![session],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n != 0)
+    .unwrap_or(false)
+}
+
 fn row_from_query(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
     let bytes_in: i64 = row.get(0)?;
     let bytes_out: i64 = row.get(1)?;
@@ -798,5 +908,233 @@ mod tests {
             ),
         );
         assert_eq!(status_line(&state, now), None);
+    }
+
+    /// `outcomes_by_tool_use_id` (issue #423) returns the outcome for every
+    /// row whose `tool_use_id` is non-empty, keyed by that id; a `tool_use_id`
+    /// with no ledger row at all (never recorded, or recorded outside the
+    /// `since_ts` window) is simply absent from the map -- the caller reads
+    /// that absence as "estimate this one instead".
+    #[test]
+    fn outcomes_by_tool_use_id_maps_every_recorded_id_and_omits_the_rest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let now = 1_700_000_000u64;
+
+        record(
+            &state,
+            &CompactionRow {
+                ts: now - 10,
+                tool_use_id: "toolu_compacted",
+                session: "sess-a",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 10_000,
+                bytes_out: 500,
+                outcome: Outcome::Compacted,
+                retrieval_id: Some("r1"),
+            },
+        );
+        record(
+            &state,
+            &CompactionRow {
+                ts: now - 20,
+                tool_use_id: "toolu_verbatim",
+                session: "sess-a",
+                repo: "repo-a",
+                program: "cat",
+                bytes_in: 8_000,
+                bytes_out: 8_000,
+                outcome: Outcome::Verbatim,
+                retrieval_id: None,
+            },
+        );
+        // Outside the `since_ts` window below -- must not appear.
+        record(
+            &state,
+            &CompactionRow {
+                ts: now - 20 * 86_400,
+                tool_use_id: "toolu_stale",
+                session: "sess-a",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 9_000,
+                bytes_out: 9_000,
+                outcome: Outcome::BelowThreshold,
+                retrieval_id: None,
+            },
+        );
+
+        let map = outcomes_by_tool_use_id(&state, now - 7 * 86_400);
+        assert_eq!(
+            map.get("toolu_compacted").map(String::as_str),
+            Some("compacted")
+        );
+        assert_eq!(
+            map.get("toolu_verbatim").map(String::as_str),
+            Some("verbatim")
+        );
+        assert_eq!(
+            map.get("toolu_stale"),
+            None,
+            "outside the since window: {map:?}"
+        );
+        assert_eq!(map.get("toolu_never_recorded"), None);
+    }
+
+    /// `outcome_counts_since` (issue #424) counts rows by outcome, ignoring
+    /// anything older than `since_ts`.
+    #[test]
+    fn outcome_counts_since_counts_by_outcome_within_the_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let now = 1_700_000_000u64;
+        record(
+            &state,
+            &row(now - 10, Outcome::Compacted, 10_000, 500, "repo-a"),
+        );
+        record(
+            &state,
+            &row(now - 20, Outcome::Compacted, 10_000, 500, "repo-a"),
+        );
+        record(
+            &state,
+            &row(now - 30, Outcome::BelowThreshold, 100, 100, "repo-a"),
+        );
+        record(
+            &state,
+            &row(now - 20 * 86_400, Outcome::Verbatim, 5_000, 5_000, "repo-a"),
+        );
+
+        let counts = outcome_counts_since(&state, now - 7 * 86_400);
+        assert_eq!(counts.get("compacted"), Some(&2));
+        assert_eq!(counts.get("below_threshold"), Some(&1));
+        assert_eq!(
+            counts.get("verbatim"),
+            None,
+            "outside the window: {counts:?}"
+        );
+    }
+
+    /// `sessions_with_large_results` (issue #424) returns only sessions with
+    /// at least one row at or above `min_bytes`, most-recently-active first.
+    #[test]
+    fn sessions_with_large_results_filters_by_size_and_orders_most_recent_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let now = 1_700_000_000u64;
+
+        record(
+            &state,
+            &CompactionRow {
+                ts: now - 100,
+                tool_use_id: "t1",
+                session: "sess-small-only",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 100,
+                bytes_out: 100,
+                outcome: Outcome::BelowThreshold,
+                retrieval_id: None,
+            },
+        );
+        record(
+            &state,
+            &CompactionRow {
+                ts: now - 50,
+                tool_use_id: "t2",
+                session: "sess-old-large",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 10_000,
+                bytes_out: 10_000,
+                outcome: Outcome::Verbatim,
+                retrieval_id: None,
+            },
+        );
+        record(
+            &state,
+            &CompactionRow {
+                ts: now - 10,
+                tool_use_id: "t3",
+                session: "sess-new-large",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 20_000,
+                bytes_out: 2_000,
+                outcome: Outcome::Compacted,
+                retrieval_id: Some("r"),
+            },
+        );
+
+        let sessions = sessions_with_large_results(&state, 4_096, 20);
+        assert_eq!(sessions, vec!["sess-new-large", "sess-old-large"]);
+    }
+
+    /// `session_large_result_counts`/`session_has_any_row` (issue #424) --
+    /// the pair `zirv ctx status`'s own per-session line reads. A session
+    /// with rows only below `min_bytes` still counts as "has a row" but
+    /// contributes nothing to the large/compacted counts.
+    #[test]
+    fn session_large_result_counts_and_has_any_row_report_correctly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let now = 1_700_000_000u64;
+
+        assert!(!session_has_any_row(&state, "sess-unknown"));
+        assert_eq!(
+            session_large_result_counts(&state, "sess-unknown", 4_096),
+            (0, 0)
+        );
+
+        record(
+            &state,
+            &CompactionRow {
+                ts: now - 10,
+                tool_use_id: "t1",
+                session: "sess-a",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 100,
+                bytes_out: 100,
+                outcome: Outcome::BelowThreshold,
+                retrieval_id: None,
+            },
+        );
+        record(
+            &state,
+            &CompactionRow {
+                ts: now - 5,
+                tool_use_id: "t2",
+                session: "sess-a",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 20_000,
+                bytes_out: 2_000,
+                outcome: Outcome::Compacted,
+                retrieval_id: Some("r"),
+            },
+        );
+        record(
+            &state,
+            &CompactionRow {
+                ts: now - 3,
+                tool_use_id: "t3",
+                session: "sess-a",
+                repo: "repo-a",
+                program: "cat",
+                bytes_in: 30_000,
+                bytes_out: 30_000,
+                outcome: Outcome::Verbatim,
+                retrieval_id: None,
+            },
+        );
+
+        assert!(session_has_any_row(&state, "sess-a"));
+        assert_eq!(
+            session_large_result_counts(&state, "sess-a", 4_096),
+            (1, 2),
+            "one compacted of two rows at/above the threshold; the 100-byte row is excluded"
+        );
     }
 }

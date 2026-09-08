@@ -19,6 +19,7 @@ pub mod context_lint;
 pub mod context_status;
 pub mod dash;
 pub mod diagnostics;
+pub mod discover;
 pub mod drift;
 pub mod envelope;
 pub mod event;
@@ -515,6 +516,11 @@ pub enum CtxVerb {
     /// to diff against (issue #294). Strictly read-only outside `measure
     /// baseline`.
     Measure(measure::MeasureArgs),
+    /// List the largest `Bash` tool results in recent sessions that reached
+    /// the model uncompacted, bucketed by reason -- measured against the
+    /// compaction ledger where a row exists, estimated from today's config
+    /// otherwise (issue #423). Read-only: never changes config.
+    Discover(discover::DiscoverArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -640,6 +646,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Task(a) => task::run(a, &mut out),
         CtxVerb::Swarm(a) => task::run_swarm(a, &mut out),
         CtxVerb::Measure(a) => measure::run(a, &mut out),
+        CtxVerb::Discover(a) => discover::run(a, &mut out),
     };
 
     match result {

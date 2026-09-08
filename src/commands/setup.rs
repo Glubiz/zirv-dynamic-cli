@@ -433,6 +433,30 @@ fn contains_command(value: &Value, command: &str) -> bool {
     }
 }
 
+/// Issue #424: whether claude's own `settings.json` currently has BOTH the
+/// compact-output `PostToolUse` hook and the safety `PreToolUse` hook
+/// installed -- the two commands `zirv ctx status`'s own bounded
+/// hook-health check treats as "the hook is wired up at all". Resolves its
+/// own home directory rather than taking one, so `status.rs` (a different
+/// module tree) never needs to reach into this module's private
+/// `home_dir`/`claude_config_dir` helpers directly. Read-only: never
+/// touches `HARNESS_HOOKS`'s own install path.
+///
+/// Fails open (`true`, meaning "assume installed, stay silent") only when
+/// the home directory itself cannot be resolved -- an environment this
+/// unusual is not evidence the hook is missing. A resolvable home with no
+/// readable `settings.json` at all is not the same doubt: that genuinely
+/// means neither hook is installed, so it returns `false`.
+pub(crate) fn claude_compaction_and_safety_hooks_installed() -> bool {
+    let Ok(home) = home_dir() else {
+        return true;
+    };
+    let claude_settings = load_json_object(&claude_config_dir(&home).join("settings.json"))
+        .unwrap_or_else(|_| json!({}));
+    contains_command(&claude_settings, CLAUDE_COMPACT_OUTPUT_HOOK.2)
+        && contains_command(&claude_settings, CLAUDE_SAFETY_HOOK.2)
+}
+
 fn load_json_object(path: &Path) -> SetupResult<Value> {
     if !path.exists() {
         return Ok(json!({}));
@@ -4568,6 +4592,27 @@ mod tests {
         assert!(
             !contains_command(&codex_hooks, CLAUDE_SAFETY_HOOK.2),
             "the safety hook must not reach codex's hooks.json either: {codex_hooks}"
+        );
+    }
+
+    /// Issue #424: `claude_compaction_and_safety_hooks_installed` reads
+    /// `false` before `zirv setup` has ever run, and `true` once both the
+    /// compact-output and safety hooks are installed -- what `zirv ctx
+    /// status`'s own bounded hook-health check gates on.
+    #[test]
+    fn claude_compaction_and_safety_hooks_installed_reflects_the_settings_file() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+
+        assert!(
+            !claude_compaction_and_safety_hooks_installed(),
+            "neither hook is installed on a fresh home"
+        );
+
+        install_claude_integration(home.path(), false).expect("apply");
+        assert!(
+            claude_compaction_and_safety_hooks_installed(),
+            "both hooks are installed after `zirv setup`"
         );
     }
 

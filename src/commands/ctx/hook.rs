@@ -49,6 +49,14 @@ pub enum HookEvent {
         /// Payload, when the agent passes it as an argument instead of stdin.
         payload: Option<String>,
     },
+    /// Aggregate the main decision log, safety/orchestrator-write denials
+    /// and the compaction ledger into one hook-health report (issue #424).
+    Audit {
+        /// Restrict to rows recorded within this window, e.g. `24h`, `7d`,
+        /// `30d`, or a bare number of seconds.
+        #[arg(long, default_value = "7d")]
+        since: String,
+    },
 }
 
 /// `stop_hook_active` is absent from the published field table but is delivered
@@ -2987,7 +2995,117 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
             };
             run_notify(w, &raw, &env)
         }
+        HookEvent::Audit { since } => run_audit(w, since, &env),
     }
+}
+
+/// `zirv ctx hook audit [--since N]` (issue #424): counts by verb/verdict
+/// over the main decision log, reuse-probe skip reasons, top denied
+/// programs from the orchestrator-write guard's own `Bash`/`PowerShell`
+/// rows (every other tool names a file path, not a program, so those are
+/// counted but never named), a bare denial count from the command-safety
+/// log (commands there are SHA-only -- see `SafetyDecision`'s own doc
+/// comment -- so no program name can ever be recovered from it), and the
+/// compaction ledger's own outcome counts. One report tying every
+/// hook-observable signal together for an operator asking "is the hook
+/// actually doing anything." Read-only throughout.
+fn run_audit<W: Write>(w: &mut W, since: &str, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let state = StateDir::resolve(env)?;
+    let since_secs = super::spend::parse_since(since).ok_or_else(|| {
+        format!(
+            "--since '{since}': expected a duration like 30m, 24h, or 7d (or a bare number of \
+             seconds)"
+        )
+    })?;
+    let since_ts = now_secs().saturating_sub(since_secs);
+
+    let decisions: Vec<log::DecisionRecord> = log::read_decisions(&state)
+        .into_iter()
+        .filter(|d| d.ts >= since_ts)
+        .collect();
+    let mut by_verb: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> =
+        Default::default();
+    for d in &decisions {
+        *by_verb
+            .entry(d.verb.clone())
+            .or_default()
+            .entry(d.verdict.clone())
+            .or_insert(0) += 1;
+    }
+    writeln!(w, "hook decision audit, --since {since}")?;
+    writeln!(w, "decisions: {} rows", decisions.len())?;
+    for (verb, verdicts) in &by_verb {
+        let parts: Vec<String> = verdicts.iter().map(|(v, n)| format!("{v}: {n}")).collect();
+        writeln!(w, "  {verb:<10} {}", parts.join(", "))?;
+    }
+
+    let mut skip_reasons: std::collections::BTreeMap<&str, u64> = Default::default();
+    for d in &decisions {
+        if d.action == "reuse-probe-skipped" {
+            *skip_reasons.entry(d.detail.as_str()).or_insert(0) += 1;
+        }
+    }
+    if !skip_reasons.is_empty() {
+        writeln!(w, "\nskip reasons:")?;
+        for (reason, n) in &skip_reasons {
+            writeln!(w, "  {reason:<30} {n}")?;
+        }
+    }
+
+    let orchestrator_blocks: Vec<_> = log::read_orchestrator_blocks(&state)
+        .into_iter()
+        .filter(|b| b.ts >= since_ts)
+        .collect();
+    let mut denied_programs: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut other_denials = 0u64;
+    for b in &orchestrator_blocks {
+        if b.outcome != "denied" {
+            continue;
+        }
+        if matches!(b.tool.as_str(), "Bash" | "PowerShell") {
+            *denied_programs.entry(b.target.clone()).or_insert(0) += 1;
+        } else {
+            other_denials += 1;
+        }
+    }
+    writeln!(
+        w,
+        "\ndenied programs (orchestrator write guard, Bash/PowerShell only):"
+    )?;
+    if denied_programs.is_empty() {
+        writeln!(w, "  none")?;
+    } else {
+        let mut sorted: Vec<_> = denied_programs.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (program, n) in sorted.into_iter().take(10) {
+            writeln!(w, "  {program:<30} {n}")?;
+        }
+    }
+    writeln!(
+        w,
+        "other denied tool calls (file path, not a program): {other_denials}"
+    )?;
+
+    let safety_denials = log::read_safety_decisions(&state)
+        .into_iter()
+        .filter(|d| d.ts >= since_ts && d.verdict == "deny")
+        .count();
+    writeln!(
+        w,
+        "safety-policy denials: {safety_denials} (commands are hashed -- no program names \
+         available)"
+    )?;
+
+    let ledger_outcomes = super::ledger::outcome_counts_since(&state, since_ts);
+    writeln!(w, "\nledger outcomes:")?;
+    if ledger_outcomes.is_empty() {
+        writeln!(w, "  no rows")?;
+    } else {
+        for (outcome, n) in &ledger_outcomes {
+            writeln!(w, "  {outcome:<15} {n}")?;
+        }
+    }
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -8406,5 +8524,167 @@ mod tests {
             .as_str()
             .expect("a summary");
         assert!(summary.contains("matches in"), "{summary}");
+    }
+
+    // -- hook audit (issue #424) -------------------------------------------
+
+    #[test]
+    fn hook_audit_parses_with_its_default_since() {
+        use clap::Parser as _;
+        let cli = crate::commands::ctx::CtxCli::try_parse_from(["zirv ctx", "hook", "audit"])
+            .expect("hook audit should parse");
+        match cli.verb {
+            crate::commands::ctx::CtxVerb::Hook(HookArgs {
+                event: HookEvent::Audit { since },
+            }) => assert_eq!(since, "7d"),
+            other => panic!("expected Hook(Audit), got {other:?}"),
+        }
+
+        let cli = crate::commands::ctx::CtxCli::try_parse_from([
+            "zirv ctx", "hook", "audit", "--since", "24h",
+        ])
+        .expect("hook audit --since should parse");
+        match cli.verb {
+            crate::commands::ctx::CtxVerb::Hook(HookArgs {
+                event: HookEvent::Audit { since },
+            }) => assert_eq!(since, "24h"),
+            other => panic!("expected Hook(Audit), got {other:?}"),
+        }
+    }
+
+    /// A fixture log with mixed outcomes (issue #424) aggregates correctly:
+    /// verb/verdict counts, a skip reason, a denied Bash program, a
+    /// safety-log denial count with no program name, and the ledger's own
+    /// outcome counts.
+    #[test]
+    fn hook_audit_aggregates_a_mixed_fixture_correctly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+        let now = now_secs();
+
+        log::append(
+            &state,
+            &log::Decision {
+                ts: now - 10,
+                session: "sess-1",
+                verb: "hook",
+                verdict: "n/a",
+                score: 0,
+                action: "reuse-probe-skipped",
+                detail: "no diff",
+                observed_at: None,
+            },
+        )
+        .expect("append");
+        log::append(
+            &state,
+            &log::Decision {
+                ts: now - 9,
+                session: "sess-1",
+                verb: "hook",
+                verdict: "deny",
+                score: 80,
+                action: "dispatch-denied",
+                detail: "",
+                observed_at: None,
+            },
+        )
+        .expect("append");
+        // Outside the `--since 7d` window -- must not be counted.
+        log::append(
+            &state,
+            &log::Decision {
+                ts: now - 20 * 86_400,
+                session: "sess-1",
+                verb: "hook",
+                verdict: "deny",
+                score: 80,
+                action: "dispatch-denied",
+                detail: "",
+                observed_at: None,
+            },
+        )
+        .expect("append");
+
+        log::append_orchestrator_block(
+            &state,
+            &log::OrchestratorBlock {
+                ts: now - 5,
+                session: "sess-1",
+                tool: "Bash",
+                target: "sed -i",
+                reason: "orchestrator seats may not edit repository files",
+                outcome: "denied",
+            },
+        )
+        .expect("append");
+        log::append_orchestrator_block(
+            &state,
+            &log::OrchestratorBlock {
+                ts: now - 4,
+                session: "sess-1",
+                tool: "Edit",
+                target: "/work/repo/src/main.rs",
+                reason: "orchestrator seats may not edit repository files",
+                outcome: "denied",
+            },
+        )
+        .expect("append");
+
+        log::append_safety(
+            &state,
+            &log::SafetyDecision {
+                ts: now - 3,
+                session: "sess-1",
+                mode: "interactive",
+                verdict: "deny",
+                command_sha256: "aaa",
+                policy_sha256: "p",
+                launch_policy_sha256: None,
+                attestation: "not-present",
+                matched_pattern: None,
+                origin: Some("built-in"),
+                platform: "linux",
+            },
+        )
+        .expect("append");
+
+        super::super::ledger::record(
+            &state,
+            &super::super::ledger::CompactionRow {
+                ts: now - 2,
+                tool_use_id: "toolu_1",
+                session: "sess-1",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 10_000,
+                bytes_out: 500,
+                outcome: super::super::ledger::Outcome::Compacted,
+                retrieval_id: Some("r1"),
+            },
+        );
+
+        let state_root = state.root().to_path_buf();
+        let env = move |key: &str| {
+            (key == crate::commands::ctx::state::STATE_ENV)
+                .then(|| state_root.display().to_string())
+        };
+        let mut out = Vec::new();
+        let code = run_audit(&mut out, "7d", &env).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("decisions: 2 rows"), "{text}");
+        assert!(text.contains("hook       deny: 1, n/a: 1"), "{text}");
+        assert!(text.contains("no diff"), "{text}");
+        assert!(text.contains("sed -i"), "{text}");
+        assert!(
+            text.contains("other denied tool calls (file path, not a program): 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("safety-policy denials: 1 (commands are hashed"),
+            "{text}"
+        );
+        assert!(text.contains("compacted"), "{text}");
     }
 }
