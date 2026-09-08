@@ -949,6 +949,7 @@ pub struct Pane {
     /// "once per turn."
     report_reminder_sent: bool,
     pub(crate) settled_mail_sent: bool,
+    pub(crate) result_schema: Option<String>,
     /// Review F1/F2 (PR #116): the deadline for phase 2 of a deferred
     /// `inject_visible` call -- `Some` from the moment phase 1's write
     /// succeeds until phase 2's lone `\r` is actually written, `None`
@@ -1275,6 +1276,10 @@ impl Pane {
             parent_session: None,
             report_reminder_sent: false,
             settled_mail_sent: false,
+            result_schema: turn_env
+                .iter()
+                .find(|(key, _)| key == super::super::agent::RESULT_SCHEMA_ENV)
+                .map(|(_, value)| value.clone()),
             pending_submit: None,
             submit_confirmation: None,
             delivery_sender: None,
