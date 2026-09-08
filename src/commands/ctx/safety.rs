@@ -3064,7 +3064,7 @@ const LAUNCHER_PREFIXES: &[LauncherPrefix] = &[
     LauncherPrefix {
         program: "command",
         value_flags: &[],
-        no_command_flags: &[],
+        no_command_flags: &["-v", "-V"],
         operands: 0,
     },
     LauncherPrefix {
@@ -3160,6 +3160,22 @@ pub(crate) fn unwrap_launcher_prefix(segment: &str) -> Option<String> {
         .find(|entry| entry.program == program)?;
     let mut i = 1usize;
     while let Some(token) = tokens.get(i) {
+        let redirection = token.trim_start_matches(|c: char| c.is_ascii_digit());
+        if program == "exec"
+            && redirection.starts_with(['<', '>'])
+            && !redirection.starts_with("<(")
+            && !redirection.starts_with(">(")
+        {
+            i += if redirection
+                .trim_start_matches(['<', '>', '&', '|'])
+                .is_empty()
+            {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
         if !token.starts_with('-') {
             break;
         }
@@ -12236,6 +12252,55 @@ mod tests {
     }
 
     #[test]
+    fn command_resolution_queries_do_not_launch_the_named_program_but_p_still_does() {
+        let policy = SafetyPolicy::default();
+        let mut envelope = safety_test_envelope();
+        envelope.network = false;
+        envelope.tools.network = false;
+        envelope.destructive = true;
+        for (command, launched, verdict) in [
+            ("command -v curl", None, Verdict::Allow),
+            ("command -V rm", None, Verdict::Allow),
+            (
+                "command -p git push --force",
+                Some("git push --force"),
+                Verdict::Ask,
+            ),
+        ] {
+            assert_eq!(
+                unwrap_launcher_prefix(command).as_deref(),
+                launched,
+                "{command}"
+            );
+            assert_eq!(
+                evaluate_with_scratchpad_roots(
+                    &policy,
+                    command,
+                    LaunchMode::Interactive,
+                    &[],
+                    Some(&envelope),
+                    None,
+                    0
+                )
+                .verdict,
+                verdict,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_file_descriptor_redirections_are_not_mistaken_for_a_launched_program() {
+        for command in ["exec 3>file", "exec 3<&-", "exec 3>file 3<&-"] {
+            assert_eq!(unwrap_launcher_prefix(command), None, "{command}");
+        }
+        assert_eq!(
+            unwrap_launcher_prefix("exec 3>file git push --force").as_deref(),
+            Some("git push --force")
+        );
+    }
+
+    #[test]
     fn a_launcher_prefix_never_hides_the_program_it_launches() {
         let policy = SafetyPolicy::default();
         for (launched, bare) in [
@@ -12252,8 +12317,6 @@ mod tests {
             ),
             ("command git push --force", "git push --force"),
             ("command -p git push --force", "git push --force"),
-            ("command -v git push --force", "git push --force"),
-            ("command -V git push --force", "git push --force"),
             ("builtin git push --force", "git push --force"),
             ("builtin command git push --force", "git push --force"),
             ("exec git push --force", "git push --force"),
