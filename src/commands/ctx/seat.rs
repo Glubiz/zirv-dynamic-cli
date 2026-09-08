@@ -498,7 +498,12 @@ pub fn resume(state: &StateDir, short: &str, now: u64) -> CtxResult<Seat> {
 pub fn mark_pending(state: &StateDir, short: &str, cause: Cause, now: u64) -> CtxResult<Seat> {
     let _lock = lock_seat(state, short)?;
     let mut seat = load(state, short).ok_or_else(|| no_seat(short))?;
-    seat.pending = Some(Pending { cause, since: now });
+    let since = seat
+        .pending
+        .as_ref()
+        .filter(|pending| std::mem::discriminant(&pending.cause) == std::mem::discriminant(&cause))
+        .map_or(now, |pending| pending.since);
+    seat.pending = Some(Pending { cause, since });
     seat.updated_at = now;
     store(state, &seat)?;
     Ok(seat)
@@ -615,6 +620,8 @@ pub struct CandidateHeadroom {
     pub model: Option<String>,
     pub projected_headroom_pct: f64,
     pub assumed: bool,
+    /// A real weekly reading retained past the collector freshness limit.
+    pub stale: bool,
     pub observed_at: u64,
 }
 
@@ -623,6 +630,8 @@ pub struct CandidateHeadroom {
 pub struct RolloverInputs<'a> {
     pub seat: &'a Seat,
     pub now: u64,
+    /// Start of the current pending reactive cause, if any.
+    pub pending_since: Option<u64>,
     /// The orchestrator's own harness's current headroom reading, or `None`
     /// when it is unknown/stale -- an unknown reading never triggers a
     /// proactive rollover (see [`decide`]'s own doc comment).
@@ -631,19 +640,12 @@ pub struct RolloverInputs<'a> {
     /// observed at -- this is the epoch a resulting [`Cause`] carries, and
     /// therefore the epoch [`Visit`]s and the candidate filter key off of.
     pub source_observed_at: u64,
-    /// Whether the source session is actively, definitely blocked right now
-    /// (a hard rate-limit/quota refusal), as opposed to merely low on
-    /// projected headroom. Takes the reactive path, which skips the
-    /// cooldown but NOT the idle boundary (issue #358 review, finding #14).
+    /// Whether the source session is definitely blocked by the provider.
+    /// Reactive rollover skips cooldown and may force after the pending grace.
     pub source_hard_blocked: bool,
     pub auto_enabled: bool,
-    /// Whether the orchestrator session is at a clean turn boundary right
-    /// now. BOTH the proactive and the reactive path refuse to move a seat
-    /// mid-turn (finding #14) -- a hard block is real evidence the seat
-    /// SHOULD move once idle, but it says nothing about whether this
-    /// session's own in-flight turn has stopped, and swapping the pty out
-    /// from under one that has not is exactly the kind of session-worsening
-    /// `wrap`/`dash::pane` may never do.
+    /// The supervisor's verified turn boundary. Proactive rollover always
+    /// waits; reactive rollover waits up to `reactive_force_after_secs`.
     pub idle: bool,
     /// The third, independent trigger: this seat is not on
     /// `cfg.fallback.order[0]` and that primary has since recovered enough
@@ -679,18 +681,10 @@ pub enum RolloverDecision {
 /// 1. `auto_enabled`/`pinned`/phase-not-`Idle` all refuse outright -- moving a
 ///    seat that is disabled, pinned, or already mid-transaction/parked is
 ///    never correct regardless of headroom.
-/// 2. The reactive path (`source_hard_blocked`) is taken over the proactive
-///    one whenever both could apply. Issue #358 review, finding #14: it does
-///    NOT skip `inputs.idle` -- a hard block already happened, but the
-///    session's own in-flight turn did not stop because of it, and swapping
-///    the pty out from under a turn that is still actively producing output
-///    is exactly the kind of session-worsening `wrap`/`dash::pane` may never
-///    do; a fresh ACCOUNT-WIDE reading can report the provider hard-blocked
-///    at any moment, entirely independent of whether THIS child ever
-///    yielded. It still skips `rollover_cooldown_secs` -- a hard block is
-///    real evidence a soft-threshold cooldown was never meant to gate, and
-///    unlike the idle boundary a cooldown is this seat's own hysteresis, not
-///    a live turn's correctness.
+/// 2. The reactive path (`source_hard_blocked`) takes priority and skips
+///    cooldown. It waits for idle until the pending cause has lasted
+///    `reactive_force_after_secs`, then allows a forced structural handover
+///    (issue #401, superseding issue #358 review finding #14's absolute wait).
 ///    `inputs.reclaim` is the third trigger, considered only when neither of
 ///    the other two fired: the seat is healthy but sitting on a fallback
 ///    harness whose primary has since recovered. It is gated exactly like the
@@ -701,8 +695,8 @@ pub enum RolloverDecision {
 ///    never triggers it, matching this codebase's existing "never migrate on
 ///    missing data" convention (`fallback.unknown_headroom_pct` is the
 ///    opposite, deliberately conservative, choice for background delegation,
-///    not this seat). Both paths require `inputs.idle` (else `Wait("idle
-///    boundary")`); proactive additionally respects `rollover_cooldown_secs`
+///    not this seat). Proactive requires `inputs.idle` (else `Wait("idle
+///    boundary")`) and additionally respects `rollover_cooldown_secs`
 ///    against `seat.last_rollover_at` (else `Wait("cooldown")`).
 /// 4. Candidates are filtered: the current agent is never its own successor;
 ///    one already [`Visit`]ed at the SAME epoch this decision's cause would
@@ -715,7 +709,8 @@ pub enum RolloverDecision {
 ///    excluded by that same visited-at-this-epoch rule. An `assumed`
 ///    candidate is only ever accepted on the reactive path -- never migrate
 ///    a seat onto a pure estimate while there is still time to wait for a
-///    real reading.
+///    real reading. A stale weekly candidate is measured and admissible on
+///    either path, subject to the same hysteresis as fresh measurements.
 /// 5. Surviving candidates need hysteresis clearance on BOTH the rollover
 ///    threshold and the (known) source reading: `projected >=
 ///    rollover_headroom_pct + min_candidate_headroom_pct` AND `projected >=
@@ -755,14 +750,11 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
         );
     }
 
-    // Finding #14 (issue #358 review): the idle boundary applies to BOTH
-    // paths -- a hard block is real evidence, but it says nothing about
-    // whether THIS session's own in-flight turn has actually stopped, and
-    // interrupting one that has not is never correct. Only the cooldown
-    // below stays proactive-only: it is this seat's own hysteresis against
-    // threshold noise, not a live turn's correctness, and a hard block is
-    // exactly the kind of evidence that hysteresis was never meant to gate.
-    if !inputs.idle {
+    let force_due = reactive
+        && inputs.pending_since.is_some_and(|since| {
+            inputs.now.saturating_sub(since) >= cfg.fallback.reactive_force_after_secs
+        });
+    if !inputs.idle && !force_due {
         return RolloverDecision::Wait("idle boundary".to_string());
     }
     if !reactive
@@ -796,7 +788,7 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
             ));
             continue;
         }
-        if c.assumed && !reactive {
+        if c.assumed && !c.stale && !reactive {
             excluded.push(format!(
                 "{}: an assumed headroom reading is only trusted reactively",
                 c.agent
@@ -814,7 +806,7 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
         // seat parked instead of rolling over. An assumed candidate clears
         // `min_candidate_headroom_pct` alone; the reactive-only gate above
         // is what keeps it out of the proactive path entirely.
-        let floor = if c.assumed {
+        let floor = if c.assumed && !c.stale {
             min_headroom
         } else {
             (threshold + min_headroom).max(source_floor + min_headroom)
@@ -873,7 +865,7 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
         None => RolloverDecision::Refuse(if excluded.is_empty() {
             "no fallback candidates available".to_string()
         } else {
-            excluded.join("; ")
+            format!("no fallback candidates available ({})", excluded.join("; "))
         }),
     }
 }
@@ -1204,6 +1196,7 @@ mod tests {
             model: None,
             projected_headroom_pct: projected,
             assumed: false,
+            stale: false,
             observed_at: 500,
         }
     }
@@ -1216,6 +1209,7 @@ mod tests {
         let disabled_inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
@@ -1234,6 +1228,7 @@ mod tests {
         let pinned_inputs = RolloverInputs {
             seat: &pinned_seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
@@ -1256,6 +1251,7 @@ mod tests {
         let inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: None,
             source_observed_at: 500,
             source_hard_blocked: false,
@@ -1275,6 +1271,7 @@ mod tests {
         let inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
@@ -1298,6 +1295,7 @@ mod tests {
         let inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
@@ -1325,6 +1323,7 @@ mod tests {
         let inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
@@ -1339,12 +1338,7 @@ mod tests {
         ));
     }
 
-    /// Finding #14 (issue #358 review): the reactive path must NOT proceed
-    /// mid-turn -- a hard block is real evidence, but it says nothing about
-    /// whether this session's own in-flight turn has stopped. A mid-turn
-    /// reactive trigger reads `Wait("idle boundary")`, the exact same verdict
-    /// a mid-turn proactive one already got; `rollover::evaluate` maps that
-    /// to `Evaluation::Pending`, not `Evaluation::Rollover`.
+    /// A newly observed block still waits for idle during its grace period.
     #[test]
     fn decide_reactive_still_waits_for_the_idle_boundary() {
         let cfg = cfg();
@@ -1353,6 +1347,7 @@ mod tests {
         let inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
@@ -1380,6 +1375,7 @@ mod tests {
         let inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
@@ -1415,6 +1411,7 @@ mod tests {
         let inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(15.0),
             source_observed_at: 500,
             source_hard_blocked: false,
@@ -1437,6 +1434,7 @@ mod tests {
         let proactive = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
@@ -1469,6 +1467,7 @@ mod tests {
         let inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
@@ -1505,6 +1504,7 @@ mod tests {
         let inputs = RolloverInputs {
             seat: &seat_a,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
@@ -1530,6 +1530,7 @@ mod tests {
         let inputs_back = RolloverInputs {
             seat: &seat_b,
             now: 2_200,
+            pending_since: None,
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
@@ -1715,11 +1716,13 @@ mod tests {
             model: Some("gpt-5.6-terra".to_string()),
             projected_headroom_pct: cfg.fallback.unknown_headroom_pct,
             assumed: true,
+            stale: false,
             observed_at: 1_000,
         }];
         let inputs = RolloverInputs {
             seat: &seat,
             now: 2_000,
+            pending_since: None,
             source_headroom_pct: None,
             source_observed_at: 500,
             source_hard_blocked: true,
@@ -1735,6 +1738,74 @@ mod tests {
             ),
             "got {:?}",
             decide(&inputs, &cfg)
+        );
+    }
+    #[test]
+    fn stale_measured_candidates_still_need_hysteresis_on_both_paths() {
+        let seat = base_seat();
+        let cfg = cfg();
+        for reactive in [false, true] {
+            let mut candidate = candidate("codex", 29.0);
+            candidate.stale = true;
+            let candidates = [candidate];
+            let inputs = RolloverInputs {
+                seat: &seat,
+                now: 2_000,
+                pending_since: None,
+                source_headroom_pct: Some(13.0),
+                source_observed_at: 500,
+                source_hard_blocked: reactive,
+                auto_enabled: true,
+                idle: true,
+                reclaim: false,
+                candidates: &candidates,
+            };
+            assert!(
+                matches!(decide(&inputs, &cfg), RolloverDecision::Refuse(reason) if reason.contains("codex: projected headroom 29.0% does not clear the hysteresis floor"))
+            );
+        }
+    }
+
+    #[test]
+    fn reactive_force_respects_pending_grace_and_proactive_never_forces() {
+        let seat = base_seat();
+        let mut cfg = cfg();
+        let candidates = [candidate("codex", 62.0)];
+        let mut inputs = RolloverInputs {
+            seat: &seat,
+            now: 2_000,
+            pending_since: Some(1_970),
+            source_headroom_pct: Some(13.0),
+            source_observed_at: 500,
+            source_hard_blocked: true,
+            auto_enabled: true,
+            idle: false,
+            reclaim: false,
+            candidates: &candidates,
+        };
+        assert_eq!(
+            decide(&inputs, &cfg),
+            RolloverDecision::Wait("idle boundary".to_string())
+        );
+        inputs.pending_since = Some(1_870);
+        assert!(
+            matches!(decide(&inputs, &cfg), RolloverDecision::Proceed { agent, .. } if agent == "codex")
+        );
+        inputs.pending_since = Some(1_880);
+        assert!(matches!(
+            decide(&inputs, &cfg),
+            RolloverDecision::Proceed { .. }
+        ));
+        cfg.fallback.reactive_force_after_secs = 121;
+        assert_eq!(
+            decide(&inputs, &cfg),
+            RolloverDecision::Wait("idle boundary".to_string())
+        );
+        inputs.source_hard_blocked = false;
+        inputs.pending_since = Some(0);
+        assert_eq!(
+            decide(&inputs, &cfg),
+            RolloverDecision::Wait("idle boundary".to_string())
         );
     }
 }

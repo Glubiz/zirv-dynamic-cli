@@ -256,11 +256,14 @@ pub fn confirmed_block(
     }
 }
 
-/// How often a supervisor should re-evaluate: the collector's own max age,
-/// floored at a minute. Evaluating faster than the usage collector refreshes
-/// can only ever re-read the same numbers.
-pub fn evaluate_interval(cfg: &CtxConfig) -> Duration {
-    Duration::from_secs(cfg.pace.collector_max_age_secs.max(60))
+/// Pending reactive causes retry each minute so the force grace can expire;
+/// otherwise evaluations follow the collector's max age, floored at a minute.
+pub fn evaluate_interval(cfg: &CtxConfig, reactive_pending: bool) -> Duration {
+    Duration::from_secs(if reactive_pending {
+        60
+    } else {
+        cfg.pace.collector_max_age_secs.max(60)
+    })
 }
 
 /// Decides whether `seat_short`'s orchestrator seat should roll onto another
@@ -269,12 +272,9 @@ pub fn evaluate_interval(cfg: &CtxConfig) -> Duration {
 /// `idle` is the supervisor's own verified-idle answer (`wrap::
 /// handover_may_act`, `dash::pane::Pane::state() == Idle`) -- never inferred
 /// here. `confirmed_block` is [`confirmed_block`]'s output: `Some` takes the
-/// reactive path (issue #358 review, finding #14: it skips `rollover_
-/// cooldown_secs`, but it never skips the idle boundary -- a hard block is
-/// real evidence, but a turn this session has not yielded from is not
-/// interrupted just because the account is blocked elsewhere; a mid-turn
-/// reactive trigger is instead recorded as `Evaluation::Pending` and retried
-/// once idle). `interactive` is the seat's own launch interactivity, carried
+/// reactive path, which skips cooldown and may force a structural handover
+/// after `fallback.reactive_force_after_secs` pending without an idle boundary.
+/// `interactive` is the seat's own launch interactivity, carried
 /// onto the request so the successor's permission posture matches the
 /// predecessor's (`handover::resolve_swap_launch`).
 #[allow(clippy::too_many_arguments)]
@@ -368,8 +368,16 @@ pub fn evaluate(
             dropped.push(format!("{}: no provider capacity", harness.name));
             continue;
         };
-        let assumed = harness.state == HarnessState::Unknown;
-        let projected_headroom_pct = if assumed {
+        let stale_window = allocator::ranking_window(provider).filter(|window| {
+            harness.state == HarnessState::Unknown
+                && window.stale
+                && window.window == "seven_day"
+                && !window.overage_covered
+        });
+        let assumed = harness.state == HarnessState::Unknown && stale_window.is_none();
+        let projected_headroom_pct = if let Some(window) = stale_window {
+            allocator::window_projected_headroom(window, cfg, provider.reserved_tokens, 0)
+        } else if assumed {
             cfg.fallback.unknown_headroom_pct
         } else {
             allocator::projected_headroom(provider, cfg, 0).unwrap_or(0.0)
@@ -389,9 +397,9 @@ pub fn evaluate(
             model: Some(model),
             projected_headroom_pct,
             assumed,
-            observed_at: provider
-                .binding
-                .and_then(|i| provider.windows.get(i))
+            stale: stale_window.is_some(),
+            observed_at: stale_window
+                .or_else(|| provider.binding.and_then(|i| provider.windows.get(i)))
                 .map(|window| window.observed_at)
                 .unwrap_or(now),
         });
@@ -453,6 +461,11 @@ pub fn evaluate(
     let inputs = seat::RolloverInputs {
         seat: &current,
         now,
+        pending_since: current
+            .pending
+            .as_ref()
+            .filter(|pending| matches!(pending.cause, seat::Cause::Reactive { .. }))
+            .map(|pending| pending.since),
         source_headroom_pct,
         source_observed_at,
         source_hard_blocked,
@@ -550,6 +563,11 @@ pub fn evaluate(
                     }
                 }
                 Err(e) => {
+                    let reason = if dropped.is_empty() {
+                        e.to_string()
+                    } else {
+                        format!("{e} ({})", dropped.join("; "))
+                    };
                     record(
                         state,
                         &current.session,
@@ -557,11 +575,11 @@ pub fn evaluate(
                         REFUSED,
                         &PoolEvent {
                             target_agent: Some(agent),
-                            reason: e.to_string(),
+                            reason: reason.clone(),
                             ..base
                         },
                     );
-                    Evaluation::Skip(e.to_string())
+                    Evaluation::Skip(reason)
                 }
             }
         }
@@ -570,9 +588,19 @@ pub fn evaluate(
                 let _ = seat::mark_pending(state, seat_short, cause.clone(), now);
                 Evaluation::Pending(cause)
             }
-            None => Evaluation::Skip(reason),
+            None => {
+                if current.pending.is_some() {
+                    let _ = seat::clear_pending(state, seat_short, now);
+                }
+                Evaluation::Skip(reason)
+            }
         },
         seat::RolloverDecision::Refuse(reason) => {
+            let reason = if dropped.is_empty() {
+                reason
+            } else {
+                format!("{reason} ({})", dropped.join("; "))
+            };
             if !source_hard_blocked {
                 record(
                     state,
@@ -1245,6 +1273,11 @@ mod tests {
         assert!(matches!(seat.phase, seat::Phase::Parked { .. }));
         let logged = std::fs::read_to_string(state.logs().join(log::LOG_FILE)).expect("log");
         assert!(logged.contains(EXHAUSTED));
+        let event = logged
+            .lines()
+            .find(|line| line.contains(EXHAUSTED))
+            .expect("exhausted event");
+        assert!(event.contains("codex:"), "{event}");
     }
 
     #[test]
@@ -1574,5 +1607,162 @@ mod tests {
             Readiness::Waiting,
             "a signal-carrying adapter waits for its own signal, not for quiet"
         );
+    }
+    #[test]
+    fn fable_seat_rolls_to_measured_codex_deep() {
+        let (_dir, state) = temp_state();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let cfg = cfg();
+        register_seat(&state);
+        let mut seat = seat::load(&state, SHORT).expect("seat");
+        seat.model = Some("fable".to_string());
+        seat::store(&state, &seat).expect("store seat");
+        store_usage(&state, "anthropic", 87.0, NOW);
+        store_usage(&state, "openai", 38.0, NOW);
+        let Evaluation::Rollover { request, .. } = evaluate_now(&state, &cfg, true, None) else {
+            panic!("fable must have a deep equivalent on codex");
+        };
+        assert_eq!(request.target_agent, "codex");
+        assert_eq!(request.target_model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn refused_event_names_the_dropped_candidate() {
+        let (_dir, state) = temp_state();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let cfg = cfg();
+        register_seat(&state);
+        let mut seat = seat::load(&state, SHORT).expect("seat");
+        seat.model = Some("unknown-model".to_string());
+        seat::store(&state, &seat).expect("store seat");
+        store_usage(&state, "anthropic", 87.0, NOW);
+        store_usage(&state, "openai", 38.0, NOW);
+        let Evaluation::Skip(reason) = evaluate_now(&state, &cfg, true, None) else {
+            panic!("unknown source model must refuse");
+        };
+        assert_eq!(
+            reason,
+            "no fallback candidates available (codex: no equivalent model tier)"
+        );
+        let logged = std::fs::read_to_string(state.logs().join(log::LOG_FILE)).expect("log");
+        let event = logged
+            .lines()
+            .find(|line| line.contains(REFUSED))
+            .expect("refused event");
+        assert!(event.contains(&reason), "{event}");
+    }
+
+    #[test]
+    fn proactive_rollover_admits_stale_weekly_but_not_five_hour_readings() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        for weekly in [true, false] {
+            let (_dir, state) = temp_state();
+            let cfg = cfg();
+            register_seat(&state);
+            store_usage(&state, "anthropic", 87.0, NOW);
+            let reading = window::Window {
+                used_percentage: 38.0,
+                observed_at: NOW - 43 * 60,
+                resets_at: NOW + if weekly { 86_400 } else { 3_600 },
+                overage_covered: false,
+                limit_reached: false,
+            };
+            window::store_for(
+                &state,
+                "openai",
+                &window::UsageWindows {
+                    five_hour: (!weekly).then_some(reading),
+                    seven_day: weekly.then_some(reading),
+                },
+            )
+            .expect("store stale reading");
+            let result = evaluate_now(&state, &cfg, true, None);
+            if weekly {
+                assert!(
+                    matches!(result, Evaluation::Rollover { ref request, .. } if request.target_agent == "codex"),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Evaluation::Skip(ref reason) if reason.contains("codex: an assumed headroom reading is only trusted reactively")),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reactive_pending_forces_after_grace_without_resetting_since() {
+        let (_dir, state) = temp_state();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let cfg = cfg();
+        register_seat(&state);
+        store_usage(&state, "anthropic", 87.0, NOW);
+        store_usage(&state, "openai", 38.0, NOW);
+        for elapsed in [0, 30, 60, 119, 130] {
+            let result = evaluate(
+                &state,
+                &cfg,
+                "wrap",
+                SHORT,
+                NOW + elapsed,
+                false,
+                Some("confirmed block".to_string()),
+                true,
+            );
+            if elapsed < 120 {
+                assert!(matches!(result, Evaluation::Pending(_)), "{result:?}");
+                assert_eq!(
+                    seat::load(&state, SHORT)
+                        .expect("seat")
+                        .pending
+                        .expect("pending")
+                        .since,
+                    NOW
+                );
+            } else {
+                let Evaluation::Rollover { request, .. } = result else {
+                    panic!("{result:?}")
+                };
+                assert!(request.force);
+                assert!(request.structural_only);
+                assert_eq!(request.target_agent, "codex");
+            }
+        }
+    }
+
+    #[test]
+    fn proactive_pending_never_forces_mid_turn() {
+        let (_dir, state) = temp_state();
+        let cfg = cfg();
+        register_seat(&state);
+        store_usage(&state, "anthropic", 87.0, NOW);
+        store_usage(&state, "openai", 38.0, NOW);
+        for elapsed in [0, 130] {
+            assert!(matches!(
+                evaluate(
+                    &state,
+                    &cfg,
+                    "wrap",
+                    SHORT,
+                    NOW + elapsed,
+                    false,
+                    None,
+                    true
+                ),
+                Evaluation::Pending(seat::Cause::Proactive { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn reactive_pending_uses_a_minute_evaluation_interval() {
+        let cfg = cfg();
+        assert_eq!(evaluate_interval(&cfg, true), Duration::from_secs(60));
+        assert_eq!(evaluate_interval(&cfg, false), Duration::from_secs(900));
     }
 }

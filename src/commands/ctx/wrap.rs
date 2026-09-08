@@ -1192,16 +1192,19 @@ fn handover_poll_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.duration_since(last) >= MAIL_POLL)
 }
 
-/// Issue #358 (task 5): the automatic rollover's own, much coarser cadence.
-/// A rollover decision is a function of the usage collector's readings, so
-/// evaluating faster than that collector refreshes can only ever re-read the
-/// same numbers -- and each evaluation costs a capacity snapshot plus a
-/// structured limit confirmation, neither of which belongs on a ~100ms tick.
+/// Automatic rollover follows collector cadence except while a reactive
+/// cause is pending, when it retries every minute to enforce the force grace.
 /// Unlike [`handover_poll_due`], `None` is NOT due: the pump seeds this with
 /// its own start instant so no usage I/O happens during session startup.
-fn rollover_eval_due(last: Option<Instant>, now: Instant, cfg: &CtxConfig) -> bool {
+fn rollover_eval_due(
+    last: Option<Instant>,
+    now: Instant,
+    cfg: &CtxConfig,
+    reactive_pending: bool,
+) -> bool {
     last.is_some_and(|last| {
-        now.saturating_duration_since(last) >= super::rollover::evaluate_interval(cfg)
+        now.saturating_duration_since(last)
+            >= super::rollover::evaluate_interval(cfg, reactive_pending)
     })
 }
 
@@ -3205,8 +3208,11 @@ fn pump(
     // this pump's start so no usage I/O runs during session startup, and the
     // one rollover transaction that may be open at a time.
     let mut last_rollover_eval: Option<Instant> = Some(Instant::now());
-    let mut pending_rollover: Option<PendingRollover> = None;
     let seat_short = bar.session_short.clone();
+    let mut reactive_pending = super::seat::load(state_dir, &seat_short)
+        .and_then(|seat| seat.pending)
+        .is_some_and(|pending| matches!(pending.cause, super::seat::Cause::Reactive { .. }));
+    let mut pending_rollover: Option<PendingRollover> = None;
     let seat_rollover_enabled =
         cfg.auto_orchestrator_rollover() && role == PromptRole::Orchestrator;
 
@@ -3376,14 +3382,15 @@ fn pump(
                 }
                 let _ =
                     super::seat::clear_pending(state_dir, &seat_short, super::state::now_secs());
+                reactive_pending = false;
                 Some(req)
             }
             None if seat_rollover_enabled
                 && pending_rollover.is_none()
-                && rollover_eval_due(last_rollover_eval, now, cfg) =>
+                && rollover_eval_due(last_rollover_eval, now, cfg, reactive_pending) =>
             {
                 last_rollover_eval = Some(now);
-                automatic_rollover_request(
+                let request = automatic_rollover_request(
                     state_dir,
                     cfg,
                     session.as_str(),
@@ -3392,7 +3399,13 @@ fn pump(
                     supervision,
                     debounce,
                     interactive_from_turn_env(turn_env),
-                )
+                );
+                reactive_pending = super::seat::load(state_dir, &seat_short)
+                    .and_then(|seat| seat.pending)
+                    .is_some_and(|pending| {
+                        matches!(pending.cause, super::seat::Cause::Reactive { .. })
+                    });
+                request
             }
             None => None,
         };
@@ -4224,20 +4237,34 @@ mod tests {
         let mut cfg = CtxConfig::default();
         cfg.pace.collector_max_age_secs = 900;
         let start = Instant::now();
+        assert!(!rollover_eval_due(
+            Some(start),
+            start + Duration::from_secs(59),
+            &cfg,
+            true
+        ));
+        assert!(rollover_eval_due(
+            Some(start),
+            start + Duration::from_secs(60),
+            &cfg,
+            true
+        ));
         assert!(
-            !rollover_eval_due(None, start, &cfg),
+            !rollover_eval_due(None, start, &cfg, false),
             "an unseeded cadence must not evaluate during session startup"
         );
-        assert!(!rollover_eval_due(Some(start), start, &cfg));
+        assert!(!rollover_eval_due(Some(start), start, &cfg, false));
         assert!(!rollover_eval_due(
             Some(start),
             start + Duration::from_secs(899),
-            &cfg
+            &cfg,
+            false
         ));
         assert!(rollover_eval_due(
             Some(start),
             start + Duration::from_secs(900),
-            &cfg
+            &cfg,
+            false
         ));
     }
 

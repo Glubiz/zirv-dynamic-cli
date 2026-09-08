@@ -10247,6 +10247,12 @@ pub fn run_dashboard(
     // transaction that may be open at a time. Seeded with this dashboard's
     // start so no usage I/O runs while it is still coming up.
     let mut last_rollover_eval = Instant::now();
+    let mut reactive_pending = panes
+        .iter()
+        .find(|pane| pane.role() == prompt::PromptRole::Orchestrator)
+        .and_then(|pane| super::seat::load(state, pane.short()))
+        .and_then(|seat| seat.pending)
+        .is_some_and(|pending| matches!(pending.cause, super::seat::Cause::Reactive { .. }));
     let mut pending_rollover: Option<(String, u64, Instant)> = None;
     // R8: see `input_stream_is_dead`.
     let mut input_errors: usize = 0;
@@ -10477,7 +10483,7 @@ pub fn run_dashboard(
                 && due(
                     last_rollover_eval,
                     sweep_now,
-                    super::rollover::evaluate_interval(cfg),
+                    super::rollover::evaluate_interval(cfg, reactive_pending),
                 )
             {
                 last_rollover_eval = sweep_now;
@@ -10489,6 +10495,14 @@ pub fn run_dashboard(
                     &mut pending_rollover,
                     &mut errors,
                 );
+                reactive_pending = panes
+                    .iter()
+                    .find(|pane| pane.role() == prompt::PromptRole::Orchestrator)
+                    .and_then(|pane| super::seat::load(state, pane.short()))
+                    .and_then(|seat| seat.pending)
+                    .is_some_and(|pending| {
+                        matches!(pending.cause, super::seat::Cause::Reactive { .. })
+                    });
             }
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
