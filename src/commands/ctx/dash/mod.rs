@@ -6029,7 +6029,7 @@ fn fulfill_spawn_request(
     size: (u16, u16),
     requests_dir: &Path,
     errors: &mut ErrorLog,
-) -> Result<(String, Vec<policy::CapabilityWarning>), SpawnRefusal> {
+) -> Result<(String, Vec<policy::CapabilityWarning>, Option<String>), SpawnRefusal> {
     // Every one of these is checked before anything is spawned, resolved or
     // written, in cheapest-and-most-hostile-first order.
     if argv_unsafe_prompt(&req.prompt) {
@@ -6748,12 +6748,15 @@ fn fulfill_spawn_request(
     // already satisfied -- and `--max-tool-calls` is reported just below
     // rather than enforced, because a pane has no verified tool-call counter.
     pane.set_timeout(Instant::now(), req.timeout_secs);
-    if let Some(warning) = super::agent::codex_read_only_build_warning(adapter.name(), req.mode) {
-        push_error(
-            errors,
-            format!("pane '{}' ({}): {warning}", pane.title(), pane.short()),
-        );
-    }
+    // Issue #399: informational, not a failure -- the sandbox posture is
+    // exactly what `--mode read-only` asked for, and `codex_read_only_build_
+    // warning`'s own stderr print (`agent::run_with`) already told the
+    // operator once at dispatch time. Pushing this through `push_error`
+    // pinned the sticky `\u{26a0}` header line for the pane's whole life over
+    // an expected posture, not a real failure; the notice channel says it
+    // once and lets it expire like any other spawn confirmation.
+    let read_only_advisory = super::agent::codex_read_only_build_warning(adapter.name(), req.mode)
+        .map(|warning| format!("pane '{}' ({}): {warning}", pane.title(), pane.short()));
     if let Some(calls) = req.max_tool_calls {
         push_error(
             errors,
@@ -6842,7 +6845,7 @@ fn fulfill_spawn_request(
         );
     }
 
-    Ok((short, capability_warnings))
+    Ok((short, capability_warnings, read_only_advisory))
 }
 
 /// Pairs every request in one taken batch with its own file stem, in order.
@@ -6902,6 +6905,7 @@ fn handle_spawn_requests(
     repo: &Path,
     size: (u16, u16),
     errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
     kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     for (dir, requester) in intake_channels(requests_dir, panes) {
@@ -6916,6 +6920,7 @@ fn handle_spawn_requests(
             repo,
             size,
             errors,
+            notices,
             kept_requests,
         );
     }
@@ -6939,6 +6944,7 @@ fn drain_one_channel(
     repo: &Path,
     size: (u16, u16),
     errors: &mut ErrorLog,
+    notices: &mut Vec<Notice>,
     kept_requests: &mut HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
 ) {
     let batch = claim_batch(spawnreq::take_requests(dir));
@@ -6969,13 +6975,19 @@ fn drain_one_channel(
             requests_dir,
             errors,
         ) {
-            Ok((short, capability_warnings)) => {
+            Ok((short, capability_warnings, advisory)) => {
                 // Issue #354 phase 3: the request that actually produced this
                 // pane, kept verbatim so `restore`/`retry` can replay THIS --
                 // never a reconstructed argv. It is moved onto the pane's
                 // retained ended row when the pane is reaped, and dropped
                 // with that row.
                 kept_requests.insert(short.clone(), (req.clone(), requester.map(str::to_string)));
+                // Issue #399: same posture as every other spawn confirmation
+                // on this path -- informational, so it goes through the
+                // transient notice channel, never the sticky error log.
+                if let Some(text) = advisory {
+                    push_notice(notices, Instant::now(), text);
+                }
                 spawnreq::SpawnAck {
                     ok: true,
                     short: Some(short),
@@ -7075,13 +7087,18 @@ fn restore_ended_row(
         requests_dir,
         errors,
     ) {
-        Ok((new_short, _)) => {
+        Ok((new_short, _, advisory)) => {
             retained.remove(index);
             kept_requests.insert(new_short.clone(), (request, requested_by));
             if let Some(restored_row) = restored_row {
                 *selected = restore_fixup(old_pane_count, panes.len(), restored_row, *selected);
             }
             push_notice(notices, now, format!("restored {short} as {new_short}"));
+            // Issue #399: same posture as the fresh-spawn path -- informational,
+            // never the sticky error log.
+            if let Some(text) = advisory {
+                push_notice(notices, now, text);
+            }
         }
         Err(refusal) => push_error(errors, format!("restore {short}: {}", refusal.reason)),
     }
@@ -10504,6 +10521,7 @@ pub fn run_dashboard(
                 repo,
                 pane_size,
                 &mut errors,
+                &mut notices,
                 &mut kept_requests,
             );
         }
@@ -11128,11 +11146,27 @@ pub fn run_dashboard(
                                                 match fulfilled {
                                                     // L13: a spawn confirmation is
                                                     // information, not a warning.
-                                                    Ok((short, _)) => push_notice(
-                                                        &mut notices,
-                                                        Instant::now(),
-                                                        format!("spawned {} as {short}", req.agent),
-                                                    ),
+                                                    Ok((short, _, advisory)) => {
+                                                        push_notice(
+                                                            &mut notices,
+                                                            Instant::now(),
+                                                            format!(
+                                                                "spawned {} as {short}",
+                                                                req.agent
+                                                            ),
+                                                        );
+                                                        // Issue #399: same posture as
+                                                        // every other spawn
+                                                        // confirmation -- informational,
+                                                        // never the sticky error log.
+                                                        if let Some(text) = advisory {
+                                                            push_notice(
+                                                                &mut notices,
+                                                                Instant::now(),
+                                                                text,
+                                                            );
+                                                        }
+                                                    }
                                                     Err(refusal) => {
                                                         push_error(&mut errors, refusal.reason)
                                                     }
@@ -16739,6 +16773,79 @@ mod tests {
         );
     }
 
+    /// Issue #399: a read-only codex pane's sandbox advisory
+    /// (`agent::codex_read_only_build_warning`) is informational, not a
+    /// failure -- its own stderr print (`agent::run_with`) already told the
+    /// operator once at dispatch time. Before this fix `fulfill_spawn_
+    /// request` pushed the identical text through `push_error`, pinning the
+    /// sticky `\u{26a0}` header line for the pane's whole life over an
+    /// expected posture, not a real one. This proves both halves: the spawn
+    /// itself leaves the sticky error log untouched, and the advisory
+    /// `fulfill_spawn_request` now returns is exactly what every real caller
+    /// (`drain_one_channel`, `restore_ended_row`, the dashboard's own Spawn
+    /// overlay) pushes into the transient notice channel instead.
+    #[test]
+    fn a_read_only_codex_spawns_advisory_is_a_notice_not_a_sticky_error() {
+        let repo = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(tmp.path());
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.fallback.enabled = false;
+        #[cfg(windows)]
+        {
+            cfg.agent_bin = Some("ping -n 3 127.0.0.1".to_string());
+        }
+        #[cfg(unix)]
+        {
+            cfg.agent_bin = Some("sleep 3".to_string());
+        }
+        let mut req = spawn_request("do the work", &repo);
+        req.agent = "codex".to_string();
+        req.mode = super::super::permit::WorkerMode::ReadOnly;
+
+        let mut panes = Vec::new();
+        let mut queues = Vec::new();
+        let mut errors = ErrorLog::default();
+        let result = fulfill_spawn_request(
+            &req,
+            false,
+            None,
+            &mut panes,
+            &mut queues,
+            &cfg,
+            &state,
+            &repo,
+            (80, 24),
+            &tmp.path().join("requests"),
+            &mut errors,
+        );
+        for pane in &mut panes {
+            let _ = pane.shutdown("");
+        }
+        let (_, _, advisory) = result.expect("a read-only codex pane still spawns");
+        assert_eq!(
+            errors.sticky_count(),
+            0,
+            "the read-only posture is expected, not a failure: {errors:?}"
+        );
+        let advisory = advisory.expect("codex_read_only_build_warning fires for codex + read-only");
+        assert!(
+            advisory.contains("codex --sandbox read-only denies every write"),
+            "got {advisory}"
+        );
+
+        // What every real caller does with it (`drain_one_channel`,
+        // `restore_ended_row`, the Spawn overlay's own match arm).
+        let mut notices: Vec<Notice> = Vec::new();
+        push_notice(&mut notices, Instant::now(), advisory.clone());
+        let notice_texts: Vec<&str> = notices.iter().map(|n| n.text.as_str()).collect();
+        assert!(
+            notice_texts.contains(&advisory.as_str()),
+            "the advisory reaches the transient notice channel: {notice_texts:?}"
+        );
+    }
+
     #[test]
     fn early_pane_failure_bounds_age_and_unicode_tail() {
         let tail = "é".repeat(180);
@@ -20271,7 +20378,7 @@ mod tests {
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = ErrorLog::default();
 
-        let (_, capability_warnings) = fulfill_spawn_request(
+        let (_, capability_warnings, _) = fulfill_spawn_request(
             &req,
             true,
             None,
@@ -21135,7 +21242,7 @@ mod tests {
         let mut sub_req = spawn_request("own this scope", &repo);
         sub_req.parent_session = Some(orch_short.clone());
         sub_req.role = Some("sub-orchestrator".to_string());
-        let (sub_short, _) = fulfill_spawn_request(
+        let (sub_short, _, _) = fulfill_spawn_request(
             &sub_req,
             false,
             Some(&orch_short),
@@ -25769,6 +25876,7 @@ mod tests {
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         handle_spawn_requests(
             &dir,
             &mut panes,
@@ -25778,6 +25886,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut HashMap::new(),
         );
 
@@ -25877,6 +25986,7 @@ mod tests {
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         let mut kept: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> = HashMap::new();
         handle_spawn_requests(
             &dir,
@@ -25887,6 +25997,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut kept,
         );
         assert_eq!(
@@ -26212,6 +26323,7 @@ mod tests {
         let stem = spawnreq::request_stem(&path).expect("stem");
 
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         handle_spawn_requests(
             &requests_dir,
             &mut panes,
@@ -26221,6 +26333,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut HashMap::new(),
         );
 
@@ -26309,6 +26422,7 @@ mod tests {
         spawnreq::write_request(&orch_channel, &req).expect("write");
 
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         handle_spawn_requests(
             &requests_dir,
             &mut panes,
@@ -26318,6 +26432,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut HashMap::new(),
         );
         assert_eq!(panes.len(), 3, "the coordinator pane spawned: {errors:?}");
@@ -26445,6 +26560,7 @@ mod tests {
         let orch_stem = spawnreq::request_stem(&orch_path).expect("stem");
 
         let mut errors = ErrorLog::default();
+        let mut notices: Vec<Notice> = Vec::new();
         handle_spawn_requests(
             &requests_dir,
             &mut panes,
@@ -26454,6 +26570,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut notices,
             &mut HashMap::new(),
         );
 
