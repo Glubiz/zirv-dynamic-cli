@@ -38,10 +38,12 @@ const SCHEMA_VERSION: i64 = 1;
 const RETENTION_DAYS: u64 = 90;
 
 /// [`record`] runs the retention `DELETE` on only one write in this many --
-/// a per-write `ts % PRUNE_EVERY == 0` gate rather than a scheduled sweep,
-/// so `hook::run_posttool` (a hot path: every large `Bash` result reaches
-/// it) pays the cost of a prune scan on roughly one write in 64, not every
-/// single one.
+/// a per-write gate on the INSERTED ROW ID (review finding F6; a `ts %
+/// PRUNE_EVERY == 0` gate re-ran the sweep on every single call inside a
+/// burst that shared one matching wall-clock second) rather than a scheduled
+/// sweep, so `hook::run_posttool` (a hot path: every large `Bash` result
+/// reaches it) pays the cost of a prune scan on exactly one write in 64, not
+/// every write whose timestamp happens to land on a multiple of it.
 const PRUNE_EVERY: u64 = 64;
 
 /// How `hook::run_posttool` disposed of one `Bash` tool result -- the
@@ -111,27 +113,49 @@ pub struct CompactionRow<'a> {
 /// `compactions` table and its `ts` index exist. Never migrates: today
 /// there is exactly one schema version, stamped via `PRAGMA user_version`
 /// only on a fresh file.
+///
+/// Review finding F7: the pragma/DDL batch and the `user_version` write used
+/// to run on EVERY call -- both CREATE statements plus a write to the
+/// database header -- for every `Bash` result that reaches `hook::
+/// run_posttool`, including every one below its compaction threshold. Now
+/// runs only when the file did not already exist before this call, or (a
+/// stray zero-byte file, or a previous run that crashed between creating it
+/// and running the schema step) `user_version` still reads its
+/// freshly-created-file default of `0`. A steady-state call -- the file
+/// exists and already carries this module's own `SCHEMA_VERSION` -- opens
+/// and returns, leaving the header and `sqlite_master` untouched.
 fn open(state: &StateDir) -> rusqlite::Result<rusqlite::Connection> {
     let root = state.root();
     let _ = state::create_private_dir_all(root);
-    let conn = rusqlite::Connection::open(root.join("ledger.sqlite"))?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         CREATE TABLE IF NOT EXISTS compactions (
-             id INTEGER PRIMARY KEY,
-             tool_use_id TEXT,
-             session TEXT,
-             repo TEXT,
-             program TEXT,
-             bytes_in INTEGER,
-             bytes_out INTEGER,
-             outcome TEXT,
-             retrieval_id TEXT,
-             ts INTEGER
-         );
-         CREATE INDEX IF NOT EXISTS compactions_ts ON compactions (ts);",
-    )?;
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    let db_path = root.join("ledger.sqlite");
+    let existed = db_path.exists();
+    let conn = rusqlite::Connection::open(&db_path)?;
+    let needs_schema = if existed {
+        conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap_or(0)
+            == 0
+    } else {
+        true
+    };
+    if needs_schema {
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS compactions (
+                 id INTEGER PRIMARY KEY,
+                 tool_use_id TEXT,
+                 session TEXT,
+                 repo TEXT,
+                 program TEXT,
+                 bytes_in INTEGER,
+                 bytes_out INTEGER,
+                 outcome TEXT,
+                 retrieval_id TEXT,
+                 ts INTEGER
+             );
+             CREATE INDEX IF NOT EXISTS compactions_ts ON compactions (ts);",
+        )?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     Ok(conn)
 }
 
@@ -163,8 +187,14 @@ fn try_record(state: &StateDir, row: &CompactionRow<'_>) -> rusqlite::Result<()>
     )?;
     // Retention: only one write in `PRUNE_EVERY` also sweeps rows older than
     // `RETENTION_DAYS` -- see `PRUNE_EVERY`'s own doc comment for why this
-    // hot path may not scan+delete on every single insert.
-    if row.ts.is_multiple_of(PRUNE_EVERY) {
+    // hot path may not scan+delete on every single insert. Review finding
+    // F6: gated on the ROW ID sqlite just assigned, not on `row.ts` -- a
+    // burst of calls sharing one wall-clock second (many `Bash` results in
+    // the same PostToolUse second) must still run the sweep once per 64
+    // WRITES, not once per call whose timestamp happens to be a multiple of
+    // it.
+    let row_id = conn.last_insert_rowid();
+    if row_id > 0 && (row_id as u64).is_multiple_of(PRUNE_EVERY) {
         let cutoff = row.ts.saturating_sub(RETENTION_DAYS * 86_400);
         conn.execute(
             "DELETE FROM compactions WHERE ts < ?1",
@@ -481,27 +511,25 @@ mod tests {
         assert_eq!(rows[1].bytes_out, 100);
     }
 
-    /// The hot path (`ts % PRUNE_EVERY != 0`) never deletes anything, even
-    /// rows far outside the retention window -- only one write in
-    /// `PRUNE_EVERY` may run the sweep at all.
+    /// The hot path (fewer than `PRUNE_EVERY` rows inserted so far) never
+    /// deletes anything, even rows far outside the retention window -- only
+    /// the write that lands on the `PRUNE_EVERY`th INSERTED ROW may run the
+    /// sweep at all (review finding F6: gated on the row id, not on any
+    /// particular `ts` value).
     #[test]
     fn the_hot_path_never_prunes_outside_its_one_in_prune_every_write() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
 
-        // A very old row, written at a timestamp that does NOT trigger the
-        // prune gate (not a multiple of PRUNE_EVERY).
-        let ancient_ts = 1; // 1 % 64 != 0
+        let ancient_ts = 1;
         record(
             &state,
             &row(ancient_ts, Outcome::Compacted, 1_000, 100, "repo-a"),
         );
 
-        // A dozen more non-triggering writes, all recent.
+        // A dozen more writes -- well under PRUNE_EVERY rows total, so the
+        // gate cannot have fired regardless of what these timestamps are.
         for ts in 1_000u64..1_010 {
-            if ts.is_multiple_of(PRUNE_EVERY) {
-                continue;
-            }
             record(&state, &row(ts, Outcome::Compacted, 10, 10, "repo-a"));
         }
 
@@ -513,7 +541,7 @@ mod tests {
         );
     }
 
-    /// On the one-in-`PRUNE_EVERY` write, rows older than `RETENTION_DAYS`
+    /// On the `PRUNE_EVERY`th row INSERTED, rows older than `RETENTION_DAYS`
     /// are actually removed.
     #[test]
     fn the_prune_write_removes_rows_older_than_retention() {
@@ -524,14 +552,120 @@ mod tests {
         record(
             &state,
             &row(far_past, Outcome::Compacted, 1_000, 100, "repo-a"),
-        );
+        ); // row id 1
 
         let now = far_past + RETENTION_DAYS * 86_400 + 1_000;
-        let prune_ts = now - (now % PRUNE_EVERY); // a multiple of PRUNE_EVERY
-        record(&state, &row(prune_ts, Outcome::Compacted, 10, 10, "repo-a"));
+        // Enough more rows, all well within retention relative to `now`, to
+        // reach the PRUNE_EVERY-th (64th) row inserted -- that write is the
+        // only one that may run the sweep.
+        for i in 0..(PRUNE_EVERY - 2) {
+            record(&state, &row(now + i, Outcome::Compacted, 10, 10, "repo-a"));
+        }
+        record(&state, &row(now, Outcome::Compacted, 10, 10, "repo-a")); // row id 64
 
         let rows = read_since(&state, 0, None);
-        assert_eq!(rows.len(), 1, "the far-past row must have been pruned");
+        assert_eq!(rows.len(), (PRUNE_EVERY - 1) as usize);
+        assert!(
+            rows.iter().all(|r| r.bytes_in == 10),
+            "the far-past row must have been pruned; a survivor still carries its 1_000 byte count"
+        );
+    }
+
+    /// Review finding F6: the prune gate is keyed on the INSERTED ROW ID,
+    /// not on the timestamp -- a burst of `record` calls that all share ONE
+    /// `ts % PRUNE_EVERY == 0` wall-clock second must not each re-run the
+    /// retention sweep. Before the fix, the second call below (row id 2,
+    /// `ts` a multiple of `PRUNE_EVERY`) would already have pruned the
+    /// seeded old row; after it, nothing runs the sweep before the 64th row.
+    #[test]
+    fn a_burst_sharing_one_timestamp_prunes_only_on_the_64th_row_not_every_call() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        let far_past = 1;
+        record(
+            &state,
+            &row(far_past, Outcome::Compacted, 1_000, 100, "repo-a"),
+        ); // row id 1
+
+        // A `now` that is itself a multiple of PRUNE_EVERY -- the exact
+        // shape that made the old `ts`-keyed gate re-fire on every one of
+        // these calls.
+        let now: u64 = 20_000_000 - (20_000_000 % PRUNE_EVERY);
+        assert!(now.is_multiple_of(PRUNE_EVERY));
+        for _ in 0..(PRUNE_EVERY - 2) {
+            record(&state, &row(now, Outcome::Compacted, 10, 10, "repo-a"));
+        }
+        // 63 rows total (row id 63): the fixed gate must not have fired yet.
+        assert_eq!(
+            read_since(&state, 0, None).len(),
+            (PRUNE_EVERY - 1) as usize,
+            "no row should have been pruned before the 64th insert"
+        );
+
+        record(&state, &row(now, Outcome::Compacted, 10, 10, "repo-a")); // row id 64
+        let rows = read_since(&state, 0, None);
+        assert_eq!(
+            rows.len(),
+            (PRUNE_EVERY - 1) as usize,
+            "the 64th insert must prune exactly the seeded old row: {} rows left",
+            rows.len()
+        );
+        assert!(
+            rows.iter().all(|r| r.bytes_in == 10),
+            "the far-past seeded row (bytes_in = 1_000) must be the one pruned"
+        );
+    }
+
+    /// Review finding F7: a steady-state `record` call on an EXISTING,
+    /// already-schema'd ledger must run no DDL and leave `user_version`
+    /// untouched -- only the very first call against a fresh file may create
+    /// the table/index and stamp the schema version.
+    #[test]
+    fn a_steady_state_record_runs_no_ddl_and_leaves_user_version_untouched() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        // First call: creates the file and its schema.
+        record(&state, &row(1, Outcome::Compacted, 100, 10, "repo-a"));
+        let conn = open(&state).expect("open after the first record");
+        let user_version_after_first: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("user_version");
+        let table_count_after_first: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("sqlite_master count");
+        assert_eq!(user_version_after_first, SCHEMA_VERSION);
+        drop(conn);
+
+        // Second call, against the now-existing file: must be schema-silent.
+        record(&state, &row(2, Outcome::BelowThreshold, 50, 50, "repo-a"));
+        let conn = open(&state).expect("open after the second record");
+        let user_version_after_second: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("user_version");
+        let table_count_after_second: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("sqlite_master count");
+        assert_eq!(
+            user_version_after_second, user_version_after_first,
+            "a steady-state call must never re-stamp user_version"
+        );
+        assert_eq!(
+            table_count_after_second, table_count_after_first,
+            "a steady-state call must never re-run the CREATE TABLE DDL"
+        );
+
+        // Both rows still made it in -- the fast path still inserts.
+        assert_eq!(read_since(&state, 0, None).len(), 2);
     }
 
     /// `savings` on an empty ledger prints a clear "nothing yet" line and
