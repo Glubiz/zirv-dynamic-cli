@@ -409,6 +409,16 @@ pub(crate) fn run_with_clock<W: Write>(
                 policy_extra.join(" ")
             },
         });
+        // Issue #420: same seam as every other supervisor-start launch path
+        // -- heal any self-healable (`Outdated`) hook entry, then warn at
+        // most once per 24h if something still drifted. Best-effort: no
+        // home directory is not a reason to fail the launch.
+        if let Ok(home) = crate::utils::home_dir() {
+            let _ = super::hook_integrity::heal_outdated(&state, &home);
+            if let Some(summary) = super::hook_integrity::drift_warning_if_due(&state, &home) {
+                announcer.emit(&super::announce::Event::HookIntegrity { summary });
+            }
+        }
         let extra: Vec<String> = policy_extra
             .iter()
             .cloned()

@@ -267,6 +267,14 @@ pub enum Event {
     /// `wrap::may_inject`, the same quiesce check every other injection
     /// already gates on).
     HandoverRefused { reason: String },
+    /// Issue #420: a hook-integrity drift warning fired at supervisor start
+    /// (`hook_integrity::drift_warning_if_due`) -- at least one of the hook
+    /// entries zirv installed no longer matches what the current binary
+    /// would write, and this is the one time in the last 24h this is worth
+    /// saying. `summary` is pre-rendered by the caller, naming which
+    /// entries and their verdicts; `zirv ctx hook status` has the full
+    /// detail.
+    HookIntegrity { summary: String },
 }
 
 /// What the nudged session is actually going to do about it -- the three
@@ -443,6 +451,7 @@ impl Event {
                 let noun = if *count == 1 { "entry" } else { "entries" };
                 format!("memory harvest wrote {count} durable {noun}")
             }
+            Event::HookIntegrity { summary } => format!("hook integrity: {summary}"),
         }
     }
 }
@@ -1028,6 +1037,20 @@ mod tests {
         );
     }
 
+    /// Issue #420: the hook-integrity drift announcement carries the
+    /// caller's own pre-rendered summary verbatim, prefixed for the channel.
+    #[test]
+    fn the_hook_integrity_announcement_carries_the_summary() {
+        let event = Event::HookIntegrity {
+            summary: "1 hook entry needs attention (claude Stop: modified); run `zirv ctx hook \
+                      status` for detail"
+                .to_string(),
+        };
+        let line = event.line();
+        assert!(line.contains("hook integrity:"), "got {line}");
+        assert!(line.contains("claude Stop: modified"), "got {line}");
+    }
+
     /// The macOS Keychain-prompt heads-up: names both halves of the promise
     /// (approve once with "Always Allow", or a headless run times out rather
     /// than hangs) so an operator reading only this one line still knows what
@@ -1100,6 +1123,9 @@ mod tests {
             Event::MacosKeychainPromptExpected,
             Event::ConfigUnparsable {
                 detail: ".zirv/ctx.toml: TOML parse error at line 1, column 2: bad".to_string(),
+            },
+            Event::HookIntegrity {
+                summary: "1 hook entry needs attention (claude Stop: modified)".to_string(),
             },
         ];
         for event in sample {

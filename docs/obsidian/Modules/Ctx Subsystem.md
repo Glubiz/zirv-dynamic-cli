@@ -28,7 +28,7 @@ last-verified: 2026-09-08
 - **`score`** — rot-score a transcript and print JSON (one-shot; see [[Rot Engine]])
 - **`handoff`** — distill a transcript into a stored handoff document
 - **`resume`** — start a clean interactive session with the latest handoff injected
-- **`hook`** — agent hook entrypoints (`Stop`, `Prompt`, `PreCompact`, `Pretool`, `Posttool` (issue #326), `Notify`, `SessionStart`, issue #244)
+- **`hook`** — agent hook entrypoints (`Stop`, `Prompt`, `PreCompact`, `Pretool`, `Posttool` (issue #326), `Notify`, `SessionStart`, issue #244, `Status` (issue #420) — see "Hook Integrity" below)
 - **`status`** — show supervised sessions, scores and handoffs
 - **`loop`** (renamed from the Rust keyword via `#[command(name = "loop")]`) — stateless loop runner, a fresh headless session per cycle
 - **`exec`** — supervise one headless run
@@ -263,6 +263,28 @@ On unix, directories are created `0700` and files `0600` (`create_private_dir_al
 `log.rs` appends one JSON line per context decision to `<state>/logs/decisions.jsonl` via `append()`, using the same private-file helpers as the rest of the state dir. Each `Decision` record carries a timestamp, session id, verb, rot verdict, numeric score, action taken, free-text detail, and an optional source-reading `observed_at` timestamp for cross-harness reroutes; omission remains compatible with older rows. `tail(state, count)` reads the whole file and returns the last `count` lines (oldest of the tail first) — used by the `status` verb. Separately, Claude permission hooks append privacy-preserving `SafetyDecision` records to UTC-day buckets at `<state>/logs/safety-decisions/<day>.jsonl`: verdict/rule/origin, platform, policy fingerprints and attestation status, with only SHA-256 of the command rather than raw shell text. Audit append is best-effort and can never alter a permission answer. **Retention (2026-09-06):** `append_safety` prunes safety-decision buckets older than `log::SAFETY_DECISION_RETENTION_DAYS` (30 UTC days) after every append — whole files at a time, so no reader ever races a partially rewritten log, and a non-bucket file in that directory is never touched. Nothing enforced retention before, so `safety-decisions/` grew without bound (7.7 MB across 13 buckets on one real machine) and every full read paid for the whole history; `zirv ctx snapshot` also now reads the buckets ONCE and shares the records between its attestation and its verdict-count sections instead of reading them twice.
 
 **Elastic scheduling's own action vocabulary (issue #358, v3.20.0/current)**, emitted by `rollover.rs` as ordinary `Decision` rows: `orchestrator-rollover-prepared`/`-committed`/`-failed`/`-refused` (a rollover transaction's lifecycle), `all-capacity-exhausted`/`capacity-resumed` (every harness parked, and a parked seat resuming), `harness-draining` (a `fallback.order` harness entered `HarnessState::Draining`), `delegation-routed` (a delegation placed on a harness other than the one requested), and `allocation-plan-changed` (the ranked set of harnesses this seat could roll onto changed). See [[Decision Log]] for the verdict grouping and [[Ctx Supervisors]] for the rollover driver these rows narrate.
+
+## Hook Integrity (issue #420)
+
+`hook_integrity.rs` gives the hook entries `setup::install_claude_integration`/`install_codex_hooks` write into `<claude config dir>/settings.json` and `<codex home>/hooks.json` a baseline, a classification, an at-most-once-per-24h drift warning, and a narrow self-heal — all keyed by the target file's own path plus `"<event>|<matcher-or-empty>"`, never by repository (these are home-level installs, not per-repo).
+
+**Baseline.** Every time an install actually writes a new hook entry, `record_baseline` hashes that exact command string (SHA-256, hex, via the same `memory::sha256_hex` helper `memory.rs` already uses) into `StateDir::hook_baseline()` (`<state>/hooks/baseline.json`), a private JSON file. Only the command string is hashed — zirv registers a command, never a script file, so there is nothing else to fingerprint.
+
+**Classification (`classify_entry`, one row per current-shape slot from `setup::HARNESS_HOOKS`/`CLAUDE_ONLY_HOOKS`):**
+
+- `Ok` — the live command matches what the current binary would write, and a baseline was recorded for it.
+- `NoBaseline` — advisory only, never a warning trigger. Covers two cases: the live command matches the current shape but no baseline exists for it, or there is no live command *and* no baseline (never installed at all — a fresh machine, or one that predates #420).
+- `Missing` — no live command, but the baseline proves this slot *was* installed: a genuine regression, distinct from "never installed."
+- `Outdated` — the live command differs from the current shape but either matches the operator's own recorded baseline hash for the slot (the strongest evidence — it is exactly what a previous zirv install wrote here) or matches a `LEGACY_HOOK_SHAPES` row for the same slot.
+- `Modified` — matches neither the current shape, the baseline, nor any known legacy shape.
+
+`LEGACY_HOOK_SHAPES` is a small, hand-maintained `(event, matcher, old_command)` table of retired command strings for a slot that still exists today, starting empty (no hook command string has changed since #420 shipped); append a row whenever one does, so an operator still on the old shape keeps classifying as `Outdated` rather than `Modified`.
+
+**Self-heal (`heal_outdated`, `zirv ctx hook status --heal`, and automatically at supervisor start for `Outdated` entries only).** Replaces a live command in place ONLY when it is byte-identical to a known previous zirv shape (a `LEGACY_HOOK_SHAPES` row) — never merely because it differs from the current shape. Nothing else in the file is touched. The write goes through `state::write_atomic` (temp file + rename in the same directory), so several concurrent heals converge on the same correct output. A slot that heals is re-baselined to the current shape's hash immediately after.
+
+**Drift warning.** `drift_warning_if_due` fires when `warning_due` (an mtime-gated marker, `StateDir::hook_warn_marker()`, fails open on any read error — a missing/unreadable marker or one with no timestamp counts as due) says a day has passed AND at least one row is `Outdated`/`Missing`/`Modified`. Printed via the `zirv ▸` channel (`Event::HookIntegrity`, `announce.rs`) at the same seam every launch path (`wrap`/`exec`/`chat`/`run_loop`) already narrates `SandboxPosture` from — supervisor start also runs `heal_outdated` first, so a self-healable slot never gets a chance to warn. `zirv ctx status` prints the same one-line summary (never heals; only supervisor start does) and never fails just because the check itself errored.
+
+`zirv ctx hook status` (`hook.rs`) prints one line per slot plus a summary count, always exits 0 (advisory), and is `MUTATING` in `command_schema.rs` only because `--heal` can write.
 
 ## Verb Modules (score / handoff / resume / hook / status)
 

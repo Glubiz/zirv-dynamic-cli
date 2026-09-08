@@ -871,6 +871,26 @@ impl StateDir {
         self.0.join("probes")
     }
 
+    /// Issue #420: the hook-integrity baseline -- `<state>/hooks/
+    /// baseline.json`, one SHA-256 per hook slot (`"<event>|<matcher-or-
+    /// empty>"`) per target settings/hooks file path, recorded whenever
+    /// `setup::install_claude_integration`/`install_codex_hooks` actually
+    /// write a hook entry. See `super::hook_integrity` for the classify/
+    /// heal/warn logic built on it.
+    pub fn hook_baseline(&self) -> PathBuf {
+        self.0.join("hooks").join("baseline.json")
+    }
+
+    /// Issue #420: the once-a-day drift-warning marker -- `<state>/hooks/
+    /// warn-marker`, an empty file whose mtime gates the "at most once per
+    /// 24h" repeat. A sibling of [`Self::hook_baseline`], not inside it: the
+    /// baseline is durable integrity data, this is a disposable throttle a
+    /// missing or unreadable file always fails open on (see
+    /// `super::hook_integrity::warning_due`).
+    pub fn hook_warn_marker(&self) -> PathBuf {
+        self.0.join("hooks").join("warn-marker")
+    }
+
     /// First 8 hex characters of the session id keep the socket path short.
     pub fn socket_for(&self, session: &str) -> PathBuf {
         let short: String = session

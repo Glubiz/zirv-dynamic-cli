@@ -29,6 +29,7 @@ pub mod group;
 pub mod handoff;
 pub mod handover;
 pub mod hook;
+pub(crate) mod hook_integrity;
 pub mod judge;
 pub mod ledger;
 pub mod log;

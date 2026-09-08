@@ -9,6 +9,7 @@ use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{TranscriptUsage, input_hash};
 use super::group;
 use super::handoff::latest_for_repo;
+use super::hook_integrity;
 use super::ledger;
 use super::mail;
 use super::memory;
@@ -1104,6 +1105,21 @@ fn render_report<W: Write>(
         label(colour, "state dir:"),
         style::paint(&state.root().display().to_string(), Tone::Muted, colour)
     )?;
+
+    // Issue #420: at most one warning line per 24h when a hook entry zirv
+    // installed has drifted (`Outdated`/`Missing`/`Modified`) -- `ctx
+    // status` never heals automatically (only supervisor start does; see
+    // `wrap`/`exec`/`chat`/`run_loop`'s own identical call), it only reports.
+    // Best-effort: no home directory is not a reason to fail the report.
+    if let Ok(home) = crate::utils::home_dir()
+        && let Some(summary) = hook_integrity::drift_warning_if_due(&state, &home)
+    {
+        writeln!(
+            w,
+            "{}",
+            style::paint(&format!("hook integrity: {summary}"), Tone::Warn, colour)
+        )?;
+    }
 
     // Fetched here, once, and reused by every section below that needs it
     // (the work-group tree, the pool section, the sessions list itself) --

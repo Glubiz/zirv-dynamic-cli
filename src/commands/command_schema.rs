@@ -168,6 +168,7 @@ const MUTATING: &[&str] = &[
     "zirv ctx hook pre-compact",
     "zirv ctx hook pretool",
     "zirv ctx hook posttool",
+    "zirv ctx hook status",
     "zirv ctx run",
     "zirv ctx hook prompt",
     "zirv ctx hook session-start",

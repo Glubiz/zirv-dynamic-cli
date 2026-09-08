@@ -57,6 +57,17 @@ pub enum HookEvent {
         #[arg(long, default_value = "7d")]
         since: String,
     },
+    /// Issue #420: report the hook-integrity baseline's verdict (Ok/
+    /// Outdated/Missing/Modified/NoBaseline) for every hook slot the current
+    /// binary would install, across both the claude and codex targets.
+    Status {
+        /// Replace any `Outdated` entry (byte-identical to a known previous
+        /// zirv shape) with the current binary's own shape. Never touches an
+        /// entry that differs by so much as a byte from every known
+        /// zirv-authored shape.
+        #[arg(long)]
+        heal: bool,
+    },
 }
 
 /// `stop_hook_active` is absent from the published field table but is delivered
@@ -2996,6 +3007,7 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
             run_notify(w, &raw, &env)
         }
         HookEvent::Audit { since } => run_audit(w, since, &env),
+        HookEvent::Status { heal } => run_hook_status(w, *heal, &env),
     }
 }
 
@@ -3108,6 +3120,57 @@ fn run_audit<W: Write>(w: &mut W, since: &str, env: EnvLookup<'_>) -> CtxResult<
     Ok(0)
 }
 
+
+/// Issue #420: `zirv ctx hook status`. Advisory only -- always exits 0,
+/// printing what went wrong inline rather than propagating it, since a
+/// classify/heal failure (e.g. a malformed `settings.json`) must never make
+/// this command itself the reason a session looks unhealthy.
+fn run_hook_status<W: Write>(w: &mut W, heal: bool, env: EnvLookup<'_>) -> CtxResult<i32> {
+    let home = crate::utils::home_dir()?;
+    let state = StateDir::resolve(env)?;
+    if heal {
+        match super::hook_integrity::heal_outdated(&state, &home) {
+            Ok(summary) => writeln!(
+                w,
+                "healed {} hook entr{}",
+                summary.healed,
+                if summary.healed == 1 { "y" } else { "ies" }
+            )?,
+            Err(error) => writeln!(w, "heal failed: {error}")?,
+        }
+    }
+    match super::hook_integrity::report(&state, &home) {
+        Ok(rows) => {
+            let (mut ok, mut outdated, mut missing, mut modified, mut no_baseline) =
+                (0, 0, 0, 0, 0);
+            for row in &rows {
+                writeln!(
+                    w,
+                    "{:<7} {}{} {}",
+                    row.provider,
+                    row.event,
+                    super::hook_integrity::matcher_suffix(row.matcher),
+                    row.state.label()
+                )?;
+                match row.state {
+                    super::hook_integrity::HookState::Ok => ok += 1,
+                    super::hook_integrity::HookState::Outdated => outdated += 1,
+                    super::hook_integrity::HookState::Missing => missing += 1,
+                    super::hook_integrity::HookState::Modified => modified += 1,
+                    super::hook_integrity::HookState::NoBaseline => no_baseline += 1,
+                }
+            }
+            writeln!(
+                w,
+                "summary: {ok} ok, {outdated} outdated, {missing} missing, {modified} modified, \
+                 {no_baseline} no-baseline"
+            )?;
+        }
+        Err(error) => writeln!(w, "hook status unavailable: {error}")?,
+    }
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::config::OrchestratorWrites;
@@ -3122,6 +3185,46 @@ mod tests {
             stop_hook_active: false,
             source: String::new(),
         }
+    }
+
+    /// Issue #420: `zirv ctx hook status` before anything was ever installed
+    /// reports every slot `no-baseline` (never installed, never a
+    /// regression) and still prints a summary line, never an error.
+    #[test]
+    fn hook_status_reports_no_baseline_before_any_install() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        run_hook_status(&mut out, false, &|k| env.get(k).cloned()).expect("status");
+        let report = String::from_utf8(out).expect("utf8");
+        assert!(report.contains("no-baseline"), "got {report}");
+        assert!(report.contains("summary:"), "got {report}");
+    }
+
+    /// `--heal` is a no-op (and still reports) when there is nothing to heal
+    /// (`LEGACY_HOOK_SHAPES` is empty, or the target was never installed).
+    #[test]
+    fn hook_status_heal_is_a_no_op_with_no_legacy_shapes_to_heal_from() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+
+        let mut out = Vec::new();
+        run_hook_status(&mut out, true, &|k| env.get(k).cloned()).expect("status --heal");
+        let report = String::from_utf8(out).expect("utf8");
+        assert!(report.contains("healed 0 hook entries"), "got {report}");
     }
 
     /// Matches `ScoreConfig::default().same_error_threshold` -- every test

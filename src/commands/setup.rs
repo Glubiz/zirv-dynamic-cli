@@ -382,13 +382,13 @@ fn home_dir() -> SetupResult<PathBuf> {
     crate::utils::home_dir()
 }
 
-fn claude_config_dir(home: &Path) -> PathBuf {
+pub(crate) fn claude_config_dir(home: &Path) -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".claude"))
 }
 
-fn codex_config_dir(home: &Path) -> PathBuf {
+pub(crate) fn codex_config_dir(home: &Path) -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"))
@@ -457,7 +457,7 @@ pub(crate) fn claude_compaction_and_safety_hooks_installed() -> bool {
         && contains_command(&claude_settings, CLAUDE_SAFETY_HOOK.2)
 }
 
-fn load_json_object(path: &Path) -> SetupResult<Value> {
+pub(crate) fn load_json_object(path: &Path) -> SetupResult<Value> {
     if !path.exists() {
         return Ok(json!({}));
     }
@@ -647,14 +647,17 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
     }
     let mut settings = load_json_object(&settings_path)?;
     let mut hooks_added = 0;
+    let mut written = Vec::new();
     for (event, matcher, command) in HARNESS_HOOKS {
         if ensure_harness_hook(&mut settings, event, matcher, command)? {
             hooks_added += 1;
+            written.push((event, matcher, command));
         }
     }
     for (event, matcher, command) in CLAUDE_ONLY_HOOKS {
         if ensure_harness_hook(&mut settings, event, matcher, command)? {
             hooks_added += 1;
+            written.push((event, matcher, command));
         }
     }
     let root = settings.as_object_mut().expect("validated object");
@@ -686,6 +689,14 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
             &(serde_json::to_string_pretty(&settings)? + "\n"),
             false,
         )?;
+        // Issue #420: best-effort -- a baseline write failure (e.g. the
+        // platform state directory cannot be determined) must never turn a
+        // successful hook install into a hard `setup apply` failure. A
+        // missing baseline just means `zirv ctx hook status` reports
+        // `NoBaseline` for these entries instead of `Ok`.
+        if let Ok(state) = ctx::state::StateDir::resolve(&ctx::config::env_from_process()) {
+            let _ = ctx::hook_integrity::record_baseline(&state, &settings_path, &written);
+        }
     }
     Ok((hooks_added, statusline_added))
 }
@@ -697,9 +708,11 @@ fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupRe
     }
     let mut hooks = load_json_object(hooks_path)?;
     let mut hooks_added = 0;
+    let mut written = Vec::new();
     for (event, matcher, command) in HARNESS_HOOKS {
         if ensure_harness_hook(&mut hooks, event, matcher, command)? {
             hooks_added += 1;
+            written.push((event, matcher, command));
         }
     }
     if !dry_run && hooks_added > 0 {
@@ -718,6 +731,11 @@ fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupRe
             &(serde_json::to_string_pretty(&hooks)? + "\n"),
             false,
         )?;
+        // Issue #420: best-effort, same reasoning as `install_claude_
+        // integration`'s own identical call.
+        if let Ok(state) = ctx::state::StateDir::resolve(&ctx::config::env_from_process()) {
+            let _ = ctx::hook_integrity::record_baseline(&state, hooks_path, &written);
+        }
     }
     Ok(hooks_added)
 }

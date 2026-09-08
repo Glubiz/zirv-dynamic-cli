@@ -2036,6 +2036,18 @@ pub fn run_with(
             policy_extra.join(" ")
         },
     });
+    // Issue #420: heal any self-healable (`Outdated`) hook entry, then warn
+    // at most once per 24h if something still drifted. Best-effort: no home
+    // directory is not a reason to fail the launch. A no-op under
+    // `--no-supervise` in effect too (`announcer` is `Announcer::silent()`
+    // there), though the heal itself still runs -- fixing a drifted hook
+    // entry is not "supervision".
+    if let Ok(home) = crate::utils::home_dir() {
+        let _ = super::hook_integrity::heal_outdated(&state_dir, &home);
+        if let Some(summary) = super::hook_integrity::drift_warning_if_due(&state_dir, &home) {
+            announcer.emit(&super::announce::Event::HookIntegrity { summary });
+        }
+    }
     // Issue #222: codex has no per-command approval mechanism zirv can
     // pre-clear the way #224 pre-approves reserved claude built-ins, so an
     // interactive launch under a prompting posture gets a one-time advisory
