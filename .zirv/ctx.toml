@@ -102,6 +102,7 @@ model = "fable"
 # idle_no_tool_secs = 450            # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_IDLE_NO_TOOL_SECS): no PTY output/transcript growth/mail activity for this long while idle latches `stalled` (issue #310)
 # in_tool_secs = 1200                # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_IN_TOOL_SECS): same progress clock, applied while inside a tool call (issue #310)
 # stall_grace_secs = 120             # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS): time a steering nudge gets before a stalled session is terminated (issue #310)
+# compact_stall_secs = 600           # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS): time a session may sit in a started-but-never-finished compaction before it reads as stalled after compaction (issue #379)
 # chain_max_restarts = 3             # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS): unplanned same-class respawns across process boundaries before the restart-chain breaker trips (issue #310)
 # chain_max_gap_secs = 300           # REPO-FORBIDDEN (ZIRV_CTX_SUPERVISE_CHAIN_MAX_GAP_SECS): max gap between chained respawns still counted toward the breaker (issue #310)
 # orchestrator_writes = "advise"     # narrow-only (ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES): this seat's own repository-write guard posture -- "allow", "advise", or "deny". A repo may only tighten (allow -> advise -> deny), never loosen. Default: advise (issue #358 T8).

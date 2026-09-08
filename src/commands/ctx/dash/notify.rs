@@ -70,6 +70,7 @@ const fn blocked_words(attention: Attention) -> &'static str {
         Attention::WorkflowGate => "waits on a workflow gate",
         Attention::WriterConflict => "waits on the writer permit",
         Attention::VerificationFailure => "failed verification",
+        Attention::Compacting => "is compacting",
         Attention::Stalled => "looks stalled",
         Attention::Unknown => "needs attention",
     }

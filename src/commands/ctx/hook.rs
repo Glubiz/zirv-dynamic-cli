@@ -1615,6 +1615,27 @@ pub fn run_pre_compact<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> 
                 observed_at: None,
             },
         );
+        // Issue #379: a compaction is also the last thing anyone hears from a
+        // session until it comes back, and no adapter emits a
+        // compaction-FINISHED event zirv can wait on for codex at all. So the
+        // start is recorded on the attention axis too: it outranks the
+        // `Working` a prompt hook left behind (both are `AdapterHook`, this
+        // one is later), which is what stops `zirv ctx status` from reporting
+        // a wedged compaction as "working (user prompt submitted)". It clears
+        // itself the moment any adapter/supervisor observation lands again --
+        // see `attention::compose`'s own clearing rule.
+        let _ = super::attention::record(
+            &state,
+            &attention_short(env, &session),
+            super::attention::Observation::new(
+                super::attention::Authority::AdapterHook,
+                "compaction started",
+                100,
+                now_secs(),
+            )
+            .with_attention(super::attention::Attention::Compacting),
+            now_secs(),
+        );
     }
 
     let _ = writeln!(w, "{}", pre_compact_output());
@@ -4879,6 +4900,59 @@ mod tests {
         assert!(
             log.contains("/tmp/t.jsonl"),
             "name the transcript it happened in: {log}"
+        );
+    }
+
+    /// Issue #379: the same hook also files the attention observation the
+    /// dashboard and `zirv ctx status` read a wedged compaction off, so a
+    /// session that never comes back from one stops reporting whatever it was
+    /// doing before it started.
+    #[test]
+    fn pre_compact_records_compacting_attention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = dir.path().join("state");
+        let env: std::collections::HashMap<String, String> = [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into();
+        let lookup = |k: &str| env.get(k).cloned();
+        let state_dir = StateDir::resolve(&lookup).expect("state dir");
+        let short = super::super::sessions::short_id("s");
+
+        // A prompt landed first, exactly as in the incident: without the
+        // observation below, this is what a wedged compaction kept showing.
+        super::super::attention::record(
+            &state_dir,
+            &short,
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "user prompt submitted",
+                100,
+                10,
+            )
+            .with_lifecycle(super::super::attention::Lifecycle::Working),
+            10,
+        );
+
+        let mut out = Vec::new();
+        let code = run_pre_compact(
+            &mut out,
+            "{\"session_id\":\"s\",\"transcript_path\":\"/tmp/t.jsonl\",\"cwd\":\"/work\"}",
+            &lookup,
+        )
+        .expect("runs");
+        assert_eq!(code, 0);
+
+        let status = super::super::attention::load(&state_dir, &short);
+        assert_eq!(
+            status.attention,
+            super::super::attention::Attention::Compacting
+        );
+        assert!(
+            super::super::attention::reason(&status).starts_with("compacting since"),
+            "got {}",
+            super::super::attention::reason(&status)
         );
     }
 

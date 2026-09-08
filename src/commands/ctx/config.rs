@@ -246,6 +246,18 @@ pub struct SuperviseConfig {
     ///
     /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`.
     pub stall_grace_secs: u64,
+    /// Issue #379: how long a session may sit in `Attention::Compacting` (a
+    /// `PreCompact` hook fired and nothing has been heard from the session
+    /// since) before `attention::project_at` renders it as stalled and a
+    /// dashboard pane mails its delegating session once. 600s is roughly
+    /// double the slowest compaction actually observed (a codex pane at
+    /// ~242K of 258K tokens took 5-6.5 minutes), so a compaction that is
+    /// merely slow never trips it.
+    ///
+    /// `REPO_FORBIDDEN`, same reasoning as `idle_no_tool_secs`: a checked-out
+    /// repo raising its own compaction fuse could silently defeat the
+    /// detector for a session running against it.
+    pub compact_stall_secs: u64,
     /// Issue #310 (3b): the restart-chain breaker's own trip threshold --
     /// this many unplanned, same-class respawns, each no more than
     /// `chain_max_gap_secs` apart, means "do not auto-resume, report"
@@ -317,6 +329,7 @@ impl Default for SuperviseConfig {
             idle_no_tool_secs: 450,
             in_tool_secs: 1200,
             stall_grace_secs: 120,
+            compact_stall_secs: 600,
             chain_max_restarts: 3,
             chain_max_gap_secs: 300,
             orchestrator_writes: OrchestratorWrites::Advise,
@@ -2086,6 +2099,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Int,
     ),
     (
+        "ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS",
+        &["supervise", "compact_stall_secs"],
+        EnvKind::Int,
+    ),
+    (
         "ZIRV_CTX_SUPERVISE_CHAIN_MAX_RESTARTS",
         &["supervise", "chain_max_restarts"],
         EnvKind::Int,
@@ -3367,6 +3385,13 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     (
         &["supervise", "stall_grace_secs"],
         "ZIRV_CTX_SUPERVISE_STALL_GRACE_SECS",
+    ),
+    // Issue #379: same reasoning again for the compaction fuse -- a repo
+    // checkout raising it could silently defeat the stalled-after-compaction
+    // detector for a session running against it.
+    (
+        &["supervise", "compact_stall_secs"],
+        "ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS",
     ),
     // Same reasoning, for the 3b restart-chain breaker: a repo checkout
     // raising its own restart budget or gap window could silently defeat
@@ -5103,6 +5128,11 @@ mod tests {
             SuperviseConfig::default().stall_grace_secs,
             120,
             "issue #310: mirrors the Hermes reference's own _STALL_GRACE_SECONDS"
+        );
+        assert_eq!(
+            SuperviseConfig::default().compact_stall_secs,
+            600,
+            "issue #379: roughly double the slowest compaction actually observed"
         );
         assert_eq!(
             SuperviseConfig::default().chain_max_restarts,
@@ -7695,6 +7725,16 @@ mod tests {
         assert_eq!(cfg.supervise.stall_grace_secs, 30);
     }
 
+    /// Issue #379: the compaction fuse reads from its own env var like every
+    /// other `supervise.*` key.
+    #[test]
+    fn compact_stall_secs_env_override_sets_the_key() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[("ZIRV_CTX_SUPERVISE_COMPACT_STALL_SECS", "90")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.supervise.compact_stall_secs, 90);
+    }
+
     #[test]
     fn chain_max_restarts_env_override_sets_the_key() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -7721,6 +7761,8 @@ mod tests {
             "idle_no_tool_secs",
             "in_tool_secs",
             "stall_grace_secs",
+            // Issue #379: the compaction fuse is one of these too.
+            "compact_stall_secs",
             "chain_max_restarts",
             "chain_max_gap_secs",
         ] {
@@ -9068,6 +9110,7 @@ mod tests {
         ("supervise", "idle_no_tool_secs"),
         ("supervise", "in_tool_secs"),
         ("supervise", "stall_grace_secs"),
+        ("supervise", "compact_stall_secs"),
         ("supervise", "chain_max_restarts"),
         ("supervise", "chain_max_gap_secs"),
         ("supervise", "orchestrator_writes"),

@@ -147,6 +147,10 @@ fn sessions_lines(
     now: u64,
     env: EnvLookup<'_>,
     colour: bool,
+    // Issue #379: `supervise.compact_stall_secs`, passed in rather than
+    // re-loaded here -- `attention::project_at`/`reason_at` are pure, and the
+    // report has already resolved the config once by the time it gets here.
+    compact_stall_secs: u64,
 ) -> Vec<String> {
     let mut records = records.to_vec();
     records.sort_by(|a, b| a.0.short.cmp(&b.0.short));
@@ -254,7 +258,12 @@ fn sessions_lines(
             // with an unread completion (`DoneUnread`) is exactly the case
             // "background completion never disappears into idle" exists for.
             let attention_status = super::attention::load(state, &record.short);
-            let projection = super::attention::project(&attention_status);
+            // Issue #379: `project_at`/`reason_at`, not `project`/`reason` --
+            // a compaction that started and never came back reads as
+            // "stalled after compaction (compacting since HH:MM UTC)" here
+            // rather than as whatever the session was doing before it.
+            let projection =
+                super::attention::project_at(&attention_status, now, compact_stall_secs);
             let attention_tone = match projection {
                 super::attention::Projection::Blocked(_) | super::attention::Projection::Failed => {
                     Tone::Err
@@ -268,7 +277,7 @@ fn sessions_lines(
                     &format!(
                         "attention: {} ({})",
                         projection.label(),
-                        super::attention::reason(&attention_status)
+                        super::attention::reason_at(&attention_status, now, compact_stall_secs)
                     ),
                     attention_tone,
                     colour
@@ -1503,6 +1512,10 @@ fn render_report<W: Write>(
             crate::commands::ctx::state::now_secs(),
             env,
             colour,
+            cfg_result
+                .as_ref()
+                .map(|cfg| cfg.supervise.compact_stall_secs)
+                .unwrap_or_else(|_| super::config::SuperviseConfig::default().compact_stall_secs),
         );
         if session_lines.is_empty() {
             writeln!(

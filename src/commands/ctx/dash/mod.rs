@@ -9437,6 +9437,69 @@ fn report_settled_pane_with(
     }
 }
 
+/// Issue #379: a pane whose last signal was "a compaction started" and that
+/// has said nothing for `supervise.compact_stall_secs` since. A codex pane
+/// wedged exactly this way -- 18 minutes into a second compaction, with
+/// `zirv ctx status` still reporting "working (user prompt submitted)" and
+/// not one word reaching the session that delegated to it.
+///
+/// Two things happen, both once per pane: a `Supervisor` observation latches
+/// `Attention::Stalled` with the rendered reason, so a `zirv ctx status` run
+/// from ANY other process sees it too (the projection alone is derived, and
+/// nothing outside this dashboard applies the compaction clock to a pane it
+/// cannot see); and the delegating session gets one mail. `now` is the
+/// caller's clock, so the whole decision is testable without waiting.
+fn report_stalled_compaction(
+    pane: &mut Pane,
+    state: &StateDir,
+    cfg: &CtxConfig,
+    errors: &mut ErrorLog,
+    now: u64,
+) {
+    if pane.stalled_mail_sent || matches!(pane.state(), PaneState::Ended(_)) {
+        return;
+    }
+    let status = super::attention::load(state, pane.short());
+    let threshold = cfg.supervise.compact_stall_secs;
+    if status.attention != super::attention::Attention::Compacting
+        || super::attention::project_at(&status, now, threshold)
+            != super::attention::Projection::Blocked(super::attention::Attention::Stalled)
+    {
+        return;
+    }
+    let reason = super::attention::reason_at(&status, now, threshold);
+    let quiet_mins = now.saturating_sub(status.last_transition) / 60;
+    // Latched before the mail is attempted, and left latched even when the
+    // pane owes nobody a report: this fires off a per-tick sweep, and a
+    // second observation (or a second mail) would say nothing the first did
+    // not.
+    pane.stalled_mail_sent = true;
+    let _ = super::attention::record(
+        state,
+        pane.short(),
+        super::attention::Observation::new(
+            super::attention::Authority::Supervisor,
+            reason.clone(),
+            90,
+            now,
+        )
+        .with_attention(super::attention::Attention::Stalled),
+        now,
+    );
+    let Some(recipient) = pane.report_to().map(str::to_string) else {
+        return;
+    };
+    let body = format!(
+        "pane {} ({}, {}) {reason}, no output for {quiet_mins} min; restart or resume it",
+        pane.short(),
+        pane.agent(),
+        pane.cwd().display()
+    );
+    if let Err(error) = store_pane_system_mail(pane, &recipient, body, state, cfg) {
+        push_error(errors, format!("stalled report: {error}"));
+    }
+}
+
 /// Pure: which live pane a short id names right now, or `None` when no pane
 /// carries it any more.
 ///
@@ -10719,8 +10782,10 @@ pub fn run_dashboard(
         // per tick purely to re-render (see its own doc comment), so doing
         // it there would double-fire for the same tick's own transition.
         sync_quiet_heuristic_attention(&panes, state, &mut quiet_lifecycle);
+        let tick_now = super::state::now_secs();
         for pane in &mut panes {
             report_settled_pane(pane, state, cfg, &mut errors);
+            report_stalled_compaction(pane, state, cfg, &mut errors, tick_now);
         }
         let rows = assemble_sidebar(
             &build_pane_rows(&panes, &retained_ended),
@@ -24379,6 +24444,114 @@ mod tests {
         assert!(messages[0].1.body.contains("settled with unread output"));
         assert!(messages[0].1.body.contains("hello"));
         panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    /// Issue #379: a pane that started a compaction and never came back mails
+    /// its delegating session exactly once, past `compact_stall_secs` -- the
+    /// silence the wedged codex pane sat in for 18 minutes. A pane still
+    /// inside a plausible compaction mails nothing at all.
+    #[test]
+    fn a_compaction_that_never_returns_mails_the_delegating_session_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let mut pane = spawn_idle_signal_less_worker_pane(
+            &state,
+            tmp.path(),
+            "dddddddd-2222-4333-8444-555555555555",
+        );
+        pane.set_report_to(Some("aaaa1111".to_string()));
+        let pane_short = pane.short().to_string();
+
+        // The pre-compact hook's own observation, at a fixed fake "now" so
+        // this test never waits on a real clock.
+        let started = 100_000_u64;
+        let start_compaction = |at: u64| {
+            super::super::attention::record(
+                &state,
+                pane_short.as_str(),
+                super::super::attention::Observation::new(
+                    super::super::attention::Authority::AdapterHook,
+                    "compaction started",
+                    100,
+                    at,
+                )
+                .with_attention(super::super::attention::Attention::Compacting),
+                at,
+            );
+        };
+        start_compaction(started);
+
+        let inbox = |state: &StateDir| {
+            mail::list(
+                state,
+                &super::super::state::repo_slug(tmp.path()),
+                None,
+                Some("aaaa1111"),
+            )
+            .expect("list")
+        };
+
+        // Still inside the fuse: nothing is reported, and the pane stays
+        // eligible.
+        let mut errors = ErrorLog::default();
+        report_stalled_compaction(
+            &mut pane,
+            &state,
+            &cfg,
+            &mut errors,
+            started + cfg.supervise.compact_stall_secs - 1,
+        );
+        assert!(inbox(&state).is_empty());
+        assert!(!pane.stalled_mail_sent);
+
+        // The session came back (a prompt hook fired on the far side of the
+        // compaction): the marker is gone, so no amount of later clock makes
+        // this a stall.
+        super::super::attention::record(
+            &state,
+            &pane_short,
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::AdapterHook,
+                "user prompt submitted",
+                100,
+                started + 60,
+            )
+            .with_lifecycle(super::super::attention::Lifecycle::Working),
+            started + 60,
+        );
+        report_stalled_compaction(&mut pane, &state, &cfg, &mut errors, started + 100_000);
+        assert!(inbox(&state).is_empty(), "a resumed session owes no report");
+        assert!(!pane.stalled_mail_sent);
+
+        // A second compaction that never returns. Past the fuse: one mail,
+        // and a `Supervisor` latch a `zirv ctx status` in any other process
+        // can read off disk.
+        let started = started + 120;
+        start_compaction(started);
+        let now = started + cfg.supervise.compact_stall_secs + 480;
+        for _ in 0..2 {
+            report_stalled_compaction(&mut pane, &state, &cfg, &mut errors, now);
+        }
+        let messages = inbox(&state);
+        assert_eq!(messages.len(), 1, "exactly one report, not one per tick");
+        let body = &messages[0].1.body;
+        assert!(body.contains("stalled after compaction"), "got {body}");
+        assert!(body.contains("compacting since"), "got {body}");
+        assert!(body.contains("no output for 18 min"), "got {body}");
+        assert!(body.contains("restart or resume it"), "got {body}");
+        let status = super::super::attention::load(&state, pane.short());
+        assert_eq!(
+            status.attention,
+            super::super::attention::Attention::Stalled
+        );
+        assert!(
+            super::super::attention::reason(&status).contains("stalled after compaction"),
+            "got {}",
+            super::super::attention::reason(&status)
+        );
+        assert!(errors.entries.is_empty(), "{:?}", errors.entries);
+        pane.finish_shutdown().expect("shutdown");
     }
 
     #[test]
