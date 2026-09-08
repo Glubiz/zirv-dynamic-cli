@@ -196,10 +196,19 @@ pub(crate) fn extract_streaming(command: &str, path: &std::path::Path) -> Option
 /// one-liner.
 pub(crate) fn matches_known_family(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
-    is_cargo_family(&lower)
-        || is_pytest_family(&lower)
-        || is_vitest_jest_family(&lower)
-        || is_go_test_family(&lower)
+    // `pytest --version`, `cargo nextest list`, `jest --help` name a runner
+    // without running any test; their clean silence is genuine.
+    let introspects = lower.split_whitespace().any(|token| {
+        matches!(
+            token,
+            "--version" | "-v" | "--help" | "-h" | "--list" | "list" | "--collect-only"
+        )
+    });
+    !introspects
+        && (is_cargo_family(&lower)
+            || is_pytest_family(&lower)
+            || is_vitest_jest_family(&lower)
+            || is_go_test_family(&lower))
 }
 
 /// Reads `path` as lines (byte-split on `\n`, lossily decoded, `\r` and the
@@ -883,5 +892,25 @@ mod tests {
         assert!(blocks[0][0].contains("tests::beta"));
         assert!(blocks[0][0].contains("src/lib.rs:10:5"));
         assert!(blocks[0][1].contains("assertion"));
+    }
+
+    #[test]
+    fn a_runner_introspection_query_is_not_a_test_run() {
+        for command in [
+            "pytest --version",
+            "cargo nextest list",
+            "jest --help",
+            "go test -h",
+        ] {
+            assert!(!matches_known_family(command), "{command}");
+        }
+        for command in [
+            "pytest tests/",
+            "cargo nextest run",
+            "npx vitest",
+            "go test ./...",
+        ] {
+            assert!(matches_known_family(command), "{command}");
+        }
     }
 }
