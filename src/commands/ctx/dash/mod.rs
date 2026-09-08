@@ -26201,6 +26201,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut Vec::new(),
             &mut HashMap::new(),
         );
 
@@ -26247,6 +26248,7 @@ mod tests {
             &repo,
             (80, 24),
             &mut errors,
+            &mut Vec::new(),
             &mut HashMap::new(),
         );
 
