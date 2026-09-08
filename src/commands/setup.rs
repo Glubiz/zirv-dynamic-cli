@@ -555,9 +555,10 @@ fn wrap_claude_statusline_command(home: &Path) -> SetupResult<(String, String)> 
     )?;
     settings["statusLine"]["command"] = Value::String(wrapped.clone());
     std::fs::create_dir_all(claude_config_dir(home))?;
-    std::fs::write(
+    ctx::state::write_atomic(
         &settings_path,
-        serde_json::to_string_pretty(&settings)? + "\n",
+        &(serde_json::to_string_pretty(&settings)? + "\n"),
+        false,
     )?;
     Ok((existing, wrapped))
 }
@@ -656,9 +657,10 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
             &claude_config_dir(home),
             std::slice::from_ref(&settings_path),
         )?;
-        std::fs::write(
+        ctx::state::write_atomic(
             &settings_path,
-            serde_json::to_string_pretty(&settings)? + "\n",
+            &(serde_json::to_string_pretty(&settings)? + "\n"),
+            false,
         )?;
     }
     Ok((hooks_added, statusline_added))
@@ -687,7 +689,11 @@ fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupRe
             base,
             &[hooks_path.to_path_buf()],
         )?;
-        std::fs::write(hooks_path, serde_json::to_string_pretty(&hooks)? + "\n")?;
+        ctx::state::write_atomic(
+            hooks_path,
+            &(serde_json::to_string_pretty(&hooks)? + "\n"),
+            false,
+        )?;
     }
     Ok(hooks_added)
 }
@@ -731,7 +737,7 @@ fn set_home_ctx_toml_value(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, toml::to_string_pretty(&root)?)?;
+    ctx::state::write_atomic(&path, &toml::to_string_pretty(&root)?, false)?;
     Ok(())
 }
 
@@ -912,7 +918,7 @@ fn union_home_safety_key(home: &Path, key: &str, additions: &[String]) -> SetupR
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, toml::to_string_pretty(&root)?)?;
+    ctx::state::write_atomic(&path, &toml::to_string_pretty(&root)?, false)?;
     Ok(added)
 }
 
@@ -1261,11 +1267,11 @@ fn run_profile<W: Write>(args: &ProfileArgs, writer: &mut W) -> SetupResult<i32>
         )?;
     }
     if changed {
-        std::fs::write(&path, toml::to_string_pretty(&root)?)?;
+        ctx::state::write_atomic(&path, &toml::to_string_pretty(&root)?, false)?;
     }
     if system_prompt_changed {
         match desired_system_prompt.expect("a changed prompt has a desired state") {
-            Some(prompt) => std::fs::write(&system_prompt_path, prompt)?,
+            Some(prompt) => ctx::state::write_atomic(&system_prompt_path, &prompt, false)?,
             None => std::fs::remove_file(&system_prompt_path)?,
         }
     }
@@ -1403,7 +1409,7 @@ fn write_new(path: &Path, text: &str, dry_run: bool) -> SetupResult<bool> {
             }
         }
         std::fs::create_dir_all(parent)?;
-        std::fs::write(path, normalized(text) + "\n")?;
+        ctx::state::write_atomic(path, &(normalized(text) + "\n"), false)?;
     }
     Ok(true)
 }
@@ -2163,9 +2169,10 @@ fn write_backup_run_keeping(
         "created": ctx::state::now_secs(),
         "targets": manifest_targets,
     });
-    std::fs::write(
-        backup_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)? + "\n",
+    ctx::state::write_atomic(
+        &backup_dir.join("manifest.json"),
+        &(serde_json::to_string_pretty(&manifest)? + "\n"),
+        false,
     )?;
     // Issue #95: prune on write only -- `restore --list` (`print_restore_
     // list`/`all_runs`) never calls this, so listing stays read-only. `base`
@@ -3378,6 +3385,37 @@ fn restore_target(backup_path: &Path, dest: &Path) -> SetupResult<()> {
     })
 }
 
+fn confined_restore_path(root: &Path, relative: &Path) -> SetupResult<PathBuf> {
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "refusing restore path outside its root: {}",
+            relative.display()
+        )
+        .into());
+    }
+    let mut path = root.to_path_buf();
+    for part in std::iter::once(None).chain(relative.components().map(Some)) {
+        if let Some(part) = part {
+            path.push(part);
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(
+                    format!("refusing to restore through symlink {}", path.display()).into(),
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(path)
+}
+
 fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) -> SetupResult<i32> {
     if !args.dry_run && !args.yes {
         return Err(
@@ -3393,37 +3431,67 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
         .into());
     }
 
+    let repo = resolved_repo(&args.repo)?;
+    let home = home_dir()?;
+    let root = match (manifest.scope, manifest.provider) {
+        (ResetScope::Project, _) => std::path::absolute(&args.repo)?,
+        (ResetScope::Global, ResetProvider::Claude) => claude_config_dir(&home),
+        (ResetScope::Global, ResetProvider::Codex) => codex_config_dir(&home),
+        (ResetScope::Global, ResetProvider::All) => home.join(".zirv"),
+        (ResetScope::All, _) => return Err("a backup must have one concrete restore scope".into()),
+    };
+    let existing = root
+        .ancestors()
+        .find(|path| path.exists())
+        .ok_or("restore root has no existing ancestor")?;
+    let canonical_root = std::fs::canonicalize(existing)?.join(root.strip_prefix(existing)?);
     let mut targets = Vec::new();
     let mut skipped_auth = Vec::new();
     for target in &manifest.targets {
-        if is_auth_relative_path(&target.relative_path) && !args.include_auth {
-            skipped_auth.push(target.clone());
+        let relative = target
+            .source
+            .strip_prefix(&root)
+            .or_else(|_| target.source.strip_prefix(&canonical_root))
+            .map_err(|_| {
+                format!(
+                    "refusing restore destination outside {}: {}",
+                    root.display(),
+                    target.source.display()
+                )
+            })?;
+        let mut target = target.clone();
+        target.source = confined_restore_path(&canonical_root, relative)?;
+        if manifest.scope == ResetScope::Project
+            && !project_candidates(manifest.provider, &canonical_root)
+                .iter()
+                .any(|candidate| target.source.starts_with(candidate))
+        {
+            return Err(format!(
+                "refusing restore destination outside provider configuration: {}",
+                target.source.display()
+            )
+            .into());
+        }
+        confined_restore_path(&run.dir.join("files"), &target.relative_path)?;
+        if target
+            .source
+            .file_name()
+            .is_some_and(|name| is_auth_relative_path(Path::new(name)))
+            && !args.include_auth
+        {
+            skipped_auth.push(target);
         } else {
-            targets.push(target.clone());
+            targets.push(target);
         }
     }
 
-    // Fail closed: validate every backup source and every current
-    // destination before writing anything.
+    // Validate every source and destination before the first write.
     for target in &targets {
         if target.existed_before {
             validate_reset_target(&run.dir.join("files").join(&target.relative_path))?;
         }
         if target.source.exists() {
             validate_reset_target(&target.source)?;
-        }
-        if let Some(parent) = target.source.parent() {
-            for candidate in parent.ancestors().take(3) {
-                if std::fs::symlink_metadata(candidate)
-                    .is_ok_and(|meta| meta.file_type().is_symlink())
-                {
-                    return Err(format!(
-                        "refusing to restore through symlink {}",
-                        candidate.display()
-                    )
-                    .into());
-                }
-            }
         }
     }
 
@@ -3456,20 +3524,22 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
     }
 
     // Back up the current state first, so this restore is itself undoable.
-    let backup_root = run
-        .dir
-        .parent()
-        .ok_or("backup run has no parent directory")?;
+    let backup_base = match manifest.scope {
+        ResetScope::Project => repo,
+        ResetScope::Global => std::fs::canonicalize(&home)?,
+        ResetScope::All => return Err("a backup must have one concrete restore scope".into()),
+    };
+    let backup_root = confined_restore_path(&backup_base, Path::new(".zirv/backups/ai-reset"))?;
     let pre_restore_sources = targets
         .iter()
         .map(|target| target.source.clone())
         .collect::<Vec<_>>();
     let safety_backup = write_backup_run_keeping(
-        backup_root,
+        &backup_root,
         BackupKind::Restore,
         manifest.provider,
         manifest.scope,
-        &manifest.base,
+        &canonical_root,
         &pre_restore_sources,
         &[run.id.as_str()],
     )?;
@@ -3481,7 +3551,7 @@ fn restore_run<W: Write>(writer: &mut W, run: &BackupRun, args: &RestoreArgs) ->
             let backup_path = run.dir.join("files").join(&target.relative_path);
             restore_target(&backup_path, &target.source)
         } else if target.source.exists() {
-            remove_reset_target(&target.source, &manifest.base)
+            remove_reset_target(&target.source, &canonical_root)
         } else {
             Ok(())
         };
@@ -4538,6 +4608,168 @@ mod tests {
             yes: false,
             json: false,
         }
+    }
+
+    #[test]
+    fn a_settings_write_preserves_content_and_permissions_without_leaving_a_temp_sibling() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("config dir");
+        std::fs::write(&settings_path, r#"{"operator":"keep me"}"#).expect("settings");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&settings_path, std::fs::Permissions::from_mode(0o640))
+                .expect("permissions");
+        }
+        install_claude_integration(home.path(), false).expect("install");
+        let settings = load_json_object(&settings_path).expect("intact JSON");
+        assert_eq!(settings["operator"], "keep me");
+        for (_, _, command) in HARNESS_HOOKS {
+            assert!(contains_command(&settings, command), "missing {command}");
+        }
+        let siblings = std::fs::read_dir(settings_path.parent().expect("parent"))
+            .expect("siblings")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("entries");
+        assert_eq!(siblings.len(), 1);
+        assert_eq!(siblings[0].path(), settings_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&settings_path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o640
+            );
+        }
+    }
+
+    #[test]
+    fn restore_rejects_manifest_paths_outside_the_selected_configuration_before_any_write() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let outside = tempfile::tempdir().expect("outside");
+        let _home = HomeGuard::set(home.path());
+        let backup_root = repo.path().join(".zirv/backups/ai-reset");
+        let source = repo.path().join("CLAUDE.md");
+        std::fs::write(&source, "current").expect("current");
+        write_fake_run_with_file(&backup_root, "run", 1, repo.path(), &source, "backup");
+        let mut run = discover_runs(&backup_root).remove(0);
+        let original = run.manifest.targets[0].clone();
+        let args = RestoreArgs {
+            yes: true,
+            ..restore_args(repo.path())
+        };
+        let foreign = outside.path().join("CLAUDE.md");
+        std::fs::write(&foreign, "foreign").expect("foreign");
+        for destination in [
+            foreign.clone(),
+            repo.path().join("../CLAUDE.md"),
+            repo.path().join("unrelated.txt"),
+        ] {
+            run.manifest.targets = vec![
+                original.clone(),
+                ManifestTarget {
+                    source: destination,
+                    ..original.clone()
+                },
+            ];
+            let error =
+                restore_run(&mut Vec::new(), &run, &args).expect_err("unconfined destination");
+            assert!(error.to_string().contains("refusing restore"), "{error}");
+            assert_eq!(
+                std::fs::read_to_string(&source).expect("current"),
+                "current"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&foreign).expect("foreign"),
+                "foreign"
+            );
+        }
+        for relative_path in [PathBuf::from("../manifest.json"), foreign] {
+            run.manifest.targets = vec![ManifestTarget {
+                relative_path,
+                ..original.clone()
+            }];
+            assert!(restore_run(&mut Vec::new(), &run, &args).is_err());
+        }
+        run.manifest.scope = ResetScope::Global;
+        run.manifest.targets = vec![original];
+        assert!(
+            restore_run(&mut Vec::new(), &run, &args).is_err(),
+            "global manifest must not target the repository"
+        );
+        assert_eq!(
+            discover_runs(&backup_root).len(),
+            1,
+            "no safety backup before validation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_rejects_a_symlinked_component_more_than_three_parents_above_the_destination() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let outside = tempfile::tempdir().expect("outside");
+        let _home = HomeGuard::set(home.path());
+        let backup_root = repo.path().join(".zirv/backups/ai-reset");
+        let source = repo.path().join("CLAUDE.md");
+        write_fake_run_with_file(&backup_root, "run", 1, repo.path(), &source, "backup");
+        let mut run = discover_runs(&backup_root).remove(0);
+        std::fs::create_dir_all(repo.path().join(".claude")).expect("config");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".claude/rules"))
+            .expect("link");
+        run.manifest.targets[0].source = repo.path().join(".claude/rules/a/b/c/d/rule.md");
+        let args = RestoreArgs {
+            yes: true,
+            ..restore_args(repo.path())
+        };
+        let error = restore_run(&mut Vec::new(), &run, &args).expect_err("symlink ancestor");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(!outside.path().join("a").exists());
+    }
+
+    #[test]
+    fn restore_filters_credentials_by_destination_even_when_the_manifest_renames_the_backup() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let base = codex_config_dir(home.path());
+        std::fs::create_dir_all(&base).expect("codex dir");
+        let source = base.join("auth.json");
+        std::fs::write(&source, "current credentials").expect("credentials");
+        let backup_root = home.path().join(".zirv/backups/ai-reset");
+        write_fake_run_with_file(&backup_root, "run", 1, &base, &source, "old credentials");
+        let mut run = discover_runs(&backup_root).remove(0);
+        run.manifest.scope = ResetScope::Global;
+        run.manifest.provider = ResetProvider::Codex;
+        std::fs::rename(
+            run.dir.join("files/auth.json"),
+            run.dir.join("files/innocent.json"),
+        )
+        .expect("rename");
+        run.manifest.targets[0].relative_path = PathBuf::from("innocent.json");
+        let args = RestoreArgs {
+            yes: true,
+            ..restore_args(repo.path())
+        };
+        let mut output = Vec::new();
+        restore_run(&mut output, &run, &args).expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(&source).expect("credentials"),
+            "current credentials"
+        );
+        assert!(
+            String::from_utf8(output)
+                .expect("output")
+                .contains("not restored (credentials")
+        );
     }
 
     #[test]

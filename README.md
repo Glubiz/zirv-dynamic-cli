@@ -864,9 +864,12 @@ marks it as shadowed in the listing.
 
 ## Reserved Command Names
 
+<!-- zchk-doc-reserved:start -->
 `help`, `version`, `init`, `create`, `ctx`, `memory`, `context`, `setup`, `report`,
-`chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`, and
-their short aliases `h`, `v`, `i`, `c`, are handled as built-in commands before zirv ever
+`chat`, `agent`, `skill`, `workflow`, `test`, `verify`, `artifact`, `frontend`,
+`commands`, `update`, and their short aliases `h`, `v`, `i`, `c`,
+<!-- zchk-doc-reserved:end -->
+are handled as built-in commands before zirv ever
 looks in `.zirv/`. The comparison is case-insensitive (`Chat`/`CHAT` collide
 just as much as `chat`, matching how NTFS/APFS resolve script filenames), so
 a differently-cased script or shortcut is caught too, even though only the
@@ -1582,11 +1585,18 @@ begin with `-` or to look like a flag is still just a prompt.
 
 ### Exit codes for supervised runs
 
+<!-- zchk-doc-exit-codes:start -->
 | Code | Meaning |
 |---|---|
 | the child's own code | the run finished on its own |
 | `75` | rot was detected and `exec` could not carry on, either because the restart budget was spent or because no prompt was available to restart with. `loop` also returns it when consecutive cycle failures hit `max_failures` |
 | `76` | the same, for a wall-clock timeout rather than rot |
+| `77` | the token or tool-call budget was reached; the run checkpoints and stops without restarting |
+| `78` | provider capacity or overload errors persisted until the restart budget was spent |
+| `79` | the provider account ran out of credits or quota; the run stops without retrying |
+| `80` | a writing delegation was refused because the tree already has a live writer; retry after it finishes or use `--worktree` |
+| `81` | progress stalled after a steering nudge and its grace period, and the restart budget was spent |
+<!-- zchk-doc-exit-codes:end -->
 
 The code names the reason, not which limit ran out: `75` means rot and `76`
 means timeout, whether the run stopped because the budget was exhausted or

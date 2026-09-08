@@ -163,12 +163,13 @@ fn temp_sibling(target: &Path) -> PathBuf {
 /// hardening; `write_shared` leaves it off, since that content lives in a
 /// normal repository checkout and should get ordinary, umask-respecting
 /// permissions like any other file zirv writes into a checkout, not the
-/// machine-local-secret treatment state-dir content gets. Unix-only in
-/// effect: the permission bits it gates don't exist on Windows, so the
-/// parameter is genuinely unused on that target, not merely unread by
-/// omission.
-#[cfg_attr(not(unix), allow(unused_variables))]
-fn write_atomic(path: &Path, contents: &str, force_owner_only: bool) -> std::io::Result<()> {
+/// machine-local-secret treatment state-dir content gets. Existing regular
+/// files retain their permissions when `force_owner_only` is false.
+pub(crate) fn write_atomic(
+    path: &Path,
+    contents: &str,
+    force_owner_only: bool,
+) -> std::io::Result<()> {
     use std::io::Write;
 
     let tmp = temp_sibling(path);
@@ -188,6 +189,12 @@ fn write_atomic(path: &Path, contents: &str, force_owner_only: bool) -> std::io:
         if force_owner_only {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        if !force_owner_only
+            && let Ok(metadata) = std::fs::symlink_metadata(path)
+            && metadata.is_file()
+        {
+            file.set_permissions(metadata.permissions())?;
         }
         file.write_all(contents.as_bytes())?;
         file.flush()

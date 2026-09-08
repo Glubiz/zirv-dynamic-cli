@@ -2045,7 +2045,14 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("this file always has a #[cfg(test)] module");
-        for needle in ["SystemTime", "Instant::now", "std::time::Instant"] {
+        for needle in [
+            "SystemTime",
+            "Instant::now",
+            "std::time::Instant",
+            "use std::time",
+            "std::fs",
+            "std::env",
+        ] {
             assert!(
                 !production_code.contains(needle),
                 "rot.rs's production code must never call a clock -- found `{needle}`"

@@ -394,7 +394,7 @@ mod tests {
             return;
         }
         let repo = tempdir().unwrap();
-        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["init", "-q", "-b", "feature"]);
         git(repo.path(), &["config", "user.email", "t@example.com"]);
         git(repo.path(), &["config", "user.name", "t"]);
         write_cargo_toml(repo.path(), "3.22.0");

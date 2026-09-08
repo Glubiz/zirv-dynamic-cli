@@ -6564,13 +6564,16 @@ fn fulfill_spawn_request(
         let withheld_mail = !mail_entries.is_empty();
         let withheld_report_back =
             cfg.mail.enabled && prompt::is_addressable_short(&req.requested_by);
-        if withheld_mail || withheld_report_back {
-            let what = match (withheld_mail, withheld_report_back) {
-                (true, true) => "mail and the report-back instruction",
-                (true, false) => "mail",
-                (false, true) => "the report-back instruction",
-                (false, false) => unreachable!("guarded by the outer if"),
-            };
+        let what = if withheld_mail && withheld_report_back {
+            Some("mail and the report-back instruction")
+        } else if withheld_mail {
+            Some("mail")
+        } else if withheld_report_back {
+            Some("the report-back instruction")
+        } else {
+            None
+        };
+        if let Some(what) = what {
             push_error(
                 errors,
                 format!(
