@@ -362,8 +362,9 @@ fn reason_label(c: &RowProvenance) -> String {
 fn hint_for_reason(reason: &str) -> Option<&'static str> {
     match reason {
         "estimated: verbatim reader" | "measured: verbatim" => Some(
-            "readers are never compacted regardless of size -- expected; for rg/grep/find/ls \
-             results, `output.compact_search = true` opts them into a grouped shape.",
+            "readers are never compacted regardless of size -- expected; rg/grep/find/ls \
+             results get a grouped shape by default (`output.compact_search`), so a verbatim \
+             reader here means either a true reader or `output.compact_search = false`.",
         ),
         "estimated: below known threshold" => Some(
             "lower `output.compact_min_bytes` if these known-shape results are worth compacting sooner.",

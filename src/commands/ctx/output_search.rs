@@ -1,9 +1,9 @@
-//! Issue #414: opt-in shape-aware compaction for search and listing output,
-//! gated by `[output] compact_search` (default `false`, operator-only --
-//! see `config::OutputConfig`'s own doc comment). Off, `rg`/`grep`/`find`/
-//! `fd`/`ls`/`dir`/`tree` stay exactly `output::VERBATIM_PROGRAMS`'s existing
+//! Issue #414: shape-aware compaction for search and listing output, gated
+//! by `[output] compact_search` (default `true`, operator-only -- see
+//! `config::OutputConfig`'s own doc comment). Off, `rg`/`grep`/`find`/`fd`/
+//! `ls`/`dir`/`tree` stay exactly `output::VERBATIM_PROGRAMS`'s existing
 //! behaviour: never compacted at any size, because a model reads that output
-//! verbatim before searching or listing again. On, those seven get
+//! verbatim before searching or listing again. On (the default), those seven get
 //! `output::CompactionScope::Shape` instead of `Verbatim`: a bounded, grouped
 //! rendering built from each program's own known grammar (a match's
 //! `path:line:text`, an `ls -l` row's fixed date anchor, a path list's own

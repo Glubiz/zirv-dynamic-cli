@@ -915,7 +915,11 @@ impl Default for SearchConfig {
 /// structured rule list): a repo checkout choosing how its own output gets
 /// shaped once it is already large enough to summarize is the identical
 /// widening `compact`/`compact_min_bytes`/`compact_generic_min_bytes` above
-/// are already forbidden from doing, just one layer further in.
+/// are already forbidden from doing, just one layer further in. `filter_
+/// defaults` is `REPO_FORBIDDEN` the same way `compact`/`compact_search`
+/// are, in both directions: it gates whether zirv's own bundled `[[output.
+/// filter]]` rules (`output_filters::bundled_output_filter_rules`) join the
+/// operator's own `filter` list at all.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
@@ -966,26 +970,44 @@ pub struct OutputConfig {
     /// `output::VERBATIM_PROGRAMS` members) get a shape-aware pass
     /// (`output_search`) instead of staying verbatim at any size. Forbidden
     /// in BOTH directions like `compact`/`compact_min_bytes`/
-    /// `compact_generic_min_bytes` above, never narrow-only: turning it on
-    /// WIDENS what a repository checkout's own commands get compacted into,
-    /// which is exactly the choice those two keys' own doc comment says is
-    /// never the checkout's to make. Default `false`.
+    /// `compact_generic_min_bytes` above, never narrow-only: turning it off
+    /// WIDENS what a repository checkout's own commands get compacted into
+    /// just as much as turning it on would, which is exactly the choice
+    /// those two keys' own doc comment says is never the checkout's to
+    /// make. Default `true` -- the original is always retrievable with
+    /// `zirv ctx output show <id>`; an operator turns this off with
+    /// `compact_search = false` in `~/.zirv/ctx.toml` or
+    /// `ZIRV_CTX_OUTPUT_COMPACT_SEARCH=false`.
     pub compact_search: bool,
     /// Issue #417: an operator-declared rule list that shapes a `Generic`-
     /// scope command's output BEFORE the generic head/tail scan
-    /// (`output::render_summary`) ever sees it -- `[[output.filter]]` in
-    /// `~/.zirv/ctx.toml` only, never a bundled default and never settable
-    /// from a repo checkout (see `REPO_FORBIDDEN`'s `output.filter` entry: a
-    /// checkout choosing what its own output looks like once summarized is
-    /// exactly the widening every other `[output]` key in this file already
-    /// refuses). Applies to `CompactionScope::Generic` only -- never
-    /// `Verbatim`, `Known`, `Diff` or `Shape`, each of which already has its
-    /// own dedicated, provably-lossless rendering. The first rule (in
-    /// declaration order) whose `match_command` matches the command line
-    /// wins; every other rule is ignored for that command. Empty by
-    /// default -- zero rules ship. See `OutputFilterRule`'s own doc comment
-    /// for the field list and stage order.
+    /// (`output::render_summary`) ever sees it -- declared in
+    /// `~/.zirv/ctx.toml` only, never settable from a repo checkout (see
+    /// `REPO_FORBIDDEN`'s `output.filter` entry: a checkout choosing what
+    /// its own output looks like once summarized is exactly the widening
+    /// every other `[output]` key in this file already refuses). Applies to
+    /// `CompactionScope::Generic` only -- never `Verbatim`, `Known`, `Diff`
+    /// or `Shape`, each of which already has its own dedicated,
+    /// provably-lossless rendering. The first rule (in declaration order)
+    /// whose `match_command` matches the command line wins; every other
+    /// rule is ignored for that command. Empty by construction here --
+    /// `CtxConfig::load` appends `output_filters::bundled_output_filter_
+    /// rules` (unless `filter_defaults` is `false`), after every operator
+    /// rule and skipping any bundled rule whose `name` an operator rule
+    /// already used. See `OutputFilterRule`'s own doc comment for the field
+    /// list and stage order.
     pub filter: Vec<OutputFilterRule>,
+    /// Issue #(bundled defaults): whether `CtxConfig::load` appends zirv's
+    /// own bundled `[[output.filter]]` rules (`output_filters::
+    /// bundled_output_filter_rules`) after the operator's own `filter`
+    /// entries, so compaction shapes common noisy build/install/download
+    /// tool output out of the box with zero configuration. `false` yields
+    /// only the operator's own rules. `REPO_FORBIDDEN` in BOTH directions,
+    /// the same shape as `compact`/`compact_search` above: a repo checkout
+    /// must not be able to widen its own output shaping by re-enabling
+    /// defaults an operator turned off, nor narrow it by turning off
+    /// defaults an operator wants applied everywhere. Default `true`.
+    pub filter_defaults: bool,
 }
 
 /// One `[[output.filter]]` rule (issue #417). `name` and `match_command` are
@@ -1083,8 +1105,9 @@ impl Default for OutputConfig {
             verbatim: Vec::new(),
             max_summary_bytes: 4096,
             diff_max_bytes: 65536,
-            compact_search: false,
+            compact_search: true,
             filter: Vec::new(),
+            filter_defaults: true,
         }
     }
 }
@@ -2652,6 +2675,11 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         EnvKind::Bool,
     ),
     (
+        "ZIRV_CTX_OUTPUT_FILTER_DEFAULTS",
+        &["output", "filter_defaults"],
+        EnvKind::Bool,
+    ),
+    (
         "ZIRV_CTX_WORKFLOW_TELEMETRY",
         &["workflow", "telemetry_enabled"],
         EnvKind::Bool,
@@ -3929,6 +3957,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["output", "compact_search"],
         "ZIRV_CTX_OUTPUT_COMPACT_SEARCH",
     ),
+    // Bundled-defaults: same forbidden-both-directions asymmetry as
+    // `compact_search` right above -- a repo checkout must not be able to
+    // re-enable zirv's bundled `[[output.filter]]` rules for an operator
+    // who turned them off, nor turn off defaults an operator wants applied
+    // to every checkout.
+    (
+        &["output", "filter_defaults"],
+        "ZIRV_CTX_OUTPUT_FILTER_DEFAULTS",
+    ),
     // Issue #417: the operator-declared `[[output.filter]]` rule list is a
     // structured value with no `ZIRV_CTX_*` scalar/CSV shape to escape
     // through (unlike `output.verbatim`'s comma-separated list), so the
@@ -5073,6 +5110,28 @@ impl CtxConfig {
         // the operator's own home layer by the time we reach here.
         validate_output_filter_rules(&cfg.output.filter)?;
 
+        // Bundled defaults (see `OutputConfig::filter_defaults`'s own doc
+        // comment): appended AFTER validating the operator's own rules above,
+        // so an operator rule always precedes every bundled rule, and skipped
+        // for any bundled `name` the operator already declared -- an operator
+        // rule with a bundled rule's name REPLACES it outright rather than
+        // running alongside it. `bundled_output_filter_rules` ships its own
+        // rules already anchored/compiling/unique, so no second `validate_
+        // output_filter_rules` pass is needed here.
+        if cfg.output.filter_defaults {
+            let operator_names: Vec<String> = cfg
+                .output
+                .filter
+                .iter()
+                .map(|rule| rule.name.clone())
+                .collect();
+            cfg.output.filter.extend(
+                super::output_filters::bundled_output_filter_rules()
+                    .into_iter()
+                    .filter(|rule| !operator_names.contains(&rule.name)),
+            );
+        }
+
         // Same union as `extra_deny` above, for `heavy_command_patterns`: the
         // operator's own home-layer patterns plus whatever the repo adds,
         // never fewer than either -- a repo layer may only add a pattern
@@ -5433,7 +5492,7 @@ fn contains_multiline_enabling_flag_group(pattern: &str) -> bool {
 /// guessing which of several is at fault. Called once from `CtxConfig::load`
 /// after the layers are merged; never re-checked at apply time in
 /// `output.rs`, which trusts a config that reached this point.
-fn validate_output_filter_rules(rules: &[OutputFilterRule]) -> CtxResult<()> {
+pub(crate) fn validate_output_filter_rules(rules: &[OutputFilterRule]) -> CtxResult<()> {
     let mut seen_names = std::collections::HashSet::new();
     for rule in rules {
         if !seen_names.insert(rule.name.as_str()) {
@@ -9842,7 +9901,8 @@ mod tests {
         assert!(cfg.output.verbatim.is_empty());
         assert_eq!(cfg.output.max_summary_bytes, 4096);
         assert_eq!(cfg.output.diff_max_bytes, 65536);
-        assert!(!cfg.output.compact_search);
+        assert!(cfg.output.compact_search);
+        assert!(cfg.output.filter_defaults);
 
         let env = env_map(&[
             ("ZIRV_CTX_OUTPUT_COMPACT", "false"),
@@ -9851,7 +9911,8 @@ mod tests {
             ("ZIRV_CTX_OUTPUT_VERBATIM", "mydump,other-tool"),
             ("ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES", "2048"),
             ("ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES", "8192"),
-            ("ZIRV_CTX_OUTPUT_COMPACT_SEARCH", "true"),
+            ("ZIRV_CTX_OUTPUT_COMPACT_SEARCH", "false"),
+            ("ZIRV_CTX_OUTPUT_FILTER_DEFAULTS", "false"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|key| env.get(key).cloned()).expect("load");
         assert!(!cfg.output.compact);
@@ -9860,7 +9921,8 @@ mod tests {
         assert_eq!(cfg.output.verbatim, vec!["mydump", "other-tool"]);
         assert_eq!(cfg.output.max_summary_bytes, 2048);
         assert_eq!(cfg.output.diff_max_bytes, 8192);
-        assert!(cfg.output.compact_search);
+        assert!(!cfg.output.compact_search);
+        assert!(!cfg.output.filter_defaults);
 
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         for line in [
@@ -9869,7 +9931,8 @@ mod tests {
             "compact_min_bytes = 999999",
             "compact_generic_min_bytes = 999999",
             "verbatim = [\"cargo\"]",
-            "compact_search = true",
+            "compact_search = false",
+            "filter_defaults = false",
         ] {
             std::fs::write(
                 repo.path().join(".zirv/ctx.toml"),
@@ -9901,8 +9964,20 @@ mod tests {
         let empty = env_map(&[]);
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
             .expect("the operator's own ctx.toml may declare output.filter rules");
-        assert_eq!(cfg.output.filter.len(), 1);
+        let bundled = super::super::output_filters::bundled_output_filter_rules();
+        assert_eq!(cfg.output.filter.len(), 1 + bundled.len());
         assert_eq!(cfg.output.filter[0].name, "gradle");
+        assert_eq!(
+            cfg.output.filter[1..]
+                .iter()
+                .map(|rule| rule.name.as_str())
+                .collect::<Vec<_>>(),
+            bundled
+                .iter()
+                .map(|rule| rule.name.as_str())
+                .collect::<Vec<_>>(),
+            "the operator rule must precede every bundled rule, in the bundled rules' own order"
+        );
 
         std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
         std::fs::write(
@@ -10296,6 +10371,7 @@ mod tests {
         ("output", "max_summary_bytes"),
         ("output", "diff_max_bytes"),
         ("output", "compact_search"),
+        ("output", "filter_defaults"),
         ("workflow", "telemetry_enabled"),
         ("workflow", "telemetry_max_events"),
         ("workflow", "telemetry_retention_days"),
@@ -10409,11 +10485,16 @@ mod tests {
             chat: ChatConfig {
                 model: Some("fable".to_string()),
             },
+            output: OutputConfig {
+                filter: super::super::output_filters::bundled_output_filter_rules(),
+                ..OutputConfig::default()
+            },
             ..CtxConfig::default()
         };
         assert_eq!(
             cfg, expected,
-            "chat.model must be the only active, non-default key in .zirv/ctx.toml"
+            "chat.model must be the only active, non-default key in .zirv/ctx.toml, and \
+             output.filter must be exactly the bundled defaults (filter_defaults defaults true)"
         );
 
         let path = repo

@@ -252,7 +252,8 @@ model = "fable"
 # verbatim = []                      # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_VERBATIM): extra program names NEVER compacted, added to the built-in reader set (cat, sed, grep, git diff, ...). Additive only. Default: [].
 # max_summary_bytes = 4096           # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES): hard cap on one compact summary. The `zirv ctx output show <id>` retrieval line always survives it. Default: 4096.
 # diff_max_bytes = 65536             # narrow-only (ZIRV_CTX_OUTPUT_DIFF_MAX_BYTES): bytes a `git diff`/`show`/`log -p`/`format-patch` result may reach before it is replaced by a bounded per-file listing, never a partial hunk. A repo may only LOWER it, never raise it. Default: 65536 (issue #412).
-# compact_search = false             # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_COMPACT_SEARCH): whether rg/grep/find/fd/ls/dir/tree get a shape-aware pass instead of staying verbatim at any size. Forbidden in BOTH directions. Default: false (issue #414).
+# compact_search = true              # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_COMPACT_SEARCH): whether rg/grep/find/fd/ls/dir/tree get a shape-aware pass instead of staying verbatim at any size. Forbidden in BOTH directions. Default: true (issue #414).
+# filter_defaults = true             # REPO-FORBIDDEN (ZIRV_CTX_OUTPUT_FILTER_DEFAULTS): whether zirv's own bundled [[output.filter]] rules join the operator's own `filter` list. Forbidden in BOTH directions. Default: true.
 
 # [policy]                           # zirv's own canonical permissions policy (src/commands/ctx/policy.rs).
 # Not REPO-FORBIDDEN, and the ONE table here that does NOT deep-merge:

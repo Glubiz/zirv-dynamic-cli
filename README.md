@@ -1439,6 +1439,52 @@ config, an unreadable file -- silently rebuilds it from a full parse. See
 [Usage pacing](#usage-pacing) below for the `[pace]` table that governs
 subscription-window waiting.
 
+#### Tool-output compaction
+
+`zirv setup` installs the claude `PostToolUse` hook: a large `Bash` result is
+replaced with a compact summary before the model ever sees it, and the
+original stays retrievable in full with `zirv ctx output show <id>`. The
+size thresholds are `output.compact_min_bytes` (4096 bytes, for a known
+build/test/VCS tool) and `output.compact_generic_min_bytes` (16384 bytes,
+for everything else); a unified diff (`git diff`/`show`/`log -p`/
+`format-patch`) instead gets `output.diff_max_bytes` (65536 bytes) and a
+bounded per-file listing rather than a head/tail. `rg`/`grep`/`find`/`fd`/
+`ls`/`dir`/`tree` results past the generic threshold get a grouped, capped
+rendering by default too (`output.compact_search`); set it to `false` to
+leave those seven verbatim at any size instead.
+
+Once a `Generic`-scope result is past its threshold, a bundled
+`[[output.filter]]` rule set (`output.filter_defaults`, on by default) strips
+common noise -- progress bars, download/package-manager chatter -- before
+the head/tail summary ever runs over it:
+
+| Rule | Commands matched | Strips |
+|---|---|---|
+| `pkg-python` | `pip`/`pipx`/`uv`/`poetry`/`pdm`/`conda`/`mamba` | Collecting/Downloading/wheel-build lines, progress bars |
+| `pkg-system` | `apt`/`dnf`/`yum`/`apk`/`pacman`/`zypper`/`brew`/`choco`/`winget`/`scoop` | Package-list/unpack/setup progress lines, progress bars |
+| `download-progress` | `curl`/`wget`/`Invoke-WebRequest`/`iwr`/`aria2c` | Transfer-meter header/rows, progress bars |
+| `build-steps` | `cmake`/`ninja`/`meson`/`bazel`/`buck` | `[n/N]`/`[n%]` build-step lines, progress bars |
+| `toolchain-install` | `rustup`/`nvm`/`fnm`/`volta`/`pyenv`/`rbenv`/`asdf`/`mise` | `info: downloading/installing/...` lines, progress bars |
+| `infra-refresh` | `terraform`/`tofu`/`terragrunt`/`pulumi`/`cdk` | `Refreshing state...`/`Still creating...` lines, progress bars |
+| `test-runner-js` | `jest`/`vitest`/`mocha`/`ava`/`tap`/`karma`/`playwright`/`cypress`/`deno test`/`bun test` | Passing (`✓`/`PASS`/`ok N -`) lines |
+| `progress-noise` | every other command (catch-all) | Progress-bar lines only |
+
+The first matching rule (in that order) wins. Declare a `[[output.filter]]`
+rule with the same `name` in `~/.zirv/ctx.toml` to replace one of these
+outright -- an operator rule always wins over a bundled rule sharing its
+name:
+
+```toml
+# ~/.zirv/ctx.toml
+[[output.filter]]
+name = "pkg-python"
+match_command = "^(pip|uv|poetry)\\b"
+strip_lines = ["^\\s*Downloading "]
+```
+
+Set `output.filter_defaults = false` to drop the bundled rules entirely and
+keep only your own.
+
 #### Trust boundary
 
 A repository config is part of a checkout, so cloning a repository must not be
@@ -1563,6 +1609,7 @@ checkout:
 | `output.max_summary_bytes` | `ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES` |
 | `output.compact_search` | `ZIRV_CTX_OUTPUT_COMPACT_SEARCH` |
 | `output.filter` | `~/.zirv/ctx.toml only` |
+| `output.filter_defaults` | `ZIRV_CTX_OUTPUT_FILTER_DEFAULTS` |
 | `fallback.orchestrator_rollover_headroom_pct` | `ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT` |
 | `fallback.rollover_cooldown_secs` | `ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS` |
 | `fallback.reactive_force_after_secs` | `ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS` |
