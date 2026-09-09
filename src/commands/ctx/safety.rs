@@ -2265,8 +2265,12 @@ const OPAQUE_HEREDOC_BODY_PLACEHOLDER: &str = "<opaque:heredoc-body>";
 /// anything else. Quote characters are kept as part of `text`/the span
 /// (never stripped here) so a caller can tell whether the value was quoted
 /// at all.
-struct QuotedToken {
-    text: String,
+pub(crate) struct QuotedToken {
+    /// `pub(crate)`: `learn.rs` reads this to diff two commands token-by-
+    /// token without splitting a quoted argument on its own embedded
+    /// whitespace (issue #425 review). `start`/`end` stay private -- nothing
+    /// outside this module needs the char-index span.
+    pub(crate) text: String,
     start: usize,
     end: usize,
 }
@@ -2276,7 +2280,7 @@ struct QuotedToken {
 /// quote tracker in this module) as part of the SAME token even when it
 /// contains embedded whitespace -- so a huge, multi-line quoted commit
 /// message is one token, exactly as a real shell would see it, not many.
-fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
+pub(crate) fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
     let mut tokens = Vec::new();
     let mut i = 0usize;
     while i < chars.len() {

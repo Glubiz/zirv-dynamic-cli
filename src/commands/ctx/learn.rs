@@ -27,6 +27,13 @@
 //! shell: resolve transcripts, run the pure pipeline, write (or, with
 //! `--dry-run`, just print) one `learned:`-prefixed private-bank entry per
 //! surviving group.
+//!
+//! The TDD/flaky-retry filter only ever excludes an EXACT repeat of the same
+//! command (no token differs, so [`single_token_diff`] returns `None`);
+//! everything else that keeps a wrong correction out -- an unrelated pair of
+//! calls that happen to fall in the same window, a diff that does not match
+//! its own error class's shape -- is [`classify_error`]'s and
+//! [`diff_matches_class`]'s job, not a second, separate TDD detector.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -35,12 +42,13 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::config::{CtxConfig, env_from_process};
+use super::discover::{MAX_TRANSCRIPT_CANDIDATES, TRANSCRIPT_SCAN_BYTE_BUDGET, human_bytes};
 use super::memory::{self, Entry};
 use super::output::bare_program;
 use super::search::{claude_candidates, codex_candidates};
 use super::search_index::Source;
 use super::state::{self, StateDir, repo_slug};
-use super::{CtxResult, safety};
+use super::{CtxResult, pace, safety};
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct LearnArgs {
@@ -166,26 +174,84 @@ pub fn classify_error(text: &str) -> Option<ErrorClass> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TokenDiff {
-    Substitute { from: String, to: String },
-    Insert { token: String },
-    Remove { token: String },
+    /// `at` is the token index (in the FAILING command's own token list)
+    /// where the change happened -- used by [`diff_matches_class`] to check
+    /// a diff's shape against its error class (e.g. `CommandNotFound` must
+    /// touch the program name itself, token 0).
+    Substitute {
+        at: usize,
+        from: String,
+        to: String,
+    },
+    Insert {
+        at: usize,
+        token: String,
+    },
+    Remove {
+        at: usize,
+        token: String,
+    },
 }
 
 impl TokenDiff {
+    fn at(&self) -> usize {
+        match self {
+            TokenDiff::Substitute { at, .. }
+            | TokenDiff::Insert { at, .. }
+            | TokenDiff::Remove { at, .. } => *at,
+        }
+    }
+
+    /// The token(s) this diff actually changed, for [`diff_matches_class`]'s
+    /// flag-shape check -- both sides of a substitution (either could be the
+    /// flag), or the one inserted/removed token.
+    fn changed_tokens(&self) -> [Option<&str>; 2] {
+        match self {
+            TokenDiff::Substitute { from, to, .. } => [Some(from.as_str()), Some(to.as_str())],
+            TokenDiff::Insert { token, .. } | TokenDiff::Remove { token, .. } => {
+                [Some(token.as_str()), None]
+            }
+        }
+    }
+
     fn key_fragment(&self) -> String {
         match self {
-            TokenDiff::Substitute { from, to } => format!("{from}->{to}"),
-            TokenDiff::Insert { token } => format!("+{token}"),
-            TokenDiff::Remove { token } => format!("-{token}"),
+            TokenDiff::Substitute { from, to, .. } => format!("{from}->{to}"),
+            TokenDiff::Insert { token, .. } => format!("+{token}"),
+            TokenDiff::Remove { token, .. } => format!("-{token}"),
         }
     }
 
     fn describe(&self) -> String {
         match self {
-            TokenDiff::Substitute { from, to } => format!("use `{to}` instead of `{from}`"),
-            TokenDiff::Insert { token } => format!("add `{token}`"),
-            TokenDiff::Remove { token } => format!("drop `{token}`"),
+            TokenDiff::Substitute { from, to, .. } => format!("use `{to}` instead of `{from}`"),
+            TokenDiff::Insert { token, .. } => format!("add `{token}`"),
+            TokenDiff::Remove { token, .. } => format!("drop `{token}`"),
         }
+    }
+}
+
+/// Whether `diff`'s own shape is even plausible for `class` -- a cheap
+/// consistency check alongside [`classify_error`]'s text-based read of the
+/// FAILURE, now checking the FIX's shape too (issue #425 review): an
+/// `UnknownFlag` correction must actually touch a `-`-leading token (on
+/// either side of a substitution, or the inserted/removed token), and a
+/// `CommandNotFound` correction must touch the program name itself, token 0
+/// -- anything else pairs a real class with an implausible fix (a quoted
+/// commit-message argument that merely reworded itself, an unrelated
+/// argument that changed for its own reason) and is rejected here rather
+/// than written down as if it were the actual correction. Every other class
+/// is unconstrained: a wrong path or a missing/extra argument can land
+/// anywhere in the command.
+fn diff_matches_class(class: ErrorClass, diff: &TokenDiff) -> bool {
+    match class {
+        ErrorClass::UnknownFlag => diff
+            .changed_tokens()
+            .into_iter()
+            .flatten()
+            .any(|t| t.starts_with('-')),
+        ErrorClass::CommandNotFound => diff.at() == 0,
+        ErrorClass::WrongPath | ErrorClass::MissingArgument | ErrorClass::PermissionDenied => true,
     }
 }
 
@@ -199,8 +265,10 @@ impl TokenDiff {
 /// token apart) -- "path exploration" (trying different, unrelated paths)
 /// is filtered the same way one level up, in [`group_corrections`]: it
 /// never repeats the SAME wrong/right pair often enough to cross the
-/// threshold.
-fn single_token_diff(a: &[&str], b: &[&str]) -> Option<TokenDiff> {
+/// threshold. `a`/`b` are quote-aware tokens (see [`quoted_tokens`]), so a
+/// quoted argument containing embedded whitespace (`-m "fix the bug"`) is
+/// one token, not several.
+fn single_token_diff(a: &[String], b: &[String]) -> Option<TokenDiff> {
     if a == b {
         return None;
     }
@@ -216,32 +284,46 @@ fn single_token_diff(a: &[&str], b: &[&str]) -> Option<TokenDiff> {
         }
         let i = diff_at?;
         return Some(TokenDiff::Substitute {
-            from: a[i].to_string(),
-            to: b[i].to_string(),
+            at: i,
+            from: a[i].clone(),
+            to: b[i].clone(),
         });
     }
     if b.len() == a.len() + 1 {
-        return single_insertion(a, b).map(|token| TokenDiff::Insert { token });
+        return single_insertion(a, b).map(|(at, token)| TokenDiff::Insert { at, token });
     }
     if a.len() == b.len() + 1 {
-        return single_insertion(b, a).map(|token| TokenDiff::Remove { token });
+        return single_insertion(b, a).map(|(at, token)| TokenDiff::Remove { at, token });
     }
     None
 }
 
-/// `longer` is exactly one token longer than `shorter`; returns that extra
-/// token when removing it from `longer` (at whichever position) leaves
-/// `shorter` exactly, `None` if no single removal does.
-fn single_insertion(shorter: &[&str], longer: &[&str]) -> Option<String> {
+/// `longer` is exactly one token longer than `shorter`; returns `(index,
+/// token)` for the extra token when removing it from `longer` (at whichever
+/// position) leaves `shorter` exactly, `None` if no single removal does.
+fn single_insertion(shorter: &[String], longer: &[String]) -> Option<(usize, String)> {
     let mut i = 0;
     while i < shorter.len() && shorter[i] == longer[i] {
         i += 1;
     }
     if shorter[i..] == longer[i + 1..] {
-        Some(longer[i].to_string())
+        Some((i, longer[i].clone()))
     } else {
         None
     }
+}
+
+/// Quote-aware tokenization of a raw command string, reusing `safety::
+/// tokenize_quoted` (issue #425 review) rather than `split_whitespace`: a
+/// quoted argument with embedded whitespace (`git commit -m "fix the bug"`)
+/// must stay one token, or an unrelated wording change inside the quotes
+/// reads as a spurious multi-token diff.
+fn quoted_tokens(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
+    safety::tokenize_quoted(&chars)
+        .into_iter()
+        .map(|t| t.text)
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,16 +362,19 @@ fn find_corrections(attempts: &[Attempt]) -> Vec<Correction> {
         let Outcome::Failure(class) = attempts[i].outcome else {
             continue;
         };
-        let fail_tokens: Vec<&str> = attempts[i].command.split_whitespace().collect();
+        let fail_tokens = quoted_tokens(&attempts[i].command);
         let end = (i + 1 + LOOKAHEAD).min(attempts.len());
         for candidate in attempts.iter().take(end).skip(i + 1) {
             if candidate.outcome != Outcome::Success {
                 continue;
             }
-            let fix_tokens: Vec<&str> = candidate.command.split_whitespace().collect();
+            let fix_tokens = quoted_tokens(&candidate.command);
             let Some(diff) = single_token_diff(&fail_tokens, &fix_tokens) else {
                 continue;
             };
+            if !diff_matches_class(class, &diff) {
+                continue;
+            }
             let program = fix_tokens
                 .first()
                 .map(|t| bare_program(t))
@@ -377,7 +462,15 @@ fn learned_key(group: &CorrectionGroup) -> String {
     )
 }
 
+/// Every piece of transcript-derived text goes through `pace::redact_for_log`
+/// before it is embedded (issue #425 review): a failing command carrying a
+/// bearer token or API key (`curl -H "Authorization: Bearer sk-..." --badflag`)
+/// must never write that secret into cross-session memory just because it
+/// happened to sit next to the actual mistake.
 fn describe_group(group: &CorrectionGroup) -> String {
+    let fix = pace::redact_for_log(&group.diff.describe());
+    let example_from = pace::redact_for_log(&group.example_from);
+    let example_to = pace::redact_for_log(&group.example_to);
     format!(
         "{} -- seen {} time{} across {} session{}.\n\n- Program: `{}`\n- Fix: {}\n- Example failing command: `{}`\n- Example fixed command: `{}`\n",
         group.class.label(),
@@ -386,9 +479,9 @@ fn describe_group(group: &CorrectionGroup) -> String {
         group.sessions.len(),
         if group.sessions.len() == 1 { "" } else { "s" },
         group.program,
-        group.diff.describe(),
-        group.example_from,
-        group.example_to,
+        fix,
+        example_from,
+        example_to,
     )
 }
 
@@ -601,21 +694,78 @@ fn modified_secs(path: &Path) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
-fn gather_sessions(repo: &Path, since_ts: u64) -> Vec<(String, Vec<Attempt>)> {
-    let mut sessions = Vec::new();
-    let candidates = claude_candidates(repo, false)
+/// [`gather_sessions`]'s outcome: the sessions found, plus enough to print
+/// the same "stopped after ... narrow --since" note `discover.rs` prints
+/// when its own identical budget cuts a scan short (issue #425 review).
+struct ScanOutcome {
+    sessions: Vec<(String, Vec<Attempt>)>,
+    files_scanned: usize,
+    bytes_scanned: u64,
+    truncated: bool,
+}
+
+/// Reads `path` up to `remaining` bytes, never more. Lossy-decoded so a cut
+/// mid multi-byte character degrades to one replacement character rather
+/// than failing the whole read -- an incomplete final JSONL line already
+/// fails `serde_json::from_str` and is silently skipped, the identical
+/// tolerance this module's own extractors already give any malformed row.
+/// Returns `(text, bytes_read, file_had_more_left)`.
+fn read_bounded(path: &Path, remaining: u64) -> Option<(String, u64, bool)> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut buf = Vec::new();
+    file.take(remaining).read_to_end(&mut buf).ok()?;
+    let consumed = buf.len() as u64;
+    Some((
+        String::from_utf8_lossy(&buf).into_owned(),
+        consumed,
+        file_len > consumed,
+    ))
+}
+
+/// Scans every claude/codex transcript candidate modified at or after
+/// `since_ts`, newest-first, stopping at whichever of `discover.rs`'s own
+/// scan budget limits (`TRANSCRIPT_SCAN_BYTE_BUDGET`/
+/// `MAX_TRANSCRIPT_CANDIDATES`, shared rather than a second hardcoded pair,
+/// issue #425 review) comes first -- a `--since` window wide enough to
+/// match a machine with years of transcript history must never OOM or
+/// stall this command any more than it may stall `discover`.
+fn gather_sessions(repo: &Path, since_ts: u64) -> ScanOutcome {
+    let mut candidates: Vec<(std::path::PathBuf, Source, u64)> = Vec::new();
+    for (path, source) in claude_candidates(repo, false)
         .into_iter()
-        .chain(codex_candidates());
-    for (path, source) in candidates {
+        .chain(codex_candidates())
+    {
         let Some(modified) = modified_secs(&path) else {
             continue;
         };
         if modified < since_ts {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        candidates.push((path, source, modified));
+    }
+    candidates.sort_by_key(|(_, _, modified)| std::cmp::Reverse(*modified));
+
+    let mut sessions = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut bytes_scanned: u64 = 0;
+    let mut truncated = false;
+    for (path, source, _modified) in candidates {
+        if files_scanned >= MAX_TRANSCRIPT_CANDIDATES {
+            truncated = true;
+            break;
+        }
+        let remaining = TRANSCRIPT_SCAN_BYTE_BUDGET.saturating_sub(bytes_scanned);
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let Some((text, consumed, file_truncated)) = read_bounded(&path, remaining) else {
             continue;
         };
+        files_scanned += 1;
+        bytes_scanned += consumed;
         let attempts = match source {
             Source::Claude => extract_claude_attempts(&text),
             Source::Codex => extract_codex_attempts(&text),
@@ -624,8 +774,17 @@ fn gather_sessions(repo: &Path, since_ts: u64) -> Vec<(String, Vec<Attempt>)> {
         if !attempts.is_empty() {
             sessions.push((session_id_from_path(&path), attempts));
         }
+        if file_truncated {
+            truncated = true;
+            break;
+        }
     }
-    sessions
+    ScanOutcome {
+        sessions,
+        files_scanned,
+        bytes_scanned,
+        truncated,
+    }
 }
 
 pub fn run<W: Write>(args: &LearnArgs, w: &mut W) -> CtxResult<i32> {
@@ -659,8 +818,16 @@ pub fn run_with<W: Write>(
     })?;
     let since_ts = now.saturating_sub(since_secs);
 
-    let sessions = gather_sessions(repo, since_ts);
-    let groups = analyze(&sessions);
+    let outcome = gather_sessions(repo, since_ts);
+    if outcome.truncated {
+        writeln!(
+            w,
+            "note: stopped after {} files / {}; narrow --since",
+            outcome.files_scanned,
+            human_bytes(outcome.bytes_scanned)
+        )?;
+    }
+    let groups = analyze(&outcome.sessions);
     if groups.is_empty() {
         writeln!(w, "no recurring corrections found, --since {}", args.since)?;
         return Ok(0);
@@ -685,13 +852,24 @@ pub fn run_with<W: Write>(
         return Ok(0);
     }
 
+    // Written in RANK order (`analyze` already sorts strongest-first) with a
+    // distinct, descending `written` second per entry rather than one shared
+    // `now` (issue #425 review): `memory::remember`'s own `prune_to_cap`
+    // evicts whichever entries have the SMALLEST `written` first once a bank
+    // is over its cap (default `memory.max_entries = 50`), and every entry
+    // sharing one identical timestamp would tie-break on directory-listing
+    // order instead -- arbitrary, and just as likely to evict this run's
+    // strongest finding as its weakest. Staggering by rank makes the weakest
+    // of THIS run's own entries the first ones sacrificed, never the
+    // strongest, without changing anything for a bank nowhere near its cap.
     let slug = repo_slug(repo);
-    for group in &groups {
+    for (idx, group) in groups.iter().enumerate() {
+        let written = now.saturating_sub(idx as u64);
         let entry = Entry {
             key: learned_key(group),
             written_by: "learn".to_string(),
-            written: now,
-            verified: now,
+            written,
+            verified: written,
             source: "learned".to_string(),
             body: describe_group(group),
             importance: None,
@@ -753,13 +931,18 @@ mod tests {
 
     // -- single_token_diff ---------------------------------------------------
 
+    fn tokens(command: &str) -> Vec<String> {
+        quoted_tokens(command)
+    }
+
     #[test]
     fn single_token_diff_finds_a_substitution() {
-        let a: Vec<&str> = "mytool --foo build".split_whitespace().collect();
-        let b: Vec<&str> = "mytool --bar build".split_whitespace().collect();
+        let a = tokens("mytool --foo build");
+        let b = tokens("mytool --bar build");
         assert_eq!(
             single_token_diff(&a, &b),
             Some(TokenDiff::Substitute {
+                at: 1,
                 from: "--foo".to_string(),
                 to: "--bar".to_string(),
             })
@@ -768,11 +951,12 @@ mod tests {
 
     #[test]
     fn single_token_diff_finds_an_insertion() {
-        let a: Vec<&str> = "mytool build".split_whitespace().collect();
-        let b: Vec<&str> = "mytool build --release".split_whitespace().collect();
+        let a = tokens("mytool build");
+        let b = tokens("mytool build --release");
         assert_eq!(
             single_token_diff(&a, &b),
             Some(TokenDiff::Insert {
+                at: 2,
                 token: "--release".to_string(),
             })
         );
@@ -780,11 +964,12 @@ mod tests {
 
     #[test]
     fn single_token_diff_finds_a_removal() {
-        let a: Vec<&str> = "mytool --bogus build".split_whitespace().collect();
-        let b: Vec<&str> = "mytool build".split_whitespace().collect();
+        let a = tokens("mytool --bogus build");
+        let b = tokens("mytool build");
         assert_eq!(
             single_token_diff(&a, &b),
             Some(TokenDiff::Remove {
+                at: 1,
                 token: "--bogus".to_string(),
             })
         );
@@ -792,15 +977,30 @@ mod tests {
 
     #[test]
     fn single_token_diff_is_none_for_identical_commands() {
-        let a: Vec<&str> = "cargo test".split_whitespace().collect();
+        let a = tokens("cargo test");
         assert_eq!(single_token_diff(&a, &a), None);
     }
 
     #[test]
     fn single_token_diff_is_none_when_more_than_one_token_differs() {
-        let a: Vec<&str> = "mytool --foo build".split_whitespace().collect();
-        let b: Vec<&str> = "othertool --bar test".split_whitespace().collect();
+        let a = tokens("mytool --foo build");
+        let b = tokens("othertool --bar test");
         assert_eq!(single_token_diff(&a, &b), None);
+    }
+
+    #[test]
+    fn single_token_diff_keeps_a_quoted_argument_as_one_token() {
+        let a = tokens(r#"git commit -m "fix bug""#);
+        let b = tokens(r#"git commit -m "fix the bug""#);
+        assert_eq!(
+            single_token_diff(&a, &b),
+            Some(TokenDiff::Substitute {
+                at: 3,
+                from: "\"fix bug\"".to_string(),
+                to: "\"fix the bug\"".to_string(),
+            }),
+            "a quoted, multi-word argument must diff as ONE token, not several"
+        );
     }
 
     // -- find_corrections ----------------------------------------------------
@@ -819,6 +1019,7 @@ mod tests {
         assert_eq!(
             corrections[0].diff,
             TokenDiff::Substitute {
+                at: 1,
                 from: "--foo".to_string(),
                 to: "--bar".to_string(),
             }
@@ -850,6 +1051,53 @@ mod tests {
         let attempts = vec![
             attempt("mytool --foo build", fail(ErrorClass::UnknownFlag)),
             attempt("mytool --bar build", Outcome::Unclassified),
+        ];
+        assert!(find_corrections(&attempts).is_empty());
+    }
+
+    // -- quote-awareness and class-consistency (issue #425 review) -----------
+
+    #[test]
+    fn find_corrections_never_reads_a_quoted_message_reword_as_an_unknown_flag_fix() {
+        // Only the QUOTED commit message changed ("bug" -> "the bug"); the
+        // actual `-m` flag never moved. A whitespace-split tokenizer would
+        // have split the message into words and seen a plausible one-word
+        // diff here -- the quote-aware tokenizer keeps it one token, and the
+        // class-consistency check rejects it outright since neither side of
+        // that token starts with `-`.
+        let attempts = vec![
+            attempt(r#"git commit -m "fix bug""#, fail(ErrorClass::UnknownFlag)),
+            attempt(r#"git commit -m "fix the bug""#, Outcome::Success),
+        ];
+        assert!(find_corrections(&attempts).is_empty());
+    }
+
+    #[test]
+    fn find_corrections_pairs_a_program_name_typo_fix_on_command_not_found() {
+        let attempts = vec![
+            attempt("foo x", fail(ErrorClass::CommandNotFound)),
+            attempt("./foo x", Outcome::Success),
+        ];
+        let corrections = find_corrections(&attempts);
+        assert_eq!(corrections.len(), 1, "expected exactly one correction");
+        assert_eq!(
+            corrections[0].diff,
+            TokenDiff::Substitute {
+                at: 0,
+                from: "foo".to_string(),
+                to: "./foo".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn find_corrections_rejects_an_unknown_flag_diff_that_never_touches_a_flag() {
+        // The class says "unknown flag", but the only thing that changed
+        // between the two commands is an ordinary positional argument --
+        // not a plausible fix for that failure, so no correction forms.
+        let attempts = vec![
+            attempt("cargo test a", fail(ErrorClass::UnknownFlag)),
+            attempt("cargo test b", Outcome::Success),
         ];
         assert!(find_corrections(&attempts).is_empty());
     }
@@ -954,6 +1202,31 @@ mod tests {
         let second = analyze(&sessions);
         assert_eq!(learned_key(&first[0]), learned_key(&second[0]));
         assert!(learned_key(&first[0]).starts_with("learned:mytool:unknown-flag:"));
+    }
+
+    // -- describe_group: redaction (issue #425 review) -------------------------
+
+    #[test]
+    fn describe_group_never_persists_a_bearer_token_from_the_example_commands() {
+        let group = CorrectionGroup {
+            program: "curl".to_string(),
+            class: ErrorClass::UnknownFlag,
+            diff: TokenDiff::Substitute {
+                at: 3,
+                from: "--badflag".to_string(),
+                to: "--good-flag".to_string(),
+            },
+            occurrences: 3,
+            sessions: BTreeSet::from(["sess-1".to_string(), "sess-2".to_string()]),
+            example_from: "curl -H \"Authorization: Bearer sk-abc123XYZ\" --badflag".to_string(),
+            example_to: "curl -H \"Authorization: Bearer sk-abc123XYZ\" --good-flag".to_string(),
+        };
+        let body = describe_group(&group);
+        assert!(
+            !body.contains("sk-abc123XYZ"),
+            "the raw token must never be persisted: {body}"
+        );
+        assert!(body.contains("[redacted]"), "{body}");
     }
 
     // -- claude/codex transcript extraction -----------------------------------
@@ -1197,5 +1470,123 @@ mod tests {
         let slug = repo_slug(tmp.path());
         let entries = memory::list(&state, &slug).expect("list");
         assert!(entries.is_empty(), "{entries:?}");
+    }
+
+    // -- scan budget (issue #425 review) ---------------------------------------
+
+    #[test]
+    fn run_with_stops_at_the_file_cap_and_reports_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("claude-home");
+        let project_dir = claude_project_dir(&home, tmp.path());
+        std::fs::create_dir_all(&project_dir).expect("mkdir project dir");
+        // One more candidate file than the shared file cap allows -- none of
+        // them need a matched tool_result; `gather_sessions`'s file-cap
+        // bookkeeping runs regardless of what (if anything) is extracted.
+        for i in 0..(MAX_TRANSCRIPT_CANDIDATES + 1) {
+            std::fs::write(
+                project_dir.join(format!("sess-{i}.jsonl")),
+                claude_line("tu0", "ls"),
+            )
+            .expect("write fixture");
+        }
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = cfg_with_memory_enabled(true);
+        let args = LearnArgs {
+            since: "30d".to_string(),
+            dry_run: true,
+        };
+        let mut out = Vec::new();
+        run_with(&state, &cfg, &args, tmp.path(), &mut out, state::now_secs()).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(&format!("stopped after {MAX_TRANSCRIPT_CANDIDATES} files")),
+            "{text}"
+        );
+        assert!(text.contains("narrow --since"), "{text}");
+    }
+
+    // -- prune_to_cap ordering (issue #425 review) -----------------------------
+
+    fn program_session_jsonl(program: &str, occurrences: usize) -> String {
+        let mut jsonl = String::new();
+        for i in 0..occurrences {
+            let fail_id = format!("{program}-fail-{i}");
+            jsonl.push_str(&claude_line(&fail_id, &format!("{program} --foo build")));
+            jsonl.push('\n');
+            jsonl.push_str(&claude_result(
+                &fail_id,
+                "error: unrecognized option '--foo'",
+                true,
+            ));
+            jsonl.push('\n');
+            let fix_id = format!("{program}-fix-{i}");
+            jsonl.push_str(&claude_line(&fix_id, &format!("{program} --bar build")));
+            jsonl.push('\n');
+            jsonl.push_str(&claude_result(&fix_id, "build ok", false));
+            jsonl.push('\n');
+        }
+        jsonl
+    }
+
+    /// `memory.max_entries` defaults to 50 (`config.rs`'s own
+    /// `MemoryConfig::default`); this test pins it to 1 so a single
+    /// `remember` call is already enough to force `prune_to_cap` to choose.
+    /// Both findings clear the `analyze` threshold (at least 3 occurrences
+    /// across at least 2 sessions) -- "strong" simply has more occurrences,
+    /// so it must be the one still standing once the private bank cannot
+    /// hold both.
+    #[test]
+    fn run_with_writes_the_strongest_finding_first_so_a_near_cap_bank_evicts_the_weakest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("claude-home");
+        let project_dir = claude_project_dir(&home, tmp.path());
+        std::fs::create_dir_all(&project_dir).expect("mkdir project dir");
+        std::fs::write(
+            project_dir.join("strong-1.jsonl"),
+            program_session_jsonl("strong", 4),
+        )
+        .expect("write fixture");
+        std::fs::write(
+            project_dir.join("strong-2.jsonl"),
+            program_session_jsonl("strong", 1),
+        )
+        .expect("write fixture");
+        std::fs::write(
+            project_dir.join("weak-1.jsonl"),
+            program_session_jsonl("weak", 2),
+        )
+        .expect("write fixture");
+        std::fs::write(
+            project_dir.join("weak-2.jsonl"),
+            program_session_jsonl("weak", 1),
+        )
+        .expect("write fixture");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = cfg_with_memory_enabled(true);
+        cfg.memory.max_entries = 1;
+        let args = LearnArgs {
+            since: "30d".to_string(),
+            dry_run: false,
+        };
+        let mut out = Vec::new();
+        run_with(&state, &cfg, &args, tmp.path(), &mut out, state::now_secs()).expect("runs");
+
+        let slug = repo_slug(tmp.path());
+        let entries = memory::list(&state, &slug).expect("list");
+        let learned: Vec<&str> = entries
+            .iter()
+            .map(|(_, e)| e.key.as_str())
+            .filter(|k| k.starts_with("learned:"))
+            .collect();
+        assert_eq!(learned.len(), 1, "{learned:?}");
+        assert!(
+            learned[0].starts_with("learned:strong:"),
+            "the higher-ranked finding must survive the cap, got {learned:?}"
+        );
     }
 }
