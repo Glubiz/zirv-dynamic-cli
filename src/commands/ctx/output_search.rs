@@ -62,8 +62,35 @@ pub(crate) enum ShapeKind {
 /// decision; this only picks a rendering among the three once it has been
 /// made.
 pub(crate) fn detect_shape(command: &str) -> Option<ShapeKind> {
-    for segment in super::safety::normalize_segments(command) {
-        let collapsed = super::safety::collapse_whitespace(&segment);
+    let segments = super::safety::normalize_segments(command);
+
+    // Verbatim wins outright over Shape, across EVERY candidate segment --
+    // mirrors `output::classify_compaction`'s own fix for the identical
+    // "first candidate is the whole unsplit string" pathology (a compound
+    // command's first `normalize_segments` candidate is the whole unsplit
+    // string, so a leading shape-eligible program could route before a
+    // later segment naming a real reader was ever inspected). In practice
+    // this never fires: `detect_shape` is only called once
+    // `classify_compaction` has already decided `Shape`, which already rules
+    // out any reader segment. Kept as defense in depth so a wrong shape
+    // choice can never silently drop a reader's content the way a wrong
+    // `Shape` classification would.
+    for segment in &segments {
+        let collapsed = super::safety::collapse_whitespace(segment);
+        let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+        let Some(first) = tokens.first() else {
+            continue;
+        };
+        let program = bare_program(first);
+        if super::output::is_verbatim_program(&program)
+            && !SEARCH_SHAPE_PROGRAMS.contains(&program.as_str())
+        {
+            return None;
+        }
+    }
+
+    for segment in &segments {
+        let collapsed = super::safety::collapse_whitespace(segment);
         let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
         let Some(first) = tokens.first() else {
             continue;
@@ -126,20 +153,36 @@ pub(crate) struct SearchScan {
 /// other line (a `--` group separator, a "binary file ... matches" notice)
 /// is simply not counted -- this pass groups matches, it does not have to
 /// account for every byte the way `output::scan_for_display` does.
-pub(crate) fn scan_search(reader: impl BufRead) -> SearchScan {
+pub(crate) fn scan_search(mut reader: impl BufRead) -> SearchScan {
     let mut scan = SearchScan::default();
-    for chunk in reader.split(b'\n') {
-        let bytes = match chunk {
-            Ok(bytes) => bytes,
+    loop {
+        // `read_until` directly, never `BufRead::split`: its `Ok` count is
+        // the EXACT number of bytes consumed (delimiter included when one
+        // was found) -- mirrors `output::scan_for_display`'s fix for the
+        // same over-count (issue #410). `split(b'\n')` strips the delimiter
+        // from every chunk and unconditionally adding 1 back assumes one was
+        // always there, over-counting by a byte whenever the input's last
+        // chunk (or the whole input) has no trailing newline.
+        let mut raw = Vec::new();
+        let n = match reader.read_until(b'\n', &mut raw) {
+            Ok(n) => n,
             Err(_) => {
                 scan.read_error = true;
                 break;
             }
         };
-        let line = String::from_utf8_lossy(&bytes);
+        if n == 0 {
+            break;
+        }
+        scan.total_bytes = scan.total_bytes.saturating_add(n as u64);
+        let bytes: &[u8] = if raw.last() == Some(&b'\n') {
+            &raw[..raw.len() - 1]
+        } else {
+            &raw[..]
+        };
+        let line = String::from_utf8_lossy(bytes);
         let line = line.strip_suffix('\r').unwrap_or(&line);
         scan.total_lines += 1;
-        scan.total_bytes = scan.total_bytes.saturating_add(bytes.len() as u64 + 1);
 
         let Some(caps) = MATCH_LINE_RE
             .captures(line)
@@ -287,20 +330,33 @@ pub(crate) struct ListingScan {
 /// which `render_listing_summary` treats as "this is not `ls -l` shaped
 /// after all" -- fail open to the untouched original rather than a
 /// half-parsed listing.
-pub(crate) fn scan_listing(reader: impl BufRead) -> ListingScan {
+pub(crate) fn scan_listing(mut reader: impl BufRead) -> ListingScan {
     let mut scan = ListingScan::default();
-    for chunk in reader.split(b'\n') {
-        let bytes = match chunk {
-            Ok(bytes) => bytes,
+    loop {
+        // See `scan_search`'s own comment: `read_until` gives the EXACT
+        // byte count consumed, unlike `split(b'\n')` plus an unconditional
+        // "+1 for the delimiter" that over-counts when the input has no
+        // trailing newline (issue #410's fix in `output::scan_for_display`).
+        let mut raw = Vec::new();
+        let n = match reader.read_until(b'\n', &mut raw) {
+            Ok(n) => n,
             Err(_) => {
                 scan.read_error = true;
                 break;
             }
         };
-        let line = String::from_utf8_lossy(&bytes);
+        if n == 0 {
+            break;
+        }
+        scan.total_bytes = scan.total_bytes.saturating_add(n as u64);
+        let bytes: &[u8] = if raw.last() == Some(&b'\n') {
+            &raw[..raw.len() - 1]
+        } else {
+            &raw[..]
+        };
+        let line = String::from_utf8_lossy(bytes);
         let line = line.strip_suffix('\r').unwrap_or(&line);
         scan.total_lines += 1;
-        scan.total_bytes = scan.total_bytes.saturating_add(bytes.len() as u64 + 1);
         let trimmed = line.trim();
         if trimmed.is_empty() || LS_TOTAL_LINE_RE.is_match(trimmed) {
             continue;
@@ -430,20 +486,33 @@ pub(crate) struct TreeScan {
     pub(crate) read_error: bool,
 }
 
-pub(crate) fn scan_tree(reader: impl BufRead) -> TreeScan {
+pub(crate) fn scan_tree(mut reader: impl BufRead) -> TreeScan {
     let mut scan = TreeScan::default();
-    for chunk in reader.split(b'\n') {
-        let bytes = match chunk {
-            Ok(bytes) => bytes,
+    loop {
+        // See `scan_search`'s own comment: `read_until` gives the EXACT
+        // byte count consumed, unlike `split(b'\n')` plus an unconditional
+        // "+1 for the delimiter" that over-counts when the input has no
+        // trailing newline (issue #410's fix in `output::scan_for_display`).
+        let mut raw = Vec::new();
+        let n = match reader.read_until(b'\n', &mut raw) {
+            Ok(n) => n,
             Err(_) => {
                 scan.read_error = true;
                 break;
             }
         };
-        let line = String::from_utf8_lossy(&bytes);
+        if n == 0 {
+            break;
+        }
+        scan.total_bytes = scan.total_bytes.saturating_add(n as u64);
+        let bytes: &[u8] = if raw.last() == Some(&b'\n') {
+            &raw[..raw.len() - 1]
+        } else {
+            &raw[..]
+        };
+        let line = String::from_utf8_lossy(bytes);
         let line = line.strip_suffix('\r').unwrap_or(&line);
         scan.total_lines += 1;
-        scan.total_bytes = scan.total_bytes.saturating_add(bytes.len() as u64 + 1);
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -558,6 +627,20 @@ mod tests {
         assert_eq!(detect_shape("cargo build"), None);
     }
 
+    /// Defense in depth, mirroring `output::classify_compaction`'s own fix
+    /// for the identical bug: `normalize_segments`'s first candidate is the
+    /// whole unsplit string, so a leading shape-eligible program used to
+    /// route before a later segment naming a real reader (`cat`) was ever
+    /// inspected. `detect_shape` is only ever called once
+    /// `classify_compaction` has already decided `Shape` (which already
+    /// rules this out), but it must independently refuse to pick a shape
+    /// when a reader is present rather than relying solely on its caller.
+    #[test]
+    fn a_reader_segment_anywhere_beats_an_earlier_shape_program() {
+        assert_eq!(detect_shape("rg TODO src && cat secrets.txt"), None);
+        assert_eq!(detect_shape("cat secrets.txt && rg TODO src"), None);
+    }
+
     fn rg_output(files: usize, matches_per_file: usize) -> String {
         let mut text = String::new();
         for f in 0..files {
@@ -608,6 +691,18 @@ mod tests {
         );
     }
 
+    /// Issue #410 fixed this exact over-count in `output::scan_for_display`
+    /// via `read_until`; `scan_search` still used `reader.split(b'\n')` then
+    /// unconditionally added 1 for a delimiter that is not there on the last
+    /// chunk when the input has no trailing newline, over-counting by a byte.
+    #[test]
+    fn scan_search_reports_the_exact_byte_count_without_a_trailing_newline() {
+        let text = "src/file0.rs:1:    let todo_0 = 1; // TODO fix this";
+        assert!(!text.ends_with('\n'));
+        let scan = scan_search(text.as_bytes());
+        assert_eq!(scan.total_bytes, text.len() as u64, "{scan:?}");
+    }
+
     fn ls_l_output() -> String {
         let mut text = String::from("total 24\n");
         for i in 0..10 {
@@ -630,6 +725,14 @@ mod tests {
             render_listing_summary("id1", "ls -l", Some(0), &scan, 4096).expect("a summary");
         assert!(summary.contains("file0.rs"), "{summary}");
         assert!(summary.contains("Jan"), "{summary}");
+    }
+
+    #[test]
+    fn scan_listing_reports_the_exact_byte_count_without_a_trailing_newline() {
+        let text = "-rw-r--r--  1 user  staff  1000 Jan  1 12:34 file0.rs";
+        assert!(!text.ends_with('\n'));
+        let scan = scan_listing(text.as_bytes());
+        assert_eq!(scan.total_bytes, text.len() as u64, "{scan:?}");
     }
 
     #[test]
@@ -663,6 +766,14 @@ mod tests {
             scan.order
         );
         assert_eq!(scan.groups["src"].len(), 2);
+    }
+
+    #[test]
+    fn scan_tree_reports_the_exact_byte_count_without_a_trailing_newline() {
+        let text = "src/main.rs\nsrc/lib.rs\ntests/it.rs\nREADME.md";
+        assert!(!text.ends_with('\n'));
+        let scan = scan_tree(text.as_bytes());
+        assert_eq!(scan.total_bytes, text.len() as u64, "{scan:?}");
     }
 
     #[test]

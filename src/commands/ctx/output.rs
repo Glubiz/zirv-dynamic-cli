@@ -665,6 +665,18 @@ const VERBATIM_PROGRAMS: &[&str] = &[
     "strings",
 ];
 
+/// Whether `program` (already bare-named and lower-cased) is one of
+/// [`VERBATIM_PROGRAMS`] -- exposed so `output_search::detect_shape` can
+/// apply the same "any segment naming a reader wins" rule this module's
+/// `classify_segment` already does, as defense in depth: `detect_shape` is
+/// only ever called once `classify_compaction` has already decided `Shape`,
+/// which already guarantees no segment is a reader, but a wrong shape choice
+/// would silently drop a reader's content just the same as a wrong `Shape`
+/// classification would.
+pub(crate) fn is_verbatim_program(program: &str) -> bool {
+    VERBATIM_PROGRAMS.contains(&program)
+}
+
 /// `git` subcommands that are reads of content rather than progress logs.
 /// `diff`/`show` moved to [`DIFF_GIT_SUBCOMMANDS`] (issue #412): a bounded,
 /// lossless-shape summary is possible for those because their grammar is
@@ -765,6 +777,102 @@ pub(crate) fn bare_program(token: &str) -> String {
         .to_string()
 }
 
+/// The early-return verdict `classify_compaction` would give for ONE
+/// `normalize_segments` candidate, plus whether that candidate names a
+/// modelled build/test/log program (`known`) when it triggers none of them.
+struct SegmentClass {
+    scope: Option<CompactionScope>,
+    known: bool,
+}
+
+fn classify_segment(segment: &str, extra: &[String], compact_search: bool) -> SegmentClass {
+    let collapsed = super::safety::collapse_whitespace(segment);
+    let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+    let Some(first) = tokens.first() else {
+        return SegmentClass {
+            scope: None,
+            known: false,
+        };
+    };
+    let program = bare_program(first);
+    let sub_index = if program == "git" {
+        git_subcommand_index(&tokens)
+    } else {
+        1
+    };
+    let sub = tokens.get(sub_index).map(|t| t.to_ascii_lowercase());
+    let sub = sub.as_deref();
+
+    if program == "zirv"
+        && sub == Some("ctx")
+        && matches!(
+            tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
+            Some("output")
+        )
+    {
+        return SegmentClass {
+            scope: Some(CompactionScope::Verbatim),
+            known: false,
+        };
+    }
+    if program == "zirv"
+        && sub == Some("ctx")
+        && matches!(
+            tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
+            Some("run")
+        )
+        && tokens.contains(&"--full")
+    {
+        return SegmentClass {
+            scope: Some(CompactionScope::Verbatim),
+            known: false,
+        };
+    }
+    if compact_search
+        && output_search::SEARCH_SHAPE_PROGRAMS.contains(&program.as_str())
+        && !extra.contains(&program)
+    {
+        return SegmentClass {
+            scope: Some(CompactionScope::Shape),
+            known: false,
+        };
+    }
+    if VERBATIM_PROGRAMS.contains(&program.as_str()) || extra.contains(&program) {
+        return SegmentClass {
+            scope: Some(CompactionScope::Verbatim),
+            known: false,
+        };
+    }
+    if program == "git" && sub.is_some_and(|sub| VERBATIM_GIT_SUBCOMMANDS.contains(&sub)) {
+        return SegmentClass {
+            scope: Some(CompactionScope::Verbatim),
+            known: false,
+        };
+    }
+    if program == "git" && sub.is_some_and(|sub| DIFF_GIT_SUBCOMMANDS.contains(&sub)) {
+        return SegmentClass {
+            scope: Some(CompactionScope::Diff),
+            known: false,
+        };
+    }
+    // `git log -p`/`--patch` prints the same unified-diff grammar as
+    // `git diff`/`show` -- issue #412 bounds it the same way, rather than
+    // leaving it verbatim at any size like every other `git log`.
+    if program == "git"
+        && sub == Some("log")
+        && tokens.iter().any(|t| *t == "-p" || *t == "--patch")
+    {
+        return SegmentClass {
+            scope: Some(CompactionScope::Diff),
+            known: false,
+        };
+    }
+
+    let known = KNOWN_PROGRAMS.contains(&program.as_str())
+        && (program != "git" || sub.is_some_and(|sub| KNOWN_GIT_SUBCOMMANDS.contains(&sub)));
+    SegmentClass { scope: None, known }
+}
+
 /// Decides how much of `command`'s output may be replaced.
 ///
 /// Verbatim wins over everything, and it is reached by three independent
@@ -796,6 +904,14 @@ pub(crate) fn bare_program(token: &str) -> String {
 /// become `CompactionScope::Shape` instead, UNLESS the operator's own
 /// `extra_verbatim` (`[output] verbatim`) also names them: that explicit,
 /// per-program "never compact this" always wins over the blanket opt-in.
+///
+/// Verbatim wins outright over Shape/Diff/Known across EVERY candidate
+/// segment `classify_segment` visits, not just the first one
+/// `normalize_segments` produces: that first candidate is always the whole
+/// unsplit command, so without this a compound command like `rg TODO src &&
+/// cat secrets.txt` classified as `Shape` from its leading `rg` before the
+/// later `cat` segment -- a real reader -- was ever inspected, silently
+/// letting file content through the shape-only renderer.
 pub(crate) fn classify_compaction(
     command: &str,
     extra_verbatim: &[String],
@@ -808,77 +924,29 @@ pub(crate) fn classify_compaction(
         .iter()
         .map(|name| bare_program(name))
         .collect();
-    let mut known = false;
-    for segment in super::safety::normalize_segments(command) {
-        let collapsed = super::safety::collapse_whitespace(&segment);
-        let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
-        let Some(first) = tokens.first() else {
-            continue;
-        };
-        let program = bare_program(first);
-        let sub_index = if program == "git" {
-            git_subcommand_index(&tokens)
-        } else {
-            1
-        };
-        let sub = tokens.get(sub_index).map(|t| t.to_ascii_lowercase());
-        let sub = sub.as_deref();
+    let classes: Vec<SegmentClass> = super::safety::normalize_segments(command)
+        .iter()
+        .map(|segment| classify_segment(segment, &extra, compact_search))
+        .collect();
 
-        if program == "zirv"
-            && sub == Some("ctx")
-            && matches!(
-                tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
-                Some("output")
-            )
-        {
-            return CompactionScope::Verbatim;
-        }
-        if program == "zirv"
-            && sub == Some("ctx")
-            && matches!(
-                tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
-                Some("run")
-            )
-            && tokens.contains(&"--full")
-        {
-            return CompactionScope::Verbatim;
-        }
-        if compact_search
-            && output_search::SEARCH_SHAPE_PROGRAMS.contains(&program.as_str())
-            && !extra.contains(&program)
-        {
-            return CompactionScope::Shape;
-        }
-        if VERBATIM_PROGRAMS.contains(&program.as_str()) || extra.contains(&program) {
-            return CompactionScope::Verbatim;
-        }
-        if program == "git" && sub.is_some_and(|sub| VERBATIM_GIT_SUBCOMMANDS.contains(&sub)) {
-            return CompactionScope::Verbatim;
-        }
-        if program == "git" && sub.is_some_and(|sub| DIFF_GIT_SUBCOMMANDS.contains(&sub)) {
-            return CompactionScope::Diff;
-        }
-        // `git log -p`/`--patch` prints the same unified-diff grammar as
-        // `git diff`/`show` -- issue #412 bounds it the same way, rather than
-        // leaving it verbatim at any size like every other `git log`.
-        if program == "git"
-            && sub == Some("log")
-            && tokens.iter().any(|t| *t == "-p" || *t == "--patch")
-        {
-            return CompactionScope::Diff;
-        }
-
-        if KNOWN_PROGRAMS.contains(&program.as_str()) {
-            // Review finding 5: OR'd across every segment/candidate this
-            // loop visits, never assigned outright -- an unrecognised git
-            // subcommand in one candidate (or the same command's own
-            // "whole" candidate) must never erase a `Known` match an
-            // earlier segment already established.
-            known |=
-                program != "git" || sub.is_some_and(|sub| KNOWN_GIT_SUBCOMMANDS.contains(&sub));
-        }
+    // Verbatim wins outright over Shape/Diff/Known -- see the doc comment.
+    if classes
+        .iter()
+        .any(|class| class.scope == Some(CompactionScope::Verbatim))
+    {
+        return CompactionScope::Verbatim;
     }
-    if known {
+    // Failing that, the first candidate (in `normalize_segments` order) to
+    // produce a Shape/Diff verdict wins -- same order-sensitivity as before
+    // this fix, just no longer able to pre-empt a later Verbatim.
+    if let Some(scope) = classes.iter().find_map(|class| class.scope) {
+        return scope;
+    }
+    // Review finding 5 (unchanged): OR'd across every segment/candidate,
+    // never assigned outright -- an unrecognised git subcommand in one
+    // candidate must never erase a `Known` match an earlier segment already
+    // established.
+    if classes.iter().any(|class| class.known) {
         CompactionScope::Known
     } else {
         CompactionScope::Generic
@@ -3173,6 +3241,29 @@ mod tests {
             classify_compaction("rg TODO src", &["rg".to_string()], true),
             CompactionScope::Verbatim,
             "an operator's own [output] verbatim entry always wins over compact_search"
+        );
+    }
+
+    /// A compound command's first `normalize_segments` candidate is the
+    /// whole unsplit string, so a leading `rg` used to return `Shape` before
+    /// the later `cat` segment -- a real reader -- was ever inspected,
+    /// silently letting `cat secrets.txt`'s content through the shape-only
+    /// renderer. Verbatim must win across every candidate, not just the
+    /// first one visited.
+    #[test]
+    fn a_later_verbatim_segment_beats_an_earlier_shape_candidate() {
+        assert_eq!(
+            classify_compaction("rg TODO src && cat secrets.txt", &[], true),
+            CompactionScope::Verbatim,
+            "cat secrets.txt must never be silently shaped away"
+        );
+        // Unchanged from main: no compact_search opt-in, no shape carve-out
+        // in play at all -- `cargo test` is a modelled Known family and
+        // `cat` is unconditionally verbatim either way.
+        assert_eq!(
+            classify_compaction("cargo test && cat x", &[], false),
+            CompactionScope::Verbatim,
+            "cat must still force verbatim regardless of compact_search"
         );
     }
 

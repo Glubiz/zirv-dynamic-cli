@@ -210,9 +210,14 @@ jobs:
   # Issue #429: an ADVISORY nudge, never a gate -- `continue-on-error: true`
   # on top of the script's own always-0 exit means this job can never fail
   # the PR no matter what it finds. PR-only (a push has no base commit to
-  # diff against in this repo's rebase-merge workflow) and needs the base
-  # ref fetched the same way `version-bump` does, since this checkout is
-  # shallow.
+  # diff against in this repo's rebase-merge workflow) and needs full
+  # history the same way the `test` job's checkout gets it: a depth-1
+  # checkout plus a SEPARATE depth-1 fetch of the base ref (the previous
+  # shape here) leaves the two shallow histories with no common ancestor
+  # object, so `git diff base...HEAD` in security-scan.sh could not find a
+  # merge base and failed -- silently, since that failure was swallowed into
+  # an empty (`|| true`) diff, making the scan a permanent silent no-op on
+  # every PR.
   security-scan:
     name: Advisory Security Scan
     if: github.event_name == 'pull_request'
@@ -221,9 +226,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
-      - name: Fetch base ref
-        run: git fetch origin "${{ github.base_ref }}" --depth=1
+        with:
+          fetch-depth: 0
 
       - name: Run advisory scan
         run: bash scripts/security-scan.sh --base "origin/${{ github.base_ref }}" >> "$GITHUB_STEP_SUMMARY"

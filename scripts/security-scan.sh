@@ -127,7 +127,16 @@ added_lines_with_numbers() {
 run_scan() {
   base="$1"
 
-  changed_files="$(git diff --name-only --diff-filter=AM "${base}...HEAD" 2>/dev/null || true)"
+  # `2>/dev/null || true` used to swallow BOTH a legitimately empty diff
+  # (nothing changed) and a hard failure (no merge base -- e.g. CI fetched
+  # both sides shallowly, so `git diff base...HEAD` cannot find a common
+  # ancestor and exits 128) into the same empty string, silently turning the
+  # advisory scan into a permanent no-op on every PR with no visible sign of
+  # it. A failed diff must say so in the report instead.
+  if ! changed_files="$(git diff --name-only --diff-filter=AM "${base}...HEAD" 2>&1)"; then
+    echo "security-scan: cannot diff against ${base}"
+    return 0
+  fi
   if [ -z "$changed_files" ]; then
     return 0
   fi
@@ -396,6 +405,26 @@ EOF
     echo "self-test ok: clean-diff"
   else
     echo "self-test FAILED: clean-diff (exit $code, output: $out)"
+    fails=$((fails + 1))
+  fi
+
+  # 7. `--base` names a ref that does not resolve to a commit sharing
+  # history with HEAD (the shape of CI's shallow-fetch bug): the failure
+  # must be visible in the report, never silently swallowed into "nothing
+  # to report".
+  dir="$(make_repo unresolvable-base)"
+  base_security_md >"$dir/SECURITY.md"
+  mkdir -p "$dir/src/commands"
+  echo 'pub fn noop() {}' >"$dir/src/commands/thing.rs"
+  commit_all "$dir" "base"
+  set +e
+  out="$( cd "$dir" && "$script_path" --base "origin/does-not-exist" )"
+  code=$?
+  set -e
+  if [ "$code" -eq 0 ] && printf '%s' "$out" | grep -Fq "cannot diff against"; then
+    echo "self-test ok: unresolvable-base"
+  else
+    echo "self-test FAILED: unresolvable-base (exit $code, output: $out)"
     fails=$((fails + 1))
   fi
 
