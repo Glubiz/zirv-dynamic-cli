@@ -2102,6 +2102,17 @@ pub fn run_kill_with<W: Write>(args: &KillArgs, w: &mut W, env: EnvLookup<'_>) -
 /// stale value's token dir has either no `owner.pid` at all (removed on
 /// that dashboard's clean quit) or one naming a different pid, either of
 /// which fails this check and falls back to the direct signal instead.
+///
+/// Residual the equality check alone does not close (review round 3):
+/// `sweep_stale_token_dirs` only removes a dir whose pid reads DEAD, so a
+/// stale dir survives forever once the OS recycles its old dashboard's pid
+/// number to some unrelated process that is still alive -- the same
+/// recycled-pid shape [`pid_looks_recycled`] already exists to catch for
+/// `record.pid` above. The `owner.pid` file's own mtime is when the ONE
+/// dashboard that ever wrote it started (the same reading `CandidateStatus::
+/// Live`'s own `started_at` takes); if the process holding `owner` today
+/// measurably started AFTER that, it is a stranger wearing the old
+/// dashboard's pid number, not the dashboard that minted this channel.
 fn kill_via_dashboard(
     state: &StateDir,
     record: &Record,
@@ -2119,10 +2130,24 @@ fn kill_via_dashboard(
         })?;
     let dir = non_empty(env(spawnreq::DASH_REQUESTS_ENV))?;
     let dir = Path::new(&dir);
-    let channel_owner = std::fs::read_to_string(spawnreq::owner_pid_path(dir))
+    let owner_pid_path = spawnreq::owner_pid_path(dir);
+    let channel_owner = std::fs::read_to_string(&owner_pid_path)
         .ok()
         .and_then(|contents| contents.trim().parse::<u32>().ok());
     if channel_owner != Some(owner) {
+        return None;
+    }
+    let channel_registered_at = std::fs::metadata(&owner_pid_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    if channel_registered_at
+        .zip(process_age_secs(owner))
+        .is_some_and(|(registered_at, age)| {
+            pid_looks_recycled(registered_at, age, super::state::now_secs())
+        })
+    {
         return None;
     }
 

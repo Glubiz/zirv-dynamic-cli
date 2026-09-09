@@ -7103,7 +7103,18 @@ fn drain_one_channel(
                 // still surfaced -- into the dashboard's own error log
                 // rather than a file nobody reads.
                 if requester.is_none() {
-                    push_error(errors, format!("kill {target}: {reason}"));
+                    // Review round 2: the pushed message must not vary with
+                    // `target` -- a same-uid process can name a different
+                    // (even nonexistent) short id on every forged kill, and
+                    // `ErrorLog::record`'s own adjacent-message dedup only
+                    // collapses BYTE-IDENTICAL text, so a varying target
+                    // would let repeated forged kills evict every real error
+                    // out of the ring (`MAX_KEPT_ERRORS` slots) indefinitely.
+                    // `reason` alone is already constant here (`kill_
+                    // allowed` returns the same `&'static str` for every
+                    // shared-channel kill), so repeats collapse onto one
+                    // slot for free.
+                    push_error(errors, format!("kill refused: {reason}"));
                     continue;
                 }
             }
@@ -26623,6 +26634,53 @@ mod tests {
         for pane in panes.iter_mut() {
             let _ = pane.shutdown("");
         }
+    }
+
+    /// Review round 2: `push_error`'s own message must not vary with the
+    /// refused kill's `target`, or a same-uid process naming a different
+    /// (even nonexistent) short id on every forged kill would defeat
+    /// `ErrorLog::record`'s adjacent-message dedup and evict every genuine
+    /// error out of the ring (`MAX_KEPT_ERRORS`, 5 slots) one forged kill at
+    /// a time. Two refusals in a row, naming two DIFFERENT targets, still
+    /// collapse onto the one slot identical adjacent text already gets.
+    #[test]
+    fn two_shared_channel_kill_refusals_in_a_row_leave_one_error_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let dir = tmp.path().join("requests");
+
+        spawnreq::write_request(&dir, &kill_request("deadbeef")).expect("write");
+        spawnreq::write_request(&dir, &kill_request("feedface")).expect("write");
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = ErrorLog::default();
+        handle_spawn_requests(
+            &dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+
+        let messages: Vec<String> = errors.messages().collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "two forged kills naming different targets must not evict each other's slot: \
+             {messages:?}"
+        );
+        assert!(
+            messages[0].ends_with("\u{d7}2"),
+            "both refusals are still counted, just onto the same slot: {messages:?}"
+        );
     }
 
     /// SECURITY (issue #435 item 1, was review round 2 finding 1): a `kill`
