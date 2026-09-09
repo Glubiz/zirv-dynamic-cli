@@ -18,6 +18,15 @@ pub const ORCHESTRATOR_BLOCKS_FILE: &str = "orchestrator-blocks.jsonl";
 /// path may do with it is look at its tail.
 pub const ORCHESTRATOR_BLOCK_TAIL_BYTES: u64 = 64 * 1024;
 
+/// How many bytes at the END of the main decision log (`decisions.jsonl`)
+/// [`read_recent_decisions`] parses. `zirv ctx status`'s bounded hook-health
+/// check (issue #424) only ever needs to know whether ANY of a handful of
+/// recently-scanned sessions has a decision at all -- materializing the
+/// whole, never-rotated decision log to answer that grows without bound on
+/// a long-lived machine, exactly the "bounded" contract this check already
+/// promises for the ledger side (`ledger::sessions_with_large_results`).
+pub const DECISION_LOG_TAIL_BYTES: u64 = 1024 * 1024;
+
 /// How many UTC days of `safety-decisions/` buckets [`append_safety`] keeps.
 /// The daily bucketing exists so retention can drop whole files without a
 /// cross-process truncate race; nothing enforced it, so the directory grew
@@ -458,6 +467,44 @@ pub fn read_decisions(state: &StateDir) -> Vec<DecisionRecord> {
         return Vec::new();
     };
     text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// The same rows as [`read_decisions`], but reading at most the last
+/// [`DECISION_LOG_TAIL_BYTES`] of `decisions.jsonl` -- for a caller (`zirv
+/// ctx status`'s bounded hook-health check) that only needs to know whether
+/// a decision exists for one of a handful of recently-scanned sessions, and
+/// must not pay for materializing the whole, never-rotated log to answer
+/// that. Same tail-window mechanics as [`read_recent_orchestrator_blocks`]:
+/// the read starts at the window boundary and discards the first,
+/// probably-partial line; a file smaller than the window is read whole. Same
+/// best-effort tolerance in every direction: an unreadable file or an
+/// unseekable handle is an empty list, a corrupt line is skipped.
+pub fn read_recent_decisions(state: &StateDir) -> Vec<DecisionRecord> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = state.logs().join(LOG_FILE);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let from = len.saturating_sub(DECISION_LOG_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+    if from > 0 {
+        lines.next();
+    }
+    lines
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect()
 }
@@ -965,6 +1012,64 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().to_path_buf());
         assert!(read_decisions(&state).is_empty());
+    }
+
+    /// `zirv ctx status`'s bounded hook-health check must not materialize
+    /// the whole, never-rotated decision log just to see whether one of a
+    /// handful of recently-scanned sessions has a decision -- the same
+    /// "bounded" contract `read_recent_orchestrator_blocks` already gives
+    /// its own log (see `hook.rs`'s
+    /// `orchestrator_advisory_only_reads_the_tail_of_the_block_ledger`).  An
+    /// ancient row before the tail window must be invisible to the bounded
+    /// reader even though the unbounded one still sees it.
+    #[test]
+    fn read_recent_decisions_reads_only_the_tail_of_the_decision_log() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().to_path_buf());
+
+        fn decision(session: &str, ts: u64) -> Decision<'_> {
+            Decision {
+                ts,
+                session,
+                verb: "hook",
+                verdict: "n/a",
+                score: 0,
+                action: "dispatch",
+                detail: "",
+                observed_at: None,
+            }
+        }
+
+        append(&state, &decision("ancient-session", 1)).expect("append ancient");
+        for i in 0..12_000u64 {
+            append(&state, &decision("filler-session", 100 + i)).expect("append filler");
+        }
+
+        let bytes = std::fs::metadata(state.logs().join(LOG_FILE))
+            .expect("metadata")
+            .len();
+        assert!(
+            bytes > DECISION_LOG_TAIL_BYTES,
+            "the fixture must exceed the tail window to be a test of it ({bytes} bytes)"
+        );
+
+        let recent = read_recent_decisions(&state);
+        assert!(
+            !recent.iter().any(|d| d.session == "ancient-session"),
+            "a decision row before the tail window must not be scanned"
+        );
+        assert!(
+            recent.iter().any(|d| d.session == "filler-session"),
+            "rows inside the tail window must still be read"
+        );
+        // Sanity: the unbounded reader still sees the ancient row, proving
+        // the bounded reader's omission is the tail window doing its job,
+        // not a bug that silently drops rows.
+        assert!(
+            read_decisions(&state)
+                .iter()
+                .any(|d| d.session == "ancient-session")
+        );
     }
 
     #[test]

@@ -354,6 +354,23 @@ pub fn session_large_result_counts(state: &StateDir, session: &str, min_bytes: u
         .unwrap_or((0, 0))
 }
 
+/// Whether the ledger holds ANY row at all, for ANY session -- `zirv ctx
+/// status`'s hook-health check (issue #424, fresh-machine fix) reads this to
+/// tell "this machine has never run a compact-eligible Bash result" (silent
+/// on a fresh install) from "it has, so a missing hook is worth a warning".
+/// Same best-effort contract as [`session_has_any_row`]: a resolution
+/// failure degrades to `false`, never an error.
+pub fn has_any_row(state: &StateDir) -> bool {
+    let Ok(conn) = open(state) else {
+        return false;
+    };
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM compactions)", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|n| n != 0)
+    .unwrap_or(false)
+}
+
 /// Whether ANY row at all exists for `session`, regardless of size --
 /// `zirv ctx status` (issue #424) reads this alongside `log::read_decisions`
 /// to tell "the hook never once looked at this session" from "it looked,

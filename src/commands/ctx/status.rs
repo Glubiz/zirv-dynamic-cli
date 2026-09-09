@@ -16,6 +16,7 @@ use super::memory;
 use super::permit;
 use super::pool;
 use super::price;
+use super::search;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, now_secs, repo_slug};
 use super::task;
@@ -1058,12 +1059,24 @@ const HOOK_HEALTH_SESSION_LIMIT: usize = 20;
 /// `recent_sessions_with_large_results` turns up a decision, so a machine
 /// with a long compaction-ledger history is never fully rescanned on every
 /// status render.
+///
+/// `machine_has_been_used` gates the "not installed" branch specifically: a
+/// fresh machine that has never run a claude session, never had a ledger
+/// row, and never recorded a decision has no evidence the hook was ever
+/// EXPECTED to be there, so the acceptance criterion for this check (silent
+/// on a fresh machine) requires this line stay silent too, not just the
+/// "installed but not firing" branch below it which already had its own
+/// `any` guard.
 fn hook_health_warning(
     hook_installed: bool,
+    machine_has_been_used: bool,
     recent_sessions_with_large_results: &[String],
     has_decision: impl Fn(&str) -> bool,
 ) -> Option<String> {
     if !hook_installed {
+        if !machine_has_been_used {
+            return None;
+        }
         return Some(
             "hook: claude's PostToolUse/PreToolUse compaction and safety hooks are not \
              installed -- run `zirv setup` to enable them"
@@ -1328,14 +1341,29 @@ fn render_report<W: Write>(
                 );
                 let hook_installed =
                     crate::commands::setup::claude_compaction_and_safety_hooks_installed();
+                // Bounded, like the ledger side (`sessions_with_large_
+                // results`) already is: only the tail of `decisions.jsonl`
+                // is read, never the whole never-rotated log.
                 let decision_sessions: std::collections::BTreeSet<String> =
-                    log::read_decisions(&state)
+                    log::read_recent_decisions(&state)
                         .into_iter()
                         .map(|d| d.session)
                         .collect();
-                if let Some(line) = hook_health_warning(hook_installed, &recent_sessions, |s| {
-                    decision_sessions.contains(s)
-                }) {
+                // Fresh-machine acceptance: silent when there is no
+                // evidence this machine has ever run claude at all -- a
+                // claude session transcript on disk, any compaction-ledger
+                // row (any size, not only the large ones scanned above), or
+                // any decision ever recorded (within the bounded tail
+                // above).
+                let machine_has_been_used = !decision_sessions.is_empty()
+                    || ledger::has_any_row(&state)
+                    || !search::claude_candidates(repo, true).is_empty();
+                if let Some(line) = hook_health_warning(
+                    hook_installed,
+                    machine_has_been_used,
+                    &recent_sessions,
+                    |s| decision_sessions.contains(s),
+                ) {
                     writeln!(w, "{}", style::paint(&line, Tone::Warn, colour))?;
                 }
             }
@@ -4281,29 +4309,51 @@ mod tests {
     }
 
     /// Issue #424: `hook_health_warning` is the bounded global check on its
-    /// own -- not installed always wins with its own message; installed with
-    /// at least one decision among the scanned sessions is silent; installed
-    /// with zero decisions across sessions that had large results warns.
+    /// own -- not installed on a machine with evidence of use always wins
+    /// with its own message; installed with at least one decision among the
+    /// scanned sessions is silent; installed with zero decisions across
+    /// sessions that had large results warns.
     #[test]
     fn hook_health_warning_covers_not_installed_healthy_and_silently_broken() {
         assert!(
-            hook_health_warning(false, &["s1".to_string()], |_| true)
-                .expect("not installed always warns")
+            hook_health_warning(false, true, &["s1".to_string()], |_| true)
+                .expect("not installed, on a used machine, always warns")
                 .contains("not installed")
         );
         assert_eq!(
-            hook_health_warning(true, &[], |_| false),
+            hook_health_warning(true, true, &[], |_| false),
             None,
             "nothing yet to judge the hook by is not a warning"
         );
         assert_eq!(
-            hook_health_warning(true, &["s1".to_string(), "s2".to_string()], |s| s == "s2"),
+            hook_health_warning(true, true, &["s1".to_string(), "s2".to_string()], |s| s
+                == "s2"),
             None,
             "short-circuits healthy the moment any scanned session has a decision"
         );
-        let warning = hook_health_warning(true, &["s1".to_string()], |_| false)
+        let warning = hook_health_warning(true, true, &["s1".to_string()], |_| false)
             .expect("installed but zero decisions across sessions with large results warns");
         assert!(warning.contains("zero decisions"));
+    }
+
+    /// The fresh-machine fix: not-installed must stay SILENT when there is
+    /// no evidence the machine has ever been used (no claude session, no
+    /// ledger row, no decision) -- the acceptance criterion this issue
+    /// names explicitly. The instant there is any usage evidence at all,
+    /// the exact same not-installed state must warn, so this is strictly a
+    /// gate on the warning, never a way to hide a real problem.
+    #[test]
+    fn hook_health_warning_is_silent_not_installed_on_a_fresh_machine() {
+        assert_eq!(
+            hook_health_warning(false, false, &[], |_| false),
+            None,
+            "no evidence of use at all: not-installed must not warn on a fresh machine"
+        );
+        assert!(
+            hook_health_warning(false, true, &[], |_| false)
+                .expect("the same not-installed state warns once there is usage evidence")
+                .contains("not installed")
+        );
     }
 
     /// Issue #424: the end-to-end bounded check in `zirv ctx status` --
@@ -4372,6 +4422,74 @@ mod tests {
         assert!(
             !text.contains("zero decisions recorded") && !text.contains("not installed"),
             "a decision now exists for the only session with a large result: {text}"
+        );
+    }
+
+    /// The fresh-machine fix, end to end: no claude settings.json, no
+    /// ledger rows, no decisions, and no claude project transcript on disk
+    /// at all -- `zirv ctx status` must never print the "not installed"
+    /// hook-health line on a machine that has plainly never run claude.
+    #[test]
+    fn status_end_to_end_hook_not_installed_is_silent_on_a_fresh_machine() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // No `write_claude_hooks_installed(&home)` call: no settings.json at
+        // all, exactly the fresh-machine state.
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let args = StatusArgs {
+            decisions: 5,
+            brief: false,
+            diff: false,
+            full: false,
+            breakdown: None,
+            json: false,
+        };
+
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned(), false).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("not installed"),
+            "a fresh machine with no usage evidence at all must stay silent: {text}"
+        );
+    }
+
+    /// The same not-installed machine as above, except a claude project
+    /// transcript already exists on disk (issue acceptance's "at least one
+    /// claude session in the registry") -- this is a used machine missing
+    /// its hooks, so the warning must fire once.
+    #[test]
+    fn status_end_to_end_hook_not_installed_warns_once_the_machine_has_been_used() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let project_dir = home.join(".claude").join("projects").join(
+            crate::commands::ctx::permissions::claude_project_dir_name(tmp.path()),
+        );
+        std::fs::create_dir_all(&project_dir).expect("mkdir project dir");
+        std::fs::write(project_dir.join("sess-1.jsonl"), "{}\n").expect("write transcript");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let args = StatusArgs {
+            decisions: 5,
+            brief: false,
+            diff: false,
+            full: false,
+            breakdown: None,
+            json: false,
+        };
+
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned(), false).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("not installed"),
+            "a claude transcript on disk is evidence of use, so the missing hook must warn: \
+             {text}"
         );
     }
 

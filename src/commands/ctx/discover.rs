@@ -2,7 +2,11 @@
 //! recent sessions that reached the model UNCOMPACTED, bucketed by why.
 //!
 //! The mechanism: scan claude transcripts for `Bash` `tool_use`/`tool_result`
-//! pairs above `[output] compact_min_bytes`, then join each one against the
+//! pairs at or above the SMALLEST of `[output] compact_min_bytes`/
+//! `compact_generic_min_bytes`/`diff_max_bytes` (see [`scan_min_bytes`] -- an
+//! operator config where `compact_min_bytes` is not itself the smallest of
+//! the three must never pre-filter out a result a wider scope would still
+//! compact), then join each one against the
 //! compaction ledger (`ledger.rs`, issue #422) by `tool_use_id`. A match is
 //! MEASURED -- the hook actually looked at this exact result, and the
 //! ledger's own `outcome` column says what it did. No match is ESTIMATED --
@@ -91,86 +95,167 @@ fn tool_result_text(block: &Value) -> String {
         })
 }
 
+/// Applies one already-trimmed transcript line to `pending`/`out` -- the
+/// single per-line rule [`extract_bash_results`] (a small in-memory string,
+/// for the existing unit fixtures) and [`extract_bash_results_bounded`] (a
+/// streamed, byte-budgeted `BufRead`, for `run_with`'s real transcript
+/// files) both apply, kept as one copy so a change to the pairing rule can
+/// never drift between the two callers.
+fn apply_transcript_line(
+    line: &str,
+    pending: &mut HashMap<String, String>,
+    min_bytes: u64,
+    out: &mut Vec<RawResult>,
+) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let Ok(row) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    if row.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return;
+    }
+    let message = row.get("message").cloned().unwrap_or(Value::Null);
+    match row.get("type").and_then(Value::as_str) {
+        Some("assistant") => {
+            let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+                return;
+            };
+            for block in blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+            {
+                let tool_name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                if !tool_name.eq_ignore_ascii_case("Bash") {
+                    continue;
+                }
+                if let (Some(id), Some(command)) = (
+                    block.get("id").and_then(Value::as_str),
+                    block
+                        .get("input")
+                        .and_then(|input| input.get("command"))
+                        .and_then(Value::as_str),
+                ) {
+                    pending.insert(id.to_string(), command.to_string());
+                }
+            }
+        }
+        Some("user") => {
+            let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+                return;
+            };
+            for block in blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(command) = pending.remove(tool_use_id) else {
+                    continue;
+                };
+                let bytes = tool_result_text(block).len() as u64;
+                if bytes < min_bytes {
+                    continue;
+                }
+                let program = command
+                    .split_whitespace()
+                    .next()
+                    .map(bare_program)
+                    .unwrap_or_default();
+                out.push(RawResult {
+                    tool_use_id: tool_use_id.to_string(),
+                    program,
+                    command,
+                    bytes,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Every `Bash` tool result in `jsonl` at or above `min_bytes`, paired to its
 /// own command by `tool_use_id` -- the identical pending-map pairing
 /// `adapters::claude::structural_context` already uses for its own handoff
 /// verification section (matched by id, however many other tool calls fall
 /// between the two rows), just kept as its own small copy here rather than
-/// exposing that private pairing for a second, unrelated caller.
+/// exposing that private pairing for a second, unrelated caller. Whole-string
+/// (never a byte budget of its own): only ever called by this module's small
+/// in-memory unit fixtures -- `run_with`'s real transcript files go through
+/// [`extract_bash_results_bounded`] instead.
+#[cfg(test)]
 fn extract_bash_results(jsonl: &str, min_bytes: u64) -> Vec<RawResult> {
     let mut pending: HashMap<String, String> = HashMap::new();
     let mut out = Vec::new();
     for line in jsonl.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(row) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if row.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-            continue;
-        }
-        let message = row.get("message").cloned().unwrap_or(Value::Null);
-        match row.get("type").and_then(Value::as_str) {
-            Some("assistant") => {
-                let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-                    continue;
-                };
-                for block in blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
-                {
-                    let tool_name = block.get("name").and_then(Value::as_str).unwrap_or("");
-                    if !tool_name.eq_ignore_ascii_case("Bash") {
-                        continue;
-                    }
-                    if let (Some(id), Some(command)) = (
-                        block.get("id").and_then(Value::as_str),
-                        block
-                            .get("input")
-                            .and_then(|input| input.get("command"))
-                            .and_then(Value::as_str),
-                    ) {
-                        pending.insert(id.to_string(), command.to_string());
-                    }
-                }
-            }
-            Some("user") => {
-                let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-                    continue;
-                };
-                for block in blocks
-                    .iter()
-                    .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-                {
-                    let Some(tool_use_id) = block.get("tool_use_id").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let Some(command) = pending.remove(tool_use_id) else {
-                        continue;
-                    };
-                    let bytes = tool_result_text(block).len() as u64;
-                    if bytes < min_bytes {
-                        continue;
-                    }
-                    let program = command
-                        .split_whitespace()
-                        .next()
-                        .map(bare_program)
-                        .unwrap_or_default();
-                    out.push(RawResult {
-                        tool_use_id: tool_use_id.to_string(),
-                        program,
-                        command,
-                        bytes,
-                    });
-                }
-            }
-            _ => {}
-        }
+        apply_transcript_line(line, &mut pending, min_bytes, &mut out);
     }
     out
+}
+
+/// The same pairing as [`extract_bash_results`], but reading `reader` one
+/// line at a time (never loading the whole transcript into memory, unlike
+/// `std::fs::read_to_string`) and stopping once `byte_budget` worth of lines
+/// has been consumed -- an unledgered multi-GB `--all` corpus must never OOM
+/// or stall `discover` just to find its largest results. Returns the rows
+/// found, how many bytes were actually consumed, and whether the budget cut
+/// the file short (a corrupt/unreadable line stops the read the same way a
+/// budget does -- both leave `out` with whatever was already found).
+fn extract_bash_results_bounded<R: std::io::BufRead>(
+    reader: R,
+    min_bytes: u64,
+    byte_budget: u64,
+) -> (Vec<RawResult>, u64, bool) {
+    let mut pending: HashMap<String, String> = HashMap::new();
+    let mut out = Vec::new();
+    let mut consumed: u64 = 0;
+    let mut truncated = false;
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            truncated = true;
+            break;
+        };
+        // `BufRead::lines()` already stripped the newline this line ended
+        // with; count it back in so `consumed` tracks bytes actually read
+        // off disk, not bytes left after stripping.
+        let line_bytes = line.len() as u64 + 1;
+        if consumed.saturating_add(line_bytes) > byte_budget {
+            truncated = true;
+            break;
+        }
+        consumed += line_bytes;
+        apply_transcript_line(&line, &mut pending, min_bytes, &mut out);
+    }
+    (out, consumed, truncated)
+}
+
+/// The floor `run_with_budget` pre-filters transcript rows against before
+/// any of them are even paired with their command, let alone scope-
+/// classified. Must be the SMALLEST of every per-scope threshold `estimate_
+/// reason`/`hook::run_posttool` apply -- `compact_min_bytes` (Known),
+/// `compact_generic_min_bytes` (Generic/Shape), and `diff_max_bytes` (Diff)
+/// -- never just `compact_min_bytes` on its own: nothing in `CtxConfig`
+/// enforces that `compact_min_bytes` IS the smallest, and an operator config
+/// where it is not (e.g. `compact_min_bytes` raised past the default
+/// `diff_max_bytes`) would otherwise pre-filter out a `git diff` result the
+/// hook itself would still have compacted today, before `estimate_reason`
+/// ever got a chance to classify it correctly. `Verbatim` has no byte
+/// threshold at all (never compacted regardless of size) and is
+/// deliberately left out of this minimum: a verbatim row this filter drops
+/// was never going to be reported as anything but "estimated: verbatim
+/// reader" either way.
+fn scan_min_bytes(cfg: &CtxConfig) -> u64 {
+    [
+        cfg.output.compact_min_bytes as u64,
+        cfg.output.compact_generic_min_bytes as u64,
+        cfg.output.diff_max_bytes as u64,
+    ]
+    .into_iter()
+    .min()
+    .unwrap_or(0)
 }
 
 /// Why an ESTIMATED row (no ledger match) most likely reached the model
@@ -178,8 +263,16 @@ fn extract_bash_results(jsonl: &str, min_bytes: u64) -> Vec<RawResult> {
 /// happened historically, only an account of what would happen now. Mirrors
 /// `hook::run_posttool`'s own threshold-per-scope logic exactly, so a row
 /// this function calls "would compact today" is one `run_posttool` really
-/// would replace under the current config.
+/// would replace under the current config. `run_posttool` checks
+/// `cfg.output.compact` BEFORE it ever classifies a scope (a command that
+/// would otherwise be a verbatim reader, or otherwise clear every
+/// threshold, still records `Disabled` when the gate is off) -- this
+/// mirrors that exact order, so a disabled config never gets misreported as
+/// "hook not installed" here.
 fn estimate_reason(command: &str, bytes: u64, cfg: &CtxConfig) -> String {
+    if !cfg.output.compact {
+        return "compaction disabled (output.compact = false)".to_string();
+    }
     let scope = classify_compaction(command, &cfg.output.verbatim, cfg.output.compact_search);
     match scope {
         CompactionScope::Verbatim => "verbatim reader".to_string(),
@@ -285,6 +378,9 @@ fn hint_for_reason(reason: &str) -> Option<&'static str> {
             "today's config would compact these but nothing was ever recorded -- confirm the \
              PostToolUse hook is installed (`zirv setup status`).",
         ),
+        "estimated: compaction disabled (output.compact = false)" => {
+            Some("set output.compact = true to let large Bash results be compacted.")
+        }
         "measured: below_threshold" => Some(
             "raise `output.compact_min_bytes`/`compact_generic_min_bytes` if these are worth \
              compacting.",
@@ -388,12 +484,112 @@ fn render<W: Write>(rows: &[DiscoverRow], args: &DiscoverArgs, w: &mut W) -> Ctx
     Ok(0)
 }
 
+/// Total bytes [`run_with`] will read across every scanned transcript before
+/// it stops -- `--all` widens scope to every claude project on the machine,
+/// and a multi-GB corpus of uncompacted (by definition -- that is what this
+/// command looks for) transcripts read whole would OOM or stall it. 256 MiB
+/// comfortably covers a normal `--since` window while still bounding the
+/// worst case.
+const TRANSCRIPT_SCAN_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// How many candidate transcript files [`run_with`] will open at most,
+/// independent of [`TRANSCRIPT_SCAN_BYTE_BUDGET`] -- a `--all` scan of a
+/// machine with thousands of small, stale transcripts must not pay a
+/// filesystem `open` for every one of them just to find they are all empty.
+const MAX_TRANSCRIPT_CANDIDATES: usize = 500;
+
+/// What one bounded scan across candidate transcripts found -- [`render`]
+/// only ever sees `raw`; `files_scanned`/`bytes_scanned`/`truncated` exist
+/// purely so `run_with` can print one honest "stopped early" note when the
+/// scan did not cover every candidate.
+struct ScanOutcome {
+    raw: Vec<RawResult>,
+    files_scanned: usize,
+    bytes_scanned: u64,
+    truncated: bool,
+}
+
+/// Scans `candidates` (path, mtime-seconds pairs) newest-first, stopping
+/// once `max_files` have been opened or `byte_budget` bytes have been read --
+/// whichever comes first. Newest-first so a truncated scan on a machine with
+/// more history than the budget allows still favours the results an operator
+/// most likely cares about right now. `truncated` is set whenever any
+/// candidate was left unscanned, whatever the reason (file cap, byte budget,
+/// or a single file alone exceeding the remaining budget).
+fn scan_candidates(
+    mut candidates: Vec<(std::path::PathBuf, u64)>,
+    min_bytes: u64,
+    byte_budget: u64,
+    max_files: usize,
+) -> ScanOutcome {
+    candidates.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
+    let total = candidates.len();
+
+    let mut raw = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut bytes_scanned: u64 = 0;
+    let mut truncated = false;
+
+    for (path, _mtime) in &candidates {
+        if files_scanned >= max_files {
+            truncated = true;
+            break;
+        }
+        let remaining = byte_budget.saturating_sub(bytes_scanned);
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        files_scanned += 1;
+        let reader = std::io::BufReader::new(file);
+        let (rows, consumed, file_truncated) =
+            extract_bash_results_bounded(reader, min_bytes, remaining);
+        bytes_scanned += consumed;
+        raw.extend(rows);
+        if file_truncated {
+            truncated = true;
+            break;
+        }
+    }
+    if files_scanned < total {
+        truncated = true;
+    }
+
+    ScanOutcome {
+        raw,
+        files_scanned,
+        bytes_scanned,
+        truncated,
+    }
+}
+
 pub fn run<W: Write>(args: &DiscoverArgs, w: &mut W) -> CtxResult<i32> {
     let env = env_from_process();
     let state = StateDir::resolve(&env)?;
     let repo = std::env::current_dir()?;
     let cfg = CtxConfig::load(&repo, &env)?;
     run_with(&state, &cfg, args, &repo, w, state::now_secs())
+}
+
+/// [`scan_candidates`]'s stopping rule, bundled into one value so
+/// `run_with_budget` (already at its `clippy::too_many_arguments` limit
+/// without it) takes it as a single parameter -- a test injects a tiny one
+/// to observe the truncation note without needing a multi-GB fixture to
+/// exceed the real default.
+#[derive(Clone, Copy)]
+struct ScanBudget {
+    bytes: u64,
+    max_files: usize,
+}
+
+impl ScanBudget {
+    const DEFAULT: Self = Self {
+        bytes: TRANSCRIPT_SCAN_BYTE_BUDGET,
+        max_files: MAX_TRANSCRIPT_CANDIDATES,
+    };
 }
 
 pub fn run_with<W: Write>(
@@ -404,6 +600,22 @@ pub fn run_with<W: Write>(
     w: &mut W,
     now: u64,
 ) -> CtxResult<i32> {
+    run_with_budget(state, cfg, args, repo, w, now, ScanBudget::DEFAULT)
+}
+
+/// [`run_with`]'s full implementation, with the scan's stopping rule taken
+/// as a parameter rather than the module constants directly -- so a test
+/// can inject a tiny [`ScanBudget`] and observe the truncation note without
+/// needing a multi-GB fixture to exceed the real one.
+fn run_with_budget<W: Write>(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    args: &DiscoverArgs,
+    repo: &Path,
+    w: &mut W,
+    now: u64,
+    budget: ScanBudget,
+) -> CtxResult<i32> {
     let since_secs = super::spend::parse_since(&args.since).ok_or_else(|| {
         format!(
             "--since '{}': expected a duration like 30m, 24h, or 7d (or a bare number of \
@@ -412,26 +624,36 @@ pub fn run_with<W: Write>(
         )
     })?;
     let since_ts = now.saturating_sub(since_secs);
-    let min_bytes = cfg.output.compact_min_bytes as u64;
+    let min_bytes = scan_min_bytes(cfg);
 
-    let mut raw = Vec::new();
+    let mut candidates = Vec::new();
     for (path, _source) in search::claude_candidates(repo, args.all) {
         let modified_secs = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
-        if modified_secs.is_none_or(|secs| secs < since_ts) {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Some(modified_secs) = modified_secs else {
             continue;
         };
-        raw.extend(extract_bash_results(&text, min_bytes));
+        if modified_secs < since_ts {
+            continue;
+        }
+        candidates.push((path, modified_secs));
+    }
+
+    let outcome = scan_candidates(candidates, min_bytes, budget.bytes, budget.max_files);
+    if outcome.truncated {
+        writeln!(
+            w,
+            "note: stopped after {} files / {}; narrow --since",
+            outcome.files_scanned,
+            human_bytes(outcome.bytes_scanned)
+        )?;
     }
 
     let ledger_outcomes = ledger::outcomes_by_tool_use_id(state, since_ts);
-    let rows = classify_rows(raw, &ledger_outcomes, cfg);
+    let rows = classify_rows(outcome.raw, &ledger_outcomes, cfg);
     render(&rows, args, w)
 }
 
@@ -618,5 +840,249 @@ mod tests {
         assert_eq!(code, 0);
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("no large Bash results found"), "{text}");
+    }
+
+    /// `estimate_reason` must check `output.compact` before it ever
+    /// classifies a scope -- `hook::run_posttool` itself does (`if
+    /// !cfg.output.compact { record(Disabled); return; }` runs before
+    /// `classify_compaction` is even called), so a disabled config must
+    /// never be misreported as "hook not installed / no decision recorded"
+    /// here. Checked against a `cat` command (a verbatim reader, which
+    /// would otherwise win first under the old ordering) to prove the
+    /// disabled check really does run before scope classification, not
+    /// merely before the size thresholds within a scope.
+    #[test]
+    fn estimate_reason_honours_output_compact_before_classifying_scope() {
+        let mut cfg = CtxConfig::default();
+        cfg.output.compact = false;
+        let bytes = cfg.output.compact_generic_min_bytes as u64 + 1_000;
+
+        assert_eq!(
+            estimate_reason("cat big.log", bytes, &cfg),
+            "compaction disabled (output.compact = false)",
+            "a verbatim reader must not out-rank the disabled gate"
+        );
+        assert_eq!(
+            estimate_reason("cargo test", bytes, &cfg),
+            "compaction disabled (output.compact = false)"
+        );
+
+        let hint = hint_for_reason("estimated: compaction disabled (output.compact = false)")
+            .expect("a disabled-gate reason gets its own hint");
+        assert!(hint.contains("output.compact = true"), "{hint}");
+    }
+
+    /// `scan_min_bytes` (the pre-filter floor `run_with_budget` uses before
+    /// any row is even scope-classified) must be the SMALLEST of every
+    /// per-scope threshold, never `compact_min_bytes` alone -- nothing in
+    /// `CtxConfig` enforces that `compact_min_bytes` IS the smallest, and an
+    /// operator config where it is not (raised past the default
+    /// `diff_max_bytes`) must never drop a `git diff` result the hook would
+    /// still have compacted today. A 70,536-byte diff -- above the default
+    /// `diff_max_bytes` (65,536), below the raised `compact_min_bytes`
+    /// (100,000) -- must survive the pre-filter and classify as "the hook
+    /// would compact this today".
+    #[test]
+    fn scan_min_bytes_never_drops_a_result_a_wider_scope_would_still_compact() {
+        let mut cfg = CtxConfig::default();
+        cfg.output.compact_min_bytes = 100_000;
+        cfg.output.compact_generic_min_bytes = 100_000;
+        // `diff_max_bytes` stays at its default (65,536) -- it is now the
+        // one genuinely smallest threshold, so the pre-filter must key off
+        // it, not either of the two thresholds just raised past it.
+
+        assert_eq!(
+            scan_min_bytes(&cfg),
+            cfg.output.diff_max_bytes as u64,
+            "diff_max_bytes (65,536) is the smallest of the three here -- compact_min_bytes and \
+             compact_generic_min_bytes were both raised past it"
+        );
+
+        let diff_bytes = cfg.output.diff_max_bytes + 5_000;
+        let big = "x".repeat(diff_bytes);
+        let jsonl = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[\
+             {{\"type\":\"tool_use\",\"id\":\"tu\",\"name\":\"Bash\",\"input\":{{\"command\":\"git diff\"}}}}\
+             ]}}}}\n\
+             {{\"type\":\"user\",\"message\":{{\"content\":[\
+             {{\"type\":\"tool_result\",\"tool_use_id\":\"tu\",\"content\":\"{big}\"}}\
+             ]}}}}\n"
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("sess.jsonl");
+        std::fs::write(&path, &jsonl).expect("write");
+
+        let min_bytes = scan_min_bytes(&cfg);
+        let candidates = vec![(path, 1_000u64)];
+        let outcome = scan_candidates(
+            candidates,
+            min_bytes,
+            TRANSCRIPT_SCAN_BYTE_BUDGET,
+            MAX_TRANSCRIPT_CANDIDATES,
+        );
+        assert_eq!(
+            outcome.raw.len(),
+            1,
+            "a compact_min_bytes-only pre-filter would have dropped this diff result entirely"
+        );
+
+        let rows = classify_rows(outcome.raw, &HashMap::new(), &cfg);
+        assert_eq!(rows.len(), 1);
+        match &rows[0].classification {
+            RowProvenance::Estimated { reason } => assert_eq!(
+                reason, "hook not installed / no decision recorded",
+                "70,536 bytes is above diff_max_bytes (65,536): the hook would compact this today"
+            ),
+            RowProvenance::Measured { .. } => panic!("no ledger row exists for this tool_use_id"),
+        }
+    }
+
+    /// `scan_candidates` (the helper `run_with` uses to bound its transcript
+    /// scan) must stop once `byte_budget` is exhausted, favouring the
+    /// NEWEST candidate first -- an unledgered multi-GB `--all` corpus must
+    /// never be read whole into memory. Two candidates, budget sized to
+    /// cover only the newer one: the older is left unscanned and
+    /// `truncated` is set.
+    #[test]
+    fn scan_candidates_stops_at_the_byte_budget_favouring_the_newest_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let min_bytes = cfg.output.compact_min_bytes as u64;
+        let big = "x".repeat(cfg.output.compact_generic_min_bytes + 1_000);
+
+        // Two fixture transcripts, each with one large `cat` (verbatim, so
+        // it always classifies as ESTIMATED regardless of the ledger) Bash
+        // result -- `old.jsonl` carries a command naming it "old", `new.
+        // jsonl` a command naming it "new", so the test can tell which file
+        // a row actually came from.
+        let jsonl_for = |command: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[\
+                 {{\"type\":\"tool_use\",\"id\":\"tu\",\"name\":\"Bash\",\"input\":{{\"command\":\"{command}\"}}}}\
+                 ]}}}}\n\
+                 {{\"type\":\"user\",\"message\":{{\"content\":[\
+                 {{\"type\":\"tool_result\",\"tool_use_id\":\"tu\",\"content\":\"{big}\"}}\
+                 ]}}}}\n"
+            )
+        };
+        let old_text = jsonl_for("cat old.log");
+        let new_text = jsonl_for("cat new.log");
+
+        let old_path = tmp.path().join("old.jsonl");
+        let new_path = tmp.path().join("new.jsonl");
+        std::fs::write(&old_path, &old_text).expect("write old");
+        std::fs::write(&new_path, &new_text).expect("write new");
+
+        // Exactly enough budget for the newest file's own lines (each
+        // consumed line is counted back to its on-disk `len + 1` for the
+        // newline `BufRead::lines()` strips, so this covers it precisely)
+        // and not one byte more -- the next candidate must find `remaining`
+        // already at zero rather than squeezing in a partial read of its
+        // own.
+        let byte_budget = new_text.len() as u64;
+        let candidates = vec![
+            (old_path, 1_000u64), // older mtime
+            (new_path, 2_000u64), // newer mtime
+        ];
+
+        let outcome = scan_candidates(candidates, min_bytes, byte_budget, usize::MAX);
+
+        assert!(
+            outcome.truncated,
+            "the older file must be left unscanned by the budget"
+        );
+        assert_eq!(
+            outcome.files_scanned, 1,
+            "only the newest candidate fits the budget"
+        );
+        assert_eq!(outcome.raw.len(), 1, "got {:?}", outcome.raw.len());
+        assert!(
+            outcome.raw[0].command.contains("new.log"),
+            "the newest file must be the one scanned: {}",
+            outcome.raw[0].command
+        );
+    }
+
+    /// End to end through `run_with_budget`: a tiny injected byte budget
+    /// over two fixture transcripts prints exactly one `note: stopped
+    /// after ... ; narrow --since` line and only reports the newer file's
+    /// row.
+    #[test]
+    fn run_with_budget_prints_a_truncation_note_when_the_budget_is_exceeded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let big = "x".repeat(cfg.output.compact_generic_min_bytes + 1_000);
+
+        let home = tmp.path().join("claude-home");
+        let projects_root = home.join(".claude").join("projects");
+        let project_dir = projects_root.join(super::super::permissions::claude_project_dir_name(
+            tmp.path(),
+        ));
+        std::fs::create_dir_all(&project_dir).expect("mkdir project dir");
+
+        let jsonl_for = |command: &str| {
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[\
+                 {{\"type\":\"tool_use\",\"id\":\"tu\",\"name\":\"Bash\",\"input\":{{\"command\":\"{command}\"}}}}\
+                 ]}}}}\n\
+                 {{\"type\":\"user\",\"message\":{{\"content\":[\
+                 {{\"type\":\"tool_result\",\"tool_use_id\":\"tu\",\"content\":\"{big}\"}}\
+                 ]}}}}\n"
+            )
+        };
+        let older_text = jsonl_for("cat older.log");
+        let newer_text = jsonl_for("cat newer.log");
+        let older_path = project_dir.join("sess-older.jsonl");
+        let newer_path = project_dir.join("sess-newer.jsonl");
+        std::fs::write(&older_path, &older_text).expect("write older");
+        std::fs::write(&newer_path, &newer_text).expect("write newer");
+
+        let now = state::now_secs();
+        // Distinct mtimes, oldest first, both well inside the `--since`
+        // window `scan_candidates` filters against. Opened with `write`
+        // (not just `open`, which is read-only) since setting a file's
+        // modified time needs write-attribute access on Windows.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&older_path)
+            .expect("open older")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - 200))
+            .expect("set older mtime");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&newer_path)
+            .expect("open newer")
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(now - 100))
+            .expect("set newer mtime");
+
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let args = DiscoverArgs {
+            since: "7d".to_string(),
+            all: false,
+        };
+
+        // Exactly enough budget for the newer file's own lines and not one
+        // byte more -- see `scan_candidates_stops_at_the_byte_budget_
+        // favouring_the_newest_file` for why this must be exact, not
+        // merely "big enough", to force the older file to be left
+        // unscanned rather than partially read.
+        let budget = ScanBudget {
+            bytes: newer_text.len() as u64,
+            max_files: usize::MAX,
+        };
+        let mut out = Vec::new();
+        let code =
+            run_with_budget(&state, &cfg, &args, tmp.path(), &mut out, now, budget).expect("runs");
+        assert_eq!(code, 0);
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("note: stopped after 1 files") && text.contains("narrow --since"),
+            "got {text}"
+        );
+        assert!(
+            text.contains("(1 of 1 large results)"),
+            "only the newer file's row was scanned: {text}"
+        );
     }
 }
