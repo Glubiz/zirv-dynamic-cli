@@ -699,10 +699,14 @@ pub(crate) fn run_with_clock<W: Write>(
                     Duration::from_millis(cfg.wrap.inject_timeout_ms),
                     poll,
                     |compact_prompt| {
+                        let session_ref = SessionRef {
+                            id: session.clone(),
+                            cwd: repo.to_path_buf(),
+                        };
                         let (mut compact, stdin_prompt) = super::exec::headless_resume_launch(
                             adapter.as_ref(),
                             compact_prompt,
-                            &session,
+                            &session_ref,
                             &extra,
                             prompt_via_stdin,
                         )?;
@@ -716,10 +720,14 @@ pub(crate) fn run_with_clock<W: Write>(
                         "{prompt}\n\nContinue the same loop cycle after the verified in-place \
                          compaction without redoing completed work."
                     );
+                    let session_ref = SessionRef {
+                        id: session.clone(),
+                        cwd: repo.to_path_buf(),
+                    };
                     let (mut continued, stdin_prompt) = super::exec::headless_resume_launch(
                         adapter.as_ref(),
                         &continuation,
-                        &session,
+                        &session_ref,
                         &extra,
                         prompt_via_stdin,
                     )
