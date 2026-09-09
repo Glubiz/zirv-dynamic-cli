@@ -160,7 +160,7 @@ EOF
     expect="$2"
     shift 2
     set +e
-    "$script_path" "$@" >"$work/$name.out" 2>&1
+    bash "$script_path" "$@" >"$work/$name.out" 2>&1
     actual=$?
     set -e
     if [ "$actual" -eq "$expect" ]; then
