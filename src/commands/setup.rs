@@ -647,17 +647,14 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
     }
     let mut settings = load_json_object(&settings_path)?;
     let mut hooks_added = 0;
-    let mut written = Vec::new();
     for (event, matcher, command) in HARNESS_HOOKS {
         if ensure_harness_hook(&mut settings, event, matcher, command)? {
             hooks_added += 1;
-            written.push((event, matcher, command));
         }
     }
     for (event, matcher, command) in CLAUDE_ONLY_HOOKS {
         if ensure_harness_hook(&mut settings, event, matcher, command)? {
             hooks_added += 1;
-            written.push((event, matcher, command));
         }
     }
     let root = settings.as_object_mut().expect("validated object");
@@ -689,13 +686,26 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
             &(serde_json::to_string_pretty(&settings)? + "\n"),
             false,
         )?;
-        // Issue #420: best-effort -- a baseline write failure (e.g. the
-        // platform state directory cannot be determined) must never turn a
-        // successful hook install into a hard `setup apply` failure. A
-        // missing baseline just means `zirv ctx hook status` reports
-        // `NoBaseline` for these entries instead of `Ok`.
+    }
+    if !dry_run {
+        // Issue #420 (review follow-up): `written` only holds hooks *newly
+        // inserted this run* -- an operator with an already-installed file
+        // re-running `zirv setup apply` (the documented remedy for
+        // `NoBaseline`) gets `written == []` and never records a baseline
+        // at all, so drift detection stays inert for every pre-existing
+        // install forever. Every current-shape slot in `HARNESS_HOOKS`/
+        // `CLAUDE_ONLY_HOOKS` is guaranteed present in `settings` at this
+        // point -- `ensure_harness_hook` either found it already there or
+        // just inserted it -- so baseline every one of them, not only the
+        // ones this call happened to add. Best-effort, same as before: a
+        // baseline write failure (e.g. the platform state directory cannot
+        // be determined) must never turn a successful hook install into a
+        // hard `setup apply` failure; it just leaves these entries
+        // `NoBaseline` in `zirv ctx hook status`.
+        let mut current_shapes: Vec<ctx::hook_integrity::HookShape> = HARNESS_HOOKS.to_vec();
+        current_shapes.extend(CLAUDE_ONLY_HOOKS);
         if let Ok(state) = ctx::state::StateDir::resolve(&ctx::config::env_from_process()) {
-            let _ = ctx::hook_integrity::record_baseline(&state, &settings_path, &written);
+            let _ = ctx::hook_integrity::record_baseline(&state, &settings_path, &current_shapes);
         }
     }
     Ok((hooks_added, statusline_added))
@@ -708,11 +718,9 @@ fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupRe
     }
     let mut hooks = load_json_object(hooks_path)?;
     let mut hooks_added = 0;
-    let mut written = Vec::new();
     for (event, matcher, command) in HARNESS_HOOKS {
         if ensure_harness_hook(&mut hooks, event, matcher, command)? {
             hooks_added += 1;
-            written.push((event, matcher, command));
         }
     }
     if !dry_run && hooks_added > 0 {
@@ -731,10 +739,18 @@ fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupRe
             &(serde_json::to_string_pretty(&hooks)? + "\n"),
             false,
         )?;
-        // Issue #420: best-effort, same reasoning as `install_claude_
-        // integration`'s own identical call.
+    }
+    if !dry_run {
+        // Issue #420 (review follow-up): same reasoning as
+        // `install_claude_integration`'s own identical block -- baseline
+        // every current-shape slot present in `hooks` (guaranteed by the
+        // `ensure_harness_hook` loop above), not only ones newly inserted
+        // this run, so a re-`apply` over an already-installed `hooks.json`
+        // still records a baseline. Best-effort: a write failure here
+        // leaves these entries `NoBaseline` in `zirv ctx hook status`
+        // instead of failing `setup apply`.
         if let Ok(state) = ctx::state::StateDir::resolve(&ctx::config::env_from_process()) {
-            let _ = ctx::hook_integrity::record_baseline(&state, hooks_path, &written);
+            let _ = ctx::hook_integrity::record_baseline(&state, hooks_path, &HARNESS_HOOKS);
         }
     }
     Ok(hooks_added)
@@ -4101,6 +4117,83 @@ mod tests {
         let (hooks_added_again, _) =
             install_claude_integration(home.path(), false).expect("re-apply");
         assert_eq!(hooks_added_again, 0, "a second apply must add nothing more");
+    }
+
+    /// Review follow-up to issue #420: an operator with an already-installed
+    /// `settings.json` re-running `zirv setup apply` -- the documented
+    /// remedy for `NoBaseline` -- must still come out of it with a baseline
+    /// recorded for every current-shape hook slot, not just the ones a
+    /// fresh install happens to add. Before the fix, `hooks_added == 0` on
+    /// the second apply meant `record_baseline` was never even called, so
+    /// `zirv ctx hook status` stayed `NoBaseline` forever.
+    #[test]
+    fn install_claude_integration_records_a_baseline_on_a_reapply_with_no_changes() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let _claude_home = VarGuard::set(&[("CLAUDE_CONFIG_DIR", None)]);
+        let state_dir = home.path().join("state");
+        let _state_env = VarGuard::set(&[(
+            ctx::state::STATE_ENV,
+            Some(state_dir.to_str().expect("utf8 state dir")),
+        )]);
+
+        let (hooks_added, _) = install_claude_integration(home.path(), false).expect("first apply");
+        assert!(hooks_added > 0);
+
+        // The re-apply is the interesting case: nothing left to add.
+        let (hooks_added_again, _) =
+            install_claude_integration(home.path(), false).expect("second apply");
+        assert_eq!(hooks_added_again, 0);
+
+        let state = ctx::state::StateDir::resolve(&ctx::config::env_from_process())
+            .expect("state dir resolves");
+        let rows = ctx::hook_integrity::report(&state, home.path()).expect("report");
+        let claude_rows: Vec<_> = rows.iter().filter(|row| row.provider == "claude").collect();
+        assert_eq!(
+            claude_rows.len(),
+            HARNESS_HOOKS.len() + CLAUDE_ONLY_HOOKS.len()
+        );
+        for row in &claude_rows {
+            assert_eq!(
+                row.state,
+                ctx::hook_integrity::HookState::Ok,
+                "every claude slot must have a baseline after either apply: {row:?}"
+            );
+        }
+    }
+
+    /// Codex counterpart of
+    /// `install_claude_integration_records_a_baseline_on_a_reapply_with_no_changes`.
+    #[test]
+    fn install_codex_integration_records_a_baseline_on_a_reapply_with_no_changes() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let _codex_home = VarGuard::set(&[("CODEX_HOME", None)]);
+        let state_dir = home.path().join("state");
+        let _state_env = VarGuard::set(&[(
+            ctx::state::STATE_ENV,
+            Some(state_dir.to_str().expect("utf8 state dir")),
+        )]);
+
+        let hooks_added = install_codex_integration(home.path(), false).expect("first apply");
+        assert!(hooks_added > 0);
+
+        let hooks_added_again =
+            install_codex_integration(home.path(), false).expect("second apply");
+        assert_eq!(hooks_added_again, 0);
+
+        let state = ctx::state::StateDir::resolve(&ctx::config::env_from_process())
+            .expect("state dir resolves");
+        let rows = ctx::hook_integrity::report(&state, home.path()).expect("report");
+        let codex_rows: Vec<_> = rows.iter().filter(|row| row.provider == "codex").collect();
+        assert_eq!(codex_rows.len(), HARNESS_HOOKS.len());
+        for row in &codex_rows {
+            assert_eq!(
+                row.state,
+                ctx::hook_integrity::HookState::Ok,
+                "every codex slot must have a baseline after either apply: {row:?}"
+            );
+        }
     }
 
     #[test]
