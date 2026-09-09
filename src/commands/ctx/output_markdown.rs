@@ -24,10 +24,11 @@ static DETAILS_BLOCK_RE: LazyLock<Regex> =
 static SUMMARY_LINE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)<summary[^>]*>.*?</summary>").expect("regex"));
 
-/// Whether `command` is a `gh`/`glab` `pr`/`issue`/`release` `view`
+/// Whether `command` is a `gh`/`glab` `pr`/`issue`/`release`/`mr` `view`
 /// invocation WITHOUT `--json` -- the exact shape this module's stripping
-/// applies to. A `--json` invocation's output is JSON, not a template body,
-/// and already has its own summarizer.
+/// applies to. `mr` is glab's merge-request subcommand (gh has no `mr`, so
+/// accepting it there is harmless). A `--json` invocation's output is JSON,
+/// not a template body, and already has its own summarizer.
 pub(crate) fn is_gh_template_view(command: &str) -> bool {
     for segment in super::safety::normalize_segments(command) {
         let collapsed = super::safety::collapse_whitespace(&segment);
@@ -41,8 +42,10 @@ pub(crate) fn is_gh_template_view(command: &str) -> bool {
         }
         let sub = tokens.get(1).map(|t| t.to_ascii_lowercase());
         let verb = tokens.get(2).map(|t| t.to_ascii_lowercase());
-        let is_view = matches!(sub.as_deref(), Some("pr") | Some("issue") | Some("release"))
-            && verb.as_deref() == Some("view");
+        let is_view = matches!(
+            sub.as_deref(),
+            Some("pr") | Some("issue") | Some("release") | Some("mr")
+        ) && verb.as_deref() == Some("view");
         let has_json = tokens.iter().any(|t| {
             t.eq_ignore_ascii_case("--json") || t.to_ascii_lowercase().starts_with("--json=")
         });
@@ -324,6 +327,7 @@ mod tests {
             "gh release view v1.0.0",
             "glab pr view 123",
             "glab issue view 7",
+            "glab mr view 42",
         ] {
             assert!(is_gh_template_view(command), "{command}");
         }

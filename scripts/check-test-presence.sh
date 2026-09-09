@@ -93,10 +93,18 @@ run_presence_gate() {
     fi
 
     # Present at HEAD (added/modified files always exist at HEAD under
-    # --diff-filter=AM).
-    if ! git show "HEAD:${file}" 2>/dev/null | grep -Fq '#[cfg(test)]'; then
+    # --diff-filter=AM). Read into a temp file rather than piping straight
+    # into `grep -Fq`: under `set -o pipefail`, `grep -q` can exit as soon
+    # as it sees the first match and close the read end, and `git show`
+    # writing a large file into an already-closed pipe dies with SIGPIPE
+    # (exit 141), which fails the whole pipeline and misreports a tested
+    # file (one with an early `#[cfg(test)]` marker) as untested.
+    head_tmp="$(mktemp)"
+    git show "HEAD:${file}" >"$head_tmp" 2>/dev/null || true
+    if ! grep -Fq '#[cfg(test)]' "$head_tmp"; then
       missing="${missing}${file}\n"
     fi
+    rm -f "$head_tmp"
 
     IFS='
 '
@@ -242,6 +250,44 @@ pub const SCHEMA: &str = "{}";
 EOF
   commit_all "$dir" "add schema data without tests"
   check_scenario "schemas-exempt" "$dir" 0
+
+  # 6. A large file (>64 KiB after the `#[cfg(test)]` marker) that DOES
+  # carry an inline test block -> must PASS. Regression test: `git show
+  # HEAD:<file> | grep -Fq '#[cfg(test)]'` under `set -o pipefail` can
+  # SIGPIPE `git show` once `grep -q` closes the pipe on its first match,
+  # which used to fail the pipeline and misreport this file as untested.
+  dir="$(make_repo large-file-early-marker)"
+  mkdir -p "$dir/src/commands/widget"
+  cat >"$dir/src/commands/widget/mod.rs" <<'EOF'
+pub fn noop() {}
+EOF
+  commit_all "$dir" "base"
+  {
+    cat <<'EOF'
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds() {
+        assert_eq!(add(1, 2), 3);
+    }
+}
+EOF
+    # Pad well past 64 KiB after the marker so an early-closing reader can
+    # trigger SIGPIPE in the writer. (No pipe here -- this script itself
+    # runs under `set -o pipefail`, and `yes | head` would trip the very
+    # bug this scenario exists to catch.)
+    for _ in $(seq 1 5000); do
+      printf '%s\n' "// pad line to bulk out the file well past 64 KiB"
+    done
+  } >"$dir/src/commands/widget/logic.rs"
+  commit_all "$dir" "add large logic.rs with an early test block"
+  check_scenario "large-file-early-marker" "$dir" 0
 
   if [ "$fails" -gt 0 ]; then
     echo "check-test-presence.sh --self-test: $fails scenario(s) failed" >&2

@@ -140,7 +140,7 @@ run_scan() {
   while IFS= read -r file; do
     [ -z "$file" ] && continue
 
-    matched_pattern="$(printf '%s' "$critical_list" | file_matches_any "$file" || true)"
+    matched_pattern="$(printf '%s\n' "$critical_list" | file_matches_any "$file" || true)"
     if [ -n "$matched_pattern" ]; then
       critical_hits="${critical_hits}- \`$file\` (matches critical-file entry \`$matched_pattern\`)\n"
     fi
@@ -359,7 +359,22 @@ EOF
   commit_all "$dir" "tweak wrap.rs"
   check_scenario "critical-file-touch" "$dir" "critical-file entry" ""
 
-  # 5. A clean diff -> no output at all.
+  # 5. Touching a file matching the LAST critical-file pattern -> flagged.
+  # Regression test: `critical_files_from_security_md` output goes through
+  # `$(...)`, which strips the trailing newline, and `file_matches_any`'s
+  # `while read` loop silently drops a final line with no trailing newline
+  # -- so the LAST pattern in SECURITY.md's list (here,
+  # `src/commands/ctx/adapters/*`) used to never match anything.
+  dir="$(make_repo critical-file-last-pattern)"
+  base_security_md >"$dir/SECURITY.md"
+  mkdir -p "$dir/src/commands/ctx/adapters"
+  echo 'pub fn build_argv() {}' >"$dir/src/commands/ctx/adapters/claude.rs"
+  commit_all "$dir" "base"
+  echo 'pub fn build_argv() { /* tweak */ }' >"$dir/src/commands/ctx/adapters/claude.rs"
+  commit_all "$dir" "tweak claude.rs adapter"
+  check_scenario "critical-file-last-pattern" "$dir" "critical-file entry" ""
+
+  # 6. A clean diff -> no output at all.
   dir="$(make_repo clean-diff)"
   base_security_md >"$dir/SECURITY.md"
   mkdir -p "$dir/src/commands"
