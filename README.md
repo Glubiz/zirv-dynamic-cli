@@ -12,6 +12,11 @@
   - [AI setup and harness migration](#ai-setup-and-harness-migration)
   - [The dashboard: multiple sessions in one terminal](#the-dashboard-multiple-sessions-in-one-terminal)
 - [Features](#features)
+  - [Script runner](#script-runner)
+  - [Harness supervision (`zirv ctx`)](#harness-supervision-zirv-ctx)
+  - [Development workflow commands](#development-workflow-commands)
+  - [Verification](#verification)
+  - [Housekeeping](#housekeeping)
 - [Installation](#installation)
 - [Upgrading](#upgrading)
 - [Usage](#usage)
@@ -391,14 +396,215 @@ disabling the harnesses themselves (claude, codex) — a separate file from
 
 ## Features
 
-- **YAML-Driven Scripts**: Define commands in `.zirv/` files with metadata (name, description, params, secrets).  
-- **Capture Output**: Use `capture: var_name` on any step to grab its stdout into `${var_name}` for later substitution.  
-- **Failure Hooks**: On a step failure you can declare a `fallback` sub-chain of commands to run as a side action; the original command is never retried.  
-- **Flexible Options**: Interactive mode, OS filters, `proceed_on_failure`, delays, and secret support.  
-- **Multi-Format**: Supports YAML, JSON, and TOML, extendable.  
-- **Cross-Platform**: Compatible with Windows, macOS, and Linux.
-- **Helpful Errors**: A mistyped script or shortcut name gets up to 3 "did you mean" suggestions instead of a bare failure.
-- **Model-Agnostic Workflows**: Compact skills, durable phase state, risk-based lifecycle selection, targeted verification, independent review packages, artifacts, and local telemetry work across supported agent adapters.
+Every capability below is derived from the command surface this binary
+actually ships (`zirv commands --json`), grouped by area; each bullet links
+to the section or vault page that documents it in depth.
+
+### Script runner
+
+- **Script formats and layout** — YAML, JSON, or TOML scripts live in
+  `.zirv/commands/` (or the global `~/.zirv/commands/`) with name/description
+  metadata, extendable to new formats. See [Directory
+  Structure](#directory-structure) and [Schema Examples](#schema-examples).
+- **Parameters** — required, positional `${var}` parameters, plus trailing
+  optional ones (`greeting?`) that resolve to an empty string when omitted.
+  See [Passing Parameters](#passing-parameters) and [Optional
+  Parameters](#optional-parameters).
+- **Capture output** — `capture: var_name` on any step grabs its stdout into
+  `${var_name}` for later substitution. See [Capture Output](#capture-output).
+- **Failure hooks** — a `fallback` sub-chain runs once on step failure (the
+  original command is never retried); `proceed_on_failure` separately
+  controls whether the script continues. See [Failure
+  Hooks](#failure-hooks).
+- **Flexible per-step options** — `interactive` mode, `operating_system`
+  filters, `proceed_on_failure`, `delay_ms`, and `secrets`. See [Schema
+  Examples](#schema-examples).
+- **Dry run** — `--dry-run` prints every `${...}`-substituted step instead of
+  running it. See [Dry Run](#dry-run).
+- **Chaining scripts** — one script calls another as an ordinary command
+  (`command: zirv build`). See [Chaining Scripts](#chaining-scripts).
+- **Concurrent shells** — nested command lists open one terminal window per
+  group, with a built-in `cd` that updates the working directory within a
+  window. See [Concurrent Shells](#concurrent-shells).
+- **Agent steps** — an `agent`/`prompt` step runs a supervised AI-agent task
+  in place of a shell command, under the same pacing and rot detection
+  `zirv ctx exec` gives a hand-written invocation. See [Agent
+  Steps](#agent-steps).
+- **Shortcuts** — short aliases for local or global scripts. See
+  [Shortcuts](#shortcuts).
+- **Reserved command names** — built-in verbs can never be shadowed by a
+  script or shortcut; a collision is flagged rather than silently swallowed.
+  See [Reserved Command Names](#reserved-command-names).
+- **Helpful errors** — a mistyped script or shortcut name gets up to 3 "did
+  you mean" suggestions by edit distance instead of a bare failure. See
+  [Running Scripts](#running-scripts).
+- **Cross-platform** — Windows, macOS, and Linux. See
+  [Installation](#installation).
+
+### Harness supervision (`zirv ctx`)
+
+- **Harness adapters** — one adapter per supported harness: `claude`,
+  `codex`, `gemini`, `opencode`, `pi`, `copilot`, `droid`, and `qwen`, each
+  enabled or disabled per repo in `.zirv/.settings.toml`. See
+  [.settings.toml](#settingstoml) and the vault's
+  [Ctx Adapters](docs/obsidian/Modules/Ctx%20Adapters.md).
+- **Dashboard** — several supervised sessions in one terminal, with panes
+  for delegated workers, worktree groups, and kill/nudge/send from the
+  keyboard. See [The dashboard: multiple sessions in one
+  terminal](#the-dashboard-multiple-sessions-in-one-terminal).
+- **Nested sessions are refused** — a supervisor started inside another
+  supervised session stops instead of sharing its outer session's registry
+  and turn signals. See [Nested sessions are
+  refused](#nested-sessions-are-refused).
+- **Rot detection** — a pure scoring engine turns transcript events into
+  advise/compact/restart verdicts before context rot ruins a session. See
+  [Signals and verdicts](#signals-and-verdicts).
+- **Usage pacing and cross-harness fallback** — bounded pauses against the
+  usage window, elastic scheduling across seats, and a handover to the other
+  harness when one is exhausted. See [Usage pacing](#usage-pacing) and
+  [Cross-harness fallback and
+  handover](#cross-harness-fallback-and-handover).
+- **Untrusted repository configuration** — repo-owned `.zirv/` surfaces may
+  only narrow what zirv does; widening keys are operator-only. See [Trust
+  boundary](#trust-boundary).
+- **Supervised exit codes** — headless runs map every supervision outcome to
+  a documented exit code. See [Exit codes for supervised
+  runs](#exit-codes-for-supervised-runs).
+- **Banner, status bar and events** — a one-line banner and status bar in
+  interactive sessions, with events surfaced as they happen. See [Banner,
+  status bar and events](#banner-status-bar-and-events).
+- **Session types** — `ctx` supervises `wrap` (an interactive TUI through a
+  PTY), `exec` (one supervised headless run), and `loop` (a fresh headless
+  session per cycle); `chat` starts an interactive orchestrator session
+  (also the top-level `zirv chat` alias, and bare `zirv`), and `agent`
+  delegates one task to a supervised worker on another enabled harness
+  (also `zirv agent`). See [Verbs](#verbs) and [Just Run
+  `zirv`](#just-run-zirv).
+- **Handoffs and recovery** — `score` rot-scores a transcript, `handoff`
+  distills one, `resume` starts a clean session with the latest handoff
+  injected, and `handover` swaps the orchestrator seat's model or harness in
+  place mid-session. See [Verbs](#verbs) and [Cross-harness fallback and
+  handover](#cross-harness-fallback-and-handover).
+- **Status and attention** — `status`, `explain-status`, and `wait` report
+  or block on a session's composed attention projection; `snapshot` prints a
+  redacted, capped diagnostic summary. See [Verbs](#verbs) and [Signals and
+  verdicts](#signals-and-verdicts).
+- **Mail and nudges** — `send`/`inbox` leave and read short notes between
+  live sessions on this machine, and `nudge` wakes one early with a message;
+  `kill` terminates a registered session outright. See [Sending mail between
+  sessions](#sending-mail-between-sessions) and [Session registry and
+  nudging](#session-registry-and-nudging).
+- **Memory bank** — `remember`/`recall`/`forget` read and write this repo's
+  cross-session memory bank from inside a session; the standalone
+  `zirv memory` (`memory`) surface (`init`, `status`, `list`, `recall`, `remember`,
+  `forget`, `verify`, plus `promote`/`rollback`/`optimize`) manages it
+  without starting one. See [`zirv memory`](#zirv-memory) and [Memory
+  bank](#memory-bank).
+- **Delegation controls** — `group`, `objective`, `spend`, `savings`,
+  `worktree`, `task`, and `swarm` bound, account for, and reclaim delegated
+  work; `permissions` (`audit`/`compile`/`propose`) and `safety`
+  (`check`/`list`/`explain`) audit and enforce zirv's harness-neutral
+  command-safety policy; `close` ends a group or objective early. See
+  [Permission auditing and safe-list
+  proposals](#permission-auditing-and-safe-list-proposals-issue-178),
+  [Command safety policy](#command-safety-policy-issue-83), and the vault's
+  [Ctx Subsystem](docs/obsidian/Modules/Ctx%20Subsystem.md#the-verb-tree).
+- **Recall, measurement, and output** — `search` ranks past
+  transcripts/handoffs/artifacts/mail against a query; `measure` and
+  `discover` report proportionality and uncompacted-tool-result metrics;
+  `run`/`output` execute a command directly and store its full output while
+  printing a compact, reversible summary; `compile` prints or measures the
+  composed session prompt. See the vault's [Ctx
+  Subsystem](docs/obsidian/Modules/Ctx%20Subsystem.md#the-verb-tree).
+- **Configuration and instruction hygiene** — `config` shows or edits the
+  operator's `~/.zirv/ctx.toml`; `context` (`sync`/`lint`/`status`) manages
+  the canonical instruction-file layer; `optimize` reports redundancy,
+  contradictions, and dead references across every configuration surface;
+  `usage` reports usage-window state or tees the statusline. See [Reviewing
+  your instruction files](#reviewing-your-instruction-files) and
+  [Environment variables worth
+  knowing](#environment-variables-worth-knowing).
+- **Hooks** — `hook` wires zirv into Claude Code's and Codex's own lifecycle
+  events (stop, prompt, pre-compact, pretool/posttool, notify,
+  session-start, plus a read-only status/audit pair). See [Hook
+  registration (Claude Code)](#hook-registration-claude-code) and the
+  vault's [Ctx
+  Subsystem](docs/obsidian/Modules/Ctx%20Subsystem.md#hook-integrity-issue-420).
+
+### Development workflow commands
+
+- **Skills** — `skill` inspects model-agnostic engineering skills (`list`,
+  `show <id>`) layered from built-in, operator-global, and repository
+  sources. See [Development Workflows](#development-workflows).
+- **Workflow lifecycle** — `workflow` runs the durable `intent → spec → plan
+  → implement → test → review → verify → deploy` lifecycle: `list` built-in
+  definitions, `show` one, `classify` a task without starting, `start` and
+  persist one, `status` an instance, `resume` a persisted one, `reclassify`
+  its methodology overlay, and `context` prints the current step's resolved
+  skill context. See [The full verb set](#the-full-verb-set) and [Lifecycle
+  and artifacts](#lifecycle-and-artifacts).
+- **Gating and progress** — `approve` a gated step, `advance` records a step
+  result and transitions the state machine, and `close` ends a workflow
+  that will not reach `Completed`. See [Deploy tiers](#deploy-tiers) and
+  [Workflow adoption](#workflow-adoption).
+- **Artifacts and agent seats** — `artifacts` inspects committed
+  work-product artifacts and their acceptance state, and `agents`
+  (`list`/`show`/`dispatch`) inspects provider-neutral workflow seats and
+  trust provenance. See [Agent registry](#agent-registry).
+- **Review** — `review` (`package`/`run`/`add`/`dispose`/`list`/
+  `ingest-pr-comments`) builds compact review packages and persists finding
+  dispositions.
+- **Maintenance and telemetry** — `maintain` (`scan`) runs deterministic
+  operator-configured maintenance detectors, and `stats` aggregates
+  privacy-conscious local workflow telemetry. See [Maintain
+  loop](#maintain-loop).
+- **Frontend quality** — `frontend` derives a design profile and drives
+  autonomous frontend work end to end (`profile`, `capabilities`, `check`,
+  `render`, `review`, `benchmark`). See [Frontend quality](#frontend-quality).
+
+### Verification
+
+- **Repository-aware checks** — `test` maps changed paths to checks
+  (`changed`), runs every eligible check (`all`), or records an
+  operator-owned baseline of already-failing tests (`baseline`) so a
+  pre-existing failure never blocks a workflow gate. See [The full verb
+  set](#the-full-verb-set) and the vault's
+  [Workflows](docs/obsidian/Modules/Workflows.md#verification).
+- **Final verification** — `verify` runs the full check suite plus zirv's
+  own built-in self-check registry, reusing fresh `test` evidence when
+  nothing has changed since. See [The full verb set](#the-full-verb-set).
+- **Repository check configuration** — optional, schema-versioned
+  `.zirv/verify.toml` declares check id/kind/command/path patterns/phase
+  eligibility/timeout; without it, Cargo commands and `npm run` scripts are
+  discovered from the manifests present. See [Frontend
+  quality](#frontend-quality) and the vault's
+  [Workflows](docs/obsidian/Modules/Workflows.md#verification).
+
+### Housekeeping
+
+- **Guided setup** — `setup` migrates an existing Claude Code/Codex repo to
+  Zirv (`apply`, `status`, `profile`), and `reset`/`restore` factory-reset or
+  restore AI-specific settings separately from the rest of Zirv (`setup
+  reset`, `setup restore`). See [AI setup and harness
+  migration](#ai-setup-and-harness-migration).
+- **Self-update** — `update` (`--version <x.y.z>`) installs the latest or a
+  specified zirv release. See [Upgrading](#upgrading).
+- **Bug and feature reports** — `report` (`bug`/`feature`) files a Zirv
+  issue on GitHub, optionally attaching a redacted `snapshot`.
+- **Workflow artifacts** — `artifact` registers and inspects workflow
+  artifacts (`list`, `present`, `render`, `show`) with static-first
+  fallback selection. See [Frontend quality](#frontend-quality).
+- **Bundled orientation** — `skill` (`--json`) prints the bundled operator
+  orientation skill for this binary (also `zirv --skill`).
+- **Command inventory** — `commands` (`--json`) lists every command this
+  binary accepts, generated straight from its own clap model.
+- **Project bootstrap** — `init` creates a `.zirv/` directory here, and
+  `create` interactively (or flag-driven) writes a new script into
+  `.zirv/commands/`. See [Initialize a Project](#initialize-a-project) and
+  [Creating a New Script](#creating-a-new-script).
+- **Help and version** — `help` lists every available script and shortcut,
+  local and global, and `version` prints the installed version. See
+  [Usage](#usage).
 
 ---
 
