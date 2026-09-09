@@ -5332,27 +5332,98 @@ fn split_top_level_alternatives(pattern: &str) -> Vec<&str> {
     parts
 }
 
-/// Whether `alternative` starts with `^`, after skipping past zero or more
-/// leading `(?flags)` inline modifier groups (letters/`-` only between `(?`
-/// and `)`, e.g. `(?i)`, `(?is)`, `(?-i)`) -- those do not weaken an anchor,
-/// so `(?i)^a` counts as anchored the same as plain `^a`.
+/// Whether `alternative` starts with `^` or `\A`, after skipping past zero or
+/// more leading `(?flags)` inline modifier groups (letters/`-` only between
+/// `(?` and `)`, e.g. `(?i)`, `(?is)`, `(?-i)`) -- those do not weaken an
+/// anchor, so `(?i)^a` counts as anchored the same as plain `^a`. `\A` (the
+/// regex crate's "absolute start of haystack" anchor) is accepted alongside
+/// `^` since it anchors even under the `m` flag, where `^` would not.
 fn starts_with_anchor(alternative: &str) -> bool {
     let mut rest = alternative;
     while let Some(after) = strip_one_inline_flag_group(rest) {
         rest = after;
     }
-    rest.starts_with('^')
+    rest.starts_with('^') || rest.starts_with("\\A")
 }
 
+/// Review finding: a leading inline flag group is only harmless to strip
+/// past when it does not itself enable the multiline flag `m` -- `(?m)^a` is
+/// NOT fully anchored, because under `m`, `^` matches at the start of every
+/// line, not just the start of the whole haystack (and `hook::run_posttool`
+/// composes a command line that can itself contain embedded newlines, e.g. a
+/// heredoc Bash command). So this only strips a flag group whose `m` is
+/// either absent or explicitly disabled (`(?-m)`); a group that enables `m`
+/// (`(?m)`, `(?im)`, `(?i-m)` does NOT count as enabling it since `-m` wins)
+/// is left in place, which makes `starts_with_anchor` correctly see a `(`,
+/// not a `^`, and reject the pattern as unanchored.
 fn strip_one_inline_flag_group(s: &str) -> Option<&str> {
     let body = s.strip_prefix("(?")?;
     let end = body.find(')')?;
     let flags = &body[..end];
-    if !flags.is_empty() && flags.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
+    if !flags.is_empty()
+        && flags.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+        && !flag_group_enables_multiline(flags)
+    {
         Some(&body[end + 1..])
     } else {
         None
     }
+}
+
+/// Whether an inline flag group's flag list (the text between `(?` and `)`,
+/// e.g. `"im"`, `"i-m"`, `"-m"`) enables the multiline flag `m` -- i.e. `m`
+/// appears before any `-`, or there is no `-` at all and `m` appears. Once a
+/// `-` is seen, every flag after it is being DISABLED, so `(?-m)` and
+/// `(?i-m)` do not enable `m` even though the letter appears in the string.
+fn flag_group_enables_multiline(flags: &str) -> bool {
+    let disable_at = flags.find('-');
+    let enabled_part = match disable_at {
+        Some(idx) => &flags[..idx],
+        None => flags,
+    };
+    enabled_part.contains('m')
+}
+
+/// Review finding: `is_fully_anchored`'s per-alternative check above is
+/// defeated if ANY inline flag group in the whole pattern enables `m`,
+/// wherever it appears -- not just a leading one `strip_one_inline_flag_
+/// group` walks past. A group later in the pattern (`^a|(?m)^b`) still makes
+/// every subsequent `^` in the SAME regex match at any line start once the
+/// regex crate applies it, so `validate_output_filter_rules` scans the whole
+/// `match_command` string for one, rather than relying solely on the leading-
+/// group walk. Matches `(?flags)` and `(?flags:...)` (a scoped group), since
+/// both syntaxes enable flags for what follows.
+fn contains_multiline_enabling_flag_group(pattern: &str) -> bool {
+    let mut idx = 0usize;
+    while let Some(rel) = pattern[idx..].find("(?") {
+        let start = idx + rel + 2;
+        let after = &pattern[start..];
+        // The flags body is the run of ASCII letters/`-` right after `(?`;
+        // it is a real inline flag group only when that run is immediately
+        // followed by `)` (`(?flags)`) or `:` (`(?flags:...)`, a scoped
+        // group) -- anything else (`(?:...)`, `(?=...)`, `(?<name>...)`,
+        // ...) is a different construct entirely and must not be misread as
+        // one.
+        let flag_len = after
+            .bytes()
+            .take_while(|&b| b.is_ascii_alphabetic() || b == b'-')
+            .count();
+        let flags = &after[..flag_len];
+        let terminator = after.as_bytes().get(flag_len).copied();
+        if !flags.is_empty()
+            && matches!(terminator, Some(b')') | Some(b':'))
+            && flag_group_enables_multiline(flags)
+        {
+            return true;
+        }
+        // Advance past this `(?` occurrence (by at least one byte) so a
+        // non-match can't loop forever re-finding the same spot.
+        idx = start + flag_len.max(1);
+        if idx > pattern.len() {
+            break;
+        }
+    }
+    false
 }
 
 /// Load-time validation for `[[output.filter]]` (issue #417): every regex
@@ -5377,6 +5448,21 @@ fn validate_output_filter_rules(rules: &[OutputFilterRule]) -> CtxResult<()> {
             return Err(format!(
                 "output.filter \"{}\": match_command {:?} is not a valid regex: {e}",
                 rule.name, rule.match_command
+            )
+            .into());
+        }
+        // Review finding: checked before the generic anchor check below so
+        // an operator sees the specific, actionable reason -- a leading
+        // `^` under the `m` flag anchors at any LINE start, not the start
+        // of the whole command line, and `hook::run_posttool`'s composed
+        // command line can itself contain embedded newlines (a heredoc Bash
+        // command), so an `m`-enabled match_command can match a line deep
+        // inside an unrelated command.
+        if contains_multiline_enabling_flag_group(&rule.match_command) {
+            return Err(format!(
+                "output.filter \"{}\": match_command must not enable the multiline flag (m): \
+                 ^ must anchor the whole command line",
+                rule.name
             )
             .into());
         }
@@ -5478,6 +5564,38 @@ fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> CtxResult<()>
         return Err(format!(
             "{key}: base_url must be an http(s) URL, got \"{}\"",
             target.base_url
+        )
+        .into());
+    }
+
+    // Review finding: `CodexAdapter::base` renders `base_url` into a codex
+    // `-c model_providers.<vendor>.base_url=<toml_quoted_string(base_url)>`
+    // argv token. `toml_quoted_string` prefers a TOML literal string
+    // (`'...'`) but falls back to an escaped basic string (`"..."`) the
+    // moment `base_url` itself contains a `'` -- and that fallback's OWN
+    // raw `"` delimiters, plus any of `&`, `(`, `)`, `%`, `!`, `^` etc. that
+    // survive either quoting form unescaped, are exactly the characters
+    // `adapters::guard_cmd_shim_reparse` fails a Windows npm-shim launch
+    // closed on. Refusing them here, at load time, catches a hostile or
+    // merely careless `base_url` before it ever reaches that argv --
+    // reusing `CMD_REPARSE_METACHARS` rather than a second, possibly
+    // drifting copy of the same character list. Whitespace and `'` are
+    // refused too, even though neither is in that list on its own: a space
+    // would silently split into a second argv token, and `'` is what
+    // forces the unsafe quoting fallback in the first place. Applied to
+    // `endpoint.claude` as well for consistency, even though its base_url
+    // currently only ever reaches its child via an environment variable
+    // (`ClaudeAdapter::base`'s `ANTHROPIC_BASE_URL`), not argv -- one rule
+    // for both tables, so they can never quietly drift apart.
+    if let Some(bad) = target.base_url.chars().find(|c| {
+        c.is_whitespace()
+            || *c == '\''
+            || *c == '"'
+            || super::adapters::CMD_REPARSE_METACHARS.contains(c)
+    }) {
+        return Err(format!(
+            "{key}: base_url must not contain {bad:?} (it is passed to codex as a -c argv \
+             token)"
         )
         .into());
     }
@@ -9886,6 +10004,103 @@ mod tests {
         assert!(!is_fully_anchored("(^a|b)"));
         assert!(!is_fully_anchored("gradle"));
         assert!(!is_fully_anchored("^a|b"));
+    }
+
+    /// Review finding: a `(?flags)` inline modifier group that enables the
+    /// multiline flag `m` defeats the whole point of requiring `^` to
+    /// anchor `match_command` -- under `m`, `^` matches at the start of
+    /// every LINE, not just the start of the whole command line, and
+    /// `hook::run_posttool`'s composed command line can itself contain
+    /// embedded newlines (a heredoc Bash command). Refused by name,
+    /// wherever the group appears (`^a|(?m)^b` is refused even though its
+    /// FIRST alternative is anchored); `(?i)^gradle`, `(?-m)^gradle` (`m`
+    /// explicitly disabled) and `\Agradle` (an absolute-start anchor immune
+    /// to `m` in the first place) are all still accepted.
+    #[test]
+    fn multiline_flag_group_defeats_the_anchor_check_and_is_refused() {
+        for bad in ["(?m)^gradle", "(?im)^gradle", "^a|(?m)^b"] {
+            let rule = OutputFilterRule {
+                name: "bad-rule".to_string(),
+                match_command: bad.to_string(),
+                strip_lines: Vec::new(),
+                keep_lines: Vec::new(),
+                truncate_line_at: None,
+                max_lines: None,
+                match_output: None,
+            };
+            let err = validate_output_filter_rules(&[rule])
+                .expect_err(&format!("{bad:?} must be refused"));
+            assert!(
+                err.to_string().contains("bad-rule"),
+                "the error must name the rule for {bad:?}: {err}"
+            );
+            assert!(
+                err.to_string().contains("multiline"),
+                "the error must explain why for {bad:?}: {err}"
+            );
+        }
+
+        for good in ["(?i)^gradle", "(?-m)^gradle", "\\Agradle"] {
+            let rule = OutputFilterRule {
+                name: "ok-rule".to_string(),
+                match_command: good.to_string(),
+                strip_lines: Vec::new(),
+                keep_lines: Vec::new(),
+                truncate_line_at: None,
+                max_lines: None,
+                match_output: None,
+            };
+            assert!(
+                validate_output_filter_rules(&[rule]).is_ok(),
+                "{good:?} must be accepted"
+            );
+        }
+    }
+
+    /// Review finding: an `[endpoint.*]` `base_url` that carries a cmd.exe
+    /// reparse metacharacter, whitespace, or a `'` (which forces `toml_
+    /// quoted_string`'s escaped-basic-string fallback, itself introducing a
+    /// raw `"`) must be refused at load time -- see `validate_endpoint_
+    /// target`'s own doc comment for the full threat. A plain URL with none
+    /// of those characters still passes.
+    #[test]
+    fn endpoint_base_url_rejects_argv_unsafe_characters() {
+        let bad_cases: &[&str] = &[
+            "[endpoint.codex]\nvendor = \"deepseek\"\nbase_url = \"https://api.example.com/v1?a=b&c=d\"\ncredential_env = \"X\"\n",
+            "[endpoint.codex]\nvendor = \"deepseek\"\nbase_url = \"https://x.y/it's\"\ncredential_env = \"X\"\n",
+        ];
+        for home_toml in bad_cases {
+            let home = tempfile::tempdir().expect("home");
+            std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+            std::fs::write(home.path().join(".zirv/ctx.toml"), home_toml).expect("write");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+            let repo = tempfile::tempdir().expect("repo");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("must be rejected: {home_toml}"));
+            assert!(
+                err.to_string().contains("endpoint.codex"),
+                "the error must name the table: {err}"
+            );
+            assert!(
+                err.to_string().contains("base_url must not contain"),
+                "the error must name the character: {err}"
+            );
+        }
+
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[endpoint.codex]\nvendor = \"deepseek\"\nbase_url = \"https://api.deepseek.com\"\ncredential_env = \"DEEPSEEK_API_KEY\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        let repo = tempfile::tempdir().expect("repo");
+        let empty: HashMap<String, String> = HashMap::new();
+        CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("a plain https URL with no unsafe characters must be accepted");
     }
 
     /// Issue #326 review finding 7: a `max_summary_bytes` below

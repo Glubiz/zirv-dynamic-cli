@@ -2042,11 +2042,16 @@ impl AgentAdapter for ClaudeAdapter {
     /// a shell redirect otherwise recreates a Write tool, and the value must
     /// be one `=`-bound argv token, since the two-token form was verified to
     /// swallow the next argv entry.
+    /// Review finding (#395 follow-up): the `--model` here now goes through
+    /// `model_args`, exactly like every other `--model` emission on this
+    /// adapter -- without that, an `[endpoint.claude]` override pinned the
+    /// interactive/headless launches to the endpoint vendor's own ladder but
+    /// left this one sending claude's native cheap alias (`"haiku"`)
+    /// straight to that endpoint, where it is not a valid model at all.
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
         cmd.arg("-p")
-            .arg("--model")
-            .arg(model)
+            .args(self.model_args(model))
             .arg("--output-format")
             .arg("text")
             .args(self.read_only_args());
@@ -2553,11 +2558,19 @@ impl AgentAdapter for ClaudeAdapter {
     /// it is replaced by that vendor's own default, so a claude alias like
     /// `opus` can never reach a GLM/DeepSeek/etc. endpoint.
     fn model_args(&self, model: &str) -> Vec<String> {
-        let model = match &self.endpoint {
+        vec!["--model".to_string(), self.pin_model_for_endpoint(model)]
+    }
+
+    /// Review finding (#395 follow-up): the shared pinning `model_args`
+    /// above and `distiller_cmd` now both route every `--model` through,
+    /// and `review_roster_line` routes its advisory text through too, so
+    /// the roster's displayed review model can never name a model the
+    /// actual launch would replace.
+    fn pin_model_for_endpoint(&self, model: &str) -> String {
+        match &self.endpoint {
             Some(ep) => ep.pin_model(Some(model)),
             None => model.to_string(),
-        };
-        vec!["--model".to_string(), model]
+        }
     }
 
     /// `--resume <SESSION_ID>` is already a fact this codebase relies on
@@ -5171,6 +5184,40 @@ mod tests {
         // A zhipu alias/id already on the ladder is honoured verbatim.
         let honoured = adapter.model_args("glm-4.6");
         assert_eq!(honoured[1], "glm-4.6");
+    }
+
+    /// Review finding (#395 follow-up): `distiller_cmd` used to hardcode
+    /// `--model haiku` regardless of any attached endpoint override, so a
+    /// zhipu/deepseek endpoint got claude's native cheap alias -- not a
+    /// valid model on that vendor's account -- for the one judgment/
+    /// distillation child every rot-scoring pass spawns. It must now carry
+    /// a vendor rung, exactly like `model_args_pins_to_the_endpoint_
+    /// vendors_own_ladder` already verifies for the interactive/headless
+    /// launches.
+    #[test]
+    fn distiller_cmd_pins_the_model_through_an_endpoint_override() {
+        let target = crate::commands::ctx::config::EndpointTarget {
+            vendor: "zhipu".to_string(),
+            base_url: "https://api.z.ai/api/anthropic".to_string(),
+            credential_env: "ZIRV_TEST_UNUSED_395".to_string(),
+            model: None,
+            wire_api: None,
+        };
+        let adapter = ClaudeAdapter::new(None).with_endpoint(target);
+        let vendor = catalogue::vendor("zhipu").expect("zhipu is a built-in vendor");
+
+        let cmd = adapter.distiller_cmd("haiku");
+        let args = built_args(&adapter, &cmd);
+        let model_at = args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("distiller_cmd must still emit --model");
+        assert_eq!(
+            args[model_at + 1],
+            vendor.rungs[0].id,
+            "the distiller must never send claude's native cheap alias to a zhipu endpoint: \
+             got {args:?}"
+        );
     }
 
     /// C: claude keeps a real default so `resolve_distiller_model` never has

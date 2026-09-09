@@ -1406,11 +1406,23 @@ impl AgentAdapter for CodexAdapter {
     /// codex's un-upgraded residual is "still reads the file *and* still
     /// honors config it did not ask for") -- `sandbox_residual_note` names
     /// this for the operator via a one-time `zirv ▸` announcement.
+    /// Review finding (#395 follow-up): routed through `model_args` (which
+    /// pins via `EndpointTarget::pin_model` when `self.endpoint` is set),
+    /// exactly like every other `--model` emission on this adapter --
+    /// without that, an `[endpoint.codex]` override pinned the interactive/
+    /// headless/resume launches to the endpoint vendor's own ladder but left
+    /// this one sending codex's native cheap alias straight to that
+    /// endpoint, where it is not a valid model at all. Still omits the flag
+    /// entirely when there is no endpoint AND no model was requested --
+    /// `resolve_distiller_model`'s documented "let the agent's own
+    /// configuration pick" case -- but under an endpoint override there is
+    /// no native config to fall back to, so `model_args` always emits a
+    /// pinned model (the endpoint's own default, at minimum) in that case.
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
         cmd.arg("exec");
-        if !model.is_empty() {
-            cmd.arg("--model").arg(model);
+        if self.endpoint.is_some() || !model.is_empty() {
+            cmd.args(self.model_args(model));
         }
         cmd.args(self.read_only_args());
         cmd
@@ -2200,11 +2212,19 @@ impl AgentAdapter for CodexAdapter {
     /// through `EndpointTarget::pin_model` first -- see `ClaudeAdapter::
     /// model_args`'s identical addition for the full rationale.
     fn model_args(&self, model: &str) -> Vec<String> {
-        let model = match &self.endpoint {
+        vec!["--model".to_string(), self.pin_model_for_endpoint(model)]
+    }
+
+    /// Review finding (#395 follow-up): the shared pinning `model_args`
+    /// above and `distiller_cmd` now both route every `--model` through,
+    /// and `review_roster_line` routes its advisory text through too, so
+    /// the roster's displayed review model can never name a model the
+    /// actual launch would replace.
+    fn pin_model_for_endpoint(&self, model: &str) -> String {
+        match &self.endpoint {
             Some(ep) => ep.pin_model(Some(model)),
             None => model.to_string(),
-        };
-        vec!["--model".to_string(), model]
+        }
     }
 
     fn register_turn_signal(&self, _session: &SessionRef, _socket: &Path) -> TurnSignalSetup {
@@ -2758,6 +2778,46 @@ mod tests {
         // A deepseek alias/id already on the ladder is honoured verbatim.
         let honoured = adapter.model_args("deepseek-v4-flash");
         assert_eq!(honoured[1], "deepseek-v4-flash");
+    }
+
+    /// Review finding (#395 follow-up): `distiller_cmd` used to emit
+    /// `--model <native cheap alias>` (or omit the flag) with no regard for
+    /// any attached endpoint override, so a deepseek endpoint got codex's
+    /// native cheap alias -- not a valid model on that vendor's account --
+    /// for the one judgment/distillation child every rot-scoring pass
+    /// spawns. It must now carry a vendor rung, exactly like `model_args_
+    /// pins_to_the_endpoint_vendors_own_ladder` already verifies for the
+    /// interactive/headless/resume launches, even when the caller passed no
+    /// model at all (there is no native config to fall back to once an
+    /// endpoint is configured).
+    #[test]
+    fn distiller_cmd_pins_the_model_through_an_endpoint_override() {
+        let target = crate::commands::ctx::config::EndpointTarget {
+            vendor: "deepseek".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            credential_env: "ZIRV_TEST_UNUSED_395".to_string(),
+            model: None,
+            wire_api: None,
+        };
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex")).with_endpoint(target);
+
+        for requested in ["gpt-5.6-sol", ""] {
+            let cmd = adapter.distiller_cmd(requested);
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            let model_at = args
+                .iter()
+                .position(|a| a == "--model")
+                .unwrap_or_else(|| panic!("must still emit --model for {requested:?}: {args:?}"));
+            assert_eq!(
+                args[model_at + 1],
+                "deepseek-v4-pro",
+                "must never send codex's native ladder to a deepseek endpoint for \
+                 {requested:?}: got {args:?}"
+            );
+        }
     }
 
     /// Issue #303: `codex exec resume [SESSION_ID] [PROMPT]`, verified via

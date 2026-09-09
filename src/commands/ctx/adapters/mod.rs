@@ -1826,6 +1826,21 @@ pub trait AgentAdapter: std::fmt::Debug {
         Vec::new()
     }
 
+    /// Review finding (#395 follow-up): pins `model` through this adapter
+    /// INSTANCE's own attached `[endpoint.*]` override, exactly like
+    /// `ClaudeAdapter::model_args`/`CodexAdapter::model_args` already pin the
+    /// `--model` launch flag via `EndpointTarget::pin_model`. Default no-op
+    /// (`model` unchanged) for every adapter that cannot carry an endpoint;
+    /// only claude/codex override it. The one seam `review_roster_line`
+    /// routes the roster's advisory review-model text through, so that text
+    /// never names a native-ladder model for a harness the operator has
+    /// retargeted at a vendor endpoint -- the actual review launch already
+    /// gets this via `model_args`, so this keeps the advisory text honest
+    /// about what that launch will actually resolve to.
+    fn pin_model_for_endpoint(&self, model: &str) -> String {
+        model.to_string()
+    }
+
     /// Argv tokens that resume `session_id`'s own conversation, for the
     /// dashboard's quit/restore roster (`dash::roster::restore_argv`, called
     /// through `dyn AgentAdapter` -- unlike `model_args` above, both
@@ -2002,8 +2017,15 @@ pub(crate) fn built_args(program: &str, cmd: &std::process::Command) -> Vec<Stri
 /// (BatBadBut / CVE-2024-24576's quote-toggle). Newline and carriage return
 /// terminate the command line outright. Any of these in a shim-form argument
 /// is therefore a command-injection primitive, not a literal argument value.
-#[cfg(windows)]
-const CMD_REPARSE_METACHARS: &[char] =
+///
+/// Review finding (#395): `pub(crate)` and not `#[cfg(windows)]`-gated (the
+/// guard's own use of it below still is) -- `config::validate_endpoint_target`
+/// also scans an `[endpoint.*]` `base_url` against this exact list at load
+/// time, on every platform a config can be validated on, so a base_url that
+/// would be refused by [`guard_cmd_shim_reparse`] on a Windows launch is
+/// rejected up front rather than reaching codex's `-c` argv as a token this
+/// guard then has to fail closed on.
+pub(crate) const CMD_REPARSE_METACHARS: &[char] =
     &['&', '|', '<', '>', '^', '(', ')', '%', '!', '"', '\n', '\r'];
 
 /// Whether `program` + `args` is the `cmd.exe /c <shim>` launcher form that
@@ -3401,13 +3423,22 @@ fn review_roster_line(cfg: &CtxConfig, roster_names: &[&str]) -> Option<String> 
         .iter()
         .filter(|(name, _)| cfg.agents.is_enabled(name) && roster_names.contains(name))
         .map(|(name, ctor)| {
-            let adapter = if agent_bin_names_a_different_adapter(bin, name).is_some() {
+            let mut adapter = if agent_bin_names_a_different_adapter(bin, name).is_some() {
                 ctor(None)
             } else {
                 ctor(bin)
             };
+            // Review finding (#395 follow-up): attach the same endpoint
+            // override `apply_endpoint_override` gives every adapter that is
+            // actually spawned -- without it, this line advised a native-
+            // ladder model for a harness the operator retargeted at a
+            // vendor endpoint, even though the real review launch
+            // (`reviewer_argv`, via this adapter's own `model_args`) pins to
+            // that endpoint's ladder.
+            apply_endpoint_override(&mut adapter, cfg);
             let choice = resolve_review_model(cfg, name, adapter.as_ref());
-            let equals_seat = seat.is_some_and(|s| s.eq_ignore_ascii_case(&choice.model));
+            let model = adapter.pin_model_for_endpoint(&choice.model);
+            let equals_seat = seat.is_some_and(|s| s.eq_ignore_ascii_case(&model));
             if equals_seat {
                 any_equals_seat = true;
             }
@@ -3418,7 +3449,7 @@ fn review_roster_line(cfg: &CtxConfig, roster_names: &[&str]) -> Option<String> 
             } else {
                 "default: one tier below the seat".to_string()
             };
-            format!("{name} -> \"{}\" ({note})", choice.model)
+            format!("{name} -> \"{}\" ({note})", model)
         })
         .collect();
     if entries.is_empty() {
@@ -4585,6 +4616,47 @@ mod tests {
             !review_line.contains("never on an orchestrator seat's own model"),
             "that clause would be false for the operator's own configured entry: {review_line}"
         );
+    }
+
+    /// Review finding: without `apply_endpoint_override` attached to the
+    /// adapter this function itself constructs, an endpoint-overridden
+    /// harness's roster line advised claude's native ladder text even
+    /// though the actual review launch (`workflow::review::reviewer_argv`,
+    /// via this same adapter's own `model_args`) pins to the endpoint
+    /// vendor's own ladder -- the two could name different models. Under
+    /// `[endpoint.claude] vendor = "zhipu"` with no seat and no `review.
+    /// claude` override, the roster line must name zhipu's own strongest
+    /// rung (`"glm-5.3"`), never an Anthropic model.
+    #[test]
+    fn review_roster_line_names_the_endpoint_vendors_own_rung() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
+        let cfg = CtxConfig {
+            endpoint: crate::commands::ctx::config::EndpointConfig {
+                claude: Some(crate::commands::ctx::config::EndpointTarget {
+                    vendor: "zhipu".to_string(),
+                    base_url: "https://api.z.ai/api/anthropic".to_string(),
+                    credential_env: "ZIRV_TEST_UNUSED_395".to_string(),
+                    model: None,
+                    wire_api: None,
+                }),
+                codex: None,
+            },
+            ..permissive_cfg()
+        };
+        let lines = harness_prompt_lines(&cfg, "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("claude -> \"glm-5.3\""),
+            "the roster line must name the endpoint vendor's own rung, not the native ladder: \
+             got {review_line}"
+        );
+        for native in ["opus", "sonnet", "haiku", "fable", "mythos"] {
+            assert!(
+                !review_line.contains(&format!("claude -> \"{native}\"")),
+                "must never advise claude's native ladder for an endpoint-overridden harness: \
+                 got {review_line}"
+            );
+        }
     }
 
     /// The seat threads all the way from `cfg.chat.model` through to the
