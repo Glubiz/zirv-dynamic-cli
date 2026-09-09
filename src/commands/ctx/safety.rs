@@ -9234,6 +9234,19 @@ mod tests {
             ),
             "the shape issue #321 added this carve-out for must still qualify"
         );
+        // Issue #421: `|&` composes into one pipe token exactly like a bare
+        // `|`, so this segments identically to the `&&` form above and must
+        // reach the same verdict, not the pre-#421 three-segment split with
+        // a spurious empty middle segment that always returned false.
+        assert!(
+            is_mixed_confined_write_and_read_only_escape_safe(
+                &policy,
+                "mkdir -p /tmp/claude/x |& gh issue view 1 --json body",
+                Verdict::Allow,
+                &roots
+            ),
+            "|& must qualify the same way && and | already do"
+        );
     }
 
     /// `zirv ctx permissions compile` WRITES new `[safety] allow` entries
