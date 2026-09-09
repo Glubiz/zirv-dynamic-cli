@@ -16,6 +16,10 @@
 //! --name-only <base>`, no `HEAD` on the right side), matching how this
 //! check is actually invoked: `zirv verify --builtin` runs pre-commit, so
 //! uncommitted changes are the honest picture of what the PR will contain.
+//! The changed-path set also includes untracked `src/` files (`git ls-files
+//! --others --exclude-standard`, since a brand-new unstaged file is invisible
+//! to `git diff` entirely) and uses `--no-renames` (since a file renamed OUT
+//! of a shipped-code path otherwise shows only under its destination).
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -53,17 +57,36 @@ fn touches_shipped_code(changed_paths: &str) -> bool {
 /// `<base> HEAD`): `zirv verify --builtin` runs pre-commit, so uncommitted
 /// changes are part of what will actually land in the PR, and leaving them
 /// out would let a shipped-code edit slip past this check unbumped simply
-/// because it hadn't been committed yet.
+/// because it hadn't been committed yet. `--no-renames`: without it, a file
+/// renamed OUT of a shipped-code path (e.g. `src/main.rs` -> `docs/moved.rs`)
+/// is printed only under its destination, so the source path -- the one
+/// that actually matters to `touches_shipped_code` -- never shows up at all;
+/// `--no-renames` makes git report the pair as a plain deletion + addition
+/// instead. Also folds in `git ls-files --others --exclude-standard`: a
+/// brand-new file that was never `git add`ed is invisible to `git diff`
+/// entirely (there is nothing yet to diff it against), so an unstaged new
+/// `src/` file would otherwise slip past this check unbumped.
 fn changed_paths_since(repo: &Path, base: &str) -> Result<String, String> {
+    let mut diff = run_git_lines(repo, &["diff", "--name-only", "--no-renames", base])
+        .map_err(|err| format!("cannot run git diff --name-only {base}: {err}"))?;
+    let untracked = run_git_lines(repo, &["ls-files", "--others", "--exclude-standard"])
+        .map_err(|err| format!("cannot run git ls-files --others --exclude-standard: {err}"))?;
+    diff.push_str(&untracked);
+    Ok(diff)
+}
+
+/// Runs `git -C <repo> <args>`, returning stdout as text on success.
+fn run_git_lines(repo: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
-        .args(["diff", "--name-only", base])
+        .args(args)
         .output()
-        .map_err(|err| format!("cannot run git diff --name-only {base}: {err}"))?;
+        .map_err(|err| format!("{err}"))?;
     if !output.status.success() {
         return Err(format!(
-            "git diff --name-only {base} failed: {}",
+            "git {} failed: {}",
+            args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -448,11 +471,14 @@ mod tests {
         assert_eq!(result.outcome, BuiltinOutcome::Fail, "{result:?}");
     }
 
-    /// A LOWER version always fails, even when nothing shipped-code
-    /// changed -- the "no bump needed" exemption never rescues a version
-    /// that actively regressed below base.
+    /// A LOWER version always fails. This diff isn't actually docs-only --
+    /// changing the version at all necessarily edits `Cargo.toml`, which is
+    /// itself one of the shipped-code paths, so `touches_shipped_code` is
+    /// already true here regardless of the README change alongside it. The
+    /// point of this test is just that a regressed version is never
+    /// rescued by the "no bump needed" exemption, full stop.
     #[test]
-    fn a_docs_only_change_with_a_lower_version_still_fails() {
+    fn a_lower_version_always_fails() {
         if !git_available() {
             eprintln!("git not available; skipping");
             return;
@@ -474,6 +500,67 @@ mod tests {
             repo,
             &["commit", "-q", "-m", "regressed version, docs only"],
         );
+
+        let result = run(repo);
+        assert_eq!(result.outcome, BuiltinOutcome::Fail, "{result:?}");
+    }
+
+    /// A brand-new, still-`git add`-less file under `src/` ships different
+    /// code just as much as a tracked edit does -- `git diff --name-only`
+    /// alone never shows it (it isn't a diff against anything yet), so
+    /// `changed_paths_since` must also fold in `git ls-files --others
+    /// --exclude-standard` or an unstaged new src file could slip past
+    /// unbumped.
+    #[test]
+    fn an_untracked_new_src_file_without_a_bump_still_fails() {
+        if !git_available() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let repo = tempdir().unwrap();
+        let repo = repo.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@example.com"]);
+        git(repo, &["config", "user.name", "t"]);
+        write_cargo_toml(repo, "1.0.0");
+        git(repo, &["add", "Cargo.toml"]);
+        git(repo, &["commit", "-q", "-m", "base"]);
+
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/new.rs"), "fn new() {}\n").unwrap();
+        // Deliberately never `git add`ed: still untracked when `run` sees it.
+
+        let result = run(repo);
+        assert_eq!(result.outcome, BuiltinOutcome::Fail, "{result:?}");
+    }
+
+    /// `git diff --name-only` alone prints only the DESTINATION of a
+    /// detected rename, so a file renamed OUT of `src/` (into a
+    /// non-shipped-code path) would otherwise look like nothing under
+    /// `src/` ever changed. `--no-renames` forces the source path to show
+    /// up as its own deletion line instead.
+    #[test]
+    fn a_file_renamed_out_of_src_without_a_bump_still_fails() {
+        if !git_available() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let repo = tempdir().unwrap();
+        let repo = repo.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@example.com"]);
+        git(repo, &["config", "user.name", "t"]);
+        write_cargo_toml(repo, "1.0.0");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        git(repo, &["add", "Cargo.toml", "src/main.rs"]);
+        git(repo, &["commit", "-q", "-m", "base"]);
+
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        git(repo, &["mv", "src/main.rs", "docs/moved.rs"]);
+        git(repo, &["commit", "-q", "-m", "rename out of src"]);
 
         let result = run(repo);
         assert_eq!(result.outcome, BuiltinOutcome::Fail, "{result:?}");

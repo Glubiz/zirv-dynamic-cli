@@ -206,22 +206,33 @@ jobs:
       - name: Require a version above the base branch when shipped code changed
         run: |
           BASE="origin/${{ github.base_ref }}"
-          CHANGED=$(git diff --name-only "$BASE...HEAD")
-          if ! echo "$CHANGED" | grep -qE '^src/|^Cargo\.toml$|^Cargo\.lock$|^build\.rs$'; then
-            echo "::notice::no shipped-code paths changed since ${{ github.base_ref }} (src/, Cargo.toml, Cargo.lock, build.rs) -- version bump not required"
-            exit 0
-          fi
           extract() { grep '^version' "$1" | head -1 | sed -E 's/version *= *"([^"]+)".*/\1/'; }
           git show "$BASE:Cargo.toml" > /tmp/base-Cargo.toml
           BASE_VERSION=$(extract /tmp/base-Cargo.toml)
           HEAD=$(extract Cargo.toml)
           echo "base branch version: $BASE_VERSION — PR version: $HEAD"
-          if [ "$BASE_VERSION" = "$HEAD" ]; then
-            echo "::error file=Cargo.toml::Version ($HEAD) is unchanged from ${{ github.base_ref }} but shipped code changed. Bump it -- a version bump is what makes CD actually publish the change."
-            exit 1
-          fi
+
+          # A LOWER version always fails, unconditionally, before the path
+          # filter below even runs -- origin/<base_ref> is the branch's
+          # current tip, not the merge-base, so main can have bumped past
+          # what this PR branched from with no local Cargo.toml edit at all;
+          # skipping this check on a docs-only diff would let that
+          # regressed, inherited version slip through unnoticed.
           if [ "$(printf '%s\n%s\n' "$BASE_VERSION" "$HEAD" | sort -V | tail -1)" != "$HEAD" ]; then
             echo "::error file=Cargo.toml::Version ($HEAD) is lower than ${{ github.base_ref }}'s ($BASE_VERSION)."
+            exit 1
+          fi
+
+          # --no-renames: a file renamed OUT of src/ (or Cargo.toml/.lock/
+          # build.rs) would otherwise show only under its destination path,
+          # hiding the shipped-code change from this filter.
+          CHANGED=$(git diff --name-only --no-renames "$BASE...HEAD")
+          if ! echo "$CHANGED" | grep -qE '^src/|^Cargo\.toml$|^Cargo\.lock$|^build\.rs$'; then
+            echo "::notice::no shipped-code paths changed since ${{ github.base_ref }} (src/, Cargo.toml, Cargo.lock, build.rs) -- version bump not required"
+            exit 0
+          fi
+          if [ "$BASE_VERSION" = "$HEAD" ]; then
+            echo "::error file=Cargo.toml::Version ($HEAD) is unchanged from ${{ github.base_ref }} but shipped code changed. Bump it -- a version bump is what makes CD actually publish the change."
             exit 1
           fi
 
