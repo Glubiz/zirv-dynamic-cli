@@ -49,15 +49,26 @@ LINUX_CHECKSUM=$(sha256sum "$LINUX_PATH" | awk '{print $1}')
 echo "macOS checksum: $MACOS_CHECKSUM"
 echo "Linux checksum: $LINUX_CHECKSUM"
 
-if [ -z "${HOMEBREW_TOKEN:-}" ]; then
-  echo "Error: HOMEBREW_TOKEN is not set!"
+if [ -z "${HOMEBREW_TAP_DEPLOY_KEY:-}" ]; then
+  echo "Error: HOMEBREW_TAP_DEPLOY_KEY is not set!"
   exit 1
 fi
+
+# The tap's main branch is locked by a ruleset that only its deploy key can
+# bypass, so the push must go over SSH with that key. The host key is pinned
+# to GitHub's published ed25519 key rather than trusted on first use.
+SSH_DIR=$(mktemp -d)
+chmod 700 "$SSH_DIR"
+printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > "$SSH_DIR/deploy_key"
+chmod 600 "$SSH_DIR/deploy_key"
+echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$SSH_DIR/known_hosts"
+export GIT_SSH_COMMAND="ssh -i $SSH_DIR/deploy_key -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=yes"
+trap 'rm -rf "$SSH_DIR"' EXIT
 
 TAP_DIR=$(mktemp -d)
 
 echo "Cloning homebrew-tap into $TAP_DIR"
-git clone "https://${HOMEBREW_TOKEN}@github.com/Glubiz/homebrew-tap.git" "$TAP_DIR"
+git clone "git@github.com:Glubiz/homebrew-tap.git" "$TAP_DIR"
 FORMULA="$TAP_DIR/Formula/zirv.rb"
 
 if [ ! -f "$FORMULA" ]; then
