@@ -1963,9 +1963,17 @@ fn process_age_secs(_pid: u32) -> Option<u64> {
 /// [`report_kill_outcome`]). And a `Verb::Dash` pane is asked of the
 /// dashboard that owns it first ([`kill_via_dashboard`]), because that
 /// dashboard is the pane process's real parent AND the holder of its writer
-/// permit -- freeing the permit is a consequence of the OWNER reaping its own
-/// child (`dash::reap_ended_panes`), which no outside signal can bring about.
-/// For every other verb, and whenever no owning dashboard answers, freeing
+/// permit -- freeing the permit is a consequence of the OWNER's own reap
+/// noticing the exit (`dash::reap_ended_panes`, fed by `Pane::poll_exit`'s
+/// `try_wait`), which happens on the OWNER's own next tick, not synchronously
+/// as part of whatever call actually ended the process. An outside signal
+/// (this function's own direct-pid fallback included) DOES still get reaped
+/// that way, eventually -- `try_wait` reports any exit, however it was
+/// caused -- it just cannot make the reap happen as part of the signal
+/// itself, which is exactly the gap that used to leave the registry record
+/// gone (this function deregisters synchronously) while the permit briefly
+/// outlived it (freed only on the owner's next tick). For every other verb,
+/// and whenever no owning dashboard answers, freeing
 /// whatever machine-wide heavy-operation permit the session's pid held
 /// (`permit::live_records`) remains a direct consequence of the pid actually
 /// dying, not a separate step here.
@@ -2071,12 +2079,29 @@ pub fn run_kill_with<W: Write>(args: &KillArgs, w: &mut W, env: EnvLookup<'_>) -
 /// shared one -- the dashboard now refuses every `kill` that arrives on its
 /// shared channel outright (`KILL_SHARED_CHANNEL_REFUSAL`), since that
 /// directory is a fixed sibling of every pane's own intake directory and
-/// proves no identity at all. `DASH_REQUESTS_ENV` is set only when this
-/// process is itself a pane's child, naming its own channel; a bare operator
-/// terminal (no dashboard pane owns it) has none, so there is no channel
-/// this request could ever be honoured on, and this returns `None` before
-/// writing anything -- the caller's fallback signals the pid directly, which
-/// an ordinary, unsandboxed terminal can do without this dashboard's help.
+/// identifies no requester at all (issue #179: even a pane's own channel
+/// only identifies the honest requester, it does not authenticate the
+/// writer). `DASH_REQUESTS_ENV` is set only when this process is itself a
+/// pane's child, naming its own channel; a bare operator terminal (no
+/// dashboard pane owns it) has none, so there is no channel this request
+/// could ever be honoured on, and this returns `None` before writing
+/// anything -- the caller's fallback signals the pid directly, which an
+/// ordinary, unsandboxed terminal can do without this dashboard's help.
+///
+/// SECURITY (review round 2, issue #435 item 1): `DASH_REQUESTS_ENV` is
+/// remembered data this process never re-validates on its own -- a
+/// dashboard that quit since it was inherited leaves the value naming a
+/// token dir that may no longer exist. Writing there anyway would resurrect
+/// it (`write_request` -> `write_atomic_private` -> `create_private_dir_
+/// all`) with no `owner.pid` inside, a leak `dash::sweep_stale_token_dirs`
+/// can never remove (it only ever revisits a dir whose `owner.pid` names a
+/// DEAD pid, never one missing `owner.pid` entirely) -- after stalling this
+/// call's whole `DASH_ACK_TIMEOUT` waiting for an ack nobody will ever
+/// write. So the channel's own `owner.pid` must name the SAME live pid
+/// `discover_live_dash_dirs` just confirmed before anything is written: a
+/// stale value's token dir has either no `owner.pid` at all (removed on
+/// that dashboard's clean quit) or one naming a different pid, either of
+/// which fails this check and falls back to the direct signal instead.
 fn kill_via_dashboard(
     state: &StateDir,
     record: &Record,
@@ -2094,6 +2119,12 @@ fn kill_via_dashboard(
         })?;
     let dir = non_empty(env(spawnreq::DASH_REQUESTS_ENV))?;
     let dir = Path::new(&dir);
+    let channel_owner = std::fs::read_to_string(spawnreq::owner_pid_path(dir))
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok());
+    if channel_owner != Some(owner) {
+        return None;
+    }
 
     let req = spawnreq::SpawnRequest {
         kill: Some(record.short.clone()),
@@ -4442,7 +4473,12 @@ mod tests {
             .expect("write owner.pid");
         let shared_requests_dir = token_dir.join("requests");
 
-        let own_channel = tmp.path().join("own-channel");
+        // A pane's own channel is a SIBLING of the shared `requests` leaf
+        // under the same token dir (`spawnreq::pane_request_dir_for`), so
+        // its `owner.pid` is the token dir's -- the new same-owner check
+        // needs that real layout, not a channel floating free of any token
+        // dir.
+        let own_channel = token_dir.join("p-faketoken");
         let env = env_map(&[(
             super::super::dash::spawnreq::DASH_REQUESTS_ENV,
             own_channel.to_str().expect("utf8"),

@@ -6955,9 +6955,10 @@ const EXIT_KILLED: i32 = 143;
 const KILL_SHARED_CHANNEL_REFUSAL: &str = "kill requests are refused on the dashboard's shared channel -- ask through the requester's own pane channel instead";
 
 /// SECURITY (issue #435 item 1): the refusal a `kill` request gets when it
-/// arrives on a pane's own channel (proving that pane's identity) but names
-/// a target that is neither that pane itself nor a pane it spawned, directly
-/// or transitively. See [`kill_allowed`].
+/// arrives on a pane's own channel (identifying that pane as the honest
+/// requester -- see [`kill_allowed`]'s own doc comment for the issue #179
+/// caveat) but names a target that is neither that pane itself nor a pane
+/// it spawned, directly or transitively. See [`kill_allowed`].
 const KILL_UNRELATED_PANE_REFUSAL: &str =
     "kill requests may only target the requester's own pane or a pane it spawned";
 
@@ -6988,14 +6989,24 @@ fn stop_owned_pane(short: &str, panes: &mut [Pane]) -> Result<(), String> {
 /// only state it needs is `kept_requests`, the very map `drain_one_channel`
 /// already threads through every spawn to make `restore_ended_row` possible.
 ///
-/// The shared channel proves no identity at all, so it is refused outright
-/// regardless of target. A pane's own channel DOES prove that pane's
-/// identity -- only its own child tree was ever handed the path -- and is
-/// trusted for that pane itself or for any pane it spawned, directly or
-/// through a chain of further spawns: found by walking `target`'s own
-/// `requested_by` ancestry (`kept_requests[short].1`) upward looking for
-/// `requester`. Anything else -- an unrelated sibling, an ancestor, a pane
-/// this dashboard never kept a request for -- is refused.
+/// The shared channel identifies no requester at all, so it is refused
+/// outright regardless of target. A pane's own channel identifies which
+/// pane an HONEST requester is -- only that pane's own child tree was ever
+/// handed the path -- and a kill arriving there is trusted for that pane
+/// itself or for any pane it spawned, directly or through a chain of
+/// further spawns: found by walking `target`'s own `requested_by` ancestry
+/// (`kept_requests[short].1`) upward looking for `requester`. Anything else
+/// -- an unrelated sibling, an ancestor, a pane this dashboard never kept a
+/// request for -- is refused.
+///
+/// Trust boundary (issue #179, the same residual the `parent_session` gate
+/// above and `spawnreq::pane_request_dir_for`'s own doc comment already
+/// carry): this narrows to the honest requester, it does not authenticate
+/// the writer. A same-uid pane can list the parent token directory,
+/// discover a sibling's `p-<pane_token>` channel, and write a forged kill
+/// request straight into it, being attributed that sibling's identity --
+/// indistinguishable here from a genuine one. Accepted for this release;
+/// socket-peer-credential hardening is tracked in issue #179.
 fn kill_allowed(
     requester: Option<&str>,
     target: &str,
@@ -7057,16 +7068,18 @@ fn drain_one_channel(
         //
         // SECURITY (issue #435 item 1, superseding review round 2's original
         // rule): honoured ONLY on the REQUESTER'S OWN pane channel
-        // (`requester` proves that pane's identity -- only its own child
-        // tree was ever handed the path), naming that pane itself or a pane
-        // spawned through it, directly or transitively (`kill_allowed`,
-        // which follows the `requested_by` chain `kept_requests` keeps for
-        // every spawn). The dashboard's own SHARED channel proves no
-        // identity at all -- it is a fixed sibling of every pane's own
-        // intake directory, so any pane's child tree can derive its path
-        // too -- and is refused outright, regardless of target. Without this
-        // gate `stop_owned_pane` matches on the short id alone and would not
-        // notice a pane killing one it does not own.
+        // (`requester` identifies that pane as the honest requester --
+        // see `kill_allowed`'s own doc comment for the issue #179 caveat: a
+        // same-uid sibling can still forge a request into it), naming that
+        // pane itself or a pane spawned through it, directly or
+        // transitively (`kill_allowed`, which follows the `requested_by`
+        // chain `kept_requests` keeps for every spawn). The dashboard's own
+        // SHARED channel identifies no requester at all -- it is a fixed
+        // sibling of every pane's own intake directory, so any pane's child
+        // tree can derive its path too -- and is refused outright,
+        // regardless of target. Without this gate `stop_owned_pane` matches
+        // on the short id alone and would not notice a pane killing one it
+        // does not own.
         if let Some(target) = req.kill.clone() {
             let stopped = match kill_allowed(requester, &target, kept_requests) {
                 // The requester's fallback is signalling the pid itself,
@@ -7074,6 +7087,26 @@ fn drain_one_channel(
                 Ok(()) => stop_owned_pane(&target, panes).map_err(|reason| (reason, true)),
                 Err(reason) => Err((reason.to_string(), false)),
             };
+            if let Err((reason, _)) = &stopped {
+                // R6, exactly as for a refused spawn: no pane was stopped
+                // and none will be, so the claim no longer stands for
+                // anything a requester that timed out could read.
+                spawnreq::remove_claim(dir, &stem);
+                // SECURITY (issue #435 item 1): `kill_allowed` refuses every
+                // shared-channel kill unconditionally, and no supported
+                // client writes one there any more (`zirv ctx kill` uses its
+                // own pane channel now -- see `sessions::kill_via_
+                // dashboard`), so nothing on the shared channel ever polls
+                // for this ack. Writing one anyway would just leave an
+                // `ack-req-<uuid>.json` neither `spawnreq::take_requests`
+                // nor `wait_for_ack` ever sweeps back up. The refusal is
+                // still surfaced -- into the dashboard's own error log
+                // rather than a file nobody reads.
+                if requester.is_none() {
+                    push_error(errors, format!("kill {target}: {reason}"));
+                    continue;
+                }
+            }
             let ack = match stopped {
                 Ok(()) => spawnreq::SpawnAck {
                     ok: true,
@@ -7083,20 +7116,14 @@ fn drain_one_channel(
                     budget_exhausted: false,
                     capability_warnings: Vec::new(),
                 },
-                Err((reason, retryable)) => {
-                    // R6, exactly as for a refused spawn: no pane was stopped
-                    // and none will be, so the claim no longer stands for
-                    // anything a requester that timed out could read.
-                    spawnreq::remove_claim(dir, &stem);
-                    spawnreq::SpawnAck {
-                        ok: false,
-                        short: None,
-                        reason: Some(reason),
-                        retryable,
-                        budget_exhausted: false,
-                        capability_warnings: Vec::new(),
-                    }
-                }
+                Err((reason, retryable)) => spawnreq::SpawnAck {
+                    ok: false,
+                    short: None,
+                    reason: Some(reason),
+                    retryable,
+                    budget_exhausted: false,
+                    capability_warnings: Vec::new(),
+                },
             };
             if let Err(e) = spawnreq::write_ack(dir, &stem, &ack) {
                 push_error(errors, format!("kill ack: {e}"));
@@ -26276,14 +26303,57 @@ mod tests {
         }
     }
 
+    fn kept(parent: Option<&str>) -> (spawnreq::SpawnRequest, Option<String>) {
+        (
+            spawnreq::SpawnRequest::default(),
+            parent.map(str::to_string),
+        )
+    }
+
+    /// Issue #435 item 1: `kill_allowed` walks `target`'s ancestry looking
+    /// for `requester` -- the DESCENDANT direction only. A worker naming its
+    /// own orchestrator as the kill target is the reverse: the orchestrator
+    /// is `requester`'s own PARENT (`kept_requests[requester]` names it, not
+    /// the other way around), so nothing in `target`'s ancestry ever equals
+    /// `requester`, and the request is refused exactly as an unrelated
+    /// sibling's would be.
+    #[test]
+    fn kill_allowed_refuses_a_worker_naming_its_own_orchestrator_as_the_target() {
+        let mut kept_requests = HashMap::new();
+        kept_requests.insert("worker01".to_string(), kept(Some("orch0001")));
+
+        assert_eq!(
+            kill_allowed(Some("worker01"), "orch0001", &kept_requests),
+            Err(KILL_UNRELATED_PANE_REFUSAL)
+        );
+    }
+
+    /// Issue #435 item 1: a `requested_by` chain corrupted into a cycle
+    /// (`a` names `b` as parent, `b` names `a`) must never spin the ancestry
+    /// walk forever -- the loop is bounded by `kept_requests.len()`, so it
+    /// visits every entry at most once and then refuses, the same answer an
+    /// unrelated pane gets.
+    #[test]
+    fn kill_allowed_terminates_and_refuses_on_a_cyclic_requested_by_chain() {
+        let mut kept_requests = HashMap::new();
+        kept_requests.insert("pane-a01".to_string(), kept(Some("pane-b01")));
+        kept_requests.insert("pane-b01".to_string(), kept(Some("pane-a01")));
+
+        assert_eq!(
+            kill_allowed(Some("requester"), "pane-a01", &kept_requests),
+            Err(KILL_UNRELATED_PANE_REFUSAL)
+        );
+    }
+
     /// Issue #435 item 1: `zirv ctx kill` writes into the REQUESTER's own
     /// pane channel now, never the dashboard's shared one (see
     /// `sessions::kill_via_dashboard`), so this is the shape a real kill
     /// takes: a pane naming itself on its own channel, honoured because that
-    /// channel proves its own identity -- the owner is the child's real
-    /// parent (so no `EPERM` from a sandboxed shell) and the only thing that
-    /// can release the pane's writer permit, which its own reap does once
-    /// the child is seen to exit.
+    /// channel identifies it as the honest requester (issue #179: a same-uid
+    /// sibling could still forge one in, this is not authentication) -- the
+    /// owner is the child's real parent (so no `EPERM` from a sandboxed
+    /// shell) and the only thing that can release the pane's writer permit,
+    /// which its own reap does once the child is seen to exit.
     #[test]
     fn a_kill_request_on_the_panes_own_channel_stops_itself_and_is_acked() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -26467,10 +26537,16 @@ mod tests {
     /// SHARED channel is refused outright, regardless of target -- that
     /// directory is a fixed sibling of every pane's own intake directory, so
     /// any pane's child tree can derive its path just as easily as `zirv ctx
-    /// kill` can, and nothing arriving there proves who wrote it. `zirv ctx
-    /// kill` itself no longer uses this channel at all (see
+    /// kill` can, and nothing arriving there identifies who wrote it. `zirv
+    /// ctx kill` itself no longer uses this channel at all (see
     /// `sessions::kill_via_dashboard`); this is the shape a same-uid process
     /// deriving the shared path by hand would be reduced to.
+    ///
+    /// Review round 2: no supported client ever polls THIS channel for an
+    /// ack any more, so `drain_one_channel` no longer writes one for this
+    /// refusal -- it would just be an `ack-req-<uuid>.json` neither
+    /// `spawnreq::take_requests` nor `wait_for_ack` ever sweeps back up. The
+    /// refusal is surfaced into the dashboard's own error log instead.
     #[test]
     fn a_kill_request_on_the_shared_channel_is_refused_and_stops_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -26519,14 +26595,22 @@ mod tests {
             &mut HashMap::new(),
         );
 
-        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
-            .expect("the refusal is acked on the channel it arrived on");
-        assert!(!ack.ok);
-        assert!(
-            !ack.retryable,
-            "final -- the shared channel will never become a valid one to retry on: {ack:?}"
+        assert_eq!(
+            spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50)),
+            None,
+            "no supported client polls the shared channel for a kill ack any more, so none is written"
         );
-        assert_eq!(ack.reason.as_deref(), Some(KILL_SHARED_CHANNEL_REFUSAL));
+        assert!(
+            !dir.join(format!("ack-{stem}.json")).exists(),
+            "and no ack file is left behind on disk either"
+        );
+        assert!(
+            errors
+                .last()
+                .is_some_and(|e| e.contains(KILL_SHARED_CHANNEL_REFUSAL)),
+            "the refusal is still surfaced, in the dashboard's own error log: {:?}",
+            errors.last()
+        );
         assert!(
             !matches!(panes[0].state(), PaneState::Ended(_)),
             "the named pane is untouched"
@@ -26545,7 +26629,8 @@ mod tests {
     /// arriving on a pane's own channel is honoured only for that pane
     /// itself or a pane it spawned -- naming an unrelated sibling (no
     /// `requested_by` chain connects them) is refused, even though the
-    /// channel itself proves the requester's own identity.
+    /// channel itself identifies the requester (issue #179: that
+    /// identification is not authentication).
     #[test]
     fn a_kill_request_on_a_panes_own_channel_targeting_an_unrelated_pane_is_refused() {
         let tmp = tempfile::tempdir().expect("tempdir");
