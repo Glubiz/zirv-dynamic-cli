@@ -82,6 +82,7 @@ const READ_ONLY: &[&str] = &[
     "zirv skill",
     "zirv commands",
     "zirv ctx score",
+    "zirv ctx ask",
     "zirv ctx config show",
     "zirv ctx status",
     "zirv ctx usage",

@@ -486,8 +486,11 @@ to the section or vault page that documents it in depth.
   `zirv`](#just-run-zirv).
 - **Handoffs and recovery** — `score` rot-scores a transcript, `handoff`
   distills one, `resume` starts a clean session with the latest handoff
-  injected, and `handover` swaps the orchestrator seat's model or harness in
-  place mid-session. See [Verbs](#verbs) and [Cross-harness fallback and
+  injected, `handover` swaps the orchestrator seat's model or harness in
+  place mid-session, and `ask` distills a read-only answer to an operator's
+  question from a LIVE worker's own transcript without ever sending it
+  input or touching its transcript or registry record. See
+  [Verbs](#verbs) and [Cross-harness fallback and
   handover](#cross-harness-fallback-and-handover).
 - **Status and attention** — `status`, `explain-status`, and `wait` report
   or block on a session's composed attention projection; `snapshot` prints a
