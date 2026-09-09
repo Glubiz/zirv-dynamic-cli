@@ -1117,6 +1117,20 @@ pub trait AgentAdapter: std::fmt::Debug {
         let _ = (prompt, session_id, extra);
         None
     }
+    /// The identifier a headless resume must actually target for `session`:
+    /// zirv's own minted id by default, since every adapter whose resume
+    /// flag takes that id directly (claude's `--resume`, qwen's `--resume`)
+    /// needs no translation at all. An adapter whose CLI mints its own,
+    /// unrelated session id (codex: `headless_cmd`'s own doc comment already
+    /// establishes it ignores zirv's id entirely) overrides this to look one
+    /// up and returns `None` when it cannot be recovered. Callers -- see
+    /// `exec::headless_resume_launch`, the sole consumer -- must fail closed
+    /// on `None` rather than fall back to guessing (never an adapter's own
+    /// "most recent session" shorthand, which races any other session of
+    /// that same adapter live in the same repo).
+    fn resume_target(&self, session: &SessionRef) -> Option<String> {
+        Some(session.id.as_str().to_string())
+    }
     /// Whether this adapter can compact and then resume the same headless
     /// conversation. False unless an adapter has verified both halves of the
     /// operation; headless supervisors use this before spending a compact

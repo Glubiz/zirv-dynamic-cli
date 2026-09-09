@@ -990,16 +990,21 @@ fn collect_rollouts(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The `(start_ms, cwd)` a rollout's own first record reports, or `None` for
-/// a file whose first line is not a parseable `session_meta`. Only the first
-/// line is read: a rollout grows to megabytes, and the one record that says
-/// when and where the session began is always its first.
+/// The `(start_ms, cwd, session id)` a rollout's own first record reports, or
+/// `None` for a file whose first line is not a parseable `session_meta`. Only
+/// the first line is read: a rollout grows to megabytes, and the one record
+/// that says when, where, and under what id the session began is always its
+/// first.
 ///
 /// The filename's own timestamp is deliberately NOT used -- codex names the
 /// file in LOCAL time (`rollout-2026-09-06T07-50-08-...`) while the record
 /// inside it is UTC (`2026-09-06T05:50:08.783Z`), so a filename comparison
 /// would be wrong by the machine's own UTC offset.
-fn rollout_session_meta(path: &Path) -> Option<(u64, Option<String>)> {
+///
+/// Issue #303 follow-up (review round 1): `payload.id` is codex's own minted
+/// session id -- the one `codex exec resume` actually needs, never zirv's own
+/// id (`resume_target` is this field's only reader for that purpose).
+fn rollout_session_meta(path: &Path) -> Option<(u64, Option<String>, Option<String>)> {
     use std::io::BufRead as _;
     let file = std::fs::File::open(path).ok()?;
     let mut line = String::new();
@@ -1018,7 +1023,11 @@ fn rollout_session_meta(path: &Path) -> Option<(u64, Option<String>)> {
         .get("cwd")
         .and_then(Value::as_str)
         .map(str::to_string);
-    Some((started, cwd))
+    let id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some((started, cwd, id))
 }
 
 /// The rollout a session that began at `started_ms` and runs in `cwd` most
@@ -1038,7 +1047,7 @@ fn resolve_rollout(sessions_root: &Path, started_ms: u64, cwd: &Path) -> Option<
     let mut candidates: Vec<(u64, bool, PathBuf)> = files
         .into_iter()
         .filter_map(|path| {
-            let (started, recorded_cwd) = rollout_session_meta(&path)?;
+            let (started, recorded_cwd, _id) = rollout_session_meta(&path)?;
             if started < started_ms {
                 return None;
             }
@@ -1155,6 +1164,69 @@ impl AgentAdapter for CodexAdapter {
         let mut cmd = self.base();
         cmd.arg("exec").args(extra);
         Some(cmd)
+    }
+
+    /// Issue #303: `codex exec resume [SESSION_ID] [PROMPT]` (verified
+    /// against the installed codex-cli's own `--help`, 0.153.4) resumes a
+    /// previously recorded exec session and, unlike interactive `codex
+    /// resume`, accepts a prompt to send once resumed -- a real headless
+    /// resume, the missing half of the honest-refusal default this trait
+    /// method otherwise falls back to. `PROMPT`'s own help text documents
+    /// exactly one non-argv delivery ("If `-` is used, read from stdin");
+    /// nothing documents an *omitted* PROMPT reading stdin the way plain
+    /// `codex exec` does, so `prompt: None` passes the literal token `-`
+    /// rather than dropping the argument, mirroring the one delivery `resume`
+    /// itself actually documents.
+    ///
+    /// Review round 1 (issue #303): `session_id` here is NOT zirv's own
+    /// minted id -- `headless_cmd`'s own doc comment already established
+    /// codex mints its own, unrelated id and ignores zirv's entirely, so
+    /// resuming zirv's own id would target a session codex never created.
+    /// `resume_target` below is what recovers the real one; this method
+    /// stays a pure argv builder and trusts its caller (`exec::
+    /// headless_resume_launch`, the sole caller) to have already resolved
+    /// `session_id` through it.
+    fn headless_resume_cmd(
+        &self,
+        prompt: Option<&str>,
+        session_id: &str,
+        extra: &[String],
+    ) -> Option<Command> {
+        let mut cmd = self.base();
+        cmd.arg("exec")
+            .arg("resume")
+            .arg(session_id)
+            .arg(prompt.unwrap_or("-"))
+            .args(extra);
+        Some(cmd)
+    }
+
+    /// Issue #303 follow-up (review round 1): recovers the id `headless_
+    /// resume_cmd` above must actually target. Reuses `transcript_path`'s own
+    /// resolution (`find_rollout`/`pinned_rollout`/`resolve_rollout`) to find
+    /// the rollout THIS zirv session's codex child minted, then reads that
+    /// file's own `session_meta.payload.id` off its first line -- the exact
+    /// id codex itself would resume. `None`, never a guess and never codex's
+    /// own `--last` (unsafe: races any other codex session live in the same
+    /// repo), whenever the rollout cannot be resolved (`transcript_path`'s
+    /// own fallback is a placeholder path that was never written) or its
+    /// first line does not parse as a `session_meta` record -- `rollout_
+    /// session_meta` returns `None` for either. Callers must fail closed on
+    /// `None` rather than resume the wrong conversation.
+    fn resume_target(&self, session: &SessionRef) -> Option<String> {
+        let path = self.transcript_path(session);
+        let (_, _, id) = rollout_session_meta(&path)?;
+        id
+    }
+
+    /// Issue #303: `headless_resume_cmd` above is real, but nothing pairs
+    /// with it -- see `compact_command`'s own doc comment for the
+    /// verification trail showing codex has no in-place compaction
+    /// directive at all. `supports_headless_compact`'s contract needs BOTH
+    /// halves verified, so this stays `false`: a codex `Verdict::Compact`
+    /// still maps to a full restart, unchanged by this issue.
+    fn supports_headless_compact(&self) -> bool {
+        false
     }
 
     /// With no subcommand, `codex [PROMPT]` forwards straight to the
@@ -1972,6 +2044,19 @@ impl AgentAdapter for CodexAdapter {
         false
     }
 
+    /// Issue #303: investigated alongside `headless_resume_cmd` above and
+    /// stays `None`. `codex exec --help`, `codex exec resume --help` and the
+    /// top-level `codex --help` document no compaction concept at all -- no
+    /// subcommand, no flag, no `-c` config key. The interactive slash-command
+    /// set remains unverified (`docs/superpowers/notes/
+    /// 2026-07-31-codex-cli-facts.md`: probing it non-interactively failed
+    /// with "stdin is not a terminal" before any slash command could be
+    /// observed, so the existing `/quit\r` placeholder below is unverified
+    /// too), but even a verified interactive `/compact` would not answer this
+    /// method -- see `qwen::QwenAdapter`'s own gap for the same reasoning:
+    /// an interactive-only slash command is not a headless directive. Never
+    /// claim a compaction step this binary has never been observed to
+    /// perform.
     fn compact_command(&self) -> Option<&'static str> {
         None
     }
@@ -2119,6 +2204,16 @@ mod tests {
     fn codex_has_no_marker_signal() {
         let caps = CodexAdapter::new(None).capabilities();
         assert!(!caps.marker_signal, "the spec gives codex no marker signal");
+    }
+
+    /// Issue #303: `headless_resume_cmd` is real (see the tests above), but
+    /// `compact_command` stays `None` -- no verified in-place compaction
+    /// directive exists to pair it with, so `supports_headless_compact`'s
+    /// "verified both halves" contract is not met.
+    #[test]
+    fn codex_has_no_headless_compact_support() {
+        assert_eq!(CodexAdapter::new(None).compact_command(), None);
+        assert!(!CodexAdapter::new(None).supports_headless_compact());
     }
 
     /// Codex reports NO capacity: none is verified for it, and a guessed
@@ -2490,6 +2585,62 @@ mod tests {
                 "gpt-5.6-luna".to_string(),
             ],
             "codex exec takes no session flag; codex mints its own session id"
+        );
+    }
+
+    /// Issue #303: `codex exec resume [SESSION_ID] [PROMPT]`, verified via
+    /// the installed codex-cli's own `--help`.
+    #[test]
+    fn headless_resume_cmd_uses_exec_resume_with_the_session_and_prompt() {
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex"));
+        let cmd = adapter
+            .headless_resume_cmd(
+                Some("keep going"),
+                "abc-123",
+                &["--model".to_string(), "gpt-5.6-luna".to_string()],
+            )
+            .expect("codex exec resume is verified");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "abc-123".to_string(),
+                "keep going".to_string(),
+                "--model".to_string(),
+                "gpt-5.6-luna".to_string(),
+            ]
+        );
+    }
+
+    /// `resume`'s own `[PROMPT]` help text documents exactly one non-argv
+    /// delivery: the literal token `-` reads from stdin. Unlike
+    /// `headless_cmd_stdin` (which OMITS the token, relying on plain `exec`'s
+    /// own documented "omitted or `-`" stdin fallback), `resume` never
+    /// documents that an omitted PROMPT reads stdin -- only that `-` does --
+    /// so a caller wanting stdin delivery here must see the literal `-`.
+    #[test]
+    fn headless_resume_cmd_with_no_prompt_uses_the_dash_stdin_token() {
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex"));
+        let cmd = adapter
+            .headless_resume_cmd(None, "abc-123", &[])
+            .expect("codex exec resume is verified");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "abc-123".to_string(),
+                "-".to_string()
+            ]
         );
     }
 
@@ -3989,6 +4140,94 @@ mod tests {
             mine,
             "a pinned rollout stays pinned once a later codex run appears"
         );
+    }
+
+    /// Issue #303 follow-up (review round 1, finding 1): `resume_target`
+    /// must recover codex's OWN minted session id -- never zirv's, which
+    /// `headless_cmd`'s own doc comment already established codex ignores
+    /// entirely -- and that id must be what actually reaches
+    /// `headless_resume_cmd`'s argv.
+    #[test]
+    fn resume_target_recovers_codexs_own_minted_session_id_not_zirvs() {
+        let home = tempfile::tempdir().expect("home");
+        let state_root = tempfile::tempdir().expect("state");
+        let day_dir = home.path().join(".codex/sessions/2026/09/06");
+        std::fs::create_dir_all(&day_dir).expect("mkdir");
+
+        let path =
+            day_dir.join("rollout-2026-09-06T06-00-10-bbbbbbbb-2222-7222-8222-222222222222.jsonl");
+        let meta = serde_json::json!({
+            "timestamp": "2026-09-06T06:00:10.000Z",
+            "type": "session_meta",
+            "payload": {"id": "abc", "timestamp": "2026-09-06T06:00:10.000Z", "cwd": "/work/repo"},
+        });
+        std::fs::write(&path, format!("{meta}\n")).expect("write rollout");
+
+        let zirv_session_id = "11111111-2222-4333-8444-555555555555";
+        let short = crate::commands::ctx::sessions::short_id(zirv_session_id);
+        let state =
+            crate::commands::ctx::state::StateDir::from_root(state_root.path().to_path_buf());
+        std::fs::create_dir_all(state.sessions()).expect("mkdir sessions");
+        let mut record = crate::commands::ctx::sessions::Record::new(
+            zirv_session_id,
+            "codex",
+            std::path::Path::new("/work/repo"),
+            crate::commands::ctx::sessions::Verb::Dash,
+        );
+        record.started_at = 1_788_674_400; // 2026-09-06T06:00:00Z
+        std::fs::write(
+            state.sessions().join(format!("{short}.json")),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("write record");
+
+        let adapter = CodexAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_state_root(state_root.path().to_path_buf());
+        let session = SessionRef {
+            id: SessionId::parse(zirv_session_id),
+            cwd: std::path::PathBuf::from("/work/repo"),
+        };
+
+        let target = adapter
+            .resume_target(&session)
+            .expect("the rollout resolves and its session_meta parses");
+        assert_eq!(target, "abc", "codex's own minted id, not zirv's");
+
+        let cmd = adapter
+            .headless_resume_cmd(Some("keep going"), &target, &[])
+            .expect("codex exec resume is verified");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"abc".to_string()), "got {args:?}");
+        assert!(
+            !args.contains(&zirv_session_id.to_string()),
+            "zirv's own id must never reach codex's argv: {args:?}"
+        );
+    }
+
+    /// Issue #303 follow-up (review round 1, finding 1): fail closed, never
+    /// guess -- a rollout that cannot be resolved at all (no matching
+    /// session registered, no rollout file) leaves `transcript_path` at its
+    /// own unresolved placeholder, which does not exist on disk, so
+    /// `rollout_session_meta` finds nothing to open and `resume_target`
+    /// returns `None` rather than falling back to codex's own `--last`.
+    #[test]
+    fn resume_target_fails_closed_when_the_rollout_cannot_be_resolved() {
+        let home = tempfile::tempdir().expect("home");
+        let state_root = tempfile::tempdir().expect("state");
+
+        let adapter = CodexAdapter::new(None)
+            .with_home(home.path().to_path_buf())
+            .with_state_root(state_root.path().to_path_buf());
+        let session = SessionRef {
+            id: SessionId::parse("11111111-2222-4333-8444-555555555555"),
+            cwd: std::path::PathBuf::from("/work/repo"),
+        };
+
+        assert_eq!(adapter.resume_target(&session), None);
     }
 
     /// Review round 1 (R6): a handover keeps the SAME zirv session id, so the
