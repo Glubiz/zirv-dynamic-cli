@@ -293,8 +293,8 @@ zirv ctx inbox
 
 `zirv ctx status` reports how many are waiting (`mail: N unread`). A mail
 message is free-form text written by whichever agent session sent it, not an
-operator instruction — see the vault's Untrusted Configuration page for how
-it's capped and labeled the same way the other untrusted surfaces are.
+operator instruction — see [Trust boundary](#trust-boundary) for how it's
+capped and labeled the same way the other untrusted surfaces are.
 
 Add `--to-session <prefix>` to address one specific live session instead of
 every session an agent has: `zirv ctx send --to-session abcd1234 --message
@@ -400,7 +400,7 @@ disabling the harnesses themselves (claude, codex) — a separate file from
 
 Every capability below is derived from the command surface this binary
 actually ships (`zirv commands --json`), grouped by area; each bullet links
-to the section or vault page that documents it in depth.
+to the section that documents it in depth.
 
 ### Script runner
 
@@ -448,8 +448,7 @@ to the section or vault page that documents it in depth.
 - **Harness adapters** — one adapter per supported harness: `claude`,
   `codex`, `gemini`, `opencode`, `pi`, `copilot`, `droid`, and `qwen`, each
   enabled or disabled per repo in `.zirv/.settings.toml`. See
-  [.settings.toml](#settingstoml) and the vault's
-  [Ctx Adapters](docs/obsidian/Modules/Ctx%20Adapters.md). For which models
+  [.settings.toml](#settingstoml). For which models
   zirv recognises on each harness, see [Supported harnesses and
   models](#supported-harnesses-and-models).
 - **Dashboard** — several supervised sessions in one terminal, with panes
@@ -507,8 +506,8 @@ to the section or vault page that documents it in depth.
   `forget`, `verify`, plus `promote`/`rollback`/`optimize`) manages it
   without starting one; `learn` promotes a recurring fail-then-fix command
   correction from recent transcripts into one private memory entry. See
-  [`zirv memory`](#zirv-memory), [Memory bank](#memory-bank), and the
-  vault's [Ctx Subsystem](docs/obsidian/Modules/Ctx%20Subsystem.md#the-verb-tree).
+  [`zirv memory`](#zirv-memory), [Memory bank](#memory-bank), and
+  [Verbs](#verbs).
 - **Delegation controls** — `group`, `objective`, `spend`, `savings`,
   `worktree`, `task`, and `swarm` bound, account for, and reclaim delegated
   work; `permissions` (`audit`/`compile`/`propose`) and `safety`
@@ -516,15 +515,14 @@ to the section or vault page that documents it in depth.
   command-safety policy; `close` ends a group or objective early. See
   [Permission auditing and safe-list
   proposals](#permission-auditing-and-safe-list-proposals-issue-178),
-  [Command safety policy](#command-safety-policy-issue-83), and the vault's
-  [Ctx Subsystem](docs/obsidian/Modules/Ctx%20Subsystem.md#the-verb-tree).
+  [Command safety policy](#command-safety-policy-issue-83), and
+  [Verbs](#verbs).
 - **Recall, measurement, and output** — `search` ranks past
   transcripts/handoffs/artifacts/mail against a query; `measure` and
   `discover` report proportionality and uncompacted-tool-result metrics;
   `run`/`output` execute a command directly and store its full output while
   printing a compact, reversible summary; `compile` prints or measures the
-  composed session prompt. See the vault's [Ctx
-  Subsystem](docs/obsidian/Modules/Ctx%20Subsystem.md#the-verb-tree).
+  composed session prompt. See [Verbs](#verbs).
 - **Configuration and instruction hygiene** — `config` shows or edits the
   operator's `~/.zirv/ctx.toml`; `context` (`sync`/`lint`/`status`) manages
   the canonical instruction-file layer; `optimize` reports redundancy,
@@ -537,9 +535,7 @@ to the section or vault page that documents it in depth.
   events (stop, prompt, pre-compact, pretool/posttool, permission, notify,
   session-start), audits recorded decisions, and checks or heals the
   installed hook entries against their baseline. See [Hook
-  registration (Claude Code)](#hook-registration-claude-code) and the
-  vault's [Ctx
-  Subsystem](docs/obsidian/Modules/Ctx%20Subsystem.md#hook-integrity-issue-420).
+  registration (Claude Code)](#hook-registration-claude-code).
 
 ### Development workflow commands
 
@@ -578,8 +574,7 @@ to the section or vault page that documents it in depth.
   (`changed`), runs every eligible check (`all`), or records an
   operator-owned baseline of already-failing tests (`baseline`) so a
   pre-existing failure never blocks a workflow gate. See [The full verb
-  set](#the-full-verb-set) and the vault's
-  [Workflows](docs/obsidian/Modules/Workflows.md#verification).
+  set](#the-full-verb-set).
 - **Final verification** — `verify` runs the full check suite plus zirv's
   own built-in self-check registry, reusing fresh `test` evidence when
   nothing has changed since. See [The full verb set](#the-full-verb-set).
@@ -587,8 +582,7 @@ to the section or vault page that documents it in depth.
   `.zirv/verify.toml` declares check id/kind/command/path patterns/phase
   eligibility/timeout; without it, Cargo commands and `npm run` scripts are
   discovered from the manifests present. See [Frontend
-  quality](#frontend-quality) and the vault's
-  [Workflows](docs/obsidian/Modules/Workflows.md#verification).
+  quality](#frontend-quality).
 
 ### Housekeeping
 
@@ -2036,10 +2030,8 @@ headroom after outstanding reservations, and — when `auto_orchestrator_
 rollover` is on — the orchestrator seat's own fencing generation. Provider
 token reservations are tracked in a small durable ledger
 (`<state>/reservations/<provider>.json`) so two admitted-but-unsettled
-delegations against the same billed account are never double-counted. See
-`docs/obsidian/Modules/Usage and Pacing.md` and `docs/obsidian/Modules/Ctx
-Supervisors.md` for the full mechanism (capacity snapshot formula, the
-fenced rollover transaction, anti-flap rules).
+delegations against the same billed account are never double-counted (capacity
+snapshot formula, the fenced rollover transaction, anti-flap rules).
 
 **`zirv ctx handover`** performs the swap directly, on demand, mid-session —
 the same mechanism the dashboard's `Ctrl+A o` picker and automatic fallback

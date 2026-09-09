@@ -59,8 +59,7 @@
 // repo-owned canonical text can describe a permission stance in prose, but
 // describing is not enforcing, so #44 must never let canonical text cause a
 // launch to be reported as `Enforced`/`Degraded` for a capability this
-// module did not itself verify a mechanism for. See `docs/obsidian/Concepts/
-// Untrusted Configuration.md`'s "Context vs. policy" section.
+// module did not itself verify a mechanism for.
 #![allow(dead_code)]
 
 use super::CtxResult;

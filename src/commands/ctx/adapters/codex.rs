@@ -1517,8 +1517,8 @@ impl AgentAdapter for CodexAdapter {
     /// `-s, --sandbox <read-only|workspace-write|danger-full-access>` is the
     /// one verified enforcement flag, and it scopes what a codex-*executed
     /// shell command may write*, not whether shell commands may execute or
-    /// which of codex's own tools may run (see `docs/obsidian/Concepts/
-    /// Untrusted Configuration.md`). That distinction matters per capability:
+    /// which of codex's own tools may run. That distinction matters per
+    /// capability:
     ///
     /// - **Repo filesystem writes** are `Degraded` at `Deny`: read-only really
     ///   does block writes inside the repo, just not by denying any tool.

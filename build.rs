@@ -4,9 +4,8 @@
 //! trojan; an unsigned binary with no version resource at all is a much
 //! stronger heuristic match than one that at least identifies itself the
 //! way legitimate Windows software does. This does not fix the underlying
-//! signing gap (out of scope -- needs an operator account, see
-//! `docs/obsidian/Development/Known Issues.md`), but it is a real,
-//! zero-cost mitigation.
+//! signing gap (out of scope -- needs an operator account), but it is a
+//! real, zero-cost mitigation.
 //!
 //! Two guards: `CARGO_CFG_TARGET_OS` picks the *target* (a Windows host
 //! building a non-Windows target embeds nothing), and `#[cfg(windows)]` on

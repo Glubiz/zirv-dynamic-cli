@@ -34,18 +34,9 @@ Nextest isolates tests per process; `--no-fail-fast` is mandatory -- diff sorted
 - Repo-owned surfaces are UNTRUSTED, may only NARROW: `<repo>/.zirv/{ctx.toml,system-prompt.md,context/*.md,memory/}` and repo skills/agents/checks. Repo-layer `REPO_FORBIDDEN` keys hard-error; only `~/.zirv/ctx.toml`, `ZIRV_CTX_*`, or flags set them.
 - Tests stay inline in `#[cfg(test)] mod tests`; `tests/fixtures/` is data only.
 
-## Vault docs
+## Docs and memory
 
-Before substantive work in an area, read `docs/obsidian/_system-context.md` and that area's Active Work entry; consult Known Issues/Decision Log when relevant. Update the matching page and bump `last-verified` only for behavior/contract/architecture changes (not refactors, bug fixes, tests, CI):
-
-- CLI arg/built-in -> `Modules/Built-in Commands.md`
-- script format/option/param/shortcut -> `Concepts/{Script Files,Shortcuts}.md`, `Modules/Script Runner.md`
-- ctx verb/adapter/safety policy -> `Modules/{Ctx Subsystem,Ctx Adapters,Command Safety}.md`, `Concepts/Untrusted Configuration.md`
-- rot/supervisor/pacing -> `Modules/{Rot Engine,Ctx Supervisors,Usage and Pacing}.md`
-- dependency/release profile -> `Architecture/Technology Stack.md`
-- decision/session work/gotcha -> `Development/{Decision Log,Work Journal,Known Issues}.md`
-
-Finished work moves to Active Work's "Recently Completed"; extend pages, don't duplicate.
+`README.md` is the reference: update its section and trust-boundary table when a CLI arg, config key, or contract changes. Before substantive work in an area, run `zirv ctx recall` for that area's durable facts. A fact a future session cannot derive from code or git (verified vendor/tool behaviour, a standing decision with its rationale, an unresolved gotcha with no issue) goes to the repo bank via `zirv ctx remember --repo --key <k>`; specs and plans live in `docs/superpowers/`.
 
 ## Git
 

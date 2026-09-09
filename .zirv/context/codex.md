@@ -25,5 +25,4 @@ glob only), say so explicitly in your report, and let the caller decide.
 `--ignore-rules` and `--ignore-user-config` exist only on codex-cli 0.146 and
 later; npm publishes 0.105.0, which errors on them.
 
-Documentation duties (which vault pages to update and when) are covered by
-`.zirv/context/common.md`.
+Documentation and memory duties are covered by `.zirv/context/common.md`.

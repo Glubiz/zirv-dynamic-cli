@@ -831,7 +831,7 @@ fn git_diff_capped(repo: &Path, base_sha: &str) -> CtxResult<(String, bool)> {
 /// sorts first -- `order_and_cap_diff` never drops a higher band in favor of
 /// a lower one when the package doesn't fit its byte budget (#229: a
 /// package that could not fit the diff dropped every `src/` hunk and kept
-/// only renames, README, vault pages and Cargo.toml).
+/// only renames, README, doc pages and Cargo.toml).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum HunkPriority {
     Code,
@@ -3742,10 +3742,7 @@ mod tests {
             hunk_priority(".zirv/verify.toml", false),
             HunkPriority::Config
         );
-        assert_eq!(
-            hunk_priority("docs/obsidian/notes.md", false),
-            HunkPriority::Docs
-        );
+        assert_eq!(hunk_priority("docs/notes.md", false), HunkPriority::Docs);
         assert_eq!(hunk_priority("README.md", false), HunkPriority::Docs);
         assert_eq!(
             hunk_priority("src/renamed.rs", true),
@@ -4323,8 +4320,8 @@ const DEFAULT_MAX_EVENTS: usize = 1000;
 
 Cross-platform CLI for executing developer-defined YAML/JSON/TOML scripts.
 Run `cargo build` then `cargo test --verbose -- --test-threads=1` before
-opening a pull request. See docs/obsidian/_system-context.md for the full
-module map and architecture overview.
+opening a pull request. See README.md for the full module map and
+architecture overview.
 "#,
             ),
             (

@@ -7,6 +7,6 @@
 - Importance: normal
 - Confidence: high
 - Tags: documentation
-- Paths: docs/obsidian/Modules/Ctx Subsystem.md
+- Paths: src/commands/ctx/log.rs
 
 `log.rs` appends one JSON line per decision to `<state>/logs/decisions.jsonl` via `append()`, using the same private-file helpers as the rest of the state dir. Each `Decision` record carries a timestamp, session id, verb, rot verdict, numeric score, action taken, and free-text detail. `tail(state, count)` reads the whole file and returns the last `count` lines (oldest of the tail first) — used by the `status` verb. The log is append-only; nothing in this module rewrites or rotates it.

@@ -27,10 +27,10 @@ config, and asserts:
   ratio, lower the bar is wrong -- RAISE `floor.txt` to the new measured
   value, rounded down to the nearest `0.05` (never round up: the floor must
   stay a value every subsequent run can actually clear).
-- Never LOWER `floor.txt` without a `docs/obsidian/Development/Decision
-  Log.md` entry explaining why the aggregate ratio regressed on purpose
-  (e.g. a mandatory-content guarantee got strictly bigger for a good
-  reason). A silent lowering defeats the entire point of this test.
+- Never LOWER `floor.txt` without a `zirv ctx remember --repo` memory entry
+  explaining why the aggregate ratio regressed on purpose (e.g. a
+  mandatory-content guarantee got strictly bigger for a good reason). A
+  silent lowering defeats the entire point of this test.
 
 ## Fixture set
 
