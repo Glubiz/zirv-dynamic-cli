@@ -6945,11 +6945,22 @@ fn handle_spawn_requests(
 /// as a clean finish.
 const EXIT_KILLED: i32 = 143;
 
-/// SECURITY (review round 2, 2026-09-08): the refusal a `kill` request gets
-/// when it arrives on a channel that proves a pane's identity rather than on
-/// the dashboard's own shared one -- see [`drain_one_channel`].
-const KILL_OFF_CHANNEL_REFUSAL: &str =
-    "kill requests are accepted only on the dashboard's own channel";
+/// SECURITY (issue #435 item 1, superseding review round 2's original rule):
+/// the refusal a `kill` request gets when it arrives on the dashboard's own
+/// SHARED channel. That directory used to be trusted precisely because it
+/// is not attributed to any one pane -- but it is a fixed sibling of every
+/// pane's own intake directory (`Pane::intake_dir`), so any pane's child
+/// tree can derive its path just as easily as `zirv ctx kill` can, and
+/// nothing arriving there proves who wrote it. See [`kill_allowed`].
+const KILL_SHARED_CHANNEL_REFUSAL: &str = "kill requests are refused on the dashboard's shared channel -- ask through the requester's own pane channel instead";
+
+/// SECURITY (issue #435 item 1): the refusal a `kill` request gets when it
+/// arrives on a pane's own channel (identifying that pane as the honest
+/// requester -- see [`kill_allowed`]'s own doc comment for the issue #179
+/// caveat) but names a target that is neither that pane itself nor a pane
+/// it spawned, directly or transitively. See [`kill_allowed`].
+const KILL_UNRELATED_PANE_REFUSAL: &str =
+    "kill requests may only target the requester's own pane or a pane it spawned";
 
 /// Issue #403: stops one pane THIS dashboard owns, on behalf of a `zirv ctx
 /// kill` that would otherwise have to signal the pane's pid from outside.
@@ -6969,6 +6980,58 @@ fn stop_owned_pane(short: &str, panes: &mut [Pane]) -> Result<(), String> {
         return Err(format!("no pane {short} is running on this dashboard"));
     };
     pane.stop_now(EXIT_KILLED).map_err(|e| e.to_string())
+}
+
+/// SECURITY (issue #435 item 1): whether a `kill` naming `target` is
+/// honoured, arriving on `requester`'s channel (`None` for the dashboard's
+/// own shared one, `Some(short)` for a pane's own intake channel -- see
+/// [`intake_channels`]). Pure and testable without a running dashboard: the
+/// only state it needs is `kept_requests`, the very map `drain_one_channel`
+/// already threads through every spawn to make `restore_ended_row` possible.
+///
+/// The shared channel identifies no requester at all, so it is refused
+/// outright regardless of target. A pane's own channel identifies which
+/// pane an HONEST requester is -- only that pane's own child tree was ever
+/// handed the path -- and a kill arriving there is trusted for that pane
+/// itself or for any pane it spawned, directly or through a chain of
+/// further spawns: found by walking `target`'s own `requested_by` ancestry
+/// (`kept_requests[short].1`) upward looking for `requester`. Anything else
+/// -- an unrelated sibling, an ancestor, a pane this dashboard never kept a
+/// request for -- is refused.
+///
+/// Trust boundary (issue #179, the same residual the `parent_session` gate
+/// above and `spawnreq::pane_request_dir_for`'s own doc comment already
+/// carry): this narrows to the honest requester, it does not authenticate
+/// the writer. A same-uid pane can list the parent token directory,
+/// discover a sibling's `p-<pane_token>` channel, and write a forged kill
+/// request straight into it, being attributed that sibling's identity --
+/// indistinguishable here from a genuine one. Accepted for this release;
+/// socket-peer-credential hardening is tracked in issue #179.
+fn kill_allowed(
+    requester: Option<&str>,
+    target: &str,
+    kept_requests: &HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
+) -> Result<(), &'static str> {
+    let Some(requester) = requester else {
+        return Err(KILL_SHARED_CHANNEL_REFUSAL);
+    };
+    if requester == target {
+        return Ok(());
+    }
+    let mut current = target;
+    // A real chain can be at most as long as `kept_requests` itself -- bound
+    // the walk by that rather than a magic constant, so corrupted or cyclic
+    // state can never loop forever.
+    for _ in 0..kept_requests.len() {
+        let Some(parent) = kept_requests.get(current).and_then(|(_, p)| p.as_deref()) else {
+            break;
+        };
+        if parent == requester {
+            return Ok(());
+        }
+        current = parent;
+    }
+    Err(KILL_UNRELATED_PANE_REFUSAL)
 }
 
 /// One intake channel's own queue: every request in `dir`, each answered with
@@ -7003,23 +7066,58 @@ fn drain_one_channel(
         // spawn gates below have anything to say about it, and it is answered
         // with the same ack shape before any of them run.
         //
-        // SECURITY (review round 2, 2026-09-08): honoured ONLY on this
-        // dashboard's own shared channel (`requester.is_none()`, the one
-        // `zirv ctx kill` writes to). A pane-attributed channel
-        // (`Pane::intake_dir`) is reachable by that pane's own low-trust
-        // child tree, and #403 exists precisely because a sandboxed shell
-        // CANNOT signal a pane process itself (`EPERM`) -- so honouring
-        // `kill` there would hand a worker the very cross-pane stop the
-        // sandbox denies it, against a pane it does not own. `stop_owned_
-        // pane` matches on the short id alone and would not notice.
+        // SECURITY (issue #435 item 1, superseding review round 2's original
+        // rule): honoured ONLY on the REQUESTER'S OWN pane channel
+        // (`requester` identifies that pane as the honest requester --
+        // see `kill_allowed`'s own doc comment for the issue #179 caveat: a
+        // same-uid sibling can still forge a request into it), naming that
+        // pane itself or a pane spawned through it, directly or
+        // transitively (`kill_allowed`, which follows the `requested_by`
+        // chain `kept_requests` keeps for every spawn). The dashboard's own
+        // SHARED channel identifies no requester at all -- it is a fixed
+        // sibling of every pane's own intake directory, so any pane's child
+        // tree can derive its path too -- and is refused outright,
+        // regardless of target. Without this gate `stop_owned_pane` matches
+        // on the short id alone and would not notice a pane killing one it
+        // does not own.
         if let Some(target) = req.kill.clone() {
-            let stopped = if requester.is_some() {
-                Err((KILL_OFF_CHANNEL_REFUSAL.to_string(), false))
-            } else {
+            let stopped = match kill_allowed(requester, &target, kept_requests) {
                 // The requester's fallback is signalling the pid itself,
-                // which a refusal from THIS branch says nothing against.
-                stop_owned_pane(&target, panes).map_err(|reason| (reason, true))
+                // which a refusal from either arm here says nothing against.
+                Ok(()) => stop_owned_pane(&target, panes).map_err(|reason| (reason, true)),
+                Err(reason) => Err((reason.to_string(), false)),
             };
+            if let Err((reason, _)) = &stopped {
+                // R6, exactly as for a refused spawn: no pane was stopped
+                // and none will be, so the claim no longer stands for
+                // anything a requester that timed out could read.
+                spawnreq::remove_claim(dir, &stem);
+                // SECURITY (issue #435 item 1): `kill_allowed` refuses every
+                // shared-channel kill unconditionally, and no supported
+                // client writes one there any more (`zirv ctx kill` uses its
+                // own pane channel now -- see `sessions::kill_via_
+                // dashboard`), so nothing on the shared channel ever polls
+                // for this ack. Writing one anyway would just leave an
+                // `ack-req-<uuid>.json` neither `spawnreq::take_requests`
+                // nor `wait_for_ack` ever sweeps back up. The refusal is
+                // still surfaced -- into the dashboard's own error log
+                // rather than a file nobody reads.
+                if requester.is_none() {
+                    // Review round 2: the pushed message must not vary with
+                    // `target` -- a same-uid process can name a different
+                    // (even nonexistent) short id on every forged kill, and
+                    // `ErrorLog::record`'s own adjacent-message dedup only
+                    // collapses BYTE-IDENTICAL text, so a varying target
+                    // would let repeated forged kills evict every real error
+                    // out of the ring (`MAX_KEPT_ERRORS` slots) indefinitely.
+                    // `reason` alone is already constant here (`kill_
+                    // allowed` returns the same `&'static str` for every
+                    // shared-channel kill), so repeats collapse onto one
+                    // slot for free.
+                    push_error(errors, format!("kill refused: {reason}"));
+                    continue;
+                }
+            }
             let ack = match stopped {
                 Ok(()) => spawnreq::SpawnAck {
                     ok: true,
@@ -7029,20 +7127,14 @@ fn drain_one_channel(
                     budget_exhausted: false,
                     capability_warnings: Vec::new(),
                 },
-                Err((reason, retryable)) => {
-                    // R6, exactly as for a refused spawn: no pane was stopped
-                    // and none will be, so the claim no longer stands for
-                    // anything a requester that timed out could read.
-                    spawnreq::remove_claim(dir, &stem);
-                    spawnreq::SpawnAck {
-                        ok: false,
-                        short: None,
-                        reason: Some(reason),
-                        retryable,
-                        budget_exhausted: false,
-                        capability_warnings: Vec::new(),
-                    }
-                }
+                Err((reason, retryable)) => spawnreq::SpawnAck {
+                    ok: false,
+                    short: None,
+                    reason: Some(reason),
+                    retryable,
+                    budget_exhausted: false,
+                    capability_warnings: Vec::new(),
+                },
             };
             if let Err(e) = spawnreq::write_ack(dir, &stem, &ack) {
                 push_error(errors, format!("kill ack: {e}"));
@@ -26222,14 +26314,252 @@ mod tests {
         }
     }
 
-    /// Issue #403: `zirv ctx kill` against a dashboard pane asks the
-    /// dashboard that owns it, over this same channel, rather than signalling
-    /// the pane's pid from outside -- the owner is the child's real parent
-    /// (so no `EPERM` from a sandboxed shell) and the only thing that can
-    /// release the pane's writer permit, which its own reap does once the
-    /// child is seen to exit.
+    fn kept(parent: Option<&str>) -> (spawnreq::SpawnRequest, Option<String>) {
+        (
+            spawnreq::SpawnRequest::default(),
+            parent.map(str::to_string),
+        )
+    }
+
+    /// Issue #435 item 1: `kill_allowed` walks `target`'s ancestry looking
+    /// for `requester` -- the DESCENDANT direction only. A worker naming its
+    /// own orchestrator as the kill target is the reverse: the orchestrator
+    /// is `requester`'s own PARENT (`kept_requests[requester]` names it, not
+    /// the other way around), so nothing in `target`'s ancestry ever equals
+    /// `requester`, and the request is refused exactly as an unrelated
+    /// sibling's would be.
     #[test]
-    fn a_kill_request_stops_the_named_pane_and_is_acked() {
+    fn kill_allowed_refuses_a_worker_naming_its_own_orchestrator_as_the_target() {
+        let mut kept_requests = HashMap::new();
+        kept_requests.insert("worker01".to_string(), kept(Some("orch0001")));
+
+        assert_eq!(
+            kill_allowed(Some("worker01"), "orch0001", &kept_requests),
+            Err(KILL_UNRELATED_PANE_REFUSAL)
+        );
+    }
+
+    /// Issue #435 item 1: a `requested_by` chain corrupted into a cycle
+    /// (`a` names `b` as parent, `b` names `a`) must never spin the ancestry
+    /// walk forever -- the loop is bounded by `kept_requests.len()`, so it
+    /// visits every entry at most once and then refuses, the same answer an
+    /// unrelated pane gets.
+    #[test]
+    fn kill_allowed_terminates_and_refuses_on_a_cyclic_requested_by_chain() {
+        let mut kept_requests = HashMap::new();
+        kept_requests.insert("pane-a01".to_string(), kept(Some("pane-b01")));
+        kept_requests.insert("pane-b01".to_string(), kept(Some("pane-a01")));
+
+        assert_eq!(
+            kill_allowed(Some("requester"), "pane-a01", &kept_requests),
+            Err(KILL_UNRELATED_PANE_REFUSAL)
+        );
+    }
+
+    /// Issue #435 item 1: `zirv ctx kill` writes into the REQUESTER's own
+    /// pane channel now, never the dashboard's shared one (see
+    /// `sessions::kill_via_dashboard`), so this is the shape a real kill
+    /// takes: a pane naming itself on its own channel, honoured because that
+    /// channel identifies it as the honest requester (issue #179: a same-uid
+    /// sibling could still forge one in, this is not authentication) -- the
+    /// owner is the child's real parent (so no `EPERM` from a sandboxed
+    /// shell) and the only thing that can release the pane's writer permit,
+    /// which its own reap does once the child is seen to exit.
+    #[test]
+    fn a_kill_request_on_the_panes_own_channel_stops_itself_and_is_acked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = tmp.path().join("requests");
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: silent_long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "bbbbbbbb-2222-4333-8444-555555555555".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut errors = ErrorLog::default();
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        panes[0].set_intake_dir(mint_pane_channel(&requests_dir, &mut errors));
+        let short = panes[0].short().to_string();
+        assert!(
+            sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "the pane registers before the kill"
+        );
+        let own_channel = panes[0]
+            .intake_dir()
+            .expect("the pane has its own channel")
+            .to_path_buf();
+
+        let path = spawnreq::write_request(&own_channel, &kill_request(&short)).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+
+        let ack = spawnreq::wait_for_ack(&own_channel, &stem, Duration::from_millis(50))
+            .expect("the kill is acked");
+        assert!(
+            ack.ok,
+            "a pane naming itself on its own channel is honoured: {ack:?}"
+        );
+        assert_eq!(ack.short.as_deref(), Some(short.as_str()));
+        assert!(
+            matches!(panes[0].state(), PaneState::Ended(_)),
+            "and the pane is left ready for this tick's reap, not lingering live"
+        );
+        assert!(
+            !sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "with its registry record released by the owner"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// Issue #435 item 1: honoured not just for self, but for any pane
+    /// spawned through the requester's own channel -- directly, or (as here)
+    /// transitively through a chain of further spawns. Two levels deep:
+    /// `requester` spawned `child`, `child` spawned `grandchild`
+    /// (`grandchild`'s own `requested_by` in `kept_requests` names `child`,
+    /// `child`'s names `requester`), and a kill for `grandchild` arriving on
+    /// `requester`'s own channel is still honoured.
+    #[test]
+    fn a_kill_request_on_the_owning_panes_channel_stops_a_descendant_two_levels_deep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = tmp.path().join("requests");
+
+        let mut errors = ErrorLog::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        for session_id in [
+            "aaaaaaaa-4444-4555-8666-777777777777",
+            "bbbbbbbb-4444-4555-8666-777777777777",
+            "cccccccc-4444-4555-8666-777777777777",
+        ] {
+            let mut pane = Pane::spawn(
+                PaneSpec {
+                    agent_name: "test-agent".to_string(),
+                    argv: silent_long_lived_argv(),
+                    role: prompt::PromptRole::Worker,
+                    verb: sessions::Verb::Dash,
+                    session_id: session_id.to_string(),
+                    title: "wrk test".to_string(),
+                },
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn");
+            pane.set_intake_dir(mint_pane_channel(&requests_dir, &mut errors));
+            panes.push(pane);
+        }
+        let requester = panes[0].short().to_string();
+        let child = panes[1].short().to_string();
+        let grandchild = panes[2].short().to_string();
+        let requester_channel = panes[0]
+            .intake_dir()
+            .expect("the requester has its own channel")
+            .to_path_buf();
+
+        let mut kept_requests: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> =
+            HashMap::new();
+        kept_requests.insert(
+            child.clone(),
+            (spawnreq::SpawnRequest::default(), Some(requester.clone())),
+        );
+        kept_requests.insert(
+            grandchild.clone(),
+            (spawnreq::SpawnRequest::default(), Some(child.clone())),
+        );
+
+        let path =
+            spawnreq::write_request(&requester_channel, &kill_request(&grandchild)).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new(); panes.len()];
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut kept_requests,
+        );
+
+        let ack = spawnreq::wait_for_ack(&requester_channel, &stem, Duration::from_millis(50))
+            .expect("the kill is acked on the channel it arrived on");
+        assert!(
+            ack.ok,
+            "a descendant two levels down the requester's own spawn chain is honoured: {ack:?}"
+        );
+        assert_eq!(ack.short.as_deref(), Some(grandchild.as_str()));
+        assert!(
+            matches!(panes[2].state(), PaneState::Ended(_)),
+            "the grandchild was stopped"
+        );
+        assert!(
+            !matches!(panes[0].state(), PaneState::Ended(_))
+                && !matches!(panes[1].state(), PaneState::Ended(_)),
+            "requester and child are untouched"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// SECURITY (issue #435 item 1): a `kill` dropped on the dashboard's own
+    /// SHARED channel is refused outright, regardless of target -- that
+    /// directory is a fixed sibling of every pane's own intake directory, so
+    /// any pane's child tree can derive its path just as easily as `zirv ctx
+    /// kill` can, and nothing arriving there identifies who wrote it. `zirv
+    /// ctx kill` itself no longer uses this channel at all (see
+    /// `sessions::kill_via_dashboard`); this is the shape a same-uid process
+    /// deriving the shared path by hand would be reduced to.
+    ///
+    /// Review round 2: no supported client ever polls THIS channel for an
+    /// ack any more, so `drain_one_channel` no longer writes one for this
+    /// refusal -- it would just be an `ack-req-<uuid>.json` neither
+    /// `spawnreq::take_requests` nor `wait_for_ack` ever sweeps back up. The
+    /// refusal is surfaced into the dashboard's own error log instead.
+    #[test]
+    fn a_kill_request_on_the_shared_channel_is_refused_and_stops_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
@@ -26258,10 +26588,6 @@ mod tests {
             .expect("spawn"),
         ];
         let short = panes[0].short().to_string();
-        assert!(
-            sessions::list(&state).iter().any(|(r, _)| r.short == short),
-            "the pane registers before the kill"
-        );
 
         let path = spawnreq::write_request(&dir, &kill_request(&short)).expect("write");
         let stem = spawnreq::request_stem(&path).expect("stem");
@@ -26280,34 +26606,91 @@ mod tests {
             &mut HashMap::new(),
         );
 
-        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
-            .expect("the kill is acked");
-        assert!(ack.ok, "the owner stopped its own pane: {ack:?}");
-        assert_eq!(ack.short.as_deref(), Some(short.as_str()));
-        assert!(
-            matches!(panes[0].state(), PaneState::Ended(_)),
-            "and the pane is left ready for this tick's reap, not lingering live"
+        assert_eq!(
+            spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50)),
+            None,
+            "no supported client polls the shared channel for a kill ack any more, so none is written"
         );
         assert!(
-            !sessions::list(&state).iter().any(|(r, _)| r.short == short),
-            "with its registry record released by the owner"
+            !dir.join(format!("ack-{stem}.json")).exists(),
+            "and no ack file is left behind on disk either"
+        );
+        assert!(
+            errors
+                .last()
+                .is_some_and(|e| e.contains(KILL_SHARED_CHANNEL_REFUSAL)),
+            "the refusal is still surfaced, in the dashboard's own error log: {:?}",
+            errors.last()
+        );
+        assert!(
+            !matches!(panes[0].state(), PaneState::Ended(_)),
+            "the named pane is untouched"
+        );
+        assert!(
+            sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "and still registered"
         );
 
         for pane in panes.iter_mut() {
-            let _ = pane.finish_shutdown();
+            let _ = pane.shutdown("");
         }
     }
 
-    /// SECURITY (review round 2, finding 1): a `kill` request is honoured
-    /// ONLY on the dashboard's own shared channel. A pane's attributed
-    /// intake channel is writable by that pane's own low-trust child tree,
-    /// and #403 exists precisely because a sandboxed shell cannot signal a
-    /// pane process itself -- so honouring one there handed a worker exactly
-    /// the cross-pane stop its sandbox denies it, against a pane it does not
-    /// own: the request names nothing but a short id, and `stop_owned_pane`
-    /// matches on that alone.
+    /// Review round 2: `push_error`'s own message must not vary with the
+    /// refused kill's `target`, or a same-uid process naming a different
+    /// (even nonexistent) short id on every forged kill would defeat
+    /// `ErrorLog::record`'s adjacent-message dedup and evict every genuine
+    /// error out of the ring (`MAX_KEPT_ERRORS`, 5 slots) one forged kill at
+    /// a time. Two refusals in a row, naming two DIFFERENT targets, still
+    /// collapse onto the one slot identical adjacent text already gets.
     #[test]
-    fn a_kill_request_on_a_panes_own_channel_is_refused_and_stops_nothing() {
+    fn two_shared_channel_kill_refusals_in_a_row_leave_one_error_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let dir = tmp.path().join("requests");
+
+        spawnreq::write_request(&dir, &kill_request("deadbeef")).expect("write");
+        spawnreq::write_request(&dir, &kill_request("feedface")).expect("write");
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = ErrorLog::default();
+        handle_spawn_requests(
+            &dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+
+        let messages: Vec<String> = errors.messages().collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "two forged kills naming different targets must not evict each other's slot: \
+             {messages:?}"
+        );
+        assert!(
+            messages[0].ends_with("\u{d7}2"),
+            "both refusals are still counted, just onto the same slot: {messages:?}"
+        );
+    }
+
+    /// SECURITY (issue #435 item 1, was review round 2 finding 1): a `kill`
+    /// arriving on a pane's own channel is honoured only for that pane
+    /// itself or a pane it spawned -- naming an unrelated sibling (no
+    /// `requested_by` chain connects them) is refused, even though the
+    /// channel itself identifies the requester (issue #179: that
+    /// identification is not authentication).
+    #[test]
+    fn a_kill_request_on_a_panes_own_channel_targeting_an_unrelated_pane_is_refused() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
@@ -26375,7 +26758,7 @@ mod tests {
             !ack.retryable,
             "and it is final -- no channel this request may be re-sent on exists: {ack:?}"
         );
-        assert_eq!(ack.reason.as_deref(), Some(KILL_OFF_CHANNEL_REFUSAL));
+        assert_eq!(ack.reason.as_deref(), Some(KILL_UNRELATED_PANE_REFUSAL));
         assert!(
             !matches!(panes[0].state(), PaneState::Ended(_)),
             "the named pane is untouched"
@@ -26394,22 +26777,30 @@ mod tests {
 
     /// Issue #403: a kill naming a pane this dashboard does not have is
     /// refused, retryably -- the requester's own fallback is signalling the
-    /// pid directly, and this refusal says nothing against that.
+    /// pid directly, and this refusal says nothing against that. Exercised
+    /// on the requester's own channel, naming itself: `kill_allowed` passes
+    /// (self is always allowed), so this is `stop_owned_pane`'s own
+    /// not-found branch, not the ownership gate -- and needs `drain_one_
+    /// channel` directly, since `handle_spawn_requests`/`intake_channels`
+    /// only ever attribute a channel to a pane that actually exists.
     #[test]
     fn a_kill_request_naming_an_unknown_pane_is_refused() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let dir = tmp.path().join("requests");
+        let requests_dir = tmp.path().join("requests");
+        let own_channel = tmp.path().join("p-deadbeef-token");
 
-        let path = spawnreq::write_request(&dir, &kill_request("deadbeef")).expect("write");
+        let path = spawnreq::write_request(&own_channel, &kill_request("deadbeef")).expect("write");
         let stem = spawnreq::request_stem(&path).expect("stem");
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = ErrorLog::default();
-        handle_spawn_requests(
-            &dir,
+        drain_one_channel(
+            &own_channel,
+            Some("deadbeef"),
+            &requests_dir,
             &mut panes,
             &mut queues,
             &CtxConfig::default(),
@@ -26421,7 +26812,7 @@ mod tests {
             &mut HashMap::new(),
         );
 
-        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
+        let ack = spawnreq::wait_for_ack(&own_channel, &stem, Duration::from_millis(50))
             .expect("the refusal is acked");
         assert!(!ack.ok);
         assert!(ack.retryable, "so the requester may signal the pid itself");
@@ -26432,7 +26823,7 @@ mod tests {
             "and says why: {ack:?}"
         );
         assert!(
-            !spawnreq::is_claimed(&dir, &stem),
+            !spawnreq::is_claimed(&own_channel, &stem),
             "a refusal withdraws its own claim, kill or spawn"
         );
         assert!(panes.is_empty(), "and nothing was spawned");
