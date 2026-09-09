@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-07
+last-verified: 2026-09-09
 ---
 
 # _system-context
@@ -59,6 +59,7 @@ Every row's "vault page" is also the page whose "If changed" line names its own 
 | `status` | Show the session registry, the memory bank, unread mail, scores, and the decision-log tail. `--brief` collapses unbounded sections to totals; `--diff` (issue #246) prints only the sections changed since this session's own previous `--diff` call. |
 | `send` / `inbox` | Leave or read repo-scoped notes between sessions, optionally addressed to one live session (`--to-session`) or fanned out to every live session (`--all`, per-session read markers on one stored message, issue #94). |
 | `nudge` | Wake a live session early with a message, resolved against the session registry. |
+| `ask` | Read-only question over a LIVE worker session's own transcript, answered by one distiller call; never sends it input or touches its transcript/registry record (issue #310). |
 | `remember` / `recall` / `forget` | Read and write the repo-scoped memory bank of durable repository facts. Also reachable as the top-level, scope-aware `zirv memory status\|list\|recall\|remember\|forget\|verify` (`--shared` for the repository-owned bank), a sibling surface intercepted directly in `main.rs`, not a `zirv ctx` verb. |
 | `loop` | Stateless loop runner — a fresh headless session and `SessionId` every cycle. |
 | `exec` | Supervise one headless run; restart in place (bounded budget) on rot or a usage limit. |

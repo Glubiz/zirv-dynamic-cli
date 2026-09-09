@@ -5326,6 +5326,13 @@ pub struct CheckArgs {
     /// payload on stdin).
     #[arg(allow_hyphen_values = true, last = true)]
     pub command: Vec<String>,
+    /// Issue #418: hook mode only -- project a non-claude agent's own native
+    /// `PreToolUse`-equivalent payload onto this hook's claude shape before
+    /// evaluating, then translate the verdict back into that agent's own
+    /// response envelope. Omitted (or `claude`) leaves this byte-for-byte
+    /// identical to the original claude-only hook.
+    #[arg(long)]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -8039,7 +8046,47 @@ pub fn run_check<W: Write>(args: &CheckArgs, w: &mut W, env: EnvLookup<'_>) -> C
         return Ok(outcome.verdict.exit_code());
     }
 
-    run_check_hook_mode_with_env(&cfg, w, &read_stdin(), env)
+    run_check_hook_mode_for_agent(&cfg, w, &read_stdin(), env, args.agent.as_deref())
+}
+
+/// Issue #418: `run_check`'s hook-mode body for every agent, split out so it
+/// can be driven directly with a raw stdin string (the same reason
+/// `run_check_hook_mode_with_env` itself exists, one layer up). `None`/
+/// `Some("claude")` is byte-for-byte the original claude-only path; any
+/// other name projects `stdin` through [`super::hook_project::
+/// project_pretool`], runs [`run_check_hook_mode_with_env`] against the
+/// projected claude-shaped payload, and translates whatever it printed via
+/// [`super::hook_project::translate_pretool_envelope`] -- the same
+/// project/run/translate shape `hook::run_pretool_for_agent` uses, so a
+/// denial from either surface reaches a non-claude agent through one shared
+/// translation, never a per-agent copy of it.
+fn run_check_hook_mode_for_agent<W: Write>(
+    cfg: &CtxConfig,
+    w: &mut W,
+    stdin: &str,
+    env: EnvLookup<'_>,
+    agent: Option<&str>,
+) -> CtxResult<i32> {
+    match agent {
+        None | Some("claude") => run_check_hook_mode_with_env(cfg, w, stdin, env),
+        Some(name) => {
+            let Some(projected) = super::hook_project::project_pretool(name, stdin) else {
+                return Ok(0);
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            let code = run_check_hook_mode_with_env(cfg, &mut buf, &projected, env)?;
+            let claude_envelope = String::from_utf8(buf)
+                .ok()
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty());
+            if let Some(translated) =
+                super::hook_project::translate_pretool_envelope(name, claude_envelope)
+            {
+                writeln!(w, "{translated}")?;
+            }
+            Ok(code)
+        }
+    }
 }
 
 /// Whether `env` carries zirv's own durable interactive-launch pin
@@ -9524,6 +9571,174 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Issue #418: non-claude agent projection ---------------------------
+
+    /// A droid `Execute` payload naming a command the safety policy denies
+    /// outright yields the claude-identical `hookSpecificOutput` deny
+    /// envelope; the gemini variant of the same command yields gemini's own
+    /// `{"decision":"deny","reason":...}` shape. Drives `run_check_hook_
+    /// mode_for_agent` three ways (claude, droid, gemini) against the SAME
+    /// underlying command and compares against the actual claude output,
+    /// rather than a hand-written expectation, so a change to the deny
+    /// reason text cannot silently desync this test from production.
+    #[test]
+    fn droid_and_gemini_projected_denies_match_claude() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let env = |_: &str| None;
+
+        let claude_stdin = r#"{"tool_name":"Bash","tool_input":{"command":"sudo rm -rf /"}}"#;
+        let mut claude_out = Vec::new();
+        run_check_hook_mode_for_agent(&cfg, &mut claude_out, claude_stdin, &env, None)
+            .expect("runs");
+        let claude_text = String::from_utf8(claude_out).expect("utf8");
+        let claude_json: serde_json::Value =
+            serde_json::from_str(claude_text.trim()).expect("json");
+        assert_eq!(
+            claude_json["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
+        let reason = claude_json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .expect("a reason")
+            .to_string();
+
+        let droid_stdin = r#"{"session_id":"s1","cwd":"/repo","tool_name":"Execute","tool_input":{"command":"sudo rm -rf /"}}"#;
+        let mut droid_out = Vec::new();
+        run_check_hook_mode_for_agent(&cfg, &mut droid_out, droid_stdin, &env, Some("droid"))
+            .expect("runs");
+        let droid_text = String::from_utf8(droid_out).expect("utf8");
+        assert_eq!(
+            droid_text.trim(),
+            claude_text.trim(),
+            "droid documents claude's exact hookSpecificOutput shape"
+        );
+
+        let gemini_stdin = r#"{"session_id":"s1","cwd":"/repo","tool_name":"run_shell_command","tool_input":{"command":"sudo rm -rf /"}}"#;
+        let mut gemini_out = Vec::new();
+        run_check_hook_mode_for_agent(&cfg, &mut gemini_out, gemini_stdin, &env, Some("gemini"))
+            .expect("runs");
+        let gemini_text = String::from_utf8(gemini_out).expect("utf8");
+        let gemini_json: serde_json::Value =
+            serde_json::from_str(gemini_text.trim()).expect("json");
+        assert_eq!(gemini_json["decision"], "deny");
+        assert_eq!(gemini_json["reason"], reason);
+    }
+
+    /// Review round (#418): a recognized field present with the wrong JSON
+    /// type must fail the whole projection (empty stdout, exit 0), never be
+    /// silently coerced into the "field absent" default and let a command
+    /// the base policy would otherwise deny sail through unclassified.
+    #[test]
+    fn droid_projected_payload_with_a_wrongly_typed_field_fails_open() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let env = |_: &str| None;
+
+        let droid_stdin =
+            r#"{"tool_name":"Execute","cwd":7,"tool_input":{"command":"sudo rm -rf /"}}"#;
+        let mut out = Vec::new();
+        let code = run_check_hook_mode_for_agent(&cfg, &mut out, droid_stdin, &env, Some("droid"))
+            .expect("runs");
+        assert_eq!(code, 0);
+        assert!(
+            out.is_empty(),
+            "a wrongly-typed recognized field must fail open: {out:?}"
+        );
+    }
+
+    /// Review round (#418): a headless `ask` verdict on an unclassified
+    /// command must not collapse to silence for a non-claude agent -- it
+    /// would read as a silent allow, the wrong failure direction for a
+    /// confirmation gate. Copilot/droid pass it through with the same
+    /// reason claude gets; gemini has no `ask` concept and fails closed to a
+    /// deny that still names the reason.
+    #[test]
+    fn projected_asks_do_not_collapse_to_silence() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = super::super::testenv::HomeGuard::set(home.path());
+        let empty: HashMap<String, String> = HashMap::new();
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("loads");
+        let env = |_: &str| None;
+        let command = "some-totally-unknown-tool --flag";
+
+        let claude_stdin =
+            format!(r#"{{"tool_name":"Bash","tool_input":{{"command":"{command}"}}}}"#);
+        let mut claude_out = Vec::new();
+        run_check_hook_mode_for_agent(&cfg, &mut claude_out, &claude_stdin, &env, None)
+            .expect("runs");
+        let claude_text = String::from_utf8(claude_out).expect("utf8");
+        let claude_json: serde_json::Value =
+            serde_json::from_str(claude_text.trim()).expect("json");
+        assert_eq!(
+            claude_json["hookSpecificOutput"]["permissionDecision"], "ask",
+            "sanity: an unclassified command must ask headlessly: {claude_text}"
+        );
+        let reason = claude_json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .expect("a reason")
+            .to_string();
+
+        let copilot_stdin = format!(
+            r#"{{"session_id":"s1","cwd":"/repo","tool_name":"bash","tool_input":{{"command":"{command}"}}}}"#
+        );
+        let mut copilot_out = Vec::new();
+        run_check_hook_mode_for_agent(
+            &cfg,
+            &mut copilot_out,
+            &copilot_stdin,
+            &env,
+            Some("copilot"),
+        )
+        .expect("runs");
+        let copilot_text = String::from_utf8(copilot_out).expect("utf8");
+        let copilot_json: serde_json::Value =
+            serde_json::from_str(copilot_text.trim()).expect("json");
+        assert_eq!(copilot_json["permissionDecision"], "ask");
+        assert_eq!(copilot_json["permissionDecisionReason"], reason);
+
+        let droid_stdin = format!(
+            r#"{{"session_id":"s1","cwd":"/repo","tool_name":"Execute","tool_input":{{"command":"{command}"}}}}"#
+        );
+        let mut droid_out = Vec::new();
+        run_check_hook_mode_for_agent(&cfg, &mut droid_out, &droid_stdin, &env, Some("droid"))
+            .expect("runs");
+        let droid_text = String::from_utf8(droid_out).expect("utf8");
+        assert_eq!(
+            droid_text.trim(),
+            claude_text.trim(),
+            "droid documents claude's exact envelope for ask too"
+        );
+
+        let gemini_stdin = format!(
+            r#"{{"session_id":"s1","cwd":"/repo","tool_name":"run_shell_command","tool_input":{{"command":"{command}"}}}}"#
+        );
+        let mut gemini_out = Vec::new();
+        run_check_hook_mode_for_agent(&cfg, &mut gemini_out, &gemini_stdin, &env, Some("gemini"))
+            .expect("runs");
+        let gemini_text = String::from_utf8(gemini_out).expect("utf8");
+        let gemini_json: serde_json::Value =
+            serde_json::from_str(gemini_text.trim()).expect("json");
+        assert_eq!(
+            gemini_json["decision"], "deny",
+            "gemini has no ask concept, so it fails closed"
+        );
+        assert!(
+            gemini_json["reason"]
+                .as_str()
+                .expect("a reason")
+                .contains(&reason),
+            "the original reason must survive: {gemini_json}"
+        );
     }
 
     // -- is_reserved_zirv_escape_safe (issue #224) ------------------------
@@ -15293,6 +15508,7 @@ mod tests {
             repo: repo.path().to_path_buf(),
             mode: LaunchMode::Interactive,
             command: vec!["rm".to_string(), "-rf".to_string(), "/".to_string()],
+            agent: None,
         };
         let mut out = Vec::new();
         let code = run_check(&args, &mut out, &|k| empty.get(k).cloned()).expect("runs");
@@ -15647,6 +15863,7 @@ mod tests {
             repo: repo.path().to_path_buf(),
             mode: LaunchMode::Interactive,
             command: vec!["echo blocked > outside.txt".into()],
+            agent: None,
         };
         let mut out = Vec::new();
         assert_eq!(run_check(&args, &mut out, &env).unwrap(), 2);

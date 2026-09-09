@@ -833,6 +833,10 @@ impl AgentAdapter for QwenAdapter {
             // `Capabilities::default()` reading, not a positive claim.
             defer_injection_submit: false,
             context_window_tokens: None,
+            // Issue #418: no verified native hooks surface for qwen-code;
+            // this wave adds seams for copilot/droid/gemini only.
+            pre_tool_hook: false,
+            post_tool_hook: false,
         }
     }
 
@@ -1345,6 +1349,11 @@ mod tests {
         assert!(caps.system_prompt);
         assert!(!caps.marker_signal);
         assert!(!caps.turn_signal);
+        assert!(
+            !caps.pre_tool_hook,
+            "issue #418: no verified native hooks surface for qwen"
+        );
+        assert!(!caps.post_tool_hook);
         assert!(!adapter().counts_tool_calls());
         assert!(!adapter().supports_headless_compact());
     }

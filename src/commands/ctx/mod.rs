@@ -4,6 +4,7 @@ pub mod adapters;
 pub mod agent;
 pub mod allocator;
 pub mod announce;
+pub mod ask;
 pub mod attention;
 pub mod breakdown;
 pub mod catalogue;
@@ -30,6 +31,7 @@ pub mod handoff;
 pub mod handover;
 pub mod hook;
 pub(crate) mod hook_integrity;
+pub(crate) mod hook_project;
 pub mod judge;
 pub mod learn;
 pub mod ledger;
@@ -39,6 +41,7 @@ pub mod measure;
 pub mod memory;
 pub mod memory_cli;
 pub mod memory_optimize;
+pub mod native_hooks;
 pub mod objective;
 pub mod optimize;
 pub mod output;
@@ -470,6 +473,11 @@ pub enum CtxVerb {
     Forget(memory::ForgetArgs),
     /// Interrupt a live session with a message: durable mail plus a wake-up.
     Nudge(sessions::NudgeArgs),
+    /// Distill a read-only answer to a question from a LIVE worker
+    /// session's own transcript (issue #310, 3c). Never sends input to that
+    /// session -- no pty/stdin write, no nudge, no mail -- and never
+    /// modifies its transcript or registry record.
+    Ask(ask::AskArgs),
     /// Terminate a registered session's process outright: SIGTERM, escalating
     /// to SIGKILL, then deregister it -- unlike `nudge`, this never depends
     /// on the target being able to notice or act on anything. On unix a pid
@@ -637,6 +645,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Recall(a) => memory::run_recall(a, &mut out),
         CtxVerb::Forget(a) => memory::run_forget(a, &mut out),
         CtxVerb::Nudge(a) => sessions::run_nudge(a, &mut out),
+        CtxVerb::Ask(a) => ask::run(a, &mut out),
         CtxVerb::Kill(a) => sessions::run_kill(a, &mut out),
         CtxVerb::Safety(a) => safety::run(a, &mut out),
         CtxVerb::Handover(a) => handover::run(a, &mut out),
@@ -808,6 +817,22 @@ mod tests {
                 command: objective::ObjectiveVerb::Close(_)
             })
         ));
+    }
+
+    /// Issue #310 (3c): `zirv ctx ask <session> "<question>"` parses, and its
+    /// `--json` flag defaults off.
+    #[test]
+    fn ask_verb_parses_session_and_question() {
+        let cli = CtxCli::try_parse_from(["zirv ctx", "ask", "abc", "what is the worker doing"])
+            .expect("ask should parse");
+        match cli.verb {
+            CtxVerb::Ask(a) => {
+                assert_eq!(a.session, "abc");
+                assert_eq!(a.question, "what is the worker doing");
+                assert!(!a.json);
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        }
     }
 
     /// `exec`'s own flags come before `--`, the headless agent command after.
@@ -1178,6 +1203,7 @@ mod tests {
             vec!["ctx", "loop", "--help"],
             vec!["ctx", "wrap", "-h"],
             vec!["ctx", "hook", "--help"],
+            vec!["ctx", "ask", "--help"],
         ] {
             let args: Vec<String> = argv.iter().map(|a| (*a).to_string()).collect();
             assert_eq!(dispatch(&args), 0, "--help must exit 0: {argv:?}");

@@ -1257,6 +1257,10 @@ pub fn evidence_from_transcripts(
             // Phase 6(b)'s job) -- this synthetic evidence pass has no real
             // adapter/model pairing to ask, so unknown is honest here too.
             context_window_tokens: None,
+            // Not read by `rot::score_events` either -- issue #418's hook
+            // seams are irrelevant to rot scoring.
+            pre_tool_hook: false,
+            post_tool_hook: false,
         };
         if rot::score_events(&events, caps, cfg).verdict == Verdict::Restart {
             evidence.rot_sessions += 1;

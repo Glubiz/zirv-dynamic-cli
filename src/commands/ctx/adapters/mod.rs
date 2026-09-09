@@ -1831,6 +1831,21 @@ pub trait AgentAdapter: std::fmt::Debug {
         let _ = session;
         Vec::new()
     }
+
+    /// Issue #418: this agent's own native, user-level hooks configuration
+    /// target -- the file zirv should install/inspect/remove its own
+    /// `PreToolUse`/`PostToolUse`-equivalent entries into, and the entries
+    /// themselves. `None` -- the default -- means no verified native hooks
+    /// surface exists at all (codex, opencode, pi, qwen); `zirv ctx hook
+    /// install <agent>` refuses cleanly on it. `home` is the bare home
+    /// directory (`crate::utils::home_dir()`'s own answer, or a tempdir in a
+    /// test); an implementation resolves its own subdirectory from it, the
+    /// same way `DroidAdapter::home_dir`/`GeminiAdapter::home_dir` already
+    /// join `.factory`/`.gemini` onto their own resolved home.
+    fn native_hooks(&self, home: &Path) -> Option<super::native_hooks::NativeHooks> {
+        let _ = home;
+        None
+    }
 }
 
 /// The program invocation at the head of an argv: the binary plus the leading
@@ -4190,6 +4205,8 @@ mod tests {
             events: true,
             defer_injection_submit: true,
             context_window_tokens: None,
+            pre_tool_hook: true,
+            post_tool_hook: true,
         };
         assert!(missing_capability_labels(all_true).is_empty());
 

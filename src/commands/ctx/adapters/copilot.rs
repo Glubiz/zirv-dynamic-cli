@@ -178,7 +178,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::super::CtxResult;
 use super::super::catalogue;
@@ -186,6 +186,7 @@ use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
     input_hash,
 };
+use super::super::native_hooks::{NativeHookEntry, NativeHooks};
 use super::super::window;
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
@@ -674,6 +675,11 @@ impl AgentAdapter for CopilotAdapter {
             // positive claim of "submits correctly".
             defer_injection_submit: false,
             context_window_tokens: None,
+            // Issue #418: `~/.copilot/hooks/zirv.json` carries both a
+            // `preToolUse` guard and a `postToolUse` compaction hook -- see
+            // `native_hooks`'s own doc comment for the DOCS-ONLY citations.
+            pre_tool_hook: true,
+            post_tool_hook: true,
         }
     }
 
@@ -682,6 +688,62 @@ impl AgentAdapter for CopilotAdapter {
             .and_then(catalogue::vendor_of)
             .and_then(catalogue::vendor)?;
         catalogue::context_window(vendor, model)
+    }
+
+    /// Issue #418, DOCS-ONLY, verified from official docs 2026-09-09, not
+    /// against a live binary (copilot CLI is not installed here -- see this
+    /// module's own top doc comment).
+    ///
+    /// `docs.github.com/en/copilot/reference/hooks-reference` (CLI 1.0.83):
+    /// every `~/.copilot/hooks/*.json` file is loaded (`$COPILOT_HOME`
+    /// overrides `~/.copilot`); zirv owns a dedicated `zirv.json` file so
+    /// uninstall is a plain delete that never touches any other hook file.
+    /// Shape: `{"version":1,"hooks":{"preToolUse":[{"type":"command",
+    /// "bash":"<cmd>","powershell":"<cmd>","timeoutSec":30}],
+    /// "postToolUse":[{...}]}}`, with an optional `"matcher":"bash|edit"` on
+    /// any one entry. The guard entry (`zirv ctx hook pretool --agent
+    /// copilot`) carries no matcher at all -- non-shell tool names are
+    /// unverified, so the guard must see every call, exactly like claude's
+    /// own `PreToolUse` `Agent|Task`/write-tool wiring does not restrict by
+    /// matcher either; the safety-check and compaction entries both carry
+    /// `"matcher":"bash"`, the one tool name this module's own doc comment
+    /// verifies.
+    fn native_hooks(&self, home: &Path) -> Option<NativeHooks> {
+        let file = home.join(".copilot").join("hooks").join("zirv.json");
+        let flat = |command: &str, matcher: Option<&str>| {
+            let mut value = json!({
+                "type": "command",
+                "bash": command,
+                "powershell": command,
+                "timeoutSec": 30
+            });
+            if let Some(matcher) = matcher {
+                value["matcher"] = Value::String(matcher.to_string());
+            }
+            value
+        };
+        Some(NativeHooks {
+            file,
+            owned_file: true,
+            root_defaults: json!({"version": 1}),
+            entries: vec![
+                NativeHookEntry {
+                    pointer: vec!["hooks".to_string(), "preToolUse".to_string()],
+                    element: flat("zirv ctx hook pretool --agent copilot", None),
+                    label: "pretool guard",
+                },
+                NativeHookEntry {
+                    pointer: vec!["hooks".to_string(), "preToolUse".to_string()],
+                    element: flat("zirv ctx safety check --agent copilot", Some("bash")),
+                    label: "safety check",
+                },
+                NativeHookEntry {
+                    pointer: vec!["hooks".to_string(), "postToolUse".to_string()],
+                    element: flat("zirv ctx hook posttool --agent copilot", Some("bash")),
+                    label: "posttool compaction",
+                },
+            ],
+        })
     }
 
     /// This adapter's own vendor is resolved per-MODEL for the ladder
@@ -907,6 +969,14 @@ mod tests {
         assert!(!caps.marker_signal);
         assert!(!caps.turn_signal);
         assert!(!caps.system_prompt);
+        assert!(
+            caps.pre_tool_hook,
+            "issue #418: preToolUse guard is native-hooked"
+        );
+        assert!(
+            caps.post_tool_hook,
+            "issue #418: postToolUse can replace a result"
+        );
         assert!(adapter().counts_tool_calls());
     }
 

@@ -33,11 +33,26 @@ pub enum HookEvent {
     /// Claude PreToolUse hook: refuse a subagent dispatch that would inherit
     /// this seat's expensive model, and refuse an orchestrator seat's own
     /// direct edit of a repository file (issue #334).
-    Pretool,
+    Pretool {
+        /// Issue #418: project a non-claude agent's own native `PreToolUse`-
+        /// equivalent payload onto this hook's claude shape before running
+        /// the guard, then translate the verdict back into that agent's own
+        /// response envelope. Omitted (or `claude`) leaves this byte-for-byte
+        /// identical to the original claude-only hook.
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Claude PostToolUse hook: replace a large `Bash` tool result with a
     /// compact, reversible summary before the model ever sees it (issue
     /// #326). The original output is stored verbatim first.
-    Posttool,
+    Posttool {
+        /// Issue #418: same projection/translation as `pretool`'s own
+        /// `--agent`, for copilot's `postToolUse` `modifiedResult` contract.
+        /// Only `copilot` has a supported native compaction envelope; any
+        /// other non-`claude` value exits 0 with nothing on stdout.
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Observe Claude permission requests and denials without changing their
     /// flow. Sandboxed-command network prompts emit a `Notification` instead
     /// and do not invoke `PermissionRequest` hooks.
@@ -67,6 +82,26 @@ pub enum HookEvent {
         /// zirv-authored shape.
         #[arg(long)]
         heal: bool,
+    },
+    /// Issue #418: install (or remove) zirv's own native hook entries into
+    /// `<agent>`'s own user-level hooks configuration file -- copilot,
+    /// droid or gemini; see `native_hooks::NativeHooks`/`AgentAdapter::
+    /// native_hooks`. Idempotent: a second `install` with no flags reports
+    /// what is already there and changes nothing.
+    Install {
+        /// A registered adapter name with a native hooks surface
+        /// (`AgentAdapter::native_hooks` returning `Some`).
+        agent: String,
+        /// Print the target file and each entry's current state without
+        /// writing anything.
+        #[arg(long)]
+        show: bool,
+        /// Remove zirv's own entries instead of installing them.
+        #[arg(long)]
+        uninstall: bool,
+        /// Print what would change without writing anything.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 
@@ -2995,8 +3030,12 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
             Ok(0)
         }
         HookEvent::PreCompact => run_pre_compact(w, &read_stdin(), &env),
-        HookEvent::Pretool => run_pretool(w, &read_stdin(), &env),
-        HookEvent::Posttool => run_posttool(w, &read_stdin(), &env),
+        HookEvent::Pretool { agent } => {
+            run_pretool_for_agent(w, &read_stdin(), &env, agent.as_deref())
+        }
+        HookEvent::Posttool { agent } => {
+            run_posttool_for_agent(w, &read_stdin(), &env, agent.as_deref())
+        }
         HookEvent::Permission => run_permission(w, &read_stdin(), &env),
         HookEvent::SessionStart => run_session_start(w, &read_stdin(), &env),
         HookEvent::Notify { payload } => {
@@ -3008,7 +3047,182 @@ pub fn run<W: Write>(args: &HookArgs, w: &mut W) -> CtxResult<i32> {
         }
         HookEvent::Audit { since } => run_audit(w, since, &env),
         HookEvent::Status { heal } => run_hook_status(w, *heal, &env),
+        HookEvent::Install {
+            agent,
+            show,
+            uninstall,
+            dry_run,
+        } => run_hook_install(w, agent, *show, *uninstall, *dry_run),
     }
+}
+
+// -- Issue #418: non-claude agent payload projection --------------------
+
+/// `pretool`'s own body for every agent. `None`/`Some("claude")` is
+/// byte-for-byte the original claude-only path (`run_pretool` itself,
+/// untouched); any other name projects the payload through
+/// [`super::hook_project::project_pretool`], runs the SAME [`run_pretool`]
+/// body against the projected claude-shaped payload, and translates whatever
+/// it printed via [`super::hook_project::translate_pretool_envelope`]. Fails
+/// open throughout: an unparseable payload or an unrecognised agent name
+/// leaves stdout empty and exits 0, exactly like `run_pretool` itself does
+/// on a payload it cannot make sense of.
+pub fn run_pretool_for_agent<W: Write>(
+    w: &mut W,
+    stdin: &str,
+    env: EnvLookup<'_>,
+    agent: Option<&str>,
+) -> CtxResult<i32> {
+    match agent {
+        None | Some("claude") => run_pretool(w, stdin, env),
+        Some(name) => {
+            let Some(projected) = super::hook_project::project_pretool(name, stdin) else {
+                return Ok(0);
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            let code = run_pretool(&mut buf, &projected, env)?;
+            let claude_envelope = String::from_utf8(buf)
+                .ok()
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty());
+            if let Some(translated) =
+                super::hook_project::translate_pretool_envelope(name, claude_envelope)
+            {
+                let _ = writeln!(w, "{translated}");
+            }
+            Ok(code)
+        }
+    }
+}
+
+/// `posttool`'s own body for every agent. `None`/`Some("claude")` is the
+/// original claude-only path unchanged. `copilot` projects/runs/translates
+/// exactly like [`run_pretool_for_agent`] does. `droid`/`gemini` have no
+/// verified result-replacement contract at all (`Capabilities::
+/// post_tool_hook` is `false` for both -- see their own `native_hooks` doc
+/// comments), so this prints one stderr note and exits 0 rather than
+/// attempting a projection that could never produce a usable envelope.
+pub fn run_posttool_for_agent<W: Write>(
+    w: &mut W,
+    stdin: &str,
+    env: EnvLookup<'_>,
+    agent: Option<&str>,
+) -> CtxResult<i32> {
+    match agent {
+        None | Some("claude") => run_posttool(w, stdin, env),
+        Some("copilot") => {
+            let Some(projected) = super::hook_project::project_posttool_copilot(stdin) else {
+                return Ok(0);
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            let code = run_posttool(&mut buf, &projected, env)?;
+            let claude_envelope = String::from_utf8(buf)
+                .ok()
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty());
+            if let Some(translated) =
+                super::hook_project::translate_posttool_envelope("copilot", stdin, claude_envelope)
+            {
+                let _ = writeln!(w, "{translated}");
+            }
+            Ok(code)
+        }
+        Some(name) => {
+            eprintln!("zirv: posttool compaction is not supported for agent `{name}`");
+            Ok(0)
+        }
+    }
+}
+
+/// `zirv ctx hook install <agent> [--show] [--uninstall] [--dry-run]`
+/// (issue #418). Resolves `agent` through the adapter registry directly
+/// (never `adapters::select`, which requires the binary to be installed and
+/// the operator gate to allow it -- writing a hooks file must work before
+/// either is true), so an unknown name or an adapter with no native hooks
+/// surface (`AgentAdapter::native_hooks` returning `None`) both exit 1 with
+/// a clear message rather than silently doing nothing.
+fn run_hook_install<W: Write>(
+    w: &mut W,
+    agent: &str,
+    show: bool,
+    uninstall: bool,
+    dry_run: bool,
+) -> CtxResult<i32> {
+    let Some(adapter) = super::adapters::ADAPTERS
+        .iter()
+        .find(|(name, _)| *name == agent)
+        .map(|(_, ctor)| ctor(None))
+    else {
+        writeln!(
+            w,
+            "unknown agent '{agent}'; known adapters: {}",
+            super::adapters::ADAPTERS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+        return Ok(1);
+    };
+    let home = crate::utils::home_dir()?;
+    let Some(hooks) = adapter.native_hooks(&home) else {
+        writeln!(w, "agent '{agent}' has no native hook seam")?;
+        return Ok(1);
+    };
+
+    if show {
+        writeln!(w, "{}", hooks.file.display())?;
+        for (label, state) in super::native_hooks::status(&hooks)? {
+            let state = match state {
+                super::native_hooks::InstallState::Installed => "installed",
+                super::native_hooks::InstallState::Missing => "missing",
+            };
+            writeln!(w, "  {label}: {state}")?;
+        }
+        return Ok(0);
+    }
+
+    if uninstall {
+        if dry_run {
+            for (label, state) in super::native_hooks::status(&hooks)? {
+                if state == super::native_hooks::InstallState::Installed {
+                    writeln!(w, "would remove: {label}")?;
+                }
+            }
+            return Ok(0);
+        }
+        let report = super::native_hooks::uninstall(&hooks)?;
+        if report.file_removed {
+            writeln!(w, "removed {}", hooks.file.display())?;
+        } else if report.removed.is_empty() {
+            writeln!(w, "nothing to remove")?;
+        } else {
+            for label in &report.removed {
+                writeln!(w, "removed: {label}")?;
+            }
+        }
+        return Ok(0);
+    }
+
+    if dry_run {
+        for (label, state) in super::native_hooks::status(&hooks)? {
+            if state == super::native_hooks::InstallState::Missing {
+                writeln!(w, "would install: {label}")?;
+            }
+        }
+        return Ok(0);
+    }
+
+    let report = super::native_hooks::install(&hooks)?;
+    if report.written.is_empty() {
+        writeln!(w, "already installed: {}", hooks.file.display())?;
+    } else {
+        writeln!(w, "installed into {}", hooks.file.display())?;
+        for label in &report.written {
+            writeln!(w, "  {label}")?;
+        }
+    }
+    Ok(0)
 }
 
 /// `zirv ctx hook audit [--since N]` (issue #424): counts by verb/verdict
@@ -3210,6 +3424,77 @@ mod tests {
         let report = String::from_utf8(out).expect("utf8");
         assert!(report.contains("no-baseline"), "got {report}");
         assert!(report.contains("summary:"), "got {report}");
+    }
+
+    /// Issue #418: `--show` never creates the file, and reports every entry
+    /// missing before any install has happened.
+    #[test]
+    fn hook_install_show_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let mut out = Vec::new();
+        let code = run_hook_install(&mut out, "copilot", true, false, false).expect("runs");
+        assert_eq!(code, 0);
+        let report = String::from_utf8(out).expect("utf8");
+        assert!(report.contains("missing"), "got {report}");
+        assert!(
+            !dir.path()
+                .join(".copilot")
+                .join("hooks")
+                .join("zirv.json")
+                .exists(),
+            "--show must never create the file"
+        );
+    }
+
+    /// A first `install` writes the entries and reports them; a second,
+    /// identical call reports "already installed" instead -- idempotent,
+    /// matching `native_hooks::install`'s own contract.
+    #[test]
+    fn hook_install_then_a_second_run_reports_already_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+
+        let mut first = Vec::new();
+        let code = run_hook_install(&mut first, "droid", false, false, false).expect("runs");
+        assert_eq!(code, 0);
+        let first_report = String::from_utf8(first).expect("utf8");
+        assert!(
+            first_report.contains("installed into"),
+            "got {first_report}"
+        );
+
+        let mut second = Vec::new();
+        let code = run_hook_install(&mut second, "droid", false, false, false).expect("runs");
+        assert_eq!(code, 0);
+        let second_report = String::from_utf8(second).expect("utf8");
+        assert!(
+            second_report.contains("already installed"),
+            "got {second_report}"
+        );
+    }
+
+    #[test]
+    fn hook_install_refuses_an_unknown_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let mut out = Vec::new();
+        let code =
+            run_hook_install(&mut out, "not-a-real-agent", false, false, false).expect("runs");
+        assert_eq!(code, 1);
+        let report = String::from_utf8(out).expect("utf8");
+        assert!(report.contains("unknown agent"), "got {report}");
+    }
+
+    #[test]
+    fn hook_install_refuses_an_agent_with_no_native_hooks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let mut out = Vec::new();
+        let code = run_hook_install(&mut out, "codex", false, false, false).expect("runs");
+        assert_eq!(code, 1);
+        let report = String::from_utf8(out).expect("utf8");
+        assert!(report.contains("no native hook seam"), "got {report}");
     }
 
     /// `--heal` is a no-op (and still reports) when there is nothing to heal
@@ -6266,6 +6551,14 @@ mod tests {
         String::from_utf8(out).expect("utf8")
     }
 
+    fn run_post_for_agent(rig: &PostToolRig, stdin: &str, agent: Option<&str>) -> String {
+        let mut out = Vec::new();
+        let code = run_posttool_for_agent(&mut out, stdin, &|k| rig.env.get(k).cloned(), agent)
+            .expect("the compact-output hook must never error");
+        assert_eq!(code, 0, "the compact-output hook must never block");
+        String::from_utf8(out).expect("utf8")
+    }
+
     /// The headline behaviour: a large `Bash` result is replaced by a
     /// shape-correct `updatedToolOutput` whose `stdout` keeps every line that
     /// carried signal, and the original is on disk byte for byte.
@@ -6355,6 +6648,52 @@ mod tests {
                 }),
             ),
         );
+        assert!(out.is_empty(), "{out}");
+    }
+
+    /// Issue #418: a copilot `postToolUse` payload carrying a large bash
+    /// result is compacted exactly like claude's own `PostToolUse` payload
+    /// is -- the output is `modifiedResult.textResultForLlm`, and it names a
+    /// retrieval id (`zirv ctx output show <id>`) rather than dropping the
+    /// original.
+    #[test]
+    fn copilot_posttool_compaction_carries_a_retrieval_id() {
+        let rig = posttool_rig(&[]);
+        let original = noisy_output();
+        let copilot_stdin = serde_json::json!({
+            "sessionId": "copilot-session",
+            "cwd": rig.repo.display().to_string(),
+            "toolArgs": {"command": "cargo test"},
+            "toolResult": {"resultType": "success", "textResultForLlm": original},
+        })
+        .to_string();
+        let out = run_post_for_agent(&rig, &copilot_stdin, Some("copilot"));
+        let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
+        let summary = parsed["modifiedResult"]["textResultForLlm"]
+            .as_str()
+            .expect("a summary");
+        assert_eq!(parsed["modifiedResult"]["resultType"], "success");
+        assert!(
+            summary.contains("full output: zirv ctx output show"),
+            "must carry a retrieval id: {summary}"
+        );
+        assert!(summary.len() < original.len() / 4, "{summary}");
+    }
+
+    /// Issue #418: droid has no verified result-replacement contract at all
+    /// (`Capabilities::post_tool_hook` is `false`), so `posttool --agent
+    /// droid` must print nothing and still exit 0 rather than attempt a
+    /// projection that could never produce a usable envelope.
+    #[test]
+    fn posttool_droid_is_unsupported_and_silent() {
+        let rig = posttool_rig(&[]);
+        let droid_stdin = posttool_stdin(
+            &rig.repo,
+            "Execute",
+            "cargo test",
+            serde_json::json!({"command": "cargo test"}),
+        );
+        let out = run_post_for_agent(&rig, &droid_stdin, Some("droid"));
         assert!(out.is_empty(), "{out}");
     }
 
@@ -7526,6 +7865,76 @@ mod tests {
             rows[0].session,
             crate::commands::ctx::sessions::short_id("zirv-sess-42")
         );
+    }
+
+    /// Issue #418: a copilot-shaped camelCase `preToolUse` payload for an
+    /// `edit` by an orchestrator-role session yields the SAME
+    /// `permissionDecisionReason` text claude's own `Edit` payload gets.
+    /// Drives `run_pretool` (claude, unmodified) and `run_pretool_for_agent`
+    /// (copilot, projected) against equivalent payloads and compares the
+    /// reason strings, rather than a hand-written expectation, so a change
+    /// to `orchestrator_write_deny_reason` cannot silently desync this test
+    /// from production.
+    #[test]
+    fn copilot_projected_edit_deny_reason_matches_claude() {
+        let repo = orchestrator_repo();
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let env: std::collections::HashMap<String, String> = [
+            (
+                adapters::SEAT_ROLE_ENV.to_string(),
+                "orchestrator".to_string(),
+            ),
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_dir.path().display().to_string(),
+            ),
+            (
+                "ZIRV_CTX_SUPERVISE_ORCHESTRATOR_WRITES".to_string(),
+                "deny".to_string(),
+            ),
+        ]
+        .into();
+
+        let mut claude_out = Vec::new();
+        run_pretool(
+            &mut claude_out,
+            &edit_payload_stdin(repo.path(), "src/x.rs"),
+            &|k| env.get(k).cloned(),
+        )
+        .expect("never errors");
+        let claude_text = String::from_utf8(claude_out).expect("utf8");
+        let claude_json: serde_json::Value =
+            serde_json::from_str(claude_text.trim()).expect("json");
+        assert_eq!(
+            claude_json["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
+        let reason = claude_json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .expect("a reason")
+            .to_string();
+
+        let target = repo.path().join("src/x.rs").display().to_string();
+        let copilot_stdin = serde_json::json!({
+            "sessionId": "copilot-session",
+            "cwd": repo.path().display().to_string(),
+            "toolName": "edit",
+            "toolArgs": {"path": target},
+        })
+        .to_string();
+        let mut copilot_out = Vec::new();
+        run_pretool_for_agent(
+            &mut copilot_out,
+            &copilot_stdin,
+            &|k| env.get(k).cloned(),
+            Some("copilot"),
+        )
+        .expect("never errors");
+        let copilot_text = String::from_utf8(copilot_out).expect("utf8");
+        let copilot_json: serde_json::Value =
+            serde_json::from_str(copilot_text.trim()).expect("json");
+        assert_eq!(copilot_json["permissionDecision"], "deny");
+        assert_eq!(copilot_json["permissionDecisionReason"], reason);
     }
 
     /// Issue #358 T8: the default posture is `advise`, not `deny` -- an

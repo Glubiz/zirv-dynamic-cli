@@ -411,6 +411,25 @@ pub struct Capabilities {
     /// `RotState::score`, so capacity reaches the rot engine without adding
     /// a single fs, clock or env read to a module that must stay pure.
     pub context_window_tokens: Option<u64>,
+    /// Issue #418: whether this agent's own CLI has a documented, user-level
+    /// hooks configuration file zirv can install a `PreToolUse`-equivalent
+    /// guard into (the orchestrator-write guard, the expensive-seat subagent
+    /// guard, and `zirv ctx safety check`'s command-safety verdict), wired
+    /// through `native_hooks::NativeHooks`/`AgentAdapter::native_hooks`. Only
+    /// claude, copilot, droid and gemini are `true`; codex, opencode, pi and
+    /// qwen have no verified native hook surface at all and stay at the
+    /// `Capabilities::default()` `false`.
+    pub pre_tool_hook: bool,
+    /// Issue #418: whether this agent's own hooks contract can replace a
+    /// tool's result before the model sees it (claude's `PostToolUse`
+    /// `updatedToolOutput`, copilot's `PostToolUse` `modifiedResult`), the
+    /// mechanism the compaction hook (`hook::run_posttool`) depends on. `true`
+    /// only for claude and copilot: droid's docs state `PostToolUse` cannot
+    /// replace output at all, and gemini's `AfterTool` only carries
+    /// `additionalContext`, not a result replacement -- see `droid.rs`'s and
+    /// `gemini.rs`'s own `native_hooks` doc comments for the DOCS-ONLY
+    /// citations.
+    pub post_tool_hook: bool,
 }
 
 /// Raw material for handoffs, extracted per-agent because it needs fields the

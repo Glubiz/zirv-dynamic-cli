@@ -486,8 +486,11 @@ to the section or vault page that documents it in depth.
   `zirv`](#just-run-zirv).
 - **Handoffs and recovery** — `score` rot-scores a transcript, `handoff`
   distills one, `resume` starts a clean session with the latest handoff
-  injected, and `handover` swaps the orchestrator seat's model or harness in
-  place mid-session. See [Verbs](#verbs) and [Cross-harness fallback and
+  injected, `handover` swaps the orchestrator seat's model or harness in
+  place mid-session, and `ask` distills a read-only answer to an operator's
+  question from a LIVE worker's own transcript without ever sending it
+  input or touching its transcript or registry record. See
+  [Verbs](#verbs) and [Cross-harness fallback and
   handover](#cross-harness-fallback-and-handover).
 - **Status and attention** — `status`, `explain-status`, and `wait` report
   or block on a session's composed attention projection; `snapshot` prints a
@@ -1327,7 +1330,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx wrap -- claude` | Supervises an interactive TUI through a PTY |
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
-| `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start>` | Agent hook entrypoints |
+| `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
 | `zirv ctx status [--json]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |

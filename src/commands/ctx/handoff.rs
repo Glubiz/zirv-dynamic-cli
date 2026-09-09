@@ -678,7 +678,7 @@ fn normalize_rendered_line(text: &str) -> String {
 /// though collapsing already guarantees a single line, the label means the
 /// rendered command text can never itself open the line, so it can never be
 /// mistaken for a Markdown heading.
-fn render_verification(outcome: Option<&VerificationOutcome>) -> String {
+pub(crate) fn render_verification(outcome: Option<&VerificationOutcome>) -> String {
     match outcome {
         None => "none recorded".to_string(),
         Some(v) => {
@@ -756,7 +756,7 @@ pub const DISTILL_PROMPT_VERSION: &str = "v3";
 /// small `StructuralContext::keep_last` kept the *count*.
 const BULLET_ITEM_CAP_BYTES: usize = 400;
 
-fn bullets(items: &[String]) -> String {
+pub(crate) fn bullets(items: &[String]) -> String {
     if items.is_empty() {
         return "(none)\n".to_string();
     }

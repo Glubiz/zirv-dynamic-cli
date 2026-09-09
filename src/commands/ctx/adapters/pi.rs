@@ -906,6 +906,11 @@ mod tests {
         assert!(caps.system_prompt);
         assert!(!caps.marker_signal);
         assert!(!caps.turn_signal);
+        assert!(
+            !caps.pre_tool_hook,
+            "issue #418: no verified native hooks surface for pi"
+        );
+        assert!(!caps.post_tool_hook);
     }
 
     #[test]

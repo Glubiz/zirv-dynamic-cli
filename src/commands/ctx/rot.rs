@@ -812,6 +812,8 @@ mod tests {
             events: true,
             defer_injection_submit: false,
             context_window_tokens: None,
+            pre_tool_hook: false,
+            post_tool_hook: false,
         }
     }
 
@@ -1458,6 +1460,8 @@ mod tests {
             events: true,
             defer_injection_submit: false,
             context_window_tokens: None,
+            pre_tool_hook: false,
+            post_tool_hook: false,
         };
         assert_eq!(signals(&events, caps, &cfg).marker_miss_rate, None);
     }
@@ -1733,6 +1737,8 @@ mod tests {
             events: true,
             defer_injection_submit: false,
             context_window_tokens: None,
+            pre_tool_hook: false,
+            post_tool_hook: false,
         };
         let mut events = looping_turns(2, "", "[zirv] ok", true, 120_000);
         events.extend(looping_turns(10, "", "sloppy", true, 120_000));
@@ -1756,6 +1762,8 @@ mod tests {
             events: true,
             defer_injection_submit: false,
             context_window_tokens: None,
+            pre_tool_hook: false,
+            post_tool_hook: false,
         };
         let events = looping_turns(12, "", "sloppy", true, 175_000);
         let result = score_events(&events, caps, &cfg);
