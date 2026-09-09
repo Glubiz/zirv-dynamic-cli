@@ -2816,7 +2816,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     } else {
         vec![payload.tool_input.command.clone()]
     };
-    let Ok((id, summary)) = super::output::capture_text(
+    let Ok((id, summary)) = super::output::capture_text_with_filters(
         &state,
         &cwd,
         &command,
@@ -2824,6 +2824,7 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
         &combined,
         cfg.output.max_summary_bytes,
         scope,
+        &cfg.output.filter,
     ) else {
         // Nothing was stored, so nothing may be replaced: handing back a
         // summary whose retrieval line names a file that does not exist would

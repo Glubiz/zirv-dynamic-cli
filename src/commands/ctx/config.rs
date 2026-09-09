@@ -909,6 +909,13 @@ impl Default for SearchConfig {
 /// at which its own `git diff`/`show`/`log -p`/`format-patch` output gets
 /// replaced by a bounded per-file listing, never raise it past the
 /// operator's own ceiling.
+///
+/// `filter` (issue #417) is `REPO_FORBIDDEN` as a whole table
+/// (`~/.zirv/ctx.toml only` -- there is no `ZIRV_CTX_*` escape hatch for a
+/// structured rule list): a repo checkout choosing how its own output gets
+/// shaped once it is already large enough to summarize is the identical
+/// widening `compact`/`compact_min_bytes`/`compact_generic_min_bytes` above
+/// are already forbidden from doing, just one layer further in.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
@@ -964,6 +971,100 @@ pub struct OutputConfig {
     /// which is exactly the choice those two keys' own doc comment says is
     /// never the checkout's to make. Default `false`.
     pub compact_search: bool,
+    /// Issue #417: an operator-declared rule list that shapes a `Generic`-
+    /// scope command's output BEFORE the generic head/tail scan
+    /// (`output::render_summary`) ever sees it -- `[[output.filter]]` in
+    /// `~/.zirv/ctx.toml` only, never a bundled default and never settable
+    /// from a repo checkout (see `REPO_FORBIDDEN`'s `output.filter` entry: a
+    /// checkout choosing what its own output looks like once summarized is
+    /// exactly the widening every other `[output]` key in this file already
+    /// refuses). Applies to `CompactionScope::Generic` only -- never
+    /// `Verbatim`, `Known`, `Diff` or `Shape`, each of which already has its
+    /// own dedicated, provably-lossless rendering. The first rule (in
+    /// declaration order) whose `match_command` matches the command line
+    /// wins; every other rule is ignored for that command. Empty by
+    /// default -- zero rules ship. See `OutputFilterRule`'s own doc comment
+    /// for the field list and stage order.
+    pub filter: Vec<OutputFilterRule>,
+}
+
+/// One `[[output.filter]]` rule (issue #417). `name` and `match_command` are
+/// mandatory -- every load error names the rule by `name`, and a rule with
+/// no way to select a command would silently apply to everything. Every
+/// other field is optional and does nothing when absent/empty.
+///
+/// Stages run in this FIXED order, documented again on
+/// `output::apply_output_filter_stages` (the code that actually applies
+/// them): (1) `match_output` -- whole-output, short-circuits every other
+/// stage below when it fires; (2) `strip_lines` -- drop every line matching
+/// any pattern; (3) `keep_lines` -- when non-empty, drop every line NOT
+/// matching any pattern; (4) `truncate_line_at` -- cut each surviving line
+/// to at most this many *characters* (never bytes, so a multi-byte character
+/// is never split); (5) `max_lines` -- keep only the first N lines and
+/// append a marker naming how many more there were and where to retrieve
+/// them.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputFilterRule {
+    /// Human-readable identity for this rule, used in every load-time error
+    /// message and nowhere else. Mandatory: an anonymous rule would leave an
+    /// operator unable to tell which one of several a load error names.
+    pub name: String,
+    /// A `regex::Regex` pattern matched against the command line
+    /// (`command.join(" ")`, the same string `hook::run_posttool` and
+    /// `run --compact` already build) to decide whether this rule applies at
+    /// all. Mandatory, and validated at load time (`CtxConfig::load`) two
+    /// ways: it must compile, and it must be FULLY ANCHORED -- every
+    /// top-level `|` alternative starts with `^` (`is_fully_anchored`) -- so
+    /// `gradle` (which would match `my-not-gradle-thing`) is refused, while
+    /// `^(\\./)?gradlew?\\b` is accepted.
+    pub match_command: String,
+    /// Regex patterns (`regex::Regex`, matched per line, unanchored is fine
+    /// here -- only `match_command` needs anchoring): a line matching ANY of
+    /// these is dropped before `keep_lines` even runs. Empty (the default)
+    /// drops nothing.
+    #[serde(default)]
+    pub strip_lines: Vec<String>,
+    /// Regex patterns: when this list is non-empty, only a line matching AT
+    /// LEAST ONE of them survives -- everything else is dropped, on top of
+    /// whatever `strip_lines` already removed. Empty (the default) keeps
+    /// every surviving line.
+    #[serde(default)]
+    pub keep_lines: Vec<String>,
+    /// Cuts each surviving line to at most this many *characters* (built
+    /// with `char_indices`, never a byte slice, so a multi-byte character is
+    /// never split mid-codepoint). `None`/absent (the default) truncates
+    /// nothing.
+    #[serde(default)]
+    pub truncate_line_at: Option<usize>,
+    /// Keeps only the first N surviving lines and appends one marker line
+    /// naming how many more there were and how to retrieve the untouched
+    /// original (`zirv ctx output show <id>`). `None`/absent (the default)
+    /// never truncates by line count.
+    #[serde(default)]
+    pub max_lines: Option<usize>,
+    /// Whole-output short-circuit: when `pattern` matches the ENTIRE
+    /// original text (not merely a substring of it -- the match span must
+    /// cover the whole input), the result is `replace` outright and no other
+    /// stage in this rule runs. `None`/absent (the default) never fires.
+    #[serde(default)]
+    pub match_output: Option<MatchOutput>,
+}
+
+/// `[[output.filter]]`'s whole-output short-circuit (see `OutputFilterRule::
+/// match_output`'s own doc comment for exactly when it fires).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MatchOutput {
+    /// A `regex::Regex` pattern; validated at load time the same way
+    /// `match_command` is (must compile), but NOT required to be anchored --
+    /// the whole-output-match check at apply time already requires the
+    /// match span to cover the entire text, which is a stronger constraint
+    /// than anchoring alone.
+    pub pattern: String,
+    /// The literal text substituted in when `pattern` matches the whole
+    /// output. No capture-group interpolation -- a fixed replacement only.
+    pub replace: String,
 }
 
 /// The smallest `[output] max_summary_bytes` that can hold a header, a
@@ -983,6 +1084,7 @@ impl Default for OutputConfig {
             max_summary_bytes: 4096,
             diff_max_bytes: 65536,
             compact_search: false,
+            filter: Vec::new(),
         }
     }
 }
@@ -3726,6 +3828,15 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["output", "compact_search"],
         "ZIRV_CTX_OUTPUT_COMPACT_SEARCH",
     ),
+    // Issue #417: the operator-declared `[[output.filter]]` rule list is a
+    // structured value with no `ZIRV_CTX_*` scalar/CSV shape to escape
+    // through (unlike `output.verbatim`'s comma-separated list), so the
+    // only way to set it at all is `~/.zirv/ctx.toml` -- same convention as
+    // `workflow.maintain` above. A repo checkout choosing how its own
+    // output gets shaped once summarized is the same widening
+    // `compact`/`compact_min_bytes`/`compact_generic_min_bytes` above are
+    // already forbidden from doing.
+    (&["output", "filter"], "~/.zirv/ctx.toml only"),
     // Issue #358: rolling the orchestrator seat itself onto another harness
     // is the same class of decision `handoff.model`/`optimize.model` already
     // gate above -- a repo checkout must not be able to tune when an
@@ -4854,6 +4965,13 @@ impl CtxConfig {
             .into());
         }
 
+        // Issue #417: every `[[output.filter]]` rule's regexes must compile,
+        // `match_command` must be fully anchored, and names must be unique --
+        // see `validate_output_filter_rules`'s own doc comment. `output.filter`
+        // being `REPO_FORBIDDEN` means this list can only ever have come from
+        // the operator's own home layer by the time we reach here.
+        validate_output_filter_rules(&cfg.output.filter)?;
+
         // Same union as `extra_deny` above, for `heavy_command_patterns`: the
         // operator's own home-layer patterns plus whatever the repo adds,
         // never fewer than either -- a repo layer may only add a pattern
@@ -5045,6 +5163,147 @@ pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
     cfg.supervise.orchestrator_writes = OrchestratorWrites::Deny;
     cfg.prompt.orchestrator_writes = OrchestratorWrites::Deny;
     cfg
+}
+
+/// Whether every top-level `|` alternative in `pattern` starts with `^`.
+/// Issue #417: `[[output.filter]]`'s `match_command` is required to be fully
+/// anchored -- `gradle` would also match `my-not-gradle-thing`, which is
+/// almost certainly not what an operator naming a program meant -- and
+/// "starts with `^`" has to be checked per top-level alternative, not on the
+/// pattern as a whole, because `^a|b` is unanchored on its `b` branch even
+/// though the string itself starts with `^`.
+///
+/// Splits on `|` at nesting depth 0 relative to `(...)` groups and outside
+/// any `[...]` character class, honouring `\`-escapes so an escaped `\|` or
+/// `\[` never it self toggles class/group state. A leading `(?flags)` inline
+/// modifier group (e.g. `(?i)^a`) is stripped before the `^` check, since it
+/// is common and does not weaken the anchor. `(^a|b)` -- one top-level
+/// alternative, the whole parenthesized group, which does not itself start
+/// with `^` -- is correctly rejected; `^a|^b`, `(?i)^a` and `^(a|b)` are all
+/// accepted.
+pub(crate) fn is_fully_anchored(pattern: &str) -> bool {
+    split_top_level_alternatives(pattern)
+        .into_iter()
+        .all(starts_with_anchor)
+}
+
+/// Splits `pattern` on every top-level `|` (see [`is_fully_anchored`]'s own
+/// doc comment for exactly what "top-level" means here).
+fn split_top_level_alternatives(pattern: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_class = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (idx, ch) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            '(' if !in_class => depth += 1,
+            ')' if !in_class => depth -= 1,
+            '|' if !in_class && depth <= 0 => {
+                parts.push(&pattern[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&pattern[start..]);
+    parts
+}
+
+/// Whether `alternative` starts with `^`, after skipping past zero or more
+/// leading `(?flags)` inline modifier groups (letters/`-` only between `(?`
+/// and `)`, e.g. `(?i)`, `(?is)`, `(?-i)`) -- those do not weaken an anchor,
+/// so `(?i)^a` counts as anchored the same as plain `^a`.
+fn starts_with_anchor(alternative: &str) -> bool {
+    let mut rest = alternative;
+    while let Some(after) = strip_one_inline_flag_group(rest) {
+        rest = after;
+    }
+    rest.starts_with('^')
+}
+
+fn strip_one_inline_flag_group(s: &str) -> Option<&str> {
+    let body = s.strip_prefix("(?")?;
+    let end = body.find(')')?;
+    let flags = &body[..end];
+    if !flags.is_empty() && flags.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
+        Some(&body[end + 1..])
+    } else {
+        None
+    }
+}
+
+/// Load-time validation for `[[output.filter]]` (issue #417): every regex
+/// must compile, `match_command` must be fully anchored
+/// ([`is_fully_anchored`]), and no two rules may share a `name` -- every
+/// error names the offending rule so an operator can find it without
+/// guessing which of several is at fault. Called once from `CtxConfig::load`
+/// after the layers are merged; never re-checked at apply time in
+/// `output.rs`, which trusts a config that reached this point.
+fn validate_output_filter_rules(rules: &[OutputFilterRule]) -> CtxResult<()> {
+    let mut seen_names = std::collections::HashSet::new();
+    for rule in rules {
+        if !seen_names.insert(rule.name.as_str()) {
+            return Err(format!(
+                "output.filter \"{}\": duplicate rule name -- every [[output.filter]] entry needs \
+                 a unique `name`",
+                rule.name
+            )
+            .into());
+        }
+        if let Err(e) = regex::Regex::new(&rule.match_command) {
+            return Err(format!(
+                "output.filter \"{}\": match_command {:?} is not a valid regex: {e}",
+                rule.name, rule.match_command
+            )
+            .into());
+        }
+        if !is_fully_anchored(&rule.match_command) {
+            return Err(format!(
+                "output.filter \"{}\": match_command must be fully anchored (every top-level \
+                 alternative starts with `^`), got {:?}",
+                rule.name, rule.match_command
+            )
+            .into());
+        }
+        for pattern in &rule.strip_lines {
+            if let Err(e) = regex::Regex::new(pattern) {
+                return Err(format!(
+                    "output.filter \"{}\": strip_lines pattern {pattern:?} is not a valid regex: \
+                     {e}",
+                    rule.name
+                )
+                .into());
+            }
+        }
+        for pattern in &rule.keep_lines {
+            if let Err(e) = regex::Regex::new(pattern) {
+                return Err(format!(
+                    "output.filter \"{}\": keep_lines pattern {pattern:?} is not a valid regex: \
+                     {e}",
+                    rule.name
+                )
+                .into());
+            }
+        }
+        if let Some(match_output) = &rule.match_output
+            && let Err(e) = regex::Regex::new(&match_output.pattern)
+        {
+            return Err(format!(
+                "output.filter \"{}\": match_output.pattern {:?} is not a valid regex: {e}",
+                rule.name, match_output.pattern
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// SECURITY (command-injection defense): shared charset/length/leading-dash
@@ -9190,6 +9449,130 @@ mod tests {
                 .expect_err("a repository must not be able to set `{line}`");
             assert!(is_repo_forbidden(err.as_ref()), "got: {err}");
         }
+    }
+
+    /// Issue #417: `output.filter` is `REPO_FORBIDDEN` as a whole table --
+    /// there is no `ZIRV_CTX_*` escape hatch for a structured rule list, so
+    /// the operator's own `~/.zirv/ctx.toml` is the only place it can be
+    /// declared.
+    #[test]
+    fn output_filter_is_repo_forbidden_but_operator_settable() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[[output.filter]]\nname = \"gradle\"\nmatch_command = \"^gradle\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("the operator's own ctx.toml may declare output.filter rules");
+        assert_eq!(cfg.output.filter.len(), 1);
+        assert_eq!(cfg.output.filter[0].name, "gradle");
+
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[[output.filter]]\nname = \"evil\"\nmatch_command = \"^anything\"\n",
+        )
+        .expect("write");
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not be able to declare output.filter rules");
+        assert!(is_repo_forbidden(err.as_ref()), "got: {err}");
+    }
+
+    /// Issue #417: an unanchored `match_command` -- one whose top-level
+    /// alternative does not start with `^` -- is refused at load time, by
+    /// name, rather than silently matching more commands than the operator
+    /// meant (`gradle` would also match `my-not-gradle-thing`).
+    #[test]
+    fn unanchored_match_command_is_a_named_config_error() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[[output.filter]]\nname = \"bad-rule\"\nmatch_command = \"gradle\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("an unanchored match_command must be refused");
+        assert!(
+            err.to_string().contains("bad-rule"),
+            "the error must name the rule: {err}"
+        );
+        assert!(
+            err.to_string().contains("fully anchored"),
+            "the error must explain why: {err}"
+        );
+    }
+
+    /// Issue #417: an invalid regex anywhere in a rule is refused by name,
+    /// not merely the anchoring check.
+    #[test]
+    fn an_invalid_regex_in_a_filter_rule_is_a_named_config_error() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[[output.filter]]\nname = \"broken\"\nmatch_command = \"^ok\"\nstrip_lines = [\"(unclosed\"]\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("an unparseable regex must be refused");
+        assert!(
+            err.to_string().contains("broken"),
+            "the error must name the rule: {err}"
+        );
+    }
+
+    /// Issue #417: two rules sharing a `name` are refused -- every load
+    /// error names a rule by its `name`, so two of them with the same name
+    /// would leave an operator unable to tell which one a later error means.
+    #[test]
+    fn duplicate_filter_rule_names_are_a_config_error() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[[output.filter]]\nname = \"dup\"\nmatch_command = \"^a\"\n\n\
+             [[output.filter]]\nname = \"dup\"\nmatch_command = \"^b\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("duplicate rule names must be refused");
+        assert!(
+            err.to_string().contains("dup"),
+            "the error must name the duplicate: {err}"
+        );
+    }
+
+    /// Unit coverage for `is_fully_anchored` itself, independent of
+    /// `CtxConfig::load` -- see its own doc comment for exactly what "every
+    /// top-level alternative starts with `^`" means.
+    #[test]
+    fn is_fully_anchored_checks_every_top_level_alternative() {
+        assert!(is_fully_anchored("^a|^b"));
+        assert!(is_fully_anchored("(?i)^a"));
+        assert!(is_fully_anchored("^(a|b)"));
+        assert!(is_fully_anchored("^(\\./)?gradlew?\\b"));
+        assert!(!is_fully_anchored("(^a|b)"));
+        assert!(!is_fully_anchored("gradle"));
+        assert!(!is_fully_anchored("^a|b"));
     }
 
     /// Issue #326 review finding 7: a `max_summary_bytes` below
