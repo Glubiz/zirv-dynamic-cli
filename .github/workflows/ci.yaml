@@ -71,6 +71,16 @@ jobs:
       - name: Build Binary
         run: cargo build
 
+      # Issue #407: the README's "## Features" section is written by hand
+      # against the real command surface, so this gate fails the PR the moment
+      # a verb `zirv commands --json` reports (depth-1 or depth-2, e.g.
+      # `ctx`/`hook`, `workflow`/`advance`) has no backticked mention there.
+      - name: README features coverage gate (issue #407)
+        run: bash scripts/check-readme-features.sh --binary ./target/debug/zirv
+
+      - name: README features coverage gate self-test
+        run: bash scripts/check-readme-features.sh --self-test
+
       # Issue #276: the built-in self-check registry (proves/fix/origin-
       # labeled invariants like version-bump and argv shape) runs from the
       # branch binary, not just as unit tests -- a regression that only
