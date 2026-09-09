@@ -106,6 +106,7 @@ const LEGACY_SLUG_LAYOUTS: &[(&str, SlugEntry, &[&str])] = &[
             "commands/setup.rs",
             "commands/ctx/memory.rs",
             "commands/ctx/memory_cli.rs",
+            "commands/ctx/learn.rs",
             "commands/ctx/compile.rs",
             "commands/ctx/context_status.rs",
             "commands/ctx/status.rs",
