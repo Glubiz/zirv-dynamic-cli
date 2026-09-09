@@ -1252,6 +1252,28 @@ fn render_report<W: Write>(
             if let Some(line) = describe_injection_fallback(cfg) {
                 writeln!(w, "{}", style::paint(&line, Tone::Warn, colour))?;
             }
+            // Issue #395: one line per configured `[endpoint.<agent>]`
+            // override, naming the vendor, the base URL and the credential
+            // environment variable's own NAME -- never its value, which
+            // this line never reads. Silent (no line at all) when neither
+            // is configured, the same allowance every other optional status
+            // line in this function gets.
+            for (name, target) in [
+                ("claude", cfg.endpoint.claude.as_ref()),
+                ("codex", cfg.endpoint.codex.as_ref()),
+            ] {
+                if let Some(target) = target {
+                    writeln!(
+                        w,
+                        "{} {} -> {} ({}, key from ${})",
+                        label(colour, "endpoint:"),
+                        name,
+                        target.vendor,
+                        target.base_url,
+                        target.credential_env,
+                    )?;
+                }
+            }
             // Issue #272 design item 4: the shared memory bank's own
             // write-cadence signal, surfaced as a `Flag` -- never blocks a
             // write, just names which writer(s) looked bursty this cycle.
@@ -1783,25 +1805,35 @@ fn render_report<W: Write>(
         .map(adapters::provider_for_usage_readout);
     match provider {
         Some(provider) if crate::commands::ctx::window::has_no_usage_source(&state, provider) => {
-            // T7 follow-up 2: a bare "no usage source" told an operator
-            // nothing about *why* -- credentials file absent, macOS Keychain
-            // access needed, or the statusline tee simply never wired.
-            // `poll::usage_source_hint` is the one place that reasoning
-            // lives, shared with nothing else so this line and a live
-            // `Event::MacosKeychainPromptExpected` announcement (`poll.rs`)
-            // never drift apart on what they tell the operator to do.
+            // Issue #395: a provider reached only through an operator
+            // `[endpoint.<agent>]` override structurally never has a usage-
+            // window collector (there is no keychain/statusline mechanism
+            // for a vendor endpoint) -- render that as the expected,
+            // permanent "spend-only" fact rather than the same wording a
+            // broken NATIVE collector would get, which would otherwise read
+            // as something to go fix.
+            //
+            // T7 follow-up 2 (unchanged for a native account): a bare "no
+            // usage source" told an operator nothing about *why* --
+            // credentials file absent, macOS Keychain access needed, or the
+            // statusline tee simply never wired. `poll::usage_source_hint`
+            // is the one place that reasoning lives, shared with nothing
+            // else so this line and a live `Event::MacosKeychainPromptExpected`
+            // announcement (`poll.rs`) never drift apart on what they tell
+            // the operator to do.
+            let detail = if super::pace::is_spend_only_provider(provider) {
+                format!("spend-only (no usage window for {provider})")
+            } else {
+                format!(
+                    "no usage source ({})",
+                    crate::commands::ctx::poll::usage_source_hint(provider)
+                )
+            };
             writeln!(
                 w,
                 "{} {}",
                 header(colour, "usage windows"),
-                style::paint(
-                    &format!(
-                        "{provider}: no usage source ({})",
-                        crate::commands::ctx::poll::usage_source_hint(provider)
-                    ),
-                    Tone::Muted,
-                    colour
-                )
+                style::paint(&format!("{provider}: {detail}"), Tone::Muted, colour)
             )?;
         }
         Some(provider) => {
@@ -4956,6 +4988,87 @@ mod tests {
             !usage_line.contains("77"),
             "the claude-only legacy file must not leak into a codex repo's usage line: {usage_line}"
         );
+    }
+
+    /// Issue #395, item 7: `zirv ctx status` renders an `endpoint:` line
+    /// naming the vendor, the base URL and the credential environment
+    /// variable's own NAME -- but never the secret VALUE, even when that
+    /// value is set in this process's own environment -- and the usage-
+    /// windows line reads "spend-only" rather than the scary generic
+    /// "no usage source" wording, since a vendor endpoint structurally has
+    /// no usage-window collector at all.
+    #[test]
+    fn status_shows_the_endpoint_line_without_the_secret_and_spend_only_usage_wording() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[endpoint.claude]\nvendor = \"zhipu\"\nbase_url = \"https://api.z.ai/api/anthropic\"\ncredential_env = \"ZIRV_TEST_STATUS_ZHIPU_KEY_395\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        // A sentinel secret value: it must never appear anywhere in the
+        // rendered report.
+        // SAFETY (test): nextest isolates tests per process, and the serial
+        // `cargo test -- --test-threads=1` run never overlaps this variable
+        // with another test.
+        unsafe {
+            std::env::set_var(
+                "ZIRV_TEST_STATUS_ZHIPU_KEY_395",
+                "top-secret-sentinel-value",
+            );
+        }
+
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+
+        // SAFETY (test): see the matching `set_var` above.
+        unsafe {
+            std::env::remove_var("ZIRV_TEST_STATUS_ZHIPU_KEY_395");
+        }
+
+        assert!(
+            !text.contains("top-secret-sentinel-value"),
+            "the secret VALUE must never be rendered: {text}"
+        );
+        let endpoint_line = text
+            .lines()
+            .find(|l| l.starts_with("endpoint:"))
+            .unwrap_or_else(|| panic!("no endpoint: line in {text}"));
+        assert!(endpoint_line.contains("claude"), "got {endpoint_line}");
+        assert!(endpoint_line.contains("zhipu"), "got {endpoint_line}");
+        assert!(endpoint_line.contains("api.z.ai"), "got {endpoint_line}");
+        assert!(
+            endpoint_line.contains("ZIRV_TEST_STATUS_ZHIPU_KEY_395"),
+            "the variable NAME is fine to show: {endpoint_line}"
+        );
+
+        let usage_line = text
+            .lines()
+            .find(|l| l.contains("usage windows:"))
+            .unwrap_or_else(|| panic!("no usage windows: line in {text}"));
+        assert!(usage_line.contains("spend-only"), "got {usage_line}");
+        assert!(usage_line.contains("zhipu"), "got {usage_line}");
     }
 
     /// Low 5 (fix): the case above configures codex while it is still

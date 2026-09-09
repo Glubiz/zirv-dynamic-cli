@@ -1059,6 +1059,147 @@ fn reserve_log(dir: &Path, started_at: u64) -> (String, PathBuf) {
     (id, path)
 }
 
+/// Issue #417: the first `[[output.filter]]` rule (declaration order) whose
+/// `match_command` matches `command_line`, or `None` when no rule matches
+/// (including when `rules` is empty, the default -- zero rules ship).
+/// `CtxConfig::load` already validated every rule's `match_command` compiles
+/// and is fully anchored, but this recompiles it here rather than caching a
+/// compiled form: rules only ever run once per `Generic`-scope command that
+/// has already cleared `compact_generic_min_bytes`, so the cost is
+/// negligible, and a pattern that somehow reached this point invalid (never
+/// possible via `CtxConfig::load`, but this function does not trust that
+/// from the outside) degrades to "does not match" instead of a panic.
+fn find_matching_output_filter<'a>(
+    rules: &'a [super::config::OutputFilterRule],
+    command_line: &str,
+) -> Option<&'a super::config::OutputFilterRule> {
+    rules.iter().find(|rule| {
+        regex::Regex::new(&rule.match_command)
+            .map(|re| re.is_match(command_line))
+            .unwrap_or(false)
+    })
+}
+
+/// Cuts `line` to at most `max_chars` *characters* -- never bytes, so a
+/// multi-byte character is never split mid-codepoint. `char_indices().nth`
+/// gives the byte offset of the character just past the cut point, which is
+/// always a valid `str` slice boundary.
+fn truncate_line_chars(line: &str, max_chars: usize) -> String {
+    match line.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => line[..byte_idx].to_string(),
+        None => line.to_string(),
+    }
+}
+
+/// Applies one already-matched `[[output.filter]]` rule's stages to `raw`,
+/// in this FIXED order (also documented on `config::OutputFilterRule`
+/// itself): (1) `match_output` -- when `pattern` matches the WHOLE `raw`
+/// text (the match span covers it end to end, not merely a substring), the
+/// result is `replace` outright and no other stage runs; (2) `strip_lines`
+/// -- drop every line matching any pattern; (3) `keep_lines` -- when
+/// non-empty, drop every line NOT matching any pattern; (4)
+/// `truncate_line_at` -- cut each surviving line to at most this many
+/// characters (`truncate_line_chars`, char-boundary safe); (5) `max_lines`
+/// -- keep only the first N surviving lines and append one marker naming
+/// how many more there were, via `retrieval_hint` (the caller's own
+/// `` `zirv ctx output show <id>` `` text -- only the caller knows the id).
+///
+/// A per-line/per-stage pattern that fails to compile here (never possible
+/// once `CtxConfig::load` has validated it, but this function does not
+/// re-trust that from the outside either) is treated as matching nothing --
+/// fail open toward keeping MORE of the output, never less than what the
+/// operator's rule asked to keep. The whole-output `match_output` re-check
+/// is the one exception: a bad pattern there simply never fires, falling
+/// through to the line-level stages, which is the same "keep more" bias.
+fn apply_output_filter_stages(
+    rule: &super::config::OutputFilterRule,
+    raw: &str,
+    retrieval_hint: &str,
+) -> String {
+    // Test-only panic-injection seam (issue #417): lets the panic-safety
+    // test exercise `apply_operator_output_filter`'s `catch_unwind` fallback
+    // without any production code path being able to trigger it -- this
+    // whole `if` compiles out entirely in a non-test build.
+    #[cfg(test)]
+    if rule.name == "__panic_test__" {
+        panic!("issue #417 test-only panic injection");
+    }
+
+    if let Some(match_output) = &rule.match_output
+        && let Ok(re) = regex::Regex::new(&match_output.pattern)
+        && let Some(m) = re.find(raw)
+        && m.start() == 0
+        && m.end() == raw.len()
+    {
+        return match_output.replace.clone();
+    }
+
+    let strip_res: Vec<regex::Regex> = rule
+        .strip_lines
+        .iter()
+        .filter_map(|p| regex::Regex::new(p).ok())
+        .collect();
+    let keep_res: Vec<regex::Regex> = rule
+        .keep_lines
+        .iter()
+        .filter_map(|p| regex::Regex::new(p).ok())
+        .collect();
+
+    let mut lines: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        if strip_res.iter().any(|re| re.is_match(line)) {
+            continue;
+        }
+        if !keep_res.is_empty() && !keep_res.iter().any(|re| re.is_match(line)) {
+            continue;
+        }
+        let line = match rule.truncate_line_at {
+            Some(max_chars) if max_chars > 0 => truncate_line_chars(line, max_chars),
+            _ => line.to_string(),
+        };
+        lines.push(line);
+    }
+
+    if let Some(max_lines) = rule.max_lines
+        && max_lines > 0
+        && lines.len() > max_lines
+    {
+        let more = lines.len() - max_lines;
+        lines.truncate(max_lines);
+        lines.push(format!("... {more} more lines (see {retrieval_hint})"));
+    }
+
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Issue #417: finds the first matching `[[output.filter]]` rule (see
+/// `find_matching_output_filter`) and applies it (see
+/// `apply_output_filter_stages`), wrapped in `catch_unwind` so a defect in a
+/// stage cannot take the whole compaction pass down with it in a dev/test
+/// build. The release profile is `panic = "abort"` (`Cargo.toml`), so in a
+/// release build this `catch_unwind` cannot actually run -- a real panic
+/// there aborts the hook process before unwinding reaches here, and claude
+/// keeps the original, unreplaced tool result, which is the real,
+/// process-level never-worse fallback everywhere else in this module.
+/// Returns `None` (meaning: use the unfiltered text) when no rule matches
+/// OR the wrapped call panicked.
+fn apply_operator_output_filter(
+    rules: &[super::config::OutputFilterRule],
+    command_line: &str,
+    raw: &str,
+    retrieval_hint: &str,
+) -> Option<String> {
+    let rule = find_matching_output_filter(rules, command_line)?;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_output_filter_stages(rule, raw, retrieval_hint)
+    }))
+    .ok()
+}
+
 /// Everything that happens AFTER a stored log exists: the scanning pass(es),
 /// the sidecar, retention, and the rendered summary. Shared by
 /// `zirv ctx run --compact` (which fills the log by handing a child both of
@@ -1068,6 +1209,23 @@ fn reserve_log(dir: &Path, started_at: u64) -> (String, PathBuf) {
 /// now picks between two summary shapes: the generic scan below for
 /// `Known`/`Generic`/`Verbatim` callers, or `output_diff::
 /// render_diff_summary`'s bounded per-file listing for `Diff`.
+///
+/// `filter_rules` (issue #417, from `[[output.filter]]`, `~/.zirv/ctx.toml`
+/// only) shapes a `CompactionScope::Generic` result's text BEFORE the
+/// generic head/tail scan below renders it -- never for `Verbatim`, `Known`,
+/// `Diff` or `Shape`, each already handled above/before this point. See
+/// `apply_operator_output_filter` for the stage order and panic-safety
+/// contract, and this function's own body (search `filter_rules`) for
+/// exactly where it is spliced in: after the binary/markdown/JSON shape
+/// checks have all declined, immediately before the final `render_summary`
+/// call. The never-worse guard inside `render_summary` is measured against
+/// the ORIGINAL raw byte count (`scan.total_bytes`, computed from the
+/// unfiltered file before any rule ran), not the filtered text's own byte
+/// count -- overwriting a freshly-filtered scan's `total_bytes`/`total_lines`
+/// with the original values keeps both the "captured N lines, M bytes"
+/// header and that guard describing what the command actually produced,
+/// even though the head/tail/failure/warning content they sit above is
+/// built from the filtered text.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn summarize_stored(
     dir: &Path,
@@ -1078,6 +1236,7 @@ pub(crate) fn summarize_stored(
     started_at: u64,
     max_summary_bytes: usize,
     scope: CompactionScope,
+    filter_rules: &[super::config::OutputFilterRule],
 ) -> CtxResult<(OutputRecord, Option<String>)> {
     if scope == CompactionScope::Diff {
         let diff_scan = super::output_diff::scan_diff_file(path);
@@ -1348,6 +1507,34 @@ pub(crate) fn summarize_stored(
         return Ok((record, Some(summary)));
     }
 
+    // Issue #417: an operator's `[[output.filter]]` rule shapes the text a
+    // `Generic`-scope command's summary is built from -- never `Known`/
+    // `Diff`/`Shape`/`Verbatim`, all already returned above this point.
+    // Only the SUMMARY sees the filtered text; the stored `path` itself is
+    // never rewritten, so `zirv ctx output show <id>` is untouched. The
+    // original `scan.total_bytes`/`total_lines` survive the swap below on
+    // purpose -- see this function's own doc comment for why the never-worse
+    // guard and the "captured N lines, M bytes" header must both keep
+    // describing what the command actually produced, not the filtered view.
+    if scope == CompactionScope::Generic
+        && !filter_rules.is_empty()
+        && let Ok(raw_bytes) = std::fs::read(path)
+    {
+        let raw_text = String::from_utf8_lossy(&raw_bytes).into_owned();
+        let retrieval_hint = format!("`zirv ctx output show {id}`");
+        if let Some(filtered) =
+            apply_operator_output_filter(filter_rules, &command_line, &raw_text, &retrieval_hint)
+        {
+            let mut filtered_scan = scan_for_display(std::io::BufReader::new(
+                std::io::Cursor::new(filtered.into_bytes()),
+            ));
+            filtered_scan.total_bytes = scan.total_bytes;
+            filtered_scan.total_lines = scan.total_lines;
+            filtered_scan.read_error = scan.read_error;
+            scan = filtered_scan;
+        }
+    }
+
     let summary = render_summary(
         id,
         &command.join(" "),
@@ -1394,6 +1581,17 @@ fn stored_tail(path: &Path, lines: usize) -> Vec<String> {
 /// and rendered summary. The bytes are written exactly as given: the stored
 /// file is byte-identical to what the caller was handed, which is the whole
 /// contract behind the retrieval line.
+///
+/// No `[[output.filter]]` rules -- callers that need them (`hook::
+/// run_posttool`, which has a resolved `CtxConfig` in hand already) use
+/// [`capture_text_with_filters`] instead; this thin wrapper exists only to
+/// keep every pre-#417 call site (this module's own tests included)
+/// source-compatible. `#[cfg(test)]`: the only caller left outside this
+/// module's own test suite was `hook::run_posttool`, which now calls
+/// `capture_text_with_filters` directly so it can pass `cfg.output.filter`
+/// through -- keeping this wrapper unconditionally `pub(crate)` would leave
+/// it dead code in an ordinary (non-test) build.
+#[cfg(test)]
 pub(crate) fn capture_text(
     state: &StateDir,
     repo: &Path,
@@ -1402,6 +1600,32 @@ pub(crate) fn capture_text(
     output: &str,
     max_summary_bytes: usize,
     scope: CompactionScope,
+) -> CtxResult<(String, Option<String>)> {
+    capture_text_with_filters(
+        state,
+        repo,
+        command,
+        exit_code,
+        output,
+        max_summary_bytes,
+        scope,
+        &[],
+    )
+}
+
+/// Same as [`capture_text`], plus the operator's `[[output.filter]]` rules
+/// (issue #417) -- threaded through to `summarize_stored`, which is where
+/// they are actually applied (and only for `CompactionScope::Generic`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_text_with_filters(
+    state: &StateDir,
+    repo: &Path,
+    command: &[String],
+    exit_code: Option<i32>,
+    output: &str,
+    max_summary_bytes: usize,
+    scope: CompactionScope,
+    filter_rules: &[super::config::OutputFilterRule],
 ) -> CtxResult<(String, Option<String>)> {
     let dir = outputs_dir(state, repo);
     state::create_private_dir_all(&dir)?;
@@ -1422,6 +1646,7 @@ pub(crate) fn capture_text(
         started_at,
         max_summary_bytes,
         scope,
+        filter_rules,
     )?;
     Ok((id, summary))
 }
@@ -1486,6 +1711,7 @@ pub fn run_with<W: Write>(
         started_at,
         cfg.output.max_summary_bytes,
         CompactionScope::Generic,
+        &cfg.output.filter,
     )?;
 
     if args.full && !args.compact {
@@ -2538,6 +2764,411 @@ mod tests {
         )]);
         let state = StateDir::resolve(&|k: &str| env.get(k).cloned()).expect("state dir");
         (tmp, state, repo, home_guard)
+    }
+
+    // -- Issue #417: operator-declared `[[output.filter]]` rules ----------
+
+    /// An operator's `strip_lines` rule removes matching lines from the
+    /// rendered `Generic`-scope summary; the stored original stays whole.
+    #[test]
+    fn an_operator_rule_strips_matching_lines_from_the_summary_but_not_the_stored_original() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let mut output = String::new();
+        for i in 0..300u32 {
+            output.push_str(&format!(
+                "> Task :app:compileJava{i} UP-TO-DATE (this line is noise)\n"
+            ));
+        }
+        for i in 0..3u32 {
+            output.push_str(&format!("real line {i}\n"));
+        }
+        output.push_str("BUILD SUCCESSFUL in 3s\n");
+
+        let rule = crate::commands::ctx::config::OutputFilterRule {
+            name: "gradle".to_string(),
+            match_command: r"^(\./)?gradlew?\b".to_string(),
+            strip_lines: vec!["^> Task .* UP-TO-DATE".to_string()],
+            keep_lines: Vec::new(),
+            truncate_line_at: None,
+            max_lines: None,
+            match_output: None,
+        };
+
+        let (id, summary) = capture_text_with_filters(
+            &state,
+            &repo,
+            &["./gradlew build".to_string()],
+            // Non-zero: keeps this off the "clean, one-liner" fast path so
+            // the head/tail sections this test actually inspects get
+            // rendered at all.
+            Some(1),
+            &output,
+            20_000,
+            CompactionScope::Generic,
+            &[rule],
+        )
+        .expect("capture");
+        let summary = summary.expect("a summary should be emitted");
+        assert!(
+            !summary.contains("UP-TO-DATE"),
+            "the operator's strip_lines rule must remove every matching line from the summary: \
+             {summary}"
+        );
+
+        let dir = outputs_dir(&state, &repo);
+        let stored = std::fs::read_to_string(dir.join(format!("{id}.log"))).expect("read stored");
+        assert!(
+            stored.contains("UP-TO-DATE"),
+            "the stored original must keep every line regardless of filtering"
+        );
+    }
+
+    /// A rule application that panics (via the `#[cfg(test)]`-only seam in
+    /// `apply_output_filter_stages`) must leave the ordinary, unfiltered
+    /// generic summary in place rather than propagating the panic.
+    #[test]
+    fn a_panicking_filter_rule_falls_back_to_the_unfiltered_generic_summary() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        // Large enough (well past the bounded head/tail window) that the
+        // fallback, unfiltered summary is still strictly smaller than the
+        // raw output -- a small original would trip the (unrelated)
+        // never-worse guard and return `None` regardless of whether the
+        // panic fallback itself worked, which is not what this test means
+        // to exercise.
+        let mut output: String = (1..=500u32)
+            .map(|i| format!("line {i} of not-especially-interesting filler text\n"))
+            .collect();
+        output.push_str("BUILD SUCCESSFUL\n");
+
+        let rule = crate::commands::ctx::config::OutputFilterRule {
+            name: "__panic_test__".to_string(),
+            match_command: r"^panicky\b".to_string(),
+            strip_lines: Vec::new(),
+            keep_lines: Vec::new(),
+            truncate_line_at: None,
+            max_lines: None,
+            match_output: None,
+        };
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = capture_text_with_filters(
+            &state,
+            &repo,
+            &["panicky-tool run".to_string()],
+            Some(1),
+            &output,
+            20_000,
+            CompactionScope::Generic,
+            &[rule],
+        );
+        std::panic::set_hook(previous_hook);
+
+        let (_, summary) =
+            result.expect("capture must not itself fail even though the rule panics");
+        let summary = summary.expect("the unfiltered generic summary must still be emitted");
+        assert!(
+            summary.contains("line 1") || summary.contains("BUILD SUCCESSFUL"),
+            "a panicking rule must fall back to the ordinary unfiltered summary: {summary}"
+        );
+    }
+
+    /// Rules declared under `[[output.filter]]` apply ONLY to
+    /// `CompactionScope::Generic` -- never `Known`, `Diff`, `Shape` or
+    /// `Verbatim`, each already handled by its own dedicated rendering
+    /// before `summarize_stored` ever reaches the filter block. Proven with
+    /// a `match_output` whole-output rule that would be unmistakable if it
+    /// fired: every non-`Generic` scope must never show its `replace` text.
+    #[test]
+    fn output_filter_rules_never_apply_outside_generic_scope() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let rule = crate::commands::ctx::config::OutputFilterRule {
+            name: "whole-output".to_string(),
+            match_command: r"^.*$".to_string(),
+            strip_lines: Vec::new(),
+            keep_lines: Vec::new(),
+            truncate_line_at: None,
+            max_lines: None,
+            match_output: Some(crate::commands::ctx::config::MatchOutput {
+                pattern: r"(?s)\A.*\z".to_string(),
+                replace: "OUTPUT_FILTER_RULE_FIRED".to_string(),
+            }),
+        };
+
+        let diff_like =
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,1 +1,1 @@\n-old\n+new\n".to_string();
+        let plain = "hello\nworld\n".to_string();
+        let cargo_test_like = "test result: ok. 1 passed; 0 failed\n".repeat(3);
+
+        for (scope, command, body) in [
+            (CompactionScope::Known, "cargo test", cargo_test_like),
+            (CompactionScope::Diff, "git diff", diff_like),
+            (CompactionScope::Shape, "rg TODO src", plain.clone()),
+            (CompactionScope::Verbatim, "cat file", plain),
+        ] {
+            let (_, summary) = capture_text_with_filters(
+                &state,
+                &repo,
+                &[command.to_string()],
+                // Non-zero: keeps every one of these off the "clean"
+                // fast-path renderer, which would trivially hide the
+                // replacement text WITHOUT the filter's own scope check
+                // being the reason -- see the sanity check below, which
+                // exercises the identical non-clean path for `Generic`.
+                Some(1),
+                &body,
+                20_000,
+                scope,
+                std::slice::from_ref(&rule),
+            )
+            .expect("capture");
+            let text = summary.unwrap_or_default();
+            assert!(
+                !text.contains("OUTPUT_FILTER_RULE_FIRED"),
+                "{scope:?} must never apply an [[output.filter]] rule: {text}"
+            );
+        }
+
+        // Sanity check on the mechanism itself: the identical rule, against
+        // `Generic` scope and the same non-clean (`Some(1)`) exit code, DOES
+        // fire -- proving the four assertions above are because of the
+        // scope check, not because the rule never fires at all. The body is
+        // large enough that the collapsed one-line replacement plus the
+        // summary's own header/retrieval overhead still beats the raw byte
+        // count -- a tiny original would make the never-worse guard itself
+        // (issue #410/#417, see the dedicated test below) reject ANY
+        // summary here, masking whether the rule fired at all.
+        let large_body: String = (0..50u32)
+            .map(|i| format!("some output line {i}\n"))
+            .collect();
+        let (_, summary) = capture_text_with_filters(
+            &state,
+            &repo,
+            &["anything at all".to_string()],
+            Some(1),
+            &large_body,
+            20_000,
+            CompactionScope::Generic,
+            &[rule],
+        )
+        .expect("capture");
+        assert!(
+            summary
+                .unwrap_or_default()
+                .contains("OUTPUT_FILTER_RULE_FIRED"),
+            "the same rule must fire under `Generic` scope"
+        );
+    }
+
+    /// `match_output`'s whole-output short circuit, isolated: when its
+    /// `pattern` matches the ENTIRE original text, the summary is built from
+    /// `replace` alone, so a large "noisy but actually fine" output collapses
+    /// to almost nothing.
+    #[test]
+    fn match_output_short_circuits_the_whole_output_for_generic_scope() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let rule = crate::commands::ctx::config::OutputFilterRule {
+            name: "helm".to_string(),
+            match_command: r"^helm\s+(install|upgrade)\b".to_string(),
+            strip_lines: Vec::new(),
+            keep_lines: Vec::new(),
+            truncate_line_at: None,
+            max_lines: None,
+            match_output: Some(crate::commands::ctx::config::MatchOutput {
+                pattern: r"(?s)\ABUILD SUCCESSFUL.*\z".to_string(),
+                replace: "BUILD SUCCESSFUL".to_string(),
+            }),
+        };
+
+        let mut noisy = String::from("BUILD SUCCESSFUL\n");
+        for i in 0..500u32 {
+            noisy.push_str(&format!(
+                "noise line {i} that is not interesting at all and quite long indeed\n"
+            ));
+        }
+
+        let (_, summary) = capture_text_with_filters(
+            &state,
+            &repo,
+            &["helm upgrade myrelease chart".to_string()],
+            Some(0),
+            &noisy,
+            20_000,
+            CompactionScope::Generic,
+            &[rule],
+        )
+        .expect("capture");
+        let summary = summary.expect("a summary should be emitted");
+        assert!(
+            !summary.contains("noise line"),
+            "match_output's replacement must collapse the whole noisy output before the \
+             generic scan ever sees the 500 noise lines: {summary}"
+        );
+        assert!(
+            summary.len() < noisy.len() / 10,
+            "the summary must be far smaller than the raw noisy output: {summary}"
+        );
+    }
+
+    /// `max_lines` keeps only the first N surviving lines and appends a
+    /// marker naming how many more there were and this capture's own
+    /// retrieval id.
+    #[test]
+    fn max_lines_appends_a_more_lines_marker_naming_the_retrieval_id() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let rule = crate::commands::ctx::config::OutputFilterRule {
+            name: "capped".to_string(),
+            match_command: r"^capped-tool\b".to_string(),
+            strip_lines: Vec::new(),
+            keep_lines: Vec::new(),
+            truncate_line_at: None,
+            max_lines: Some(5),
+            match_output: None,
+        };
+
+        // Large enough that the tiny (5-line-plus-marker) filtered summary
+        // still beats the raw byte count -- see the never-worse guard note
+        // on the panic-fallback test above for why a small original would
+        // make `render_summary` return `None` regardless of whether
+        // `max_lines` itself worked.
+        let output: String = (1..=400u32)
+            .map(|i| format!("row {i} of not-especially-interesting filler text\n"))
+            .collect();
+
+        let (id, summary) = capture_text_with_filters(
+            &state,
+            &repo,
+            &["capped-tool run".to_string()],
+            Some(1),
+            &output,
+            20_000,
+            CompactionScope::Generic,
+            &[rule],
+        )
+        .expect("capture");
+        let summary = summary.expect("a summary should be emitted");
+        assert!(
+            summary.contains(&format!("more lines (see `zirv ctx output show {id}`)")),
+            "max_lines must append a retrieval marker naming this capture's own id: {summary}"
+        );
+    }
+
+    /// `truncate_line_at` cuts on *character* boundaries, never bytes -- a
+    /// multi-byte character must never be split mid-codepoint (which would
+    /// otherwise panic on the resulting invalid `&str` slice).
+    #[test]
+    fn truncate_line_at_is_char_boundary_safe_on_multibyte_text() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let rule = crate::commands::ctx::config::OutputFilterRule {
+            name: "trunc".to_string(),
+            match_command: r"^multibyte-tool\b".to_string(),
+            strip_lines: Vec::new(),
+            keep_lines: Vec::new(),
+            truncate_line_at: Some(5),
+            max_lines: None,
+            match_output: None,
+        };
+
+        // Every character below is multi-byte in UTF-8, so a byte-offset cut
+        // at 5 would land mid-codepoint. Padded with plain filler ahead of
+        // it so the raw output is large enough that the (heavily truncated)
+        // summary still beats the never-worse guard's raw-byte comparison --
+        // see the panic-fallback test above for why a small original alone
+        // would make `render_summary` return `None` regardless of whether
+        // truncation itself worked. The multi-byte lines sit at the very
+        // end, inside the bounded tail window, so they are guaranteed to
+        // appear in the rendered summary.
+        let line = "日本語のテキストです";
+        let mut output: String = (1..=300u32)
+            .map(|i| format!("filler line {i} that is definitely longer than five characters\n"))
+            .collect();
+        output.push_str(line);
+        output.push('\n');
+        output.push_str(line);
+        output.push('\n');
+
+        let (_, summary) = capture_text_with_filters(
+            &state,
+            &repo,
+            &["multibyte-tool run".to_string()],
+            Some(1),
+            &output,
+            20_000,
+            CompactionScope::Generic,
+            &[rule],
+        )
+        .expect("capture must not panic on multi-byte truncation");
+        let summary = summary.expect("a summary should be emitted");
+        let expected: String = line.chars().take(5).collect();
+        assert!(
+            summary.contains(&expected),
+            "each line must be cut to exactly 5 CHARACTERS, not bytes: {summary}"
+        );
+        assert!(
+            !summary.contains(line),
+            "the untruncated line must not survive filtering: {summary}"
+        );
+    }
+
+    /// The never-worse guard inside `render_summary` must be measured
+    /// against the ORIGINAL raw byte count, not the filtered text's own,
+    /// much smaller byte count -- otherwise a rule that shrinks a large
+    /// output down to a handful of bytes would make the guard reject even an
+    /// honest, hugely-smaller summary (a header plus a retrieval line alone
+    /// would already be "not smaller than" a few filtered bytes).
+    #[test]
+    fn the_never_worse_guard_is_measured_against_the_original_raw_bytes() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let mut output = String::new();
+        for i in 0..2000u32 {
+            output.push_str(&format!(
+                "NOISE line {i} padded out to be reasonably long indeed, on purpose\n"
+            ));
+        }
+        output.push_str("keep me\n");
+        assert!(
+            output.len() > 20_000,
+            "the raw output must be large: {}",
+            output.len()
+        );
+
+        let rule = crate::commands::ctx::config::OutputFilterRule {
+            name: "shrink-a-lot".to_string(),
+            match_command: r"^shrink-tool\b".to_string(),
+            strip_lines: vec!["^NOISE ".to_string()],
+            keep_lines: Vec::new(),
+            truncate_line_at: None,
+            max_lines: None,
+            match_output: None,
+        };
+
+        let (_, summary) = capture_text_with_filters(
+            &state,
+            &repo,
+            &["shrink-tool run".to_string()],
+            Some(1),
+            &output,
+            4096,
+            CompactionScope::Generic,
+            &[rule],
+        )
+        .expect("capture");
+        assert!(
+            summary.is_some(),
+            "a summary trivially smaller than the ORIGINAL raw output must still be emitted, \
+             even though it is not smaller than the filtered text's own tiny byte count"
+        );
+        assert!(
+            summary.as_deref().unwrap().len() < output.len(),
+            "the emitted summary must be strictly smaller than the original raw output"
+        );
     }
 
     // -- Issue #410: never-worse guard ------------------------------------

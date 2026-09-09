@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-08
+last-verified: 2026-09-09
 ---
 
 # Usage and Pacing
@@ -70,6 +70,8 @@ A per-agent usage reading used to collapse both subscription windows into one nu
 - `WaitUntil { reset_at, window, percent, source }` — the hard pause, at or above `max_percent`
 - `Slow { delay_secs, window, percent, source }` (2026-08-16) — the pace-to-reset soft-throttle band, between `soft_percent` and `max_percent`
 - `Unknown` — no usable data at all (proceeds, but is reported honestly as unknown rather than as a healthy 0%)
+
+**Spend-only providers (issue #395, 2026-09-09).** An operator `[endpoint.claude]`/`[endpoint.codex]` override (see [[Untrusted Configuration]] and [[Ctx Adapters]]'s "Endpoint overrides" subsection) resolves `AgentAdapter::provider()`/`provider_for_model()` to the endpoint vendor's own catalogue slug rather than `"anthropic"`/`"openai"` — a GLM/Kimi/DeepSeek/Qwen/Mistral/MiniMax account, or a local Ollama/LM Studio/vLLM runtime. None of those has a usage-window collector at all: there is no statusline `rate_limits` payload and no rollout scan for a vendor-compatible endpoint, so `window::load_for` returns `None` for it *permanently*, not just until the operator wires something up. `pace::is_spend_only_provider(provider)` (`true` for any provider other than the two native accounts) is what lets the surfaces that would otherwise read this as a scary "unknown"/"no usage source" render it as the expected, honest "spend-only" fact instead: `zirv ctx status`'s usage-windows line prints `<vendor>: spend-only (no usage window for <vendor>)`, and `zirv ctx usage`'s no-subcommand report prints the identical line in place of its own generic `"<provider>: no usage source"`. `pace::decide` itself is unchanged — a spend-only provider still resolves to `PaceDecision::Unknown` and still proceeds unthrottled, exactly like any other provider with no data; only the *wording* two display surfaces choose changes, deliberately bounded to those two lines rather than a broader allocator/pool-view change (an endpoint-routed provider was never reserved against or steered away from by the allocator to begin with, since it never had a usage window to reserve against). Spend itself is still tracked normally: `StateDir::usage_for(vendor)` is simply the file that never gets written, while the cost ledger (`price::price`, next section) prices the pinned rung id against the catalogue's own survey rates regardless of which account is billed.
 
 The logic, in order:
 

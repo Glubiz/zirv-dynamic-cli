@@ -690,6 +690,36 @@ const VENDORS: &[Vendor] = &[
         extra_prices: &[],
         as_of: Some(CATALOGUE_AS_OF),
     },
+    // Issue #395: local-runtime "vendors" an operator's own endpoint override
+    // can name (`ollama`, `lmstudio`, `vllm`) -- there is no fixed model
+    // lineup or published price for a self-hosted runtime, so each carries
+    // EMPTY rungs, no prices, and no default context window. `EndpointTarget`
+    // validation therefore REQUIRES `model` for these three (see `config.rs`'s
+    // `validate_endpoint_target`: "model is required for a vendor with no
+    // catalogue rungs to default from"), and `EndpointTarget::pin_model`
+    // never overrides an operator's own choice for them, since there is no
+    // ladder to resolve a requested model against either.
+    Vendor {
+        slug: "ollama",
+        rungs: &[],
+        default_context_window: None,
+        extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
+    },
+    Vendor {
+        slug: "lmstudio",
+        rungs: &[],
+        default_context_window: None,
+        extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
+    },
+    Vendor {
+        slug: "vllm",
+        rungs: &[],
+        default_context_window: None,
+        extra_prices: &[],
+        as_of: Some(CATALOGUE_AS_OF),
+    },
 ];
 
 /// The vendor named `slug`, or `None` when this catalogue does not carry it.
@@ -881,8 +911,37 @@ mod tests {
             "minimax",
             "meta",
             "amazon",
+            "ollama",
+            "lmstudio",
+            "vllm",
         ] {
             assert!(slugs.contains(&expected), "missing vendor {expected}");
+        }
+    }
+
+    /// Issue #395: the three local-runtime vendors carry no ladder at all --
+    /// no rungs, no fallback context window, no priced rows -- so an
+    /// endpoint override against one of them cannot silently guess a model
+    /// or a price.
+    #[test]
+    fn local_runtime_vendors_carry_no_ladder_at_all() {
+        for slug in ["ollama", "lmstudio", "vllm"] {
+            let v = vendor(slug).unwrap_or_else(|| panic!("{slug} is a built-in vendor"));
+            assert!(v.rungs.is_empty(), "{slug}: expected no rungs");
+            assert_eq!(
+                v.default_context_window, None,
+                "{slug}: expected no fallback window"
+            );
+            assert_eq!(
+                context_window(v, None),
+                None,
+                "{slug}: expected no context window"
+            );
+            assert_eq!(
+                rung_below(v, None),
+                "",
+                "{slug}: an empty ladder has nothing below"
+            );
         }
     }
 

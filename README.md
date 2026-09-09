@@ -1525,6 +1525,7 @@ checkout:
 | `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
+| `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
@@ -1561,6 +1562,7 @@ checkout:
 | `output.verbatim` | `ZIRV_CTX_OUTPUT_VERBATIM` |
 | `output.max_summary_bytes` | `ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES` |
 | `output.compact_search` | `ZIRV_CTX_OUTPUT_COMPACT_SEARCH` |
+| `output.filter` | `~/.zirv/ctx.toml only` |
 | `fallback.orchestrator_rollover_headroom_pct` | `ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT` |
 | `fallback.rollover_cooldown_secs` | `ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS` |
 | `fallback.reactive_force_after_secs` | `ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS` |

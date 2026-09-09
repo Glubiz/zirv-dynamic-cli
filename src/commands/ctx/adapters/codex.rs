@@ -258,6 +258,11 @@ pub struct CodexAdapter {
     program: String,
     bin_args: Vec<String>,
     home: Option<PathBuf>,
+    /// Issue #395: an operator-only `[endpoint.codex]` override, attached
+    /// post-construction via `AgentAdapter::apply_endpoint` (production) or
+    /// `with_endpoint` (tests/direct construction) -- never set from a repo
+    /// layer, see `config.rs`'s `REPO_FORBIDDEN` entry for `endpoint`.
+    endpoint: Option<super::super::config::EndpointTarget>,
     /// Test seam only: forces `ignore_flags_supported`'s answer instead of
     /// spawning a real `--help` probe against whatever "codex" happens to
     /// resolve to on the machine running the test suite -- without this,
@@ -311,6 +316,7 @@ impl CodexAdapter {
             program,
             bin_args: parts.collect(),
             home: None,
+            endpoint: None,
             #[cfg(test)]
             forced_ignore_flags_support: None,
             #[cfg(test)]
@@ -322,6 +328,17 @@ impl CodexAdapter {
             #[cfg(test)]
             forced_state_root: None,
         }
+    }
+
+    /// Issue #395: attaches an operator `[endpoint.codex]` override.
+    /// Production code reaches this through `AgentAdapter::apply_endpoint`
+    /// (see `adapters::apply_endpoint_override`), mirroring `with_home`/
+    /// `with_ignore_flags_forced`-style test seams below; this builder is
+    /// only the direct-construction path tests use.
+    #[cfg(test)]
+    pub fn with_endpoint(mut self, endpoint: super::super::config::EndpointTarget) -> Self {
+        self.endpoint = Some(endpoint);
+        self
     }
 
     /// Test seam: pins the home directory the transcript path is built from.
@@ -500,6 +517,40 @@ impl CodexAdapter {
         let mut cmd = Command::new(&resolved.program);
         cmd.args(&resolved.prefix);
         cmd.args(&self.bin_args);
+        // Issue #395: an operator `[endpoint.codex]` override registers a
+        // vendor-named `model_providers.<vendor>` entry and selects it,
+        // rather than passing the secret directly -- codex reads the key
+        // from `env_key` itself at launch time, so zirv never copies it onto
+        // argv. `AgentAdapter::ready()` (called before any command built
+        // from `base()` is ever spawned) already refused the launch if
+        // `credential_env` is unset/empty. Every token is TOML-quoted the
+        // same way `read_only_sandbox_args` above quotes its own state-root
+        // path, so it passes `guard_cmd_shim_reparse` on a shim launch.
+        if let Some(ep) = &self.endpoint {
+            let wire_api = ep.wire_api.as_deref().unwrap_or("chat");
+            cmd.arg("-c")
+                .arg(format!("model_provider={}", toml_quoted_string(&ep.vendor)));
+            cmd.arg("-c").arg(format!(
+                "model_providers.{}.name={}",
+                ep.vendor,
+                toml_quoted_string(&ep.vendor)
+            ));
+            cmd.arg("-c").arg(format!(
+                "model_providers.{}.base_url={}",
+                ep.vendor,
+                toml_quoted_string(&ep.base_url)
+            ));
+            cmd.arg("-c").arg(format!(
+                "model_providers.{}.env_key={}",
+                ep.vendor,
+                toml_quoted_string(&ep.credential_env)
+            ));
+            cmd.arg("-c").arg(format!(
+                "model_providers.{}.wire_api={}",
+                ep.vendor,
+                toml_quoted_string(wire_api)
+            ));
+        }
         cmd
     }
 
@@ -1108,7 +1159,17 @@ impl AgentAdapter for CodexAdapter {
     /// Codex spends an OpenAI account's limits. Nothing collects readings for
     /// it yet, which is exactly why the provider is named: a usage readout
     /// can then say "openai: no usage source" rather than imply zero.
+    ///
+    /// Issue #395: an operator `[endpoint.codex]` override retargets this
+    /// away from codex's own native account -- see `ClaudeAdapter::
+    /// provider`'s identical doc comment for the full rationale, mirrored
+    /// here.
     fn provider(&self) -> &'static str {
+        if let Some(ep) = &self.endpoint
+            && let Some(vendor) = catalogue::vendor(&ep.vendor)
+        {
+            return vendor.slug;
+        }
         "openai"
     }
 
@@ -1121,9 +1182,28 @@ impl AgentAdapter for CodexAdapter {
     /// as the OS's own "not found" at spawn time, not caught here. Codex
     /// support is otherwise honestly degraded (see the module doc comment)
     /// but not refused.
+    ///
+    /// Issue #395: also refuses (naming only the environment variable's
+    /// NAME) when an `[endpoint.codex]` override is attached and its
+    /// `credential_env` is unset or empty -- see `ClaudeAdapter::ready`'s
+    /// identical addition.
     fn ready(&self) -> CtxResult<()> {
         super::resolve_program(&self.program)?;
+        if let Some(ep) = &self.endpoint {
+            super::require_endpoint_credential(ep)?;
+        }
         Ok(())
+    }
+
+    /// Issue #395: the production seam (`adapters::apply_endpoint_override`,
+    /// called by `select`/`resolve_default`) that attaches a resolved
+    /// `[endpoint.codex]` target after construction.
+    fn apply_endpoint(&mut self, endpoint: Option<&super::super::config::EndpointTarget>) {
+        self.endpoint = endpoint.cloned();
+    }
+
+    fn endpoint_vendor(&self) -> Option<&str> {
+        self.endpoint.as_ref().map(|ep| ep.vendor.as_str())
     }
 
     fn detect(&self, command: &[String]) -> bool {
@@ -1326,11 +1406,23 @@ impl AgentAdapter for CodexAdapter {
     /// codex's un-upgraded residual is "still reads the file *and* still
     /// honors config it did not ask for") -- `sandbox_residual_note` names
     /// this for the operator via a one-time `zirv ▸` announcement.
+    /// Review finding (#395 follow-up): routed through `model_args` (which
+    /// pins via `EndpointTarget::pin_model` when `self.endpoint` is set),
+    /// exactly like every other `--model` emission on this adapter --
+    /// without that, an `[endpoint.codex]` override pinned the interactive/
+    /// headless/resume launches to the endpoint vendor's own ladder but left
+    /// this one sending codex's native cheap alias straight to that
+    /// endpoint, where it is not a valid model at all. Still omits the flag
+    /// entirely when there is no endpoint AND no model was requested --
+    /// `resolve_distiller_model`'s documented "let the agent's own
+    /// configuration pick" case -- but under an endpoint override there is
+    /// no native config to fall back to, so `model_args` always emits a
+    /// pinned model (the endpoint's own default, at minimum) in that case.
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
         cmd.arg("exec");
-        if !model.is_empty() {
-            cmd.arg("--model").arg(model);
+        if self.endpoint.is_some() || !model.is_empty() {
+            cmd.args(self.model_args(model));
         }
         cmd.args(self.read_only_args());
         cmd
@@ -2115,8 +2207,24 @@ impl AgentAdapter for CodexAdapter {
     /// 139): `-m, --model <MODEL>` is present on top-level `codex --help`
     /// with the same description as on `codex exec --help`, so the
     /// interactive launch this feeds (`interactive_cmd`) accepts it too.
+    ///
+    /// Issue #395: under an `[endpoint.codex]` override, `model` is pinned
+    /// through `EndpointTarget::pin_model` first -- see `ClaudeAdapter::
+    /// model_args`'s identical addition for the full rationale.
     fn model_args(&self, model: &str) -> Vec<String> {
-        vec!["--model".to_string(), model.to_string()]
+        vec!["--model".to_string(), self.pin_model_for_endpoint(model)]
+    }
+
+    /// Review finding (#395 follow-up): the shared pinning `model_args`
+    /// above and `distiller_cmd` now both route every `--model` through,
+    /// and `review_roster_line` routes its advisory text through too, so
+    /// the roster's displayed review model can never name a model the
+    /// actual launch would replace.
+    fn pin_model_for_endpoint(&self, model: &str) -> String {
+        match &self.endpoint {
+            Some(ep) => ep.pin_model(Some(model)),
+            None => model.to_string(),
+        }
     }
 
     fn register_turn_signal(&self, _session: &SessionRef, _socket: &Path) -> TurnSignalSetup {
@@ -2591,6 +2699,125 @@ mod tests {
             ],
             "codex exec takes no session flag; codex mints its own session id"
         );
+    }
+
+    /// Issue #395, item 3: an `[endpoint.codex]` override registers a
+    /// `model_providers.<vendor>` config entry and selects it via `-c
+    /// model_provider=<vendor>` -- codex itself reads the key from the
+    /// registered `env_key`, so zirv never copies the secret onto argv.
+    /// Every emitted token must also pass `guard_cmd_shim_reparse`, the
+    /// fail-closed backstop against an npm-shim `cmd.exe` reparse.
+    #[test]
+    fn an_endpoint_override_registers_and_selects_a_model_provider() {
+        let target = crate::commands::ctx::config::EndpointTarget {
+            vendor: "deepseek".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            credential_env: "DEEPSEEK_API_KEY".to_string(),
+            model: None,
+            wire_api: None,
+        };
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex")).with_endpoint(target);
+        let cmd = adapter.headless_cmd("do the work", &SessionId::parse("abc"), &[]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_provider='deepseek'"),
+            "got {args:?}"
+        );
+        for (key, expected) in [
+            ("name", "'deepseek'"),
+            ("base_url", "'https://api.deepseek.com'"),
+            ("env_key", "'DEEPSEEK_API_KEY'"),
+            ("wire_api", "'chat'"),
+        ] {
+            let token = format!("model_providers.deepseek.{key}={expected}");
+            assert!(
+                args.windows(2).any(|w| w[0] == "-c" && w[1] == token),
+                "missing {token:?} in {args:?}"
+            );
+        }
+
+        // Every `-c` value token must survive the fail-closed cmd.exe
+        // reparse guard on the shim launch shape it protects.
+        let synthetic_shim_args: Vec<String> = std::iter::once("/c".to_string())
+            .chain(std::iter::once("shim.cmd".to_string()))
+            .chain(args.iter().cloned())
+            .collect();
+        assert!(
+            super::super::guard_cmd_shim_reparse("cmd.exe", &synthetic_shim_args).is_ok(),
+            "an endpoint-override token failed the cmd.exe reparse guard: {args:?}"
+        );
+    }
+
+    /// Issue #395, item 4 (codex side): a requested model that does not
+    /// resolve on the endpoint vendor's own ladder is replaced by that
+    /// vendor's own default; a requested model that DOES resolve is
+    /// honoured verbatim -- mirrors `ClaudeAdapter`'s identical test.
+    #[test]
+    fn model_args_pins_to_the_endpoint_vendors_own_ladder() {
+        let target = crate::commands::ctx::config::EndpointTarget {
+            vendor: "deepseek".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            credential_env: "DEEPSEEK_API_KEY".to_string(),
+            model: None,
+            wire_api: None,
+        };
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex")).with_endpoint(target);
+
+        // A codex-native ladder tier must never reach a DeepSeek endpoint.
+        let replaced = adapter.model_args("gpt-5.6-sol");
+        assert_eq!(
+            replaced[1], "deepseek-v4-pro",
+            "the vendor's own strongest rung"
+        );
+
+        // A deepseek alias/id already on the ladder is honoured verbatim.
+        let honoured = adapter.model_args("deepseek-v4-flash");
+        assert_eq!(honoured[1], "deepseek-v4-flash");
+    }
+
+    /// Review finding (#395 follow-up): `distiller_cmd` used to emit
+    /// `--model <native cheap alias>` (or omit the flag) with no regard for
+    /// any attached endpoint override, so a deepseek endpoint got codex's
+    /// native cheap alias -- not a valid model on that vendor's account --
+    /// for the one judgment/distillation child every rot-scoring pass
+    /// spawns. It must now carry a vendor rung, exactly like `model_args_
+    /// pins_to_the_endpoint_vendors_own_ladder` already verifies for the
+    /// interactive/headless/resume launches, even when the caller passed no
+    /// model at all (there is no native config to fall back to once an
+    /// endpoint is configured).
+    #[test]
+    fn distiller_cmd_pins_the_model_through_an_endpoint_override() {
+        let target = crate::commands::ctx::config::EndpointTarget {
+            vendor: "deepseek".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            credential_env: "ZIRV_TEST_UNUSED_395".to_string(),
+            model: None,
+            wire_api: None,
+        };
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex")).with_endpoint(target);
+
+        for requested in ["gpt-5.6-sol", ""] {
+            let cmd = adapter.distiller_cmd(requested);
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().to_string())
+                .collect();
+            let model_at = args
+                .iter()
+                .position(|a| a == "--model")
+                .unwrap_or_else(|| panic!("must still emit --model for {requested:?}: {args:?}"));
+            assert_eq!(
+                args[model_at + 1],
+                "deepseek-v4-pro",
+                "must never send codex's native ladder to a deepseek endpoint for \
+                 {requested:?}: got {args:?}"
+            );
+        }
     }
 
     /// Issue #303: `codex exec resume [SESSION_ID] [PROMPT]`, verified via

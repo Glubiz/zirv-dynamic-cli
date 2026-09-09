@@ -962,6 +962,11 @@ pub struct ClaudeAdapter {
     program: String,
     bin_args: Vec<String>,
     home: Option<PathBuf>,
+    /// Issue #395: an operator-only `[endpoint.claude]` override, attached
+    /// post-construction via `AgentAdapter::apply_endpoint` (production) or
+    /// `with_endpoint` (tests/direct construction) -- never set from a repo
+    /// layer, see `config.rs`'s `REPO_FORBIDDEN` entry for `endpoint`.
+    endpoint: Option<super::super::config::EndpointTarget>,
     #[cfg(test)]
     forced_file_support: Option<bool>,
     #[cfg(test)]
@@ -980,6 +985,7 @@ impl ClaudeAdapter {
             program,
             bin_args: parts.collect(),
             home: None,
+            endpoint: None,
             #[cfg(test)]
             forced_file_support: None,
             #[cfg(test)]
@@ -987,6 +993,17 @@ impl ClaudeAdapter {
                 "zirv-test-claude-launch-settings.json",
             ))),
         }
+    }
+
+    /// Issue #395: attaches an operator `[endpoint.claude]` override.
+    /// Production code reaches this through `AgentAdapter::apply_endpoint`
+    /// (see `adapters::apply_endpoint_override`), mirroring `with_home`/
+    /// `with_ignore_flags_forced`-style test seams below; this builder is
+    /// only the direct-construction path tests use.
+    #[cfg(test)]
+    pub fn with_endpoint(mut self, endpoint: super::super::config::EndpointTarget) -> Self {
+        self.endpoint = Some(endpoint);
+        self
     }
 
     /// Test seam: pins the home directory the transcript path is built from.
@@ -1032,6 +1049,21 @@ impl ClaudeAdapter {
         let mut cmd = Command::new(&resolved.program);
         cmd.args(&resolved.prefix);
         cmd.args(&self.bin_args);
+        // Issue #395: an operator `[endpoint.claude]` override retargets
+        // this launch at an Anthropic-compatible vendor endpoint instead of
+        // claude's own native account. `AgentAdapter::ready()` (called
+        // before any command built from `base()` is ever spawned -- see
+        // `adapters::select`/`resolve_default`) already refused the launch
+        // if `credential_env` is unset/empty, so reading it here is safe;
+        // this is nonetheless a fail-soft read (never a panic) for any
+        // caller that reaches `base()` without going through `ready()`
+        // first (a unit test building a `Command` directly, say).
+        if let Some(ep) = &self.endpoint {
+            cmd.env("ANTHROPIC_BASE_URL", &ep.base_url);
+            if let Ok(value) = std::env::var(&ep.credential_env) {
+                cmd.env("ANTHROPIC_AUTH_TOKEN", value);
+            }
+        }
         cmd
     }
 
@@ -1833,7 +1865,22 @@ impl AgentAdapter for ClaudeAdapter {
     /// Claude Code's subscription windows are Anthropic's, and the account is
     /// what the limit belongs to: a different Anthropic-backed harness would
     /// answer `"anthropic"` here too and share these readings.
+    ///
+    /// Issue #395: an operator `[endpoint.claude]` override retargets this
+    /// away from claude's own native account -- usage/spend then lands under
+    /// the endpoint vendor's own catalogue slug instead, so `StateDir::
+    /// usage_for` and the price ledger attribute it correctly. Load-time
+    /// validation (`config.rs`'s `validate_endpoint_target`) already proved
+    /// `vendor` names a real catalogue vendor, so this lookup is infallible
+    /// in practice; a failure still falls back to the native account rather
+    /// than panicking, since a stale in-memory config outliving a catalogue
+    /// change is cheap insurance, not a real expected path.
     fn provider(&self) -> &'static str {
+        if let Some(ep) = &self.endpoint
+            && let Some(vendor) = catalogue::vendor(&ep.vendor)
+        {
+            return vendor.slug;
+        }
         "anthropic"
     }
 
@@ -1843,9 +1890,28 @@ impl AgentAdapter for ClaudeAdapter {
     /// raw `os error 193` out of the spawn. A program that resolves to
     /// nothing at all is not an error here: that is the OS's own
     /// "not found", raised at spawn time where it has always been raised.
+    ///
+    /// Issue #395: also refuses (naming only the environment variable's
+    /// NAME, never a value) when an `[endpoint.claude]` override is
+    /// attached and its `credential_env` is unset or empty -- before any
+    /// child is ever spawned, exactly like the missing-binary case above.
     fn ready(&self) -> CtxResult<()> {
         super::resolve_program(&self.program)?;
+        if let Some(ep) = &self.endpoint {
+            super::require_endpoint_credential(ep)?;
+        }
         Ok(())
+    }
+
+    /// Issue #395: the production seam (`adapters::apply_endpoint_override`,
+    /// called by `select`/`resolve_default`) that attaches a resolved
+    /// `[endpoint.claude]` target after construction.
+    fn apply_endpoint(&mut self, endpoint: Option<&super::super::config::EndpointTarget>) {
+        self.endpoint = endpoint.cloned();
+    }
+
+    fn endpoint_vendor(&self) -> Option<&str> {
+        self.endpoint.as_ref().map(|ep| ep.vendor.as_str())
     }
 
     fn detect(&self, command: &[String]) -> bool {
@@ -1976,11 +2042,16 @@ impl AgentAdapter for ClaudeAdapter {
     /// a shell redirect otherwise recreates a Write tool, and the value must
     /// be one `=`-bound argv token, since the two-token form was verified to
     /// swallow the next argv entry.
+    /// Review finding (#395 follow-up): the `--model` here now goes through
+    /// `model_args`, exactly like every other `--model` emission on this
+    /// adapter -- without that, an `[endpoint.claude]` override pinned the
+    /// interactive/headless launches to the endpoint vendor's own ladder but
+    /// left this one sending claude's native cheap alias (`"haiku"`)
+    /// straight to that endpoint, where it is not a valid model at all.
     fn distiller_cmd(&self, model: &str) -> Command {
         let mut cmd = self.base();
         cmd.arg("-p")
-            .arg("--model")
-            .arg(model)
+            .args(self.model_args(model))
             .arg("--output-format")
             .arg("text")
             .args(self.read_only_args());
@@ -2479,8 +2550,27 @@ impl AgentAdapter for ClaudeAdapter {
 
     /// Verified against the real CLI (`claude --help`, v2.1.220): `--model
     /// <MODEL>` is a real flag.
+    ///
+    /// Issue #395: under an `[endpoint.claude]` override, `model` is pinned
+    /// through `EndpointTarget::pin_model` first -- a requested model
+    /// (`chat.model`, a handoff tier, an operator `--model`) is honoured
+    /// only when it resolves on the ENDPOINT vendor's own ladder, otherwise
+    /// it is replaced by that vendor's own default, so a claude alias like
+    /// `opus` can never reach a GLM/DeepSeek/etc. endpoint.
     fn model_args(&self, model: &str) -> Vec<String> {
-        vec!["--model".to_string(), model.to_string()]
+        vec!["--model".to_string(), self.pin_model_for_endpoint(model)]
+    }
+
+    /// Review finding (#395 follow-up): the shared pinning `model_args`
+    /// above and `distiller_cmd` now both route every `--model` through,
+    /// and `review_roster_line` routes its advisory text through too, so
+    /// the roster's displayed review model can never name a model the
+    /// actual launch would replace.
+    fn pin_model_for_endpoint(&self, model: &str) -> String {
+        match &self.endpoint {
+            Some(ep) => ep.pin_model(Some(model)),
+            None => model.to_string(),
+        }
     }
 
     /// `--resume <SESSION_ID>` is already a fact this codebase relies on
@@ -4960,6 +5050,173 @@ mod tests {
         assert_eq!(
             adapter.model_args("opus"),
             vec!["--model".to_string(), "opus".to_string()]
+        );
+    }
+
+    /// Issue #395, item 1: an `[endpoint.claude]` override retargets a
+    /// launch at a vendor-compatible endpoint end to end -- the launched
+    /// `Command` carries the vendor's own base URL and the credential read
+    /// fresh from its named environment variable, `model_args` pins a real
+    /// vendor rung id, `provider()` reports the vendor slug (so usage/spend
+    /// files land under it), and that rung id prices.
+    #[test]
+    fn an_endpoint_override_retargets_the_launch_at_the_vendor() {
+        // SAFETY (test): nextest isolates tests per process, and the serial
+        // `cargo test -- --test-threads=1` run never overlaps this variable
+        // with another test.
+        unsafe {
+            std::env::set_var("ZIRV_TEST_ZHIPU_KEY_395", "sekrit-value");
+        }
+        let target = crate::commands::ctx::config::EndpointTarget {
+            vendor: "zhipu".to_string(),
+            base_url: "https://api.z.ai/api/anthropic".to_string(),
+            credential_env: "ZIRV_TEST_ZHIPU_KEY_395".to_string(),
+            model: None,
+            wire_api: None,
+        };
+        let adapter = ClaudeAdapter::new(None).with_endpoint(target);
+        assert!(
+            adapter.ready().is_ok(),
+            "credential is set, so ready() must pass"
+        );
+        assert_eq!(adapter.provider(), "zhipu");
+
+        let cmd = adapter.headless_cmd("hi", &SessionId::parse("s"), &[]);
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.iter().any(|(k, v)| k == "ANTHROPIC_BASE_URL"
+                && v.as_deref() == Some("https://api.z.ai/api/anthropic")),
+            "got {envs:?}"
+        );
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == "ANTHROPIC_AUTH_TOKEN" && v.as_deref() == Some("sekrit-value")),
+            "got {envs:?}"
+        );
+
+        let vendor = catalogue::vendor("zhipu").expect("zhipu is a built-in vendor");
+        let model_args = adapter.model_args("opus");
+        assert_eq!(model_args[0], "--model");
+        assert_eq!(
+            model_args[1], vendor.rungs[0].id,
+            "no operator model set -> the vendor's own strongest rung"
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = crate::commands::ctx::state::StateDir::from_root(tmp.path().to_path_buf());
+        assert!(
+            state.usage_for("zhipu").ends_with("usage-zhipu.json"),
+            "got {}",
+            state.usage_for("zhipu").display()
+        );
+
+        let price_table = crate::commands::ctx::price::built_in_table();
+        assert!(
+            crate::commands::ctx::price::price(
+                &model_args[1],
+                &crate::commands::ctx::event::TranscriptUsage::default(),
+                &price_table
+            )
+            .is_some(),
+            "the pinned rung id must have a built-in price"
+        );
+
+        // SAFETY (test): see the matching `set_var` above.
+        unsafe {
+            std::env::remove_var("ZIRV_TEST_ZHIPU_KEY_395");
+        }
+    }
+
+    /// Issue #395, item 2: a missing credential fails `ready()` -- the
+    /// pre-spawn gate every real launch goes through (`select`/`resolve_
+    /// default`) -- naming the environment variable's own NAME, never a
+    /// value, and never reaching a spawn at all.
+    #[test]
+    fn a_missing_endpoint_credential_fails_ready_by_name() {
+        // SAFETY (test): see the identical pattern above.
+        unsafe {
+            std::env::remove_var("ZIRV_TEST_MISSING_KEY_395");
+        }
+        let target = crate::commands::ctx::config::EndpointTarget {
+            vendor: "zhipu".to_string(),
+            base_url: "https://api.z.ai/api/anthropic".to_string(),
+            credential_env: "ZIRV_TEST_MISSING_KEY_395".to_string(),
+            model: None,
+            wire_api: None,
+        };
+        let adapter = ClaudeAdapter::new(None).with_endpoint(target);
+        let err = adapter.ready().expect_err("no credential must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains("ZIRV_TEST_MISSING_KEY_395"),
+            "got {message}"
+        );
+    }
+
+    /// Issue #395, item 4: a requested model that does not resolve on the
+    /// endpoint vendor's own ladder (a claude alias, here) is replaced by
+    /// the endpoint's own default; a requested model that DOES resolve on
+    /// that ladder is honoured verbatim.
+    #[test]
+    fn model_args_pins_to_the_endpoint_vendors_own_ladder() {
+        let target = crate::commands::ctx::config::EndpointTarget {
+            vendor: "zhipu".to_string(),
+            base_url: "https://api.z.ai/api/anthropic".to_string(),
+            credential_env: "ZIRV_TEST_UNUSED_395".to_string(),
+            model: None,
+            wire_api: None,
+        };
+        let adapter = ClaudeAdapter::new(None).with_endpoint(target);
+        let vendor = catalogue::vendor("zhipu").expect("zhipu is a built-in vendor");
+
+        // A claude-native alias must never reach a GLM endpoint.
+        let replaced = adapter.model_args("opus");
+        assert_eq!(replaced[1], vendor.rungs[0].id);
+
+        // A zhipu alias/id already on the ladder is honoured verbatim.
+        let honoured = adapter.model_args("glm-4.6");
+        assert_eq!(honoured[1], "glm-4.6");
+    }
+
+    /// Review finding (#395 follow-up): `distiller_cmd` used to hardcode
+    /// `--model haiku` regardless of any attached endpoint override, so a
+    /// zhipu/deepseek endpoint got claude's native cheap alias -- not a
+    /// valid model on that vendor's account -- for the one judgment/
+    /// distillation child every rot-scoring pass spawns. It must now carry
+    /// a vendor rung, exactly like `model_args_pins_to_the_endpoint_
+    /// vendors_own_ladder` already verifies for the interactive/headless
+    /// launches.
+    #[test]
+    fn distiller_cmd_pins_the_model_through_an_endpoint_override() {
+        let target = crate::commands::ctx::config::EndpointTarget {
+            vendor: "zhipu".to_string(),
+            base_url: "https://api.z.ai/api/anthropic".to_string(),
+            credential_env: "ZIRV_TEST_UNUSED_395".to_string(),
+            model: None,
+            wire_api: None,
+        };
+        let adapter = ClaudeAdapter::new(None).with_endpoint(target);
+        let vendor = catalogue::vendor("zhipu").expect("zhipu is a built-in vendor");
+
+        let cmd = adapter.distiller_cmd("haiku");
+        let args = built_args(&adapter, &cmd);
+        let model_at = args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("distiller_cmd must still emit --model");
+        assert_eq!(
+            args[model_at + 1],
+            vendor.rungs[0].id,
+            "the distiller must never send claude's native cheap alias to a zhipu endpoint: \
+             got {args:?}"
         );
     }
 

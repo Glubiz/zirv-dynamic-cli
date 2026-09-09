@@ -1097,6 +1097,35 @@ pub trait AgentAdapter: std::fmt::Debug {
         self.provider()
     }
 
+    /// Issue #395 (operator-only endpoint overrides): attaches `endpoint` --
+    /// resolved from `[endpoint.claude]`/`[endpoint.codex]` in the
+    /// operator's own `~/.zirv/ctx.toml`, never a repo layer (see `config.rs`'s
+    /// whole-table `REPO_FORBIDDEN` entry for `endpoint`) -- to this adapter
+    /// INSTANCE, so `provider()`, `ready()`'s credential-presence check,
+    /// `base()`'s launch-time wiring (claude's `ANTHROPIC_BASE_URL`/
+    /// `ANTHROPIC_AUTH_TOKEN` env, codex's `-c model_provider=...` argv) and
+    /// `model_args`'s vendor-ladder pinning all read the SAME resolved
+    /// target rather than re-deriving it independently. `select`/
+    /// `resolve_default` call this exactly once, right after constructing
+    /// the adapter and before `ready()` -- so a missing credential fails the
+    /// same pre-spawn check a genuinely unlaunchable binary already does,
+    /// not a later step. Default no-op: every adapter this override cannot
+    /// name (anything but claude/codex, since `[endpoint.<agent>]` schema
+    /// only has those two leaves) never overrides it and is unaffected.
+    fn apply_endpoint(&mut self, endpoint: Option<&super::config::EndpointTarget>) {
+        let _ = endpoint;
+    }
+
+    /// Issue #395: the catalogue vendor slug of this adapter INSTANCE's own
+    /// attached endpoint override, or `None` when it has none -- what
+    /// `harness_prompt_lines`'s roster line and `zirv ctx status` render as
+    /// `(endpoint: <vendor>)`, without either caller needing to know the
+    /// concrete adapter type behind a `&dyn AgentAdapter`. Default `None`;
+    /// only claude/codex override it, mirroring `provider()`.
+    fn endpoint_vendor(&self) -> Option<&str> {
+        None
+    }
+
     /// `Err` when the adapter exists but is not safe to use yet, so callers
     /// fail loudly instead of scoring garbage.
     fn ready(&self) -> CtxResult<()>;
@@ -1797,6 +1826,21 @@ pub trait AgentAdapter: std::fmt::Debug {
         Vec::new()
     }
 
+    /// Review finding (#395 follow-up): pins `model` through this adapter
+    /// INSTANCE's own attached `[endpoint.*]` override, exactly like
+    /// `ClaudeAdapter::model_args`/`CodexAdapter::model_args` already pin the
+    /// `--model` launch flag via `EndpointTarget::pin_model`. Default no-op
+    /// (`model` unchanged) for every adapter that cannot carry an endpoint;
+    /// only claude/codex override it. The one seam `review_roster_line`
+    /// routes the roster's advisory review-model text through, so that text
+    /// never names a native-ladder model for a harness the operator has
+    /// retargeted at a vendor endpoint -- the actual review launch already
+    /// gets this via `model_args`, so this keeps the advisory text honest
+    /// about what that launch will actually resolve to.
+    fn pin_model_for_endpoint(&self, model: &str) -> String {
+        model.to_string()
+    }
+
     /// Argv tokens that resume `session_id`'s own conversation, for the
     /// dashboard's quit/restore roster (`dash::roster::restore_argv`, called
     /// through `dyn AgentAdapter` -- unlike `model_args` above, both
@@ -1973,8 +2017,15 @@ pub(crate) fn built_args(program: &str, cmd: &std::process::Command) -> Vec<Stri
 /// (BatBadBut / CVE-2024-24576's quote-toggle). Newline and carriage return
 /// terminate the command line outright. Any of these in a shim-form argument
 /// is therefore a command-injection primitive, not a literal argument value.
-#[cfg(windows)]
-const CMD_REPARSE_METACHARS: &[char] =
+///
+/// Review finding (#395): `pub(crate)` and not `#[cfg(windows)]`-gated (the
+/// guard's own use of it below still is) -- `config::validate_endpoint_target`
+/// also scans an `[endpoint.*]` `base_url` against this exact list at load
+/// time, on every platform a config can be validated on, so a base_url that
+/// would be refused by [`guard_cmd_shim_reparse`] on a Windows launch is
+/// rejected up front rather than reaching codex's `-c` argv as a token this
+/// guard then has to fail closed on.
+pub(crate) const CMD_REPARSE_METACHARS: &[char] =
     &['&', '|', '<', '>', '^', '(', ')', '%', '!', '"', '\n', '\r'];
 
 /// Whether `program` + `args` is the `cmd.exe /c <shim>` launcher form that
@@ -2616,6 +2667,38 @@ pub fn provider_for_agent_and_model(name: Option<&str>, model: Option<&str>) -> 
         .unwrap_or(super::window::LEGACY_USAGE_PROVIDER)
 }
 
+/// Issue #395: attaches `cfg.endpoint.claude`/`cfg.endpoint.codex` (whichever
+/// names `adapter`, if either) via [`AgentAdapter::apply_endpoint`]. The one
+/// helper `select`/`resolve_default` call right after constructing an
+/// adapter and before `adapter.ready()`, so a configured endpoint's
+/// credential check rides the same pre-spawn gate a genuinely unlaunchable
+/// binary already goes through.
+fn apply_endpoint_override(adapter: &mut Box<dyn AgentAdapter>, cfg: &CtxConfig) {
+    let target = match adapter.name() {
+        "claude" => cfg.endpoint.claude.as_ref(),
+        "codex" => cfg.endpoint.codex.as_ref(),
+        _ => None,
+    };
+    adapter.apply_endpoint(target);
+}
+
+/// Issue #395: the credential-presence check both `ClaudeAdapter::ready`
+/// and `CodexAdapter::ready` apply when an operator endpoint override is
+/// configured. Named by the environment variable's own NAME only, never its
+/// value -- a missing/empty key fails loudly here, before any child is
+/// spawned, rather than launching a request with no auth token at all.
+pub(super) fn require_endpoint_credential(target: &super::config::EndpointTarget) -> CtxResult<()> {
+    match std::env::var(&target.credential_env) {
+        Ok(value) if !value.is_empty() => Ok(()),
+        _ => Err(format!(
+            "endpoint credential environment variable `{}` is not set (or is empty); export it \
+             before launching this agent against its configured endpoint",
+            target.credential_env
+        )
+        .into()),
+    }
+}
+
 /// `AgentAdapter::read_only_args`/`interactive_read_only_args` for a
 /// registered adapter name, without requiring that adapter to be enabled or
 /// ready -- the same static-fact lookup through `ADAPTERS` that
@@ -3011,7 +3094,8 @@ pub(crate) fn adapter_liveness(
         return Err(format!("no adapter registered for '{name}'"));
     };
     let names_other = agent_bin_names_a_different_adapter(bin, name).is_some();
-    let adapter = if names_other { ctor(None) } else { ctor(bin) };
+    let mut adapter = if names_other { ctor(None) } else { ctor(bin) };
+    apply_endpoint_override(&mut adapter, cfg);
     adapter.ready().map_err(|err| err.to_string())?;
     let program = adapter.program().to_string();
     let resolved_bin = if names_other { None } else { bin };
@@ -3088,13 +3172,21 @@ fn harness_roster_lines(
                 } else {
                     ""
                 };
+                // Issue #395: names an attached `[endpoint.<agent>]`
+                // override by its catalogue vendor slug, never the URL or
+                // credential -- `zirv ctx status`'s own `endpoint:` line
+                // carries those.
+                let endpoint_note = adapter
+                    .endpoint_vendor()
+                    .map(|vendor| format!(" (endpoint: {vendor})"))
+                    .unwrap_or_default();
                 lines.push(if is_self {
                     format!(
-                        "- {name}: enabled, ready{capacity_note} (this session's harness){degraded}"
+                        "- {name}: enabled, ready{capacity_note} (this session's harness){endpoint_note}{degraded}"
                     )
                 } else {
                     format!(
-                        "- {name}: enabled, ready{capacity_note} -- initiate with `zirv agent {name} \"<prompt>\"`{degraded}"
+                        "- {name}: enabled, ready{capacity_note} -- initiate with `zirv agent {name} \"<prompt>\"`{endpoint_note}{degraded}"
                     )
                 });
                 roster_names.push(name);
@@ -3331,13 +3423,22 @@ fn review_roster_line(cfg: &CtxConfig, roster_names: &[&str]) -> Option<String> 
         .iter()
         .filter(|(name, _)| cfg.agents.is_enabled(name) && roster_names.contains(name))
         .map(|(name, ctor)| {
-            let adapter = if agent_bin_names_a_different_adapter(bin, name).is_some() {
+            let mut adapter = if agent_bin_names_a_different_adapter(bin, name).is_some() {
                 ctor(None)
             } else {
                 ctor(bin)
             };
+            // Review finding (#395 follow-up): attach the same endpoint
+            // override `apply_endpoint_override` gives every adapter that is
+            // actually spawned -- without it, this line advised a native-
+            // ladder model for a harness the operator retargeted at a
+            // vendor endpoint, even though the real review launch
+            // (`reviewer_argv`, via this adapter's own `model_args`) pins to
+            // that endpoint's ladder.
+            apply_endpoint_override(&mut adapter, cfg);
             let choice = resolve_review_model(cfg, name, adapter.as_ref());
-            let equals_seat = seat.is_some_and(|s| s.eq_ignore_ascii_case(&choice.model));
+            let model = adapter.pin_model_for_endpoint(&choice.model);
+            let equals_seat = seat.is_some_and(|s| s.eq_ignore_ascii_case(&model));
             if equals_seat {
                 any_equals_seat = true;
             }
@@ -3348,7 +3449,7 @@ fn review_roster_line(cfg: &CtxConfig, roster_names: &[&str]) -> Option<String> 
             } else {
                 "default: one tier below the seat".to_string()
             };
-            format!("{name} -> \"{}\" ({note})", choice.model)
+            format!("{name} -> \"{}\" ({note})", model)
         })
         .collect();
     if entries.is_empty() {
@@ -3509,7 +3610,7 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
     let bin = cfg.agent_bin.as_deref();
 
     if let Some(name) = cfg.agent.as_deref() {
-        let adapter = ADAPTERS
+        let mut adapter = ADAPTERS
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, ctor)| ctor(bin))
@@ -3519,6 +3620,7 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
                     describe_known_adapters(&cfg.agents)
                 )
             })?;
+        apply_endpoint_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -3530,7 +3632,8 @@ pub fn resolve_default(cfg: &CtxConfig) -> CtxResult<(Box<dyn AgentAdapter>, Def
     let mut reasons = Vec::new();
     let mut repo_narrowed: Option<&str> = None;
     for (name, ctor) in ADAPTERS {
-        let adapter = ctor(bin);
+        let mut adapter = ctor(bin);
+        apply_endpoint_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(name) {
             // Final wave item 3: the same cross-adapter skip Medium 2 gave
             // the enabled-and-ready arm below, applied here too. Without
@@ -3610,12 +3713,13 @@ pub fn select(
 
     if let Some(name) = name {
         let found = adapters.into_iter().find(|a| a.name() == name);
-        let adapter = found.ok_or_else(|| {
+        let mut adapter = found.ok_or_else(|| {
             format!(
                 "unknown agent '{name}'; known adapters: {}",
                 describe_known_adapters(&cfg.agents)
             )
         })?;
+        apply_endpoint_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -3624,7 +3728,8 @@ pub fn select(
         return Ok(adapter);
     }
 
-    if let Some(adapter) = adapters.into_iter().find(|a| a.detect(command)) {
+    if let Some(mut adapter) = adapters.into_iter().find(|a| a.detect(command)) {
+        apply_endpoint_override(&mut adapter, cfg);
         if let Some(refusal) = cfg.agents.refusal(adapter.name()) {
             return Err(refusal.into());
         }
@@ -4513,6 +4618,47 @@ mod tests {
         );
     }
 
+    /// Review finding: without `apply_endpoint_override` attached to the
+    /// adapter this function itself constructs, an endpoint-overridden
+    /// harness's roster line advised claude's native ladder text even
+    /// though the actual review launch (`workflow::review::reviewer_argv`,
+    /// via this same adapter's own `model_args`) pins to the endpoint
+    /// vendor's own ladder -- the two could name different models. Under
+    /// `[endpoint.claude] vendor = "zhipu"` with no seat and no `review.
+    /// claude` override, the roster line must name zhipu's own strongest
+    /// rung (`"glm-5.3"`), never an Anthropic model.
+    #[test]
+    fn review_roster_line_names_the_endpoint_vendors_own_rung() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
+        let cfg = CtxConfig {
+            endpoint: crate::commands::ctx::config::EndpointConfig {
+                claude: Some(crate::commands::ctx::config::EndpointTarget {
+                    vendor: "zhipu".to_string(),
+                    base_url: "https://api.z.ai/api/anthropic".to_string(),
+                    credential_env: "ZIRV_TEST_UNUSED_395".to_string(),
+                    model: None,
+                    wire_api: None,
+                }),
+                codex: None,
+            },
+            ..permissive_cfg()
+        };
+        let lines = harness_prompt_lines(&cfg, "");
+        let review_line = lines.last().expect("at least the review line");
+        assert!(
+            review_line.contains("claude -> \"glm-5.3\""),
+            "the roster line must name the endpoint vendor's own rung, not the native ladder: \
+             got {review_line}"
+        );
+        for native in ["opus", "sonnet", "haiku", "fable", "mythos"] {
+            assert!(
+                !review_line.contains(&format!("claude -> \"{native}\"")),
+                "must never advise claude's native ladder for an endpoint-overridden harness: \
+                 got {review_line}"
+            );
+        }
+    }
+
     /// The seat threads all the way from `cfg.chat.model` through to the
     /// rendered claude entry: seat "sonnet" resolves claude's own ladder
     /// default to "haiku" (one tier below sonnet).
@@ -4531,6 +4677,51 @@ mod tests {
             review_line.contains("claude -> \"haiku\" (default: one tier below the seat)"),
             "got {review_line}"
         );
+    }
+
+    /// Issue #395, item 7: a harness with an attached `[endpoint.<agent>]`
+    /// override earns an `(endpoint: <vendor>)` suffix on its own roster
+    /// line -- never the base URL or the credential, which `zirv ctx
+    /// status`'s own `endpoint:` line carries instead.
+    #[test]
+    fn harness_prompt_lines_names_an_attached_endpoint_override() {
+        let _live = crate::commands::ctx::testenv::stub_live_adapters_on_path();
+        // SAFETY (test): nextest isolates tests per process, and the serial
+        // `cargo test -- --test-threads=1` run never overlaps this variable
+        // with another test.
+        unsafe {
+            std::env::set_var("ZIRV_TEST_ROSTER_ZHIPU_KEY_395", "sekrit");
+        }
+        let cfg = CtxConfig {
+            endpoint: crate::commands::ctx::config::EndpointConfig {
+                claude: Some(crate::commands::ctx::config::EndpointTarget {
+                    vendor: "zhipu".to_string(),
+                    base_url: "https://api.z.ai/api/anthropic".to_string(),
+                    credential_env: "ZIRV_TEST_ROSTER_ZHIPU_KEY_395".to_string(),
+                    model: None,
+                    wire_api: None,
+                }),
+                codex: None,
+            },
+            ..permissive_cfg()
+        };
+        let lines = harness_prompt_lines(&cfg, "");
+        let claude_line = lines
+            .iter()
+            .find(|l| l.starts_with("- claude:"))
+            .unwrap_or_else(|| panic!("no claude line in {lines:?}"));
+        assert!(
+            claude_line.contains("(endpoint: zhipu)"),
+            "got {claude_line}"
+        );
+        assert!(
+            !claude_line.contains("api.z.ai") && !claude_line.contains("sekrit"),
+            "the roster line must never carry the URL or the credential: {claude_line}"
+        );
+        // SAFETY (test): see the matching `set_var` above.
+        unsafe {
+            std::env::remove_var("ZIRV_TEST_ROSTER_ZHIPU_KEY_395");
+        }
     }
 
     /// No enabled harness at all: `review_roster_line` must not emit a
