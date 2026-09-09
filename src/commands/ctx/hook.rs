@@ -3121,7 +3121,7 @@ pub fn run_posttool_for_agent<W: Write>(
                 .map(|text| text.trim().to_string())
                 .filter(|text| !text.is_empty());
             if let Some(translated) =
-                super::hook_project::translate_posttool_envelope("copilot", claude_envelope)
+                super::hook_project::translate_posttool_envelope("copilot", stdin, claude_envelope)
             {
                 let _ = writeln!(w, "{translated}");
             }

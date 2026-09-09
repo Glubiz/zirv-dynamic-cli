@@ -128,36 +128,102 @@ fn array_at<'a>(root: &'a Value, pointer: &[String]) -> Option<&'a Vec<Value>> {
     current.as_array()
 }
 
-/// Ensures every object along `pointer` exists (creating `{}` as needed,
-/// and coercing a non-object/non-array in the way to the shape this path
-/// needs), then ensures the terminal segment holds an array, and returns a
-/// mutable handle to it. `None` only for an empty `pointer` -- every
-/// `NativeHookEntry` this module ships always has at least one segment.
-fn ensure_array_at<'a>(root: &'a mut Value, pointer: &[String]) -> Option<&'a mut Vec<Value>> {
-    let (last, init) = pointer.split_last()?;
+/// Mutable counterpart to [`array_at`], with exactly the same contract:
+/// `None` when any segment is missing or the terminal value is not an array.
+/// Never creates or coerces anything -- unlike [`ensure_array_at`], this is
+/// what `uninstall` uses, since removing zirv's own entries from an array
+/// that is not there yet (or is not an array at all) has nothing to do.
+fn array_at_mut<'a>(root: &'a mut Value, pointer: &[String]) -> Option<&'a mut Vec<Value>> {
     let mut current = root;
+    for seg in pointer {
+        current = current.get_mut(seg)?;
+    }
+    current.as_array_mut()
+}
+
+/// A short, human-readable name for `value`'s JSON type, used only inside
+/// [`ensure_array_at`]'s own type-mismatch error text.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Ensures every object along `pointer` exists -- creating `{}` for a
+/// segment that is genuinely MISSING, and nothing else -- then ensures the
+/// terminal segment holds an array (creating `[]` when it too is missing),
+/// and returns a mutable handle to it.
+///
+/// **Never coerces an existing value of the wrong shape.** An intermediate
+/// segment that already holds something other than an object, or a terminal
+/// segment that already holds something other than an array, is refused
+/// with an `Err` naming `file` and the pointer path -- nothing is written in
+/// that case, since every caller (`install`) only calls `write` after this
+/// succeeds. This is the whole reason `install` can never silently replace
+/// an operator's own non-array `hooks.PreToolUse` (say) with an empty array
+/// and start appending to it.
+fn ensure_array_at<'a>(
+    root: &'a mut Value,
+    file: &Path,
+    pointer: &[String],
+) -> CtxResult<&'a mut Vec<Value>> {
+    let Some((last, init)) = pointer.split_last() else {
+        return Err(format!("{}: empty pointer; not modified", file.display()).into());
+    };
+    let mut current = root;
+    let mut walked: Vec<&str> = Vec::new();
     for seg in init {
         if !current.is_object() {
-            *current = json!({});
+            return Err(format!(
+                "{}: {} holds {}, expected an object; not modified",
+                file.display(),
+                walked.join("/"),
+                json_type_name(current)
+            )
+            .into());
         }
         current = current
             .as_object_mut()
-            .expect("just coerced to an object")
+            .expect("just checked is_object")
             .entry(seg.clone())
             .or_insert_with(|| json!({}));
+        walked.push(seg.as_str());
     }
     if !current.is_object() {
-        *current = json!({});
+        return Err(format!(
+            "{}: {} holds {}, expected an object; not modified",
+            file.display(),
+            walked.join("/"),
+            json_type_name(current)
+        )
+        .into());
     }
-    let entry = current
-        .as_object_mut()
-        .expect("just coerced to an object")
-        .entry(last.clone())
-        .or_insert_with(|| json!([]));
-    if !entry.is_array() {
-        *entry = json!([]);
+    let map = current.as_object_mut().expect("just checked is_object");
+    match map.get(last.as_str()) {
+        None => {
+            map.insert(last.clone(), json!([]));
+        }
+        Some(existing) if !existing.is_array() => {
+            walked.push(last.as_str());
+            return Err(format!(
+                "{}: {} holds {}, expected an array; not modified",
+                file.display(),
+                walked.join("/"),
+                json_type_name(existing)
+            )
+            .into());
+        }
+        Some(_) => {}
     }
-    entry.as_array_mut()
+    Ok(map
+        .get_mut(last.as_str())
+        .and_then(Value::as_array_mut)
+        .expect("just ensured this key holds an array"))
 }
 
 /// Loads `path` as a JSON object, `{}` when it does not exist yet. Errors on
@@ -175,6 +241,15 @@ fn load(path: &Path) -> CtxResult<Value> {
     Ok(value)
 }
 
+/// This crate's `serde_json` has no `preserve_order` feature, so writing a
+/// shared file (droid's `hooks.json`, gemini's `settings.json`) through
+/// `serde_json::Value` re-serializes EVERY key in the file in sorted order,
+/// not the order an operator's own editor left them in -- the same cosmetic
+/// reordering `setup.rs`'s own `heal_target` doc comment calls out for why
+/// IT patches raw text instead. Accepted here: unlike `heal_target`, this
+/// module's own writes are rare (install/uninstall, not a hot self-heal
+/// path) and always touch the file's actual content, so a text-preserving
+/// patch would not avoid a diff anyway.
 fn write(path: &Path, value: &Value) -> CtxResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -213,10 +288,9 @@ pub fn install(hooks: &NativeHooks) -> CtxResult<InstallReport> {
         if already_present {
             continue;
         }
-        if let Some(arr) = ensure_array_at(&mut root, &entry.pointer) {
-            arr.push(entry.element.clone());
-            written.push(entry.label);
-        }
+        let arr = ensure_array_at(&mut root, &hooks.file, &entry.pointer)?;
+        arr.push(entry.element.clone());
+        written.push(entry.label);
     }
     if !written.is_empty() {
         write(&hooks.file, &root)?;
@@ -224,26 +298,69 @@ pub fn install(hooks: &NativeHooks) -> CtxResult<InstallReport> {
     Ok(InstallReport { written })
 }
 
-/// Removes only zirv-owned elements. `owned_file` deletes the whole file
-/// instead (and never touches `entries` at all); otherwise each entry's own
-/// array is filtered in place, leaving every non-zirv-owned element (an
-/// operator's own hook) untouched, and the file is rewritten only when
-/// something actually changed.
+/// Whether every element of every array reachable from `value` (at any
+/// nesting depth, not only the paths `NativeHooks::entries` names) is
+/// zirv-owned. `uninstall`'s `owned_file` branch uses this to decide whether
+/// deleting the whole file is actually safe: an operator (or a future zirv
+/// version) may have added an array element this walk finds that
+/// `entries`'s own pointers never look at, and deleting the file would
+/// destroy it right along with zirv's own entries.
+fn every_array_element_is_zirv_owned(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => {
+            items.iter().all(value_is_zirv_owned)
+                && items.iter().all(every_array_element_is_zirv_owned)
+        }
+        Value::Object(map) => map.values().all(every_array_element_is_zirv_owned),
+        _ => true,
+    }
+}
+
+/// Removes only zirv-owned elements, using [`array_at_mut`] -- no creation,
+/// no coercion, so a shared file's own array that is missing, or that some
+/// other tool has since replaced with a non-array value, is simply skipped
+/// rather than fabricated or overwritten.
+///
+/// `owned_file` (copilot's `zirv.json`) is more than a blind delete: after
+/// filtering every entry's own array, the WHOLE root is walked
+/// ([`every_array_element_is_zirv_owned`]) for any array element that is not
+/// zirv's -- an operator (or a future zirv version) may have added content
+/// this module's own `entries` pointers do not name. Only when nothing
+/// non-zirv-owned survives anywhere is the file actually deleted; otherwise
+/// the filtered root is written back, keeping whatever was found.
 pub fn uninstall(hooks: &NativeHooks) -> CtxResult<UninstallReport> {
     if hooks.owned_file {
-        let file_removed = hooks.file.exists();
-        if file_removed {
-            std::fs::remove_file(&hooks.file)?;
+        if !hooks.file.exists() {
+            return Ok(UninstallReport::default());
         }
+        let mut root = load(&hooks.file)?;
+        let mut removed = Vec::new();
+        for entry in &hooks.entries {
+            if let Some(arr) = array_at_mut(&mut root, &entry.pointer) {
+                let before = arr.len();
+                arr.retain(|v| !value_is_zirv_owned(v));
+                if arr.len() != before {
+                    removed.push(entry.label);
+                }
+            }
+        }
+        if every_array_element_is_zirv_owned(&root) {
+            std::fs::remove_file(&hooks.file)?;
+            return Ok(UninstallReport {
+                file_removed: true,
+                removed,
+            });
+        }
+        write(&hooks.file, &root)?;
         return Ok(UninstallReport {
-            file_removed,
-            removed: Vec::new(),
+            file_removed: false,
+            removed,
         });
     }
     let mut root = load(&hooks.file)?;
     let mut removed = Vec::new();
     for entry in &hooks.entries {
-        if let Some(arr) = ensure_array_at(&mut root, &entry.pointer) {
+        if let Some(arr) = array_at_mut(&mut root, &entry.pointer) {
             let before = arr.len();
             arr.retain(|v| !value_is_zirv_owned(v));
             if arr.len() != before {
@@ -481,5 +598,96 @@ mod tests {
             2,
             "guard and safety-check entries both land in preToolUse"
         );
+    }
+
+    /// Review round (#418): `install` must never coerce a non-array value
+    /// that is already at an entry's own pointer -- it errors and leaves the
+    /// file byte-identical.
+    #[test]
+    fn install_over_a_non_array_slot_errors_and_never_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks = droid_hooks(dir.path());
+        std::fs::create_dir_all(hooks.file.parent().unwrap()).unwrap();
+        let original =
+            serde_json::to_string(&json!({"PreToolUse": {"operatorSetting": true}})).unwrap();
+        std::fs::write(&hooks.file, &original).unwrap();
+
+        let err = install(&hooks).expect_err("must refuse to coerce an object into an array");
+        assert!(
+            err.to_string().contains("PreToolUse"),
+            "error should name the pointer: {err}"
+        );
+        assert!(
+            err.to_string().contains("expected an array"),
+            "error should say what was expected: {err}"
+        );
+
+        let after = std::fs::read_to_string(&hooks.file).expect("read");
+        assert_eq!(after, original, "a failed install must not touch the file");
+    }
+
+    /// Review round (#418): `uninstall` over the same non-array slot is a
+    /// pure no-op (no creation, no coercion, no write) rather than an error
+    /// -- there is nothing zirv-owned to remove from something that is not
+    /// an array at all.
+    #[test]
+    fn uninstall_over_a_non_array_slot_is_a_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks = droid_hooks(dir.path());
+        std::fs::create_dir_all(hooks.file.parent().unwrap()).unwrap();
+        let original =
+            serde_json::to_string(&json!({"PreToolUse": {"operatorSetting": true}})).unwrap();
+        std::fs::write(&hooks.file, &original).unwrap();
+
+        let report = uninstall(&hooks).expect("uninstall never errors");
+        assert!(!report.file_removed);
+        assert!(report.removed.is_empty());
+
+        let after = std::fs::read_to_string(&hooks.file).expect("read");
+        assert_eq!(after, original, "a no-op uninstall must not touch the file");
+    }
+
+    /// Review round (#418): an `owned_file` uninstall (copilot) must not
+    /// blindly delete the file when an operator's own element still lives in
+    /// one of its arrays -- it filters instead, keeping everything zirv did
+    /// not write.
+    #[test]
+    fn uninstall_on_copilot_keeps_the_file_when_an_operator_element_survives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks = copilot_hooks(dir.path());
+        install(&hooks).expect("install");
+
+        // An operator hand-adds their own entry to the same array zirv's
+        // own guard/safety-check entries live in.
+        let mut root: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks.file).expect("read"))
+                .expect("json");
+        root["hooks"]["preToolUse"]
+            .as_array_mut()
+            .expect("array")
+            .push(json!({"type": "command", "bash": "./mine.sh"}));
+        std::fs::write(&hooks.file, serde_json::to_string(&root).unwrap()).unwrap();
+
+        let report = uninstall(&hooks).expect("uninstall");
+        assert!(
+            !report.file_removed,
+            "the operator's own element must keep the file alive"
+        );
+        assert!(hooks.file.exists());
+
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks.file).expect("read"))
+                .expect("json");
+        assert_eq!(after.get("version").and_then(Value::as_u64), Some(1));
+        assert!(
+            !value_is_zirv_owned(&after),
+            "no zirv-owned element may survive: {after}"
+        );
+        let pre = after
+            .pointer("/hooks/preToolUse")
+            .and_then(Value::as_array)
+            .expect("array");
+        assert_eq!(pre.len(), 1, "only the operator's own element remains");
+        assert_eq!(pre[0]["bash"], "./mine.sh");
     }
 }
