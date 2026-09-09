@@ -1157,6 +1157,42 @@ impl AgentAdapter for CodexAdapter {
         Some(cmd)
     }
 
+    /// Issue #303: `codex exec resume [SESSION_ID] [PROMPT]` (verified
+    /// against the installed codex-cli's own `--help`, 0.153.4) resumes a
+    /// previously recorded exec session and, unlike interactive `codex
+    /// resume`, accepts a prompt to send once resumed -- a real headless
+    /// resume, the missing half of the honest-refusal default this trait
+    /// method otherwise falls back to. `PROMPT`'s own help text documents
+    /// exactly one non-argv delivery ("If `-` is used, read from stdin");
+    /// nothing documents an *omitted* PROMPT reading stdin the way plain
+    /// `codex exec` does, so `prompt: None` passes the literal token `-`
+    /// rather than dropping the argument, mirroring the one delivery `resume`
+    /// itself actually documents.
+    fn headless_resume_cmd(
+        &self,
+        prompt: Option<&str>,
+        session_id: &str,
+        extra: &[String],
+    ) -> Option<Command> {
+        let mut cmd = self.base();
+        cmd.arg("exec")
+            .arg("resume")
+            .arg(session_id)
+            .arg(prompt.unwrap_or("-"))
+            .args(extra);
+        Some(cmd)
+    }
+
+    /// Issue #303: `headless_resume_cmd` above is real, but nothing pairs
+    /// with it -- see `compact_command`'s own doc comment for the
+    /// verification trail showing codex has no in-place compaction
+    /// directive at all. `supports_headless_compact`'s contract needs BOTH
+    /// halves verified, so this stays `false`: a codex `Verdict::Compact`
+    /// still maps to a full restart, unchanged by this issue.
+    fn supports_headless_compact(&self) -> bool {
+        false
+    }
+
     /// With no subcommand, `codex [PROMPT]` forwards straight to the
     /// interactive CLI (verified via `codex --help`), exactly like claude.
     fn interactive_cmd(&self, initial_prompt: Option<&str>, extra: &[String]) -> Command {
@@ -1972,6 +2008,19 @@ impl AgentAdapter for CodexAdapter {
         false
     }
 
+    /// Issue #303: investigated alongside `headless_resume_cmd` above and
+    /// stays `None`. `codex exec --help`, `codex exec resume --help` and the
+    /// top-level `codex --help` document no compaction concept at all -- no
+    /// subcommand, no flag, no `-c` config key. The interactive slash-command
+    /// set remains unverified (`docs/superpowers/notes/
+    /// 2026-07-31-codex-cli-facts.md`: probing it non-interactively failed
+    /// with "stdin is not a terminal" before any slash command could be
+    /// observed, so the existing `/quit\r` placeholder below is unverified
+    /// too), but even a verified interactive `/compact` would not answer this
+    /// method -- see `qwen::QwenAdapter`'s own gap for the same reasoning:
+    /// an interactive-only slash command is not a headless directive. Never
+    /// claim a compaction step this binary has never been observed to
+    /// perform.
     fn compact_command(&self) -> Option<&'static str> {
         None
     }
@@ -2119,6 +2168,16 @@ mod tests {
     fn codex_has_no_marker_signal() {
         let caps = CodexAdapter::new(None).capabilities();
         assert!(!caps.marker_signal, "the spec gives codex no marker signal");
+    }
+
+    /// Issue #303: `headless_resume_cmd` is real (see the tests above), but
+    /// `compact_command` stays `None` -- no verified in-place compaction
+    /// directive exists to pair it with, so `supports_headless_compact`'s
+    /// "verified both halves" contract is not met.
+    #[test]
+    fn codex_has_no_headless_compact_support() {
+        assert_eq!(CodexAdapter::new(None).compact_command(), None);
+        assert!(!CodexAdapter::new(None).supports_headless_compact());
     }
 
     /// Codex reports NO capacity: none is verified for it, and a guessed
@@ -2490,6 +2549,62 @@ mod tests {
                 "gpt-5.6-luna".to_string(),
             ],
             "codex exec takes no session flag; codex mints its own session id"
+        );
+    }
+
+    /// Issue #303: `codex exec resume [SESSION_ID] [PROMPT]`, verified via
+    /// the installed codex-cli's own `--help`.
+    #[test]
+    fn headless_resume_cmd_uses_exec_resume_with_the_session_and_prompt() {
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex"));
+        let cmd = adapter
+            .headless_resume_cmd(
+                Some("keep going"),
+                "abc-123",
+                &["--model".to_string(), "gpt-5.6-luna".to_string()],
+            )
+            .expect("codex exec resume is verified");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "abc-123".to_string(),
+                "keep going".to_string(),
+                "--model".to_string(),
+                "gpt-5.6-luna".to_string(),
+            ]
+        );
+    }
+
+    /// `resume`'s own `[PROMPT]` help text documents exactly one non-argv
+    /// delivery: the literal token `-` reads from stdin. Unlike
+    /// `headless_cmd_stdin` (which OMITS the token, relying on plain `exec`'s
+    /// own documented "omitted or `-`" stdin fallback), `resume` never
+    /// documents that an omitted PROMPT reads stdin -- only that `-` does --
+    /// so a caller wanting stdin delivery here must see the literal `-`.
+    #[test]
+    fn headless_resume_cmd_with_no_prompt_uses_the_dash_stdin_token() {
+        let adapter = CodexAdapter::new(Some("/tmp/fake-codex"));
+        let cmd = adapter
+            .headless_resume_cmd(None, "abc-123", &[])
+            .expect("codex exec resume is verified");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "abc-123".to_string(),
+                "-".to_string()
+            ]
         );
     }
 

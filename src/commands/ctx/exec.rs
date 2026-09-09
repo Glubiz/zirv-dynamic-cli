@@ -5123,6 +5123,12 @@ mod tests {
         );
     }
 
+    /// Issue #303 gave codex a real `headless_resume_cmd` (`codex exec
+    /// resume`), but deliberately left `supports_headless_compact` `false`:
+    /// no verified in-place compaction directive exists to pair the resume
+    /// with (see `CodexAdapter::compact_command`'s own doc comment). This
+    /// pins that a codex `Verdict::Compact` still restarts, unchanged by
+    /// that issue.
     #[test]
     fn codex_compact_verdict_restarts_without_arming_the_compact_budget() {
         let codex = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);

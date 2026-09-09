@@ -2059,8 +2059,11 @@ fn report_back_message(
 /// is now valid -- the caller re-reads the transcript and re-validates
 /// itself. `Err` covers the adapter having no resume support at all (never
 /// reached in practice: callers check `headless_resume_cmd(..).is_some()`
-/// first, since a resume attempt on codex would spend a retry the bounded
-/// budget never gets back) and the command failing to start or run.
+/// first, since a resume attempt on an adapter with no resume support at
+/// all would spend a retry the bounded budget never gets back -- issue
+/// #303 gave codex its own real `headless_resume_cmd`, so it now takes
+/// this same bounded retry like any other resume-capable adapter) and the
+/// command failing to start or run.
 fn run_contract_retry(
     adapter: &dyn AgentAdapter,
     session: &SessionId,
@@ -3885,10 +3888,12 @@ pub fn run_with<W: Write>(
 
             // One bounded retry, only when the adapter that actually ran
             // this delegation can resume a headless conversation at all
-            // (codex cannot: `CodexAdapter::headless_resume_cmd` is the
-            // trait's own honest-refusal default) -- a worker with no
-            // resume support gets exactly one attempt, never a synthetic
-            // second chance it cannot structurally receive.
+            // (some adapters still cannot: any still on the trait's own
+            // honest-refusal `headless_resume_cmd` default, e.g. droid,
+            // gemini, pi, opencode, copilot -- codex gained a real one in
+            // issue #303) -- a worker on an adapter with no resume support
+            // gets exactly one attempt, never a synthetic second chance it
+            // cannot structurally receive.
             if validated.is_none()
                 && let Some(first_errors) = attempts.first()
                 && result_adapter
@@ -8118,17 +8123,25 @@ mod tests {
         );
     }
 
-    /// Issue #318: codex has no verified `headless_resume_cmd` (the trait's
-    /// own honest-refusal default), so a worker on it gets exactly ONE
-    /// contract attempt, never a synthetic retry it cannot structurally
-    /// receive. `fake-agent.sh` always writes a claude-shaped transcript
+    /// Issue #303 gave codex a real `headless_resume_cmd` (`codex exec
+    /// resume`), so a worker on it now gets the same bounded retry any other
+    /// resume-capable adapter does -- but the retry still cannot rescue this
+    /// run: `fake-agent.sh` always writes a claude-shaped transcript
     /// regardless of which adapter invoked it, and codex's own
     /// `transcript_path` looks under `.codex/sessions/`, so this run's
-    /// worker transcript is genuinely unreadable to the codex adapter --
-    /// exactly the "no final text at all" case a real codex worker that
-    /// crashed before replying would also produce.
+    /// worker transcript is genuinely unreadable to the codex adapter on
+    /// BOTH attempts -- exactly the "no final text at all" case a real
+    /// codex worker that crashed before replying would also produce.
+    /// Neither of codex's own launches (`headless_cmd`'s bare `exec
+    /// <prompt>`, `headless_resume_cmd`'s `exec resume <session> <prompt>`)
+    /// passes `fake-agent.sh`'s own `--session-id`/`--resume` flags it
+    /// recognizes, so both invocations fall through to its no-session
+    /// "distiller/judge call" branch (issue #314) and print a bare verdict
+    /// line instead of touching any transcript at all -- again exactly the
+    /// "worker produced no final text" case this test wants on both
+    /// attempts.
     #[test]
-    fn a_headless_run_on_an_adapter_with_no_resume_support_gets_exactly_one_attempt() {
+    fn a_headless_run_on_codex_gets_the_bounded_retry_but_stays_contract_failed() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -8149,13 +8162,12 @@ mod tests {
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
         }
-        // Codex's own `headless_cmd` mints its own session id and passes no
-        // `--session-id` flag at all -- `fake-agent.sh` refuses outright
-        // without one (exit 64), which is exactly the "worker produced no
-        // final text" case this test wants: the exit code itself is not
-        // what is under test here, only the contract outcome below is.
         code.expect("runs");
         let printed = String::from_utf8_lossy(&out);
+        // The printed count is the LAST attempt's own error list length (here
+        // always 1: one "no JSON object found" message), not the number of
+        // attempts -- `errors.len()` on the persisted record below is what
+        // actually counts attempts.
         assert!(
             printed.contains("result: contract_failed (1 errors)"),
             "got {printed}"
@@ -8175,8 +8187,9 @@ mod tests {
         let errors = record["errors"].as_array().expect("errors array");
         assert_eq!(
             errors.len(),
-            1,
-            "no resume support means exactly one attempt, never a synthetic retry: {errors:?}"
+            2,
+            "codex now has resume support, so the bounded retry is spent even though its own \
+             transcript stays unreadable on both attempts: {errors:?}"
         );
     }
 
