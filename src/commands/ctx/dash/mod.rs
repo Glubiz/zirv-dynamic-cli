@@ -10629,6 +10629,15 @@ pub fn run_dashboard(
             &mut notices,
             Instant::now(),
         );
+        // Issue #440: strictly BEFORE the reap below. `reap_ended_panes` ->
+        // `Pane::finish_shutdown` -> `rollover::forget` removes the seat
+        // record and then the pane itself, so a successor that died was
+        // settled against a seat that no longer existed -- `seat::abort`
+        // failed, and the prepared transaction ended with no terminal row at
+        // all. Settled here, the `Readiness::Dead` arm still sees both.
+        if cfg.auto_orchestrator_rollover() {
+            settle_pending_rollover(&mut panes, cfg, state, &mut pending_rollover);
+        }
         let reap_confirmations = reap_ended_panes(
             &mut panes,
             &mut nudge_queues,
@@ -10730,37 +10739,35 @@ pub fn run_dashboard(
             report_back_reminder_sweep(&mut panes, state, &mut errors);
         }
         // Issue #358 (task 5): the orchestrator pane's automatic rollover.
-        // Both halves live on their own cadence -- the readiness watch is
-        // pure in-memory state, the evaluation costs a capacity snapshot --
-        // and both are no-ops until `fallback.auto_orchestrator_rollover`
-        // is on.
-        if cfg.auto_orchestrator_rollover() {
-            settle_pending_rollover(&mut panes, cfg, state, &mut pending_rollover);
-            if pending_rollover.is_none()
-                && due(
-                    last_rollover_eval,
-                    sweep_now,
-                    super::rollover::evaluate_interval(cfg, reactive_pending),
-                )
-            {
-                last_rollover_eval = sweep_now;
-                rollover_sweep(
-                    &mut panes,
-                    cfg,
-                    repo,
-                    state,
-                    &mut pending_rollover,
-                    &mut errors,
-                );
-                reactive_pending = panes
-                    .iter()
-                    .find(|pane| pane.role() == prompt::PromptRole::Orchestrator)
-                    .and_then(|pane| super::seat::load(state, pane.short()))
-                    .and_then(|seat| seat.pending)
-                    .is_some_and(|pending| {
-                        matches!(pending.cause, super::seat::Cause::Reactive { .. })
-                    });
-            }
+        // The evaluation half costs a capacity snapshot, so it runs on its own
+        // cadence; its readiness watch is pure in-memory state and runs every
+        // tick, above the reap (issue #440). Both are no-ops until
+        // `fallback.auto_orchestrator_rollover` is on.
+        if cfg.auto_orchestrator_rollover()
+            && pending_rollover.is_none()
+            && due(
+                last_rollover_eval,
+                sweep_now,
+                super::rollover::evaluate_interval(cfg, reactive_pending),
+            )
+        {
+            last_rollover_eval = sweep_now;
+            rollover_sweep(
+                &mut panes,
+                cfg,
+                repo,
+                state,
+                &mut pending_rollover,
+                &mut errors,
+            );
+            reactive_pending = panes
+                .iter()
+                .find(|pane| pane.role() == prompt::PromptRole::Orchestrator)
+                .and_then(|pane| super::seat::load(state, pane.short()))
+                .and_then(|seat| seat.pending)
+                .is_some_and(|pending| {
+                    matches!(pending.cause, super::seat::Cause::Reactive { .. })
+                });
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
         // F1/F2: every tick, not throttled -- see `drain_pending_submits`'s

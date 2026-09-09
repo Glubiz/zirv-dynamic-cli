@@ -673,6 +673,19 @@ fn park_for_reset(
     let window = choice.window.to_string();
     let detail = format!("{reason}; {}", choice.detail());
     if let Err(e) = seat::park(state, seat_short, choice.reset_at, &window, &detail, now) {
+        // Issue #440: the park is the whole point of this arm, so a park that
+        // could not be written is a refusal an operator has to be able to
+        // read, not a silent return.
+        record(
+            state,
+            &current.session,
+            verb,
+            REFUSED,
+            &PoolEvent {
+                reason: format!("{detail}; the seat could not be parked: {e}"),
+                ..base
+            },
+        );
         return Evaluation::Skip(e.to_string());
     }
     record(
@@ -806,6 +819,10 @@ pub fn record_route(
 
 /// Commits a prepared rollover once the successor has proven itself ready --
 /// the supervisors' half of [`Evaluation::Rollover`].
+///
+/// Issue #440: a commit the seat refuses is still an outcome, so the
+/// transaction ends as [`FAILED`] rather than as nothing at all -- see
+/// [`fail`] for why a prepared rollover may never fall off the end of the log.
 pub fn commit(
     state: &StateDir,
     verb: &str,
@@ -814,7 +831,24 @@ pub fn commit(
     successor_session: &str,
     now: u64,
 ) -> CtxResult<seat::Seat> {
-    let committed = seat::commit(state, seat_short, generation, successor_session, now)?;
+    let committed = match seat::commit(state, seat_short, generation, successor_session, now) {
+        Ok(committed) => committed,
+        Err(e) => {
+            let reason = format!("the successor answered but the seat refused the commit: {e}");
+            let known = seat::load(state, seat_short);
+            terminate(
+                state,
+                verb,
+                seat_short,
+                generation,
+                now,
+                FAILED,
+                &reason,
+                known.as_ref(),
+            );
+            return Err(e);
+        }
+    };
     record(
         state,
         &committed.session,
@@ -835,6 +869,16 @@ pub fn commit(
 /// Aborts a prepared rollover: the successor never took the seat, and
 /// `seat::abort` records a visit against it so [`evaluate`]'s next call at
 /// the same epoch tries the NEXT candidate rather than this one again.
+///
+/// Issue #440: infallible on purpose. Every supervisor arm that reaches here
+/// already discards the result, so a `?` on `seat::abort` meant a whole class
+/// of endings -- a dashboard pane reaped (and its seat record `forget`ten)
+/// before its own transaction settled, a generation that no longer matches,
+/// a seat that is no longer `Prepared` -- wrote NO terminal row at all. That
+/// is how a live orchestrator seat disappeared between `prepared` and
+/// silence. The row is the contract, so nothing here may return early: a seat
+/// that could not be closed cleanly says so in `reason` and is recorded
+/// anyway. `None` means the seat record itself was already gone.
 pub fn fail(
     state: &StateDir,
     verb: &str,
@@ -842,22 +886,55 @@ pub fn fail(
     generation: u64,
     reason: &str,
     now: u64,
-) -> CtxResult<seat::Seat> {
-    let aborted = seat::abort(state, seat_short, generation, now)?;
+) -> Option<seat::Seat> {
+    let before = seat::load(state, seat_short);
+    let outcome = seat::abort(state, seat_short, generation, now);
+    let reason = match &outcome {
+        Ok(_) => reason.to_string(),
+        Err(e) => format!("{reason}; the seat transaction could not be closed: {e}"),
+    };
+    terminate(
+        state,
+        verb,
+        seat_short,
+        generation,
+        now,
+        FAILED,
+        &reason,
+        outcome.as_ref().ok().or(before.as_ref()),
+    );
+    outcome.ok()
+}
+
+/// Writes the one terminal row a prepared rollover always ends with, from
+/// whatever is still known about the seat -- `known` is `None` once the seat
+/// record has been removed, which is precisely the case the row matters most
+/// for. Falls back to the seat's short id as the log's session field: an
+/// operator correlating an incident has the address either way.
+#[allow(clippy::too_many_arguments)]
+fn terminate(
+    state: &StateDir,
+    verb: &str,
+    seat_short: &str,
+    generation: u64,
+    now: u64,
+    action: &'static str,
+    reason: &str,
+    known: Option<&seat::Seat>,
+) {
     record(
         state,
-        &aborted.session,
+        known.map_or(seat_short, |seat| seat.session.as_str()),
         verb,
-        FAILED,
+        action,
         &PoolEvent {
             snapshot_at: now,
-            source_agent: aborted.agent.clone(),
+            source_agent: known.map(|seat| seat.agent.clone()).unwrap_or_default(),
             generation: Some(generation),
             reason: reason.to_string(),
             ..PoolEvent::default()
         },
     );
-    Ok(aborted)
 }
 
 /// A parked seat's window has elapsed. Returns the seat to `Idle` and, when
@@ -987,13 +1064,25 @@ pub fn on_startup(
         return None;
     };
     let now = super::state::now_secs();
-    let recovered = seat::recover(state, seat_short, successor_alive, now)
-        .ok()
-        .flatten()?;
-    let committed = recovered.generation == generation;
+    let recovered = seat::recover(state, seat_short, successor_alive, now);
+    // Issue #440: a stale `Prepared` seat is a rollover that never ended, so
+    // it always ends HERE -- committed when the successor is genuinely
+    // answering, failed otherwise. Recovery that itself fails (or a seat that
+    // vanished between the load above and the recover) used to return
+    // silently, leaving the interrupted transaction with no terminal row.
+    let committed = matches!(&recovered, Ok(Some(seat)) if seat.generation == generation);
+    let reason = match &recovered {
+        Ok(Some(_)) => "interrupted rollover recovered at supervisor startup".to_string(),
+        Ok(None) => "interrupted rollover: the seat record vanished before recovery".to_string(),
+        Err(e) => format!("interrupted rollover could not be recovered at startup: {e}"),
+    };
     record(
         state,
-        &recovered.session,
+        recovered
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or(before.session.as_str(), |seat| seat.session.as_str()),
         "startup",
         if committed { COMMITTED } else { FAILED },
         &PoolEvent {
@@ -1001,11 +1090,11 @@ pub fn on_startup(
             source_agent: before.agent.clone(),
             target_agent: Some(successor_agent),
             generation: Some(generation),
-            reason: "interrupted rollover recovered at supervisor startup".to_string(),
+            reason,
             ..PoolEvent::default()
         },
     );
-    Some(recovered)
+    recovered.ok().flatten()
 }
 
 #[cfg(test)]
@@ -1310,6 +1399,111 @@ mod tests {
                 Evaluation::Park { .. }
             ),
             "the only candidate already failed against this evidence, so the seat parks"
+        );
+        // Issue #440's second contract: a handover that could not complete
+        // leaves the source waiting out its own window, never torn down.
+        let seat = seat::load(&state, SHORT).expect("seat");
+        let seat::Phase::Parked { until, .. } = seat.phase else {
+            panic!("the source must be parked until its limit resets, got {seat:?}");
+        };
+        assert_eq!(until, NOW + 3_600);
+        assert_eq!(seat.agent, "claude", "the source still holds its own seat");
+    }
+
+    /// Issue #440: the exit path that lost a live orchestrator seat. A
+    /// dashboard reaps an ended pane -- `Pane::finish_shutdown` -> `rollover::
+    /// forget` -> `seat::remove` -- before the pane's own prepared rollover
+    /// settles, so `seat::abort` has nothing left to abort. The transaction
+    /// must still end in the log: a `prepared` row followed by silence is
+    /// exactly what left an operator with no orchestrator and no explanation.
+    #[test]
+    fn a_terminal_row_is_written_even_when_the_seat_record_is_already_gone() {
+        let (_dir, state) = temp_state();
+        register_seat(&state);
+        let generation =
+            seat::prepare(&state, SHORT, "codex", None, seat::Cause::Manual, NOW).expect("prepare");
+        forget(&state, SHORT);
+
+        assert!(
+            fail(
+                &state,
+                "dash",
+                SHORT,
+                generation,
+                "the successor pane is gone",
+                NOW,
+            )
+            .is_none(),
+            "there is no seat record left to return"
+        );
+
+        let logged = std::fs::read_to_string(state.logs().join(log::LOG_FILE)).expect("log");
+        let row = logged
+            .lines()
+            .find(|line| line.contains(FAILED))
+            .expect("a prepared rollover always ends in a terminal row");
+        assert!(row.contains("the successor pane is gone"), "{row}");
+        assert!(
+            row.contains("could not be closed"),
+            "the row says the seat itself was already gone: {row}"
+        );
+        assert!(
+            row.contains(&format!("generation\\\":{generation}")),
+            "{row}"
+        );
+    }
+
+    /// Issue #440: a commit the seat refuses (a generation that no longer
+    /// matches, a phase that is no longer `Prepared`) is still an ending.
+    #[test]
+    fn a_commit_the_seat_refuses_still_ends_the_transaction() {
+        let (_dir, state) = temp_state();
+        register_seat(&state);
+        let generation =
+            seat::prepare(&state, SHORT, "codex", None, seat::Cause::Manual, NOW).expect("prepare");
+
+        commit(&state, "wrap", SHORT, generation + 1, "session-b", NOW)
+            .expect_err("a mismatched generation is refused");
+
+        let logged = std::fs::read_to_string(state.logs().join(log::LOG_FILE)).expect("log");
+        assert!(logged.contains(FAILED), "{logged}");
+        assert!(
+            !logged.contains(COMMITTED),
+            "a refused commit never claims the seat: {logged}"
+        );
+    }
+
+    /// Issue #440: a supervisor starting on a seat left `Prepared` by one
+    /// that died mid-swap must close it as FAILED, not leave it pending --
+    /// and must say so in the decision log, which is the only place an
+    /// operator can see the interrupted rollover ended at all.
+    #[test]
+    fn on_startup_records_a_stale_prepared_seat_as_failed() {
+        let (_dir, state) = temp_state();
+        register_seat(&state);
+        let generation =
+            seat::prepare(&state, SHORT, "codex", None, seat::Cause::Manual, NOW).expect("prepare");
+
+        let recovered =
+            on_startup(&state, SHORT, &|_| None).expect("a stale prepared seat is recovered");
+        assert!(
+            matches!(recovered.phase, seat::Phase::Idle),
+            "the seat may not stay prepared: {recovered:?}"
+        );
+        assert_eq!(recovered.generation, 1, "the successor never took the seat");
+
+        let logged = std::fs::read_to_string(state.logs().join(log::LOG_FILE)).expect("log");
+        let row = logged
+            .lines()
+            .find(|line| line.contains(FAILED))
+            .expect("a stale prepared seat ends in a terminal row");
+        assert!(
+            row.contains(&format!("generation\\\":{generation}")),
+            "{row}"
+        );
+        assert!(
+            !logged.contains(COMMITTED),
+            "a successor that is not alive never commits: {logged}"
         );
     }
 
