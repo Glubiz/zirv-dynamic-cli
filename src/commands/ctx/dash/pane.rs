@@ -2417,6 +2417,18 @@ impl Pane {
             // install it was refused by `guard_cmd_shim_reparse` below and a
             // large one could overflow the command line outright.
             let command = if resuming {
+                // Delta review: claude applies its system-prompt flag per
+                // INVOCATION, so a resumed session keeps its whole
+                // conversation but would lose zirv's role layer for the rest
+                // of its life unless this relaunch carries it again. The role
+                // layer only -- no handoff text, no positional prompt.
+                extra.extend(super::super::prompt::role_layer_args(
+                    new_adapter.as_ref(),
+                    role,
+                    &cfg.prompt,
+                    &self.state_dir,
+                    &self.session_id,
+                ));
                 new_adapter.interactive_cmd(None, &extra)
             } else {
                 let prompt_text = super::super::prompt::interactive_handoff_prompt(
@@ -4734,6 +4746,112 @@ pub(crate) mod tests {
             "1",
             "a manual swap must carry the seat's current (unchanged) generation, not leave the \
              successor unfenced"
+        );
+
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// Issue #440 (delta review): a SOURCE recovery resumes the harness's own
+    /// conversation, and claude applies its system-prompt flag per
+    /// invocation -- so the relaunch must carry the role layer again or a
+    /// recovered orchestrator runs without zirv's posture for the rest of its
+    /// life. It must NOT carry a handoff prompt: the resumed conversation
+    /// already holds everything a handoff could summarise.
+    #[test]
+    fn a_resume_relaunch_carries_the_role_layer_and_no_handoff_prompt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "44444444-2222-4333-8444-555555555555";
+        let mut spec = test_spec(session_id);
+        spec.argv = long_lived_argv();
+        spec.agent_name = "claude".to_string();
+        spec.role = PromptRole::Orchestrator;
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let argv_log = tmp.path().join("successor-argv.log");
+        let script = tmp.path().join("log-argv.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nsleep 3\n",
+                argv_log.display()
+            ),
+        )
+        .expect("write script");
+
+        let cfg = crate::commands::ctx::config::CtxConfig {
+            agent_bin: Some(format!("sh {}", script.display())),
+            ..Default::default()
+        };
+        let req = crate::commands::ctx::handover::HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+            interactive: true,
+            automatic: true,
+            generation: None,
+            structural_only: true,
+            resume_session: Some(session_id.to_string()),
+        };
+
+        pane.handover(
+            &cfg,
+            &req,
+            &crate::commands::ctx::handoff::Handoff::default(),
+            PromptRole::Orchestrator,
+            &repo,
+            (80, 24),
+        )
+        .expect("the source resumes");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !argv_log.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let logged = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        let args: Vec<&str> = logged.lines().collect();
+
+        let at = args
+            .iter()
+            .position(|arg| *arg == "--resume")
+            .unwrap_or_else(|| panic!("the resume flag must be there: {args:?}"));
+        assert_eq!(
+            args.get(at + 1).copied(),
+            Some(session_id),
+            "the resume flag names the source session: {args:?}"
+        );
+        // Either delivery form: the file flag where the adapter's own `--help`
+        // probe verified it, the inline flag otherwise. The invariant is that
+        // the layer is carried at all, not which flag carries it.
+        let layer_at = args
+            .iter()
+            .position(|arg| {
+                *arg == "--append-system-prompt-file" || *arg == "--append-system-prompt"
+            })
+            .unwrap_or_else(|| panic!("the role layer must survive the relaunch: {args:?}"));
+        assert!(
+            args.get(layer_at + 1).is_some_and(|arg| !arg.is_empty()),
+            "the flag must actually name a layer: {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains(crate::commands::ctx::prompt::HANDOFF_BY_FILE_PROMPT)),
+            "a resumed conversation gets no handoff prompt: {args:?}"
         );
 
         pane.finish_shutdown().expect("shutdown");

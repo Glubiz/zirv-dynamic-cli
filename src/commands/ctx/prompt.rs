@@ -1885,6 +1885,64 @@ pub fn relayer_recomposed(
 /// `PromptRole::Worker`/`SubOrchestrator` layer. This is the one place that
 /// check lives: `adapters::codex::ORCHESTRATOR_PROMPT` itself is
 /// unconditional content, same as `claude::ORCHESTRATOR_PROMPT`.
+/// Which of the adapter's own role layers a launch in `role` carries --
+/// `base_system_prompt` for an orchestrator, `sub_orchestrator_system_prompt`
+/// / `worker_system_prompt` for the other two. Only ever one of the three: a
+/// worker must never receive the orchestrator layer's "delegate everything"
+/// coaching. Shared by [`with_adapter_layer`]'s splice and by
+/// [`role_layer_args`], so a relaunch cannot drift from a first launch on
+/// which layer a role gets.
+fn adapter_layer_for(
+    adapter: &dyn AgentAdapter,
+    role: PromptRole,
+    cfg: &PromptConfig,
+) -> Option<String> {
+    match role {
+        PromptRole::Orchestrator => adapter.base_system_prompt(cfg.orchestrator_writes),
+        PromptRole::SubOrchestrator => adapter.sub_orchestrator_system_prompt().map(str::to_string),
+        PromptRole::Worker => adapter.worker_system_prompt().map(str::to_string),
+    }
+    .filter(|layer| !layer.trim().is_empty())
+}
+
+/// Issue #440: the adapter's role layer as launch args, with no handoff text
+/// and no positional prompt.
+///
+/// Claude applies `--append-system-prompt`/`--append-system-prompt-file` per
+/// INVOCATION, so a session resumed into a fresh process (`AgentAdapter::
+/// resume_args`) keeps its whole conversation but loses zirv's role layer for
+/// the rest of its life unless the relaunch carries it again. Every other
+/// launch path composes the full layered prompt; a resume deliberately does
+/// not, because the conversation already holds every layer that was written
+/// into it -- what it cannot hold is a flag the process was started with.
+///
+/// The file form is preferred where the adapter has one, for the same
+/// `ps`-visibility reason [`injection_args_for_session`] prefers it, but the
+/// inline fallback is safe here even on a reparsing Windows shim: this text
+/// is zirv's own shipped adapter constant, never repo-sourced.
+pub fn role_layer_args(
+    adapter: &dyn AgentAdapter,
+    role: PromptRole,
+    cfg: &PromptConfig,
+    state: &StateDir,
+    session: &str,
+) -> Vec<String> {
+    // The same operator switch `with_adapter_layer` honours, so a relaunch
+    // cannot hand a codex orchestrator a layer its first launch suppressed.
+    let suppressed =
+        role == PromptRole::Orchestrator && adapter.name() == "codex" && !cfg.codex_orchestrator;
+    let Some(layer) = adapter_layer_for(adapter, role, cfg).filter(|_| !suppressed) else {
+        return Vec::new();
+    };
+    if delivers_system_prompt_by_file(adapter, &[])
+        && let Some(flag) = adapter.system_prompt_file_flag()
+        && let Ok(path) = write_prompt_file(state, &format!("{session}-role"), &layer)
+    {
+        return vec![flag.to_string(), path.display().to_string()];
+    }
+    adapter.system_prompt_args(&layer)
+}
+
 fn with_adapter_layer(
     composed: Option<ComposedPrompt>,
     adapter: &dyn AgentAdapter,
@@ -1898,13 +1956,8 @@ fn with_adapter_layer(
     // the one that names the actual enforcement mechanism) -- the other two
     // roles' own layers are `&'static str` still, widened to `String` here
     // purely so all three match arms share one type.
-    let layer = match role {
-        PromptRole::Orchestrator if codex_orchestrator_suppressed => None,
-        PromptRole::Orchestrator => adapter.base_system_prompt(cfg.orchestrator_writes),
-        PromptRole::SubOrchestrator => adapter.sub_orchestrator_system_prompt().map(str::to_string),
-        PromptRole::Worker => adapter.worker_system_prompt().map(str::to_string),
-    };
-    let Some(layer) = layer else {
+    let layer = adapter_layer_for(adapter, role, cfg);
+    let Some(layer) = layer.filter(|_| !codex_orchestrator_suppressed) else {
         return Some(composed);
     };
     let layer = layer.trim();

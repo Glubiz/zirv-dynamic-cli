@@ -170,10 +170,13 @@ pub fn forget(state: &StateDir, seat_short: &str) {
     // so the short id matches and `seat::register` (which preserves `phase`)
     // hands the restored pane its park back.
     let seat = seat::load(state, seat_short);
-    if seat
-        .as_ref()
-        .is_some_and(|seat| matches!(seat.phase, seat::Phase::Parked { .. }))
-    {
+    // Delta review: only a park that is still RUNNING outlives its session.
+    // Once the window has elapsed there is nothing left to wait for, and
+    // holding the record would leak `<short>.seat.json` and its pool state
+    // for every pane that was killed for good while parked.
+    if seat.as_ref().is_some_and(|seat| {
+        matches!(seat.phase, seat::Phase::Parked { until, .. } if until > super::state::now_secs())
+    }) {
         return;
     }
     // Issue #440: a session released with a rollover still OPEN ends that
@@ -182,6 +185,13 @@ pub fn forget(state: &StateDir, seat_short: &str) {
     // neither settles a pending rollover of its own, so quitting inside the
     // prepare-to-ready window used to leave `prepared` followed by silence,
     // the incident signature exactly.
+    //
+    // Residual (delta review, accepted): under a disk fault that persists
+    // across both writes, `release_prepared` cannot clear the phase and this
+    // arm then writes a SECOND terminal row for the same generation. Two
+    // rows beat none -- an operator reading the log still sees the
+    // transaction end -- and a state dir that cannot be written has already
+    // lost more than this.
     if let Some(open) = seat.as_ref()
         && let seat::Phase::Prepared { generation, .. } = open.phase
     {
@@ -1602,6 +1612,29 @@ mod tests {
         assert!(
             !state2.logs().join(log::LOG_FILE).exists(),
             "releasing a seat with nothing open logs nothing"
+        );
+    }
+
+    /// Delta review: a park outlives its session only while the window it is
+    /// waiting on is still running. Once it has elapsed the record is inert,
+    /// and keeping it would leak a seat file per pane killed while parked.
+    #[test]
+    fn forget_keeps_a_running_park_and_drops_an_elapsed_one() {
+        let (_dir, state) = temp_state();
+        register_seat(&state);
+        let now = super::super::state::now_secs();
+        seat::park(&state, SHORT, now + 3_600, "five_hour", "exhausted", now).expect("park");
+        forget(&state, SHORT);
+        assert!(
+            seat::load(&state, SHORT).is_some(),
+            "a park still waiting on its window survives the session that held it"
+        );
+
+        seat::park(&state, SHORT, now - 1, "five_hour", "exhausted", now).expect("park");
+        forget(&state, SHORT);
+        assert!(
+            seat::load(&state, SHORT).is_none(),
+            "an elapsed park is inert and released with everything else"
         );
     }
 
