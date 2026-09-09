@@ -2443,6 +2443,12 @@ impl AgentAdapter for ClaudeAdapter {
             // correctly -- issue #118 is codex-specific.
             defer_injection_submit: false,
             context_window_tokens: self.context_window_tokens(None),
+            // Issue #418: the ORIGINAL surface these hooks are named for --
+            // `hook::run_pretool`/`hook::run_posttool` and `safety::run_check`
+            // all parse claude's own PreToolUse/PostToolUse payload shapes
+            // directly, no projection involved.
+            pre_tool_hook: true,
+            post_tool_hook: true,
         }
     }
 
@@ -4869,6 +4875,13 @@ mod tests {
     #[test]
     fn claude_advertises_the_capability() {
         assert!(ClaudeAdapter::new(None).capabilities().system_prompt);
+    }
+
+    #[test]
+    fn issue_418_claude_advertises_both_native_hook_capabilities() {
+        let caps = ClaudeAdapter::new(None).capabilities();
+        assert!(caps.pre_tool_hook);
+        assert!(caps.post_tool_hook);
     }
 
     /// Claude reports a per-model capacity, with a CONSERVATIVE default for a

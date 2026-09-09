@@ -1330,7 +1330,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx wrap -- claude` | Supervises an interactive TUI through a PTY |
 | `zirv ctx handoff --transcript <path>` | Distills a handoff and stores it |
 | `zirv ctx resume` | Starts a clean session with the latest handoff injected |
-| `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start>` | Agent hook entrypoints |
+| `zirv ctx hook <stop\|prompt\|pre-compact\|pretool\|notify\|session-start\|install>` | Agent hook entrypoints; `install <agent>` wires zirv's own guard/compaction hooks into a non-claude agent's native hooks file (copilot, droid, gemini) |
 | `zirv ctx status [--json]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |

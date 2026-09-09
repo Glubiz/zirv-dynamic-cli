@@ -186,13 +186,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::super::CtxResult;
 use super::super::catalogue;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
 };
+use super::super::native_hooks::{NativeHookEntry, NativeHooks};
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
 /// This adapter's own vendor slug in `catalogue`'s registry (issue #381) --
@@ -876,11 +877,64 @@ impl AgentAdapter for GeminiAdapter {
             // positive claim of "submits correctly".
             defer_injection_submit: false,
             context_window_tokens: None,
+            // Issue #418: `~/.gemini/settings.json` carries a `BeforeTool`
+            // guard, but gemini's `AfterTool` only carries `additionalContext`
+            // -- no verified result-replacement mechanism -- see
+            // `native_hooks`'s own doc comment.
+            pre_tool_hook: true,
+            post_tool_hook: false,
         }
     }
 
     fn context_window_tokens(&self, model: Option<&str>) -> Option<u64> {
         catalogue::vendor(CATALOGUE_VENDOR).and_then(|v| catalogue::context_window(v, model))
+    }
+
+    /// Issue #418, DOCS-ONLY, verified from official docs 2026-09-09, not
+    /// against a live binary (`github.com/google-gemini/gemini-cli`
+    /// `docs/hooks/reference.md`, 0.61 nightly; gemini-cli is not installed
+    /// here -- see this module's own top doc comment).
+    ///
+    /// The user-level file is `~/.gemini/settings.json`, shared with
+    /// operator config already there (patch under the top-level `hooks` key,
+    /// never own the whole file). Shape: `{"hooks":{"BeforeTool":[{
+    /// "matcher":"run_shell_command|write_file|replace","hooks":[{"name":
+    /// "zirv-guard","type":"command","command":"<cmd>","timeout":30000}]}]}}`
+    /// -- timeouts here are milliseconds, unlike copilot's/droid's own
+    /// seconds. The safety-check entry narrows its own matcher to
+    /// `"run_shell_command"` alone, the one shell tool name
+    /// [`READ_ONLY_POLICY_TOML`] above already verifies. No `AfterTool`
+    /// entry is installed: gemini's own docs give `AfterTool` only an
+    /// `additionalContext` channel, no verified result-replacement
+    /// mechanism -- see `Capabilities::post_tool_hook` above.
+    fn native_hooks(&self, home: &Path) -> Option<NativeHooks> {
+        let file = home.join(".gemini").join("settings.json");
+        let group = |matcher: &str, command: &str| {
+            json!({
+                "matcher": matcher,
+                "hooks": [{"name": "zirv-guard", "type": "command", "command": command, "timeout": 30000}]
+            })
+        };
+        Some(NativeHooks {
+            file,
+            owned_file: false,
+            root_defaults: json!({}),
+            entries: vec![
+                NativeHookEntry {
+                    pointer: vec!["hooks".to_string(), "BeforeTool".to_string()],
+                    element: group(
+                        "run_shell_command|write_file|replace",
+                        "zirv ctx hook pretool --agent gemini",
+                    ),
+                    label: "pretool guard",
+                },
+                NativeHookEntry {
+                    pointer: vec!["hooks".to_string(), "BeforeTool".to_string()],
+                    element: group("run_shell_command", "zirv ctx safety check --agent gemini"),
+                    label: "safety check",
+                },
+            ],
+        })
     }
 
     fn review_model_below(&self, seat: Option<&str>) -> &'static str {
@@ -1304,6 +1358,14 @@ mod tests {
         assert!(!caps.marker_signal);
         assert!(!caps.turn_signal);
         assert!(!caps.system_prompt);
+        assert!(
+            caps.pre_tool_hook,
+            "issue #418: BeforeTool guard is native-hooked"
+        );
+        assert!(
+            !caps.post_tool_hook,
+            "issue #418: AfterTool cannot replace a result"
+        );
         assert!(!adapter().counts_tool_calls());
     }
 

@@ -193,13 +193,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::UNIX_EPOCH;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::super::CtxResult;
 use super::super::catalogue;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, input_hash,
 };
+use super::super::native_hooks::{NativeHookEntry, NativeHooks};
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
 
 /// See this module's own doc comment ("Session storage") for the verification
@@ -795,7 +796,58 @@ impl AgentAdapter for DroidAdapter {
             // behavior was never observed (no live REPL was driven here).
             defer_injection_submit: false,
             context_window_tokens: None,
+            // Issue #418: `~/.factory/hooks.json` carries a `PreToolUse`
+            // guard, but droid's own docs state `PostToolUse` cannot replace
+            // a tool's result -- see `native_hooks`'s own doc comment.
+            pre_tool_hook: true,
+            post_tool_hook: false,
         }
+    }
+
+    /// Issue #418, DOCS-ONLY, verified from official docs 2026-09-09, not
+    /// against a live binary (see this module's own top doc comment on
+    /// docs-vs-binary disagreements generally).
+    ///
+    /// `docs.factory.ai/reference/hooks-reference`: the user-level file is
+    /// `~/.factory/hooks.json`, shared with any operator entries already
+    /// there (patch, never own outright), shape `{"PreToolUse":[{"matcher":
+    /// "Execute|Edit|Create|ApplyPatch","hooks":[{"type":"command",
+    /// "command":"<cmd>","timeout":30}]}]}` (top-level event keys, one
+    /// matcher-scoped group per array entry, timeout in seconds -- the same
+    /// `{matcher, hooks: [...]}` shape claude's own `settings.json` uses).
+    /// The safety-check entry narrows its own matcher to `"Execute"` alone
+    /// (the one shell tool name this module's own doc comment verifies).
+    /// `PostToolUse` is deliberately absent: droid's docs state outright that
+    /// it cannot replace a tool's result, so no compaction hook is installed
+    /// at all -- see `Capabilities::post_tool_hook` above.
+    fn native_hooks(&self, home: &Path) -> Option<NativeHooks> {
+        let file = home.join(".factory").join("hooks.json");
+        let group = |matcher: &str, command: &str| {
+            json!({
+                "matcher": matcher,
+                "hooks": [{"type": "command", "command": command, "timeout": 30}]
+            })
+        };
+        Some(NativeHooks {
+            file,
+            owned_file: false,
+            root_defaults: json!({}),
+            entries: vec![
+                NativeHookEntry {
+                    pointer: vec!["PreToolUse".to_string()],
+                    element: group(
+                        "Execute|Edit|Create|ApplyPatch",
+                        "zirv ctx hook pretool --agent droid",
+                    ),
+                    label: "pretool guard",
+                },
+                NativeHookEntry {
+                    pointer: vec!["PreToolUse".to_string()],
+                    element: group("Execute", "zirv ctx safety check --agent droid"),
+                    label: "safety check",
+                },
+            ],
+        })
     }
 
     fn context_window_tokens(&self, model: Option<&str>) -> Option<u64> {
@@ -993,6 +1045,14 @@ mod tests {
         assert!(!caps.token_usage);
         assert!(!caps.marker_signal);
         assert!(!caps.turn_signal);
+        assert!(
+            caps.pre_tool_hook,
+            "issue #418: PreToolUse guard is native-hooked"
+        );
+        assert!(
+            !caps.post_tool_hook,
+            "issue #418: PostToolUse cannot replace a result"
+        );
         assert!(adapter().counts_tool_calls());
     }
 

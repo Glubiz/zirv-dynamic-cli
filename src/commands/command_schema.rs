@@ -170,6 +170,9 @@ const MUTATING: &[&str] = &[
     "zirv ctx hook pretool",
     "zirv ctx hook posttool",
     "zirv ctx hook status",
+    // Issue #418: writes a non-claude agent's own native hooks file by
+    // default; `--show`/`--dry-run` read-only but the verb itself can write.
+    "zirv ctx hook install",
     "zirv ctx run",
     "zirv ctx hook prompt",
     "zirv ctx hook session-start",

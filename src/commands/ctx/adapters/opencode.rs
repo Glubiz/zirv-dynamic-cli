@@ -1139,6 +1139,10 @@ impl AgentAdapter for OpenCodeAdapter {
             // reason. Revisit once a real install can be probed.
             defer_injection_submit: false,
             context_window_tokens: self.context_window_tokens(None),
+            // Issue #418: no verified native hooks surface for opencode;
+            // this wave adds seams for copilot/droid/gemini only.
+            pre_tool_hook: false,
+            post_tool_hook: false,
         }
     }
 
@@ -1937,6 +1941,11 @@ mod tests {
         assert!(!caps.marker_signal);
         assert!(!caps.turn_signal);
         assert!(!caps.token_usage);
+        assert!(
+            !caps.pre_tool_hook,
+            "issue #418: no verified native hooks surface for opencode"
+        );
+        assert!(!caps.post_tool_hook);
     }
 
     #[test]

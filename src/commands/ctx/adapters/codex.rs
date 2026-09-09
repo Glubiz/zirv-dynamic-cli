@@ -2094,6 +2094,11 @@ impl AgentAdapter for CodexAdapter {
             // one is worse than falling back to rot's absolute defaults,
             // which are at least a known quantity. Never fake parity.
             context_window_tokens: None,
+            // Issue #418: no verified native hooks surface for codex exists
+            // (see `docs/design/2026-09-01-hook-surface-gap-analysis.md`);
+            // this wave adds seams for copilot/droid/gemini only.
+            pre_tool_hook: false,
+            post_tool_hook: false,
         }
     }
 
@@ -3520,6 +3525,13 @@ mod tests {
             !args.iter().any(|a| a == "untrusted"),
             "untrusted is the noisy polarity this task exists to avoid: {args:?}"
         );
+    }
+
+    #[test]
+    fn issue_418_codex_has_no_native_hooks_capability() {
+        let caps = CodexAdapter::new(None).capabilities();
+        assert!(!caps.pre_tool_hook);
+        assert!(!caps.post_tool_hook);
     }
 
     #[test]
