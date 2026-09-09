@@ -214,11 +214,21 @@ impl TokenDiff {
         }
     }
 
+    /// Redacted through `pace::redact_for_log` (issue #425 review, round 2):
+    /// belt and braces alongside [`diff_looks_secret`] filtering a
+    /// secret-shaped diff out of [`find_corrections`] entirely -- this is
+    /// the LAST place raw diff text turns into something written to disk
+    /// (`learned_key`) or printed (`--dry-run`), so it redacts on its own
+    /// rather than trusting every caller to have filtered already.
     fn key_fragment(&self) -> String {
         match self {
-            TokenDiff::Substitute { from, to, .. } => format!("{from}->{to}"),
-            TokenDiff::Insert { token, .. } => format!("+{token}"),
-            TokenDiff::Remove { token, .. } => format!("-{token}"),
+            TokenDiff::Substitute { from, to, .. } => format!(
+                "{}->{}",
+                pace::redact_for_log(from),
+                pace::redact_for_log(to)
+            ),
+            TokenDiff::Insert { token, .. } => format!("+{}", pace::redact_for_log(token)),
+            TokenDiff::Remove { token, .. } => format!("-{}", pace::redact_for_log(token)),
         }
     }
 
@@ -253,6 +263,24 @@ fn diff_matches_class(class: ErrorClass, diff: &TokenDiff) -> bool {
         ErrorClass::CommandNotFound => diff.at() == 0,
         ErrorClass::WrongPath | ErrorClass::MissingArgument | ErrorClass::PermissionDenied => true,
     }
+}
+
+/// Whether any token this diff touches looks secret-shaped under
+/// `pace::redact_for_log` (issue #425 review, round 2): with quote-aware
+/// tokens, the differing token itself can be a whole secret-bearing
+/// argument (`"Authorization: Bearer sk-OLD"` -> `"Authorization: Bearer
+/// sk-NEW"`, classified `PermissionDenied` -- a class `diff_matches_class`
+/// deliberately leaves unconstrained, since a wrong path or missing
+/// argument fix can land anywhere). A secret ROTATION is never a learnable
+/// command correction -- it is not a mistake anyone should be reminded not
+/// to repeat -- so a diff that redacts to something different than it
+/// started as is rejected here, before it ever reaches a group, a memory
+/// key, or a printed line.
+fn diff_looks_secret(diff: &TokenDiff) -> bool {
+    diff.changed_tokens()
+        .into_iter()
+        .flatten()
+        .any(|t| pace::redact_for_log(t) != t)
 }
 
 /// The single-token edit (substitution, or a one-token insertion/removal)
@@ -373,6 +401,9 @@ fn find_corrections(attempts: &[Attempt]) -> Vec<Correction> {
                 continue;
             };
             if !diff_matches_class(class, &diff) {
+                continue;
+            }
+            if diff_looks_secret(&diff) {
                 continue;
             }
             let program = fix_tokens
@@ -1102,6 +1133,27 @@ mod tests {
         assert!(find_corrections(&attempts).is_empty());
     }
 
+    #[test]
+    fn find_corrections_rejects_a_bearer_token_rotation_even_under_an_unconstrained_class() {
+        // issue #425 review, round 2: `PermissionDenied` is deliberately
+        // unconstrained by `diff_matches_class` (a wrong path or missing
+        // argument fix can land anywhere), so without the secret filter this
+        // would otherwise pair as a "correction" -- but rotating a bearer
+        // token is not a learnable command mistake, and must never be
+        // described or persisted.
+        let attempts = vec![
+            attempt(
+                r#"curl -H "Authorization: Bearer sk-OLD" example.com"#,
+                fail(ErrorClass::PermissionDenied),
+            ),
+            attempt(
+                r#"curl -H "Authorization: Bearer sk-NEW" example.com"#,
+                Outcome::Success,
+            ),
+        ];
+        assert!(find_corrections(&attempts).is_empty());
+    }
+
     // -- analyze: thresholds and TDD/flaky exclusion --------------------------
 
     fn foo_bar_session(session: &str) -> (String, Vec<Attempt>) {
@@ -1227,6 +1279,32 @@ mod tests {
             "the raw token must never be persisted: {body}"
         );
         assert!(body.contains("[redacted]"), "{body}");
+    }
+
+    #[test]
+    fn learned_key_never_persists_a_raw_secret_value_from_the_diff() {
+        // Belt and braces (issue #425 review, round 2): even a diff that
+        // somehow reached `learned_key` still carrying a secret-shaped
+        // `token=`/`key=` value must never write that value into the
+        // persisted key -- `find_corrections`'s own `diff_looks_secret`
+        // filter is the first line of defense, this is the last.
+        let group = CorrectionGroup {
+            program: "curl".to_string(),
+            class: ErrorClass::PermissionDenied,
+            diff: TokenDiff::Substitute {
+                at: 1,
+                from: "token=sk-abc123OLD".to_string(),
+                to: "token=sk-abc123NEW".to_string(),
+            },
+            occurrences: 3,
+            sessions: BTreeSet::from(["sess-1".to_string(), "sess-2".to_string()]),
+            example_from: "curl --token=sk-abc123OLD".to_string(),
+            example_to: "curl --token=sk-abc123NEW".to_string(),
+        };
+        let key = learned_key(&group);
+        assert!(!key.contains("sk-abc123OLD"), "{key}");
+        assert!(!key.contains("sk-abc123NEW"), "{key}");
+        assert!(key.contains("[redacted]"), "{key}");
     }
 
     // -- claude/codex transcript extraction -----------------------------------
