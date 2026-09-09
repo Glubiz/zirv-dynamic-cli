@@ -50,9 +50,10 @@ cargo fmt -- --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-Every PR must bump the version in `Cargo.toml` above its base version on `main`,
-including docs-only PRs. CD releases on every merge to `main`, so an unbumped PR
-duplicates a release tag. Run `cargo build` to update `Cargo.lock` and include it.
+Bump the version in `Cargo.toml` above its base version on `main` whenever the
+diff touches `src/`, `Cargo.toml`, `Cargo.lock`, or `build.rs` -- CD's release
+step is idempotent on an already-published version, so a docs/CI-only PR needs
+no bump. Run `cargo build` to update `Cargo.lock` and include it.
 
 Commit subjects use `type(scope): summary`, with types such as `feat`, `fix`,
 `docs`, and `chore`; for example, `fix(dash): restore keyboard focus`.

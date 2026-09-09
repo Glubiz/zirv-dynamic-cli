@@ -1,9 +1,21 @@
-//! ZCHK-VERSION-BUMP: `Cargo.toml`'s `[package] version` must be strictly
-//! above the base branch's (via `git merge-base`), and `Cargo.lock`'s own
-//! `zirv` package entry must agree with `Cargo.toml`. CI's `version-bump`
-//! job (`.github/workflows/ci.yaml`) already enforces the first half in bash
-//! after a push; this reimplements the same check so it also runs locally,
-//! before a PR is even opened, via `zirv verify`/`zirv verify --builtin`.
+//! ZCHK-VERSION-BUMP: when the diff against the base branch touches a path
+//! that changes the shipped binary (`src/`, `Cargo.toml`, `Cargo.lock`,
+//! `build.rs`), `Cargo.toml`'s `[package] version` must be strictly above
+//! the base branch's (via `git merge-base`), and `Cargo.lock`'s own `zirv`
+//! package entry must agree with `Cargo.toml`. A diff limited to everything
+//! else (README/docs/scripts/.github/tests-fixtures/.zirv/*.md) needs no
+//! bump at all. This isn't a duplicate-tag guard -- `.github/workflows/
+//! cd.yaml`'s release step is idempotent on an already-published version
+//! (it prints "already published; nothing to do" and skips the Homebrew/
+//! Chocolatey jobs), so an unbumped merge just deploys nothing. A bump is
+//! what makes a shipped-code change actually reach users. CI's
+//! `version-bump` job (`.github/workflows/ci.yaml`) already enforces the
+//! same path-filtered rule in bash after a push; this reimplements it so it
+//! also runs locally, before a PR is even opened, via `zirv verify`/`zirv
+//! verify --builtin`. The diff is taken against the working tree (`git diff
+//! --name-only <base>`, no `HEAD` on the right side), matching how this
+//! check is actually invoked: `zirv verify --builtin` runs pre-commit, so
+//! uncommitted changes are the honest picture of what the PR will contain.
 
 use std::cmp::Ordering;
 use std::path::Path;
@@ -12,14 +24,51 @@ use std::process::Command;
 use super::BuiltinCheckResult;
 
 pub const ID: &str = "ZCHK-VERSION-BUMP";
-const PROVES: &str = "Cargo.toml's [package] version is strictly above the base branch's, and Cargo.lock's own \
-     zirv entry agrees with it";
+const PROVES: &str = "when the diff against the base branch touches a shipped-code path (src/, Cargo.toml, \
+     Cargo.lock, build.rs), Cargo.toml's [package] version is strictly above the base branch's, \
+     and Cargo.lock's own zirv entry agrees with it";
 const FIX: &str = "bump [package] version in Cargo.toml above the base branch's before opening \
-     or updating the PR (every merge to main publishes a release, and CD fails on a duplicate \
-     tag); run `cargo build`/`cargo check` once afterward so Cargo.lock's own zirv entry picks \
-     up the new version";
-const ORIGIN: &str = "CD duplicate-tag failures -- reminded twice (Development/Decision Log.md, Known Issues.md); \
-     also enforced in CI by .github/workflows/ci.yaml's version-bump job";
+     or updating the PR -- a version bump is what makes CD actually publish a shipped-code \
+     change (CD is idempotent and deploys nothing on an unbumped, already-published version); \
+     run `cargo build`/`cargo check` once afterward so Cargo.lock's own zirv entry picks up the \
+     new version";
+const ORIGIN: &str = "operator decision 2026-09-09 (Development/Decision Log.md): a README/docs/CI-only PR \
+     should not be deployed, and CD's idempotent release step means it never was anyway; also \
+     enforced in CI by .github/workflows/ci.yaml's version-bump job";
+
+/// Paths whose change means the diff touches the shipped binary and
+/// therefore needs a version bump. Anything else -- README.md, docs/**,
+/// scripts/**, .github/**, tests/fixtures/**, .zirv/**, other *.md -- ships
+/// nothing, so a version bump buys nothing for it.
+fn touches_shipped_code(changed_paths: &str) -> bool {
+    changed_paths.lines().any(|path| {
+        path.starts_with("src/")
+            || path == "Cargo.toml"
+            || path == "Cargo.lock"
+            || path == "build.rs"
+    })
+}
+
+/// `git diff --name-only <base>` against the working tree (deliberately not
+/// `<base> HEAD`): `zirv verify --builtin` runs pre-commit, so uncommitted
+/// changes are part of what will actually land in the PR, and leaving them
+/// out would let a shipped-code edit slip past this check unbumped simply
+/// because it hadn't been committed yet.
+fn changed_paths_since(repo: &Path, base: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--name-only", base])
+        .output()
+        .map_err(|err| format!("cannot run git diff --name-only {base}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git diff --name-only {base} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
 
 pub fn run(repo: &Path) -> BuiltinCheckResult {
     // What this check actually guards is zirv's OWN release pipeline (every
@@ -90,6 +139,28 @@ pub fn run(repo: &Path) -> BuiltinCheckResult {
         Ok(version) => version,
         Err(reason) => return BuiltinCheckResult::inconclusive(ID, PROVES, FIX, ORIGIN, reason),
     };
+
+    let changed_paths = match changed_paths_since(repo, &base) {
+        Ok(paths) => paths,
+        Err(reason) => return BuiltinCheckResult::inconclusive(ID, PROVES, FIX, ORIGIN, reason),
+    };
+
+    // No shipped-code path changed and the version is unchanged from base:
+    // nothing here would actually ship differently, so a bump buys nothing.
+    // A LOWER version still falls through to the comparison below and
+    // fails regardless of what changed -- that's never a valid state.
+    if !touches_shipped_code(&changed_paths) && head_version == base_version {
+        return BuiltinCheckResult::pass(
+            ID,
+            PROVES,
+            FIX,
+            ORIGIN,
+            format!(
+                "no shipped-code paths changed since base ({base}); version {head_version} \
+                 unchanged is fine"
+            ),
+        );
+    }
 
     match compare_dotted_versions(&head_version, &base_version) {
         Some(Ordering::Greater) => BuiltinCheckResult::pass(
@@ -321,8 +392,11 @@ mod tests {
         assert_eq!(result.outcome, BuiltinOutcome::Pass, "{result:?}");
     }
 
+    /// A README-only diff changes nothing about the shipped binary, so an
+    /// unbumped version passes -- CD is idempotent and would deploy nothing
+    /// either way (operator decision 2026-09-09, Decision Log.md).
     #[test]
-    fn an_unchanged_version_against_main_fails() {
+    fn a_docs_only_change_without_a_bump_passes() {
         if !git_available() {
             eprintln!("git not available; skipping");
             return;
@@ -340,6 +414,66 @@ mod tests {
         std::fs::write(repo.join("README.md"), "unrelated change\n").unwrap();
         git(repo, &["add", "README.md"]);
         git(repo, &["commit", "-q", "-m", "unrelated"]);
+
+        let result = run(repo);
+        assert_eq!(result.outcome, BuiltinOutcome::Pass, "{result:?}");
+    }
+
+    /// A change under `src/` ships different code, so it still needs a
+    /// bump even though this repo's own manifest lives at the root --
+    /// `touches_shipped_code` must catch it via the `src/` path, not just
+    /// `Cargo.toml`/`Cargo.lock`/`build.rs`.
+    #[test]
+    fn a_src_change_without_a_bump_still_fails() {
+        if !git_available() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let repo = tempdir().unwrap();
+        let repo = repo.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@example.com"]);
+        git(repo, &["config", "user.name", "t"]);
+        write_cargo_toml(repo, "1.0.0");
+        git(repo, &["add", "Cargo.toml"]);
+        git(repo, &["commit", "-q", "-m", "base"]);
+
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").unwrap();
+        git(repo, &["add", "src/main.rs"]);
+        git(repo, &["commit", "-q", "-m", "shipped-code change"]);
+
+        let result = run(repo);
+        assert_eq!(result.outcome, BuiltinOutcome::Fail, "{result:?}");
+    }
+
+    /// A LOWER version always fails, even when nothing shipped-code
+    /// changed -- the "no bump needed" exemption never rescues a version
+    /// that actively regressed below base.
+    #[test]
+    fn a_docs_only_change_with_a_lower_version_still_fails() {
+        if !git_available() {
+            eprintln!("git not available; skipping");
+            return;
+        }
+        let repo = tempdir().unwrap();
+        let repo = repo.path();
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "t@example.com"]);
+        git(repo, &["config", "user.name", "t"]);
+        write_cargo_toml(repo, "1.5.0");
+        git(repo, &["add", "Cargo.toml"]);
+        git(repo, &["commit", "-q", "-m", "base"]);
+
+        git(repo, &["checkout", "-q", "-b", "feature"]);
+        write_cargo_toml(repo, "1.4.0");
+        std::fs::write(repo.join("README.md"), "unrelated change\n").unwrap();
+        git(repo, &["add", "Cargo.toml", "README.md"]);
+        git(
+            repo,
+            &["commit", "-q", "-m", "regressed version, docs only"],
+        );
 
         let result = run(repo);
         assert_eq!(result.outcome, BuiltinOutcome::Fail, "{result:?}");

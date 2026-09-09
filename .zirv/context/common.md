@@ -36,7 +36,7 @@ Nextest isolates tests per process; `--no-fail-fast` is mandatory -- diff sorted
 
 ## Vault docs
 
-Before substantive work in an area, read `docs/obsidian/_system-context.md` and that area's Active Work entry; consult Known Issues / Decision Log when a decision or gotcha is in play. Update the matching page and bump `last-verified` only for behavior/contract/architecture changes (not refactors, bug fixes, tests, CI):
+Before substantive work in an area, read `docs/obsidian/_system-context.md` and that area's Active Work entry; consult Known Issues/Decision Log when relevant. Update the matching page and bump `last-verified` only for behavior/contract/architecture changes (not refactors, bug fixes, tests, CI):
 
 - CLI arg/built-in -> `Modules/Built-in Commands.md`
 - script format/option/param/shortcut -> `Concepts/{Script Files,Shortcuts}.md`, `Modules/Script Runner.md`
@@ -49,4 +49,4 @@ Finished work moves to Active Work's "Recently Completed"; extend pages, don't d
 
 ## Git
 
-Never commit/push `main`/`master`: branch and open a PR. Every PR bumps `Cargo.toml` above its base or CD duplicates the release tag. No `Co-Authored-By` or `Generated with Claude Code` lines.
+Never commit/push `main`/`master`: branch and open a PR. Bump `Cargo.toml` above base only when `src/`, `Cargo.toml`, `Cargo.lock`, or `build.rs` changed (CD is idempotent, so doc/CI-only PRs need none). No `Co-Authored-By` or `Generated with Claude Code` lines.

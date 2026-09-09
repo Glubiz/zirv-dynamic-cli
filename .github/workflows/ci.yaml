@@ -29,10 +29,11 @@ jobs:
 
       # Issue #428: `fetch-depth: 0` above fetches full history for every
       # branch and tag, so `origin/${{ github.base_ref }}` already resolves
-      # here without a separate fetch (unlike the shallow `version-bump` job
-      # below, which fetches its own base ref explicitly for that reason).
-      # Runs before the build: a missing test is cheaper to report before
-      # spending the rest of this job's time on it.
+      # here without a separate fetch (the `version-bump` job below does its
+      # own `fetch-depth: 0` checkout for the same reason -- it needs a real
+      # merge base for its own path-filtered diff). Runs before the build: a
+      # missing test is cheaper to report before spending the rest of this
+      # job's time on it.
       - name: Test-presence gate (issue #428)
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -179,31 +180,48 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Every merge to main triggers CD, which re-publishes whatever version main
-  # carries and fails on a duplicate — so every PR must raise Cargo.toml's
-  # version above its base branch before it can merge.
+  # CD is idempotent on an already-published version (the release step prints
+  # "release $TAG is already published; nothing to do" and skips the
+  # Homebrew/Chocolatey jobs), so an unbumped merge just deploys nothing --
+  # it does not fail. A bump is what makes a code change actually ship. So
+  # this only requires a version bump when the diff since the base branch
+  # touches a path that changes the shipped binary (src/, Cargo.toml,
+  # Cargo.lock, build.rs); a README/docs/CI-only PR passes unbumped.
   version-bump:
     name: Version Bump Check
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so `origin/${{ github.base_ref }}...HEAD` has a real
+      # merge base to diff from -- mirrors the security-scan job below,
+      # which needs the same thing for the same reason. A depth-1 checkout
+      # plus a depth-1 fetch of just the base ref (the previous approach)
+      # gives two disconnected single commits with no common ancestor, so
+      # the three-dot form can't resolve a merge base at all.
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Require a version above the base branch
+      - name: Require a version above the base branch when shipped code changed
         run: |
-          git fetch origin "${{ github.base_ref }}" --depth=1
+          BASE="origin/${{ github.base_ref }}"
+          CHANGED=$(git diff --name-only "$BASE...HEAD")
+          if ! echo "$CHANGED" | grep -qE '^src/|^Cargo\.toml$|^Cargo\.lock$|^build\.rs$'; then
+            echo "::notice::no shipped-code paths changed since ${{ github.base_ref }} (src/, Cargo.toml, Cargo.lock, build.rs) -- version bump not required"
+            exit 0
+          fi
           extract() { grep '^version' "$1" | head -1 | sed -E 's/version *= *"([^"]+)".*/\1/'; }
-          git show "origin/${{ github.base_ref }}:Cargo.toml" > /tmp/base-Cargo.toml
-          BASE=$(extract /tmp/base-Cargo.toml)
+          git show "$BASE:Cargo.toml" > /tmp/base-Cargo.toml
+          BASE_VERSION=$(extract /tmp/base-Cargo.toml)
           HEAD=$(extract Cargo.toml)
-          echo "base branch version: $BASE — PR version: $HEAD"
-          if [ "$BASE" = "$HEAD" ]; then
-            echo "::error file=Cargo.toml::Version ($HEAD) is unchanged from ${{ github.base_ref }}. Bump it — every merge to main publishes a release."
+          echo "base branch version: $BASE_VERSION — PR version: $HEAD"
+          if [ "$BASE_VERSION" = "$HEAD" ]; then
+            echo "::error file=Cargo.toml::Version ($HEAD) is unchanged from ${{ github.base_ref }} but shipped code changed. Bump it -- a version bump is what makes CD actually publish the change."
             exit 1
           fi
-          if [ "$(printf '%s\n%s\n' "$BASE" "$HEAD" | sort -V | tail -1)" != "$HEAD" ]; then
-            echo "::error file=Cargo.toml::Version ($HEAD) is lower than ${{ github.base_ref }}'s ($BASE)."
+          if [ "$(printf '%s\n%s\n' "$BASE_VERSION" "$HEAD" | sort -V | tail -1)" != "$HEAD" ]; then
+            echo "::error file=Cargo.toml::Version ($HEAD) is lower than ${{ github.base_ref }}'s ($BASE_VERSION)."
             exit 1
           fi
 
