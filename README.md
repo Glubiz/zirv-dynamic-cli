@@ -1343,6 +1343,7 @@ checkout:
 | `output.compact_generic_min_bytes` | `ZIRV_CTX_OUTPUT_COMPACT_GENERIC_MIN_BYTES` |
 | `output.verbatim` | `ZIRV_CTX_OUTPUT_VERBATIM` |
 | `output.max_summary_bytes` | `ZIRV_CTX_OUTPUT_MAX_SUMMARY_BYTES` |
+| `output.compact_search` | `ZIRV_CTX_OUTPUT_COMPACT_SEARCH` |
 | `fallback.orchestrator_rollover_headroom_pct` | `ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT` |
 | `fallback.rollover_cooldown_secs` | `ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS` |
 | `fallback.reactive_force_after_secs` | `ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS` |

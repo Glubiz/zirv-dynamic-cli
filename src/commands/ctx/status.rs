@@ -9,12 +9,14 @@ use super::config::{CtxConfig, EnvLookup, env_from_process};
 use super::event::{TranscriptUsage, input_hash};
 use super::group;
 use super::handoff::latest_for_repo;
+use super::hook_integrity;
 use super::ledger;
 use super::mail;
 use super::memory;
 use super::permit;
 use super::pool;
 use super::price;
+use super::search;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, now_secs, repo_slug};
 use super::task;
@@ -142,16 +144,33 @@ fn chain_class_label(class: chain::FailureClass) -> &'static str {
     }
 }
 
+/// Bundles `sessions_lines`' own config-derived and precomputed inputs
+/// (issue #424) -- kept as one struct rather than three more positional
+/// parameters, which would have pushed that function past clippy's
+/// `too_many_arguments` threshold.
+struct SessionLineContext<'a> {
+    // Issue #379: `supervise.compact_stall_secs`, passed in rather than
+    // re-loaded here -- `attention::project_at`/`reason_at` are pure, and the
+    // report has already resolved the config once by the time it gets here.
+    compact_stall_secs: u64,
+    // Issue #424: `cfg.output.compact_min_bytes`, passed in for the same
+    // reason -- what counts as a "large" ledger row for this line must match
+    // the config `hook::run_posttool` itself resolved.
+    compact_min_bytes: usize,
+    // Issue #424: every session the main decision log has ever recorded a
+    // row for, fetched once by the caller (`log::read_decisions` is a full
+    // read of `decisions.jsonl`, so a per-record call here would re-read it
+    // once per claude session shown).
+    decision_sessions: &'a std::collections::BTreeSet<String>,
+}
+
 fn sessions_lines(
     records: &[(sessions::Record, Liveness)],
     state: &StateDir,
     now: u64,
     env: EnvLookup<'_>,
     colour: bool,
-    // Issue #379: `supervise.compact_stall_secs`, passed in rather than
-    // re-loaded here -- `attention::project_at`/`reason_at` are pure, and the
-    // report has already resolved the config once by the time it gets here.
-    compact_stall_secs: u64,
+    ctx: &SessionLineContext<'_>,
 ) -> Vec<String> {
     let mut records = records.to_vec();
     records.sort_by(|a, b| a.0.short.cmp(&b.0.short));
@@ -264,7 +283,7 @@ fn sessions_lines(
             // "stalled after compaction (compacting since HH:MM UTC)" here
             // rather than as whatever the session was doing before it.
             let projection =
-                super::attention::project_at(&attention_status, now, compact_stall_secs);
+                super::attention::project_at(&attention_status, now, ctx.compact_stall_secs);
             let attention_tone = match projection {
                 super::attention::Projection::Blocked(_) | super::attention::Projection::Failed => {
                     Tone::Err
@@ -278,7 +297,7 @@ fn sessions_lines(
                     &format!(
                         "attention: {} ({})",
                         projection.label(),
-                        super::attention::reason_at(&attention_status, now, compact_stall_secs)
+                        super::attention::reason_at(&attention_status, now, ctx.compact_stall_secs)
                     ),
                     attention_tone,
                     colour
@@ -315,6 +334,36 @@ fn sessions_lines(
                             colour
                         )
                     ));
+                }
+            }
+            // Issue #424: a claude session is the only kind this hook
+            // covers at all (`hook::run_posttool`/`run_pretool` are
+            // claude-only) -- for any other agent there is nothing to
+            // report here, and no line is added.
+            if record.agent == "claude" {
+                let has_ledger_row = super::ledger::session_has_any_row(state, &record.session);
+                let has_decision = ctx.decision_sessions.contains(&record.session);
+                if !has_ledger_row && !has_decision {
+                    line.push_str(&format!(
+                        "  {}",
+                        style::paint("hook: no decisions recorded", Tone::Warn, colour)
+                    ));
+                } else {
+                    let (compacted, large) = super::ledger::session_large_result_counts(
+                        state,
+                        &record.session,
+                        ctx.compact_min_bytes as u64,
+                    );
+                    if large > 0 {
+                        line.push_str(&format!(
+                            "  {}",
+                            style::paint(
+                                &format!("compaction: {compacted} of {large} large results"),
+                                Tone::Muted,
+                                colour
+                            )
+                        ));
+                    }
                 }
             }
             line
@@ -993,6 +1042,71 @@ fn orchestrator_blocks_status_line(
     ))
 }
 
+/// How many of the most recent sessions with a large ledger row [`hook_
+/// health_warning`] may scan before giving up -- `zirv ctx status` runs on
+/// every checkpoint, so this may not rescan every session the ledger has
+/// ever recorded.
+const HOOK_HEALTH_SESSION_LIMIT: usize = 20;
+
+/// Issue #424: one line, at most, warning that the claude compaction/safety
+/// hook looks silently broken -- either the two hooks are not installed in
+/// claude's own `settings.json` at all, or they ARE installed but zero
+/// decisions have ever been recorded across the most recent sessions that
+/// had a large tool result, the "installed but not actually firing" failure
+/// a settings check alone cannot see. `None` when the hook looks healthy, or
+/// when there is nothing yet to judge it by (no session has ever had a large
+/// result). Short-circuits `has_decision` the moment one of
+/// `recent_sessions_with_large_results` turns up a decision, so a machine
+/// with a long compaction-ledger history is never fully rescanned on every
+/// status render.
+///
+/// `machine_has_been_used` gates the "not installed" branch specifically: a
+/// fresh machine that has never run a claude session, never had a ledger
+/// row, and never recorded a decision has no evidence the hook was ever
+/// EXPECTED to be there, so the acceptance criterion for this check (silent
+/// on a fresh machine) requires this line stay silent too, not just the
+/// "installed but not firing" branch below it which already had its own
+/// `any` guard. Taken as a closure, not a plain `bool`: computing it may walk
+/// every claude project on the machine (`search::claude_candidates(repo,
+/// true)`), so it must never be paid for when `hook_installed` is `true` --
+/// the value this branch alone reads.
+fn hook_health_warning(
+    hook_installed: bool,
+    machine_has_been_used: impl FnOnce() -> bool,
+    recent_sessions_with_large_results: &[String],
+    has_decision: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if !hook_installed {
+        if !machine_has_been_used() {
+            return None;
+        }
+        return Some(
+            "hook: claude's PostToolUse/PreToolUse compaction and safety hooks are not \
+             installed -- run `zirv setup` to enable them"
+                .to_string(),
+        );
+    }
+    let mut any = false;
+    for session in recent_sessions_with_large_results
+        .iter()
+        .take(HOOK_HEALTH_SESSION_LIMIT)
+    {
+        any = true;
+        if has_decision(session) {
+            return None;
+        }
+    }
+    if any {
+        Some(
+            "hook: zero decisions recorded across recent sessions with large tool results -- \
+             the hook may not be running"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 fn render_report<W: Write>(
     args: &StatusArgs,
     w: &mut W,
@@ -1007,6 +1121,21 @@ fn render_report<W: Write>(
         label(colour, "state dir:"),
         style::paint(&state.root().display().to_string(), Tone::Muted, colour)
     )?;
+
+    // Issue #420: at most one warning line per 24h when a hook entry zirv
+    // installed has drifted (`Outdated`/`Missing`/`Modified`) -- `ctx
+    // status` never heals automatically (only supervisor start does; see
+    // `wrap`/`exec`/`chat`/`run_loop`'s own identical call), it only reports.
+    // Best-effort: no home directory is not a reason to fail the report.
+    if let Ok(home) = crate::utils::home_dir()
+        && let Some(summary) = hook_integrity::drift_warning_if_due(&state, &home)
+    {
+        writeln!(
+            w,
+            "{}",
+            style::paint(&format!("hook integrity: {summary}"), Tone::Warn, colour)
+        )?;
+    }
 
     // Fetched here, once, and reused by every section below that needs it
     // (the work-group tree, the pool section, the sessions list itself) --
@@ -1202,6 +1331,49 @@ fn render_report<W: Write>(
             // trailing 7 days -- see `ledger::status_line`.
             if let Some(line) = ledger::status_line(&state, now_secs()) {
                 writeln!(w, "{line}")?;
+            }
+            // Issue #424: bounded hook-health check, present in `--brief`
+            // too, the same allowance every other single-line health signal
+            // above gets.
+            {
+                let min_bytes = cfg.output.compact_min_bytes as u64;
+                let recent_sessions = ledger::sessions_with_large_results(
+                    &state,
+                    min_bytes,
+                    HOOK_HEALTH_SESSION_LIMIT,
+                );
+                let hook_installed =
+                    crate::commands::setup::claude_compaction_and_safety_hooks_installed();
+                // Bounded, like the ledger side (`sessions_with_large_
+                // results`) already is: only the tail of `decisions.jsonl`
+                // is read, never the whole never-rotated log.
+                let decision_sessions: std::collections::BTreeSet<String> =
+                    log::read_recent_decisions(&state)
+                        .into_iter()
+                        .map(|d| d.session)
+                        .collect();
+                // Fresh-machine acceptance: silent when there is no
+                // evidence this machine has ever run claude at all -- a
+                // claude session transcript on disk, any compaction-ledger
+                // row (any size, not only the large ones scanned above), or
+                // any decision ever recorded (within the bounded tail
+                // above). Computed lazily: `search::claude_candidates(repo,
+                // true)` may walk every claude project on the machine, and
+                // `hook_health_warning` only ever reads this when `hook_
+                // installed` is false, so a healthy machine must never pay
+                // for the walk.
+                if let Some(line) = hook_health_warning(
+                    hook_installed,
+                    || {
+                        !decision_sessions.is_empty()
+                            || ledger::has_any_row(&state)
+                            || !search::claude_candidates(repo, true).is_empty()
+                    },
+                    &recent_sessions,
+                    |s| decision_sessions.contains(s),
+                ) {
+                    writeln!(w, "{}", style::paint(&line, Tone::Warn, colour))?;
+                }
             }
             if cfg.fallback.enabled && !args.brief {
                 let now = crate::commands::ctx::state::now_secs();
@@ -1514,16 +1686,28 @@ fn render_report<W: Write>(
         )?;
     } else {
         writeln!(w, "{}", header(colour, "sessions"))?;
+        let decision_sessions: std::collections::BTreeSet<String> = log::read_decisions(&state)
+            .into_iter()
+            .map(|d| d.session)
+            .collect();
+        let session_line_ctx = SessionLineContext {
+            compact_stall_secs: cfg_result
+                .as_ref()
+                .map(|cfg| cfg.supervise.compact_stall_secs)
+                .unwrap_or_else(|_| super::config::SuperviseConfig::default().compact_stall_secs),
+            compact_min_bytes: cfg_result
+                .as_ref()
+                .map(|cfg| cfg.output.compact_min_bytes)
+                .unwrap_or_else(|_| super::config::OutputConfig::default().compact_min_bytes),
+            decision_sessions: &decision_sessions,
+        };
         let session_lines = sessions_lines(
             &session_records,
             &state,
             crate::commands::ctx::state::now_secs(),
             env,
             colour,
-            cfg_result
-                .as_ref()
-                .map(|cfg| cfg.supervise.compact_stall_secs)
-                .unwrap_or_else(|_| super::config::SuperviseConfig::default().compact_stall_secs),
+            &session_line_ctx,
         );
         if session_lines.is_empty() {
             writeln!(
@@ -3998,6 +4182,348 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("compaction: saved"), "got {text}");
         assert!(text.contains("1 results this week"), "got {text}");
+    }
+
+    /// Writes a minimal claude `settings.json` under `home` carrying both
+    /// hook commands `claude_compaction_and_safety_hooks_installed` checks
+    /// for -- `contains_command` only cares that a `"command"` key matches
+    /// somewhere in the tree, so this need not reproduce claude's real
+    /// `hooks.PostToolUse[].hooks[].command` nesting.
+    fn write_claude_hooks_installed(home: &std::path::Path) {
+        std::fs::create_dir_all(home.join(".claude")).expect("mkdir .claude");
+        std::fs::write(
+            home.join(".claude").join("settings.json"),
+            serde_json::json!({
+                "a": {"command": "zirv ctx hook posttool"},
+                "b": {"command": "zirv ctx safety check"},
+            })
+            .to_string(),
+        )
+        .expect("write settings.json");
+    }
+
+    /// Issue #424: a claude session with no ledger rows and no decisions at
+    /// all shows `hook: no decisions recorded` on its own status line rather
+    /// than a `compaction:` line with nothing to report.
+    #[test]
+    fn a_claude_session_with_no_ledger_rows_and_no_decisions_shows_no_decisions_recorded() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        let record = crate::commands::ctx::sessions::Record::new(
+            "eeee5555-2222-4333-8444-555555555555",
+            "claude",
+            tmp.path(),
+            crate::commands::ctx::sessions::Verb::Wrap,
+        );
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("hook: no decisions recorded"), "got {text}");
+        assert!(!text.contains("compaction: 0 of"), "got {text}");
+    }
+
+    /// Issue #424: a claude session with a large, compacted ledger row shows
+    /// `compaction: X of Y large results` on its own status line instead.
+    #[test]
+    fn a_claude_session_with_a_large_ledger_row_shows_its_own_compaction_count() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+
+        let session_id = "ffff6666-2222-4333-8444-555555555555";
+        let record = crate::commands::ctx::sessions::Record::new(
+            session_id,
+            "claude",
+            tmp.path(),
+            crate::commands::ctx::sessions::Verb::Wrap,
+        );
+        let _guard = crate::commands::ctx::sessions::SessionGuard::register(&state, record);
+
+        ledger::record(
+            &state,
+            &ledger::CompactionRow {
+                ts: crate::commands::ctx::state::now_secs(),
+                tool_use_id: "toolu_1",
+                session: session_id,
+                repo: &crate::commands::ctx::state::repo_slug(tmp.path()),
+                program: "cargo",
+                bytes_in: 10_000,
+                bytes_out: 1_000,
+                outcome: ledger::Outcome::Compacted,
+                retrieval_id: Some("out1"),
+            },
+        );
+        ledger::record(
+            &state,
+            &ledger::CompactionRow {
+                ts: crate::commands::ctx::state::now_secs(),
+                tool_use_id: "toolu_2",
+                session: session_id,
+                repo: &crate::commands::ctx::state::repo_slug(tmp.path()),
+                program: "cat",
+                bytes_in: 20_000,
+                bytes_out: 20_000,
+                outcome: ledger::Outcome::Verbatim,
+                retrieval_id: None,
+            },
+        );
+
+        let mut out = Vec::new();
+        run_with(
+            &StatusArgs {
+                decisions: 5,
+                brief: false,
+                diff: false,
+                full: false,
+                breakdown: None,
+                json: false,
+            },
+            &mut out,
+            tmp.path(),
+            &|k| env.get(k).cloned(),
+            false,
+        )
+        .expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("compaction: 1 of 2 large results"),
+            "got {text}"
+        );
+        assert!(!text.contains("hook: no decisions recorded"), "got {text}");
+    }
+
+    /// Issue #424: `hook_health_warning` is the bounded global check on its
+    /// own -- not installed on a machine with evidence of use always wins
+    /// with its own message; installed with at least one decision among the
+    /// scanned sessions is silent; installed with zero decisions across
+    /// sessions that had large results warns.
+    #[test]
+    fn hook_health_warning_covers_not_installed_healthy_and_silently_broken() {
+        assert!(
+            hook_health_warning(false, || true, &["s1".to_string()], |_| true)
+                .expect("not installed, on a used machine, always warns")
+                .contains("not installed")
+        );
+        assert_eq!(
+            hook_health_warning(true, || true, &[], |_| false),
+            None,
+            "nothing yet to judge the hook by is not a warning"
+        );
+        assert_eq!(
+            hook_health_warning(
+                true,
+                || true,
+                &["s1".to_string(), "s2".to_string()],
+                |s| s == "s2"
+            ),
+            None,
+            "short-circuits healthy the moment any scanned session has a decision"
+        );
+        let warning = hook_health_warning(true, || true, &["s1".to_string()], |_| false)
+            .expect("installed but zero decisions across sessions with large results warns");
+        assert!(warning.contains("zero decisions"));
+    }
+
+    /// The lazy-probe fix: when the hook is installed, `hook_health_warning`
+    /// must never call `machine_has_been_used` at all -- a probe that would
+    /// walk every claude project on the machine (`search::claude_candidates`)
+    /// must not be paid for on the common, healthy path.
+    #[test]
+    fn hook_health_warning_never_calls_the_probe_when_the_hook_is_installed() {
+        let called = std::cell::Cell::new(false);
+        let probe = || {
+            called.set(true);
+            true
+        };
+        assert_eq!(
+            hook_health_warning(true, probe, &["s1".to_string()], |_| true),
+            None
+        );
+        assert!(
+            !called.get(),
+            "the machine-usage probe must not run when hook_installed is true"
+        );
+    }
+
+    /// The fresh-machine fix: not-installed must stay SILENT when there is
+    /// no evidence the machine has ever been used (no claude session, no
+    /// ledger row, no decision) -- the acceptance criterion this issue
+    /// names explicitly. The instant there is any usage evidence at all,
+    /// the exact same not-installed state must warn, so this is strictly a
+    /// gate on the warning, never a way to hide a real problem.
+    #[test]
+    fn hook_health_warning_is_silent_not_installed_on_a_fresh_machine() {
+        assert_eq!(
+            hook_health_warning(false, || false, &[], |_| false),
+            None,
+            "no evidence of use at all: not-installed must not warn on a fresh machine"
+        );
+        assert!(
+            hook_health_warning(false, || true, &[], |_| false)
+                .expect("the same not-installed state warns once there is usage evidence")
+                .contains("not installed")
+        );
+    }
+
+    /// Issue #424: the end-to-end bounded check in `zirv ctx status` --
+    /// installed hooks, a session with a large ledger row and no decision at
+    /// all triggers exactly one warning line; once that session also has a
+    /// decision recorded, the warning disappears.
+    #[test]
+    fn status_end_to_end_hook_health_check_warns_then_clears_once_a_decision_exists() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        write_claude_hooks_installed(&home);
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let args = StatusArgs {
+            decisions: 5,
+            brief: false,
+            diff: false,
+            full: false,
+            breakdown: None,
+            json: false,
+        };
+
+        ledger::record(
+            &state,
+            &ledger::CompactionRow {
+                ts: crate::commands::ctx::state::now_secs(),
+                tool_use_id: "toolu_1",
+                session: "sess-no-decision",
+                repo: "repo-a",
+                program: "cargo",
+                bytes_in: 10_000,
+                bytes_out: 10_000,
+                outcome: ledger::Outcome::BelowThreshold,
+                retrieval_id: None,
+            },
+        );
+
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned(), false).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("zero decisions recorded"),
+            "hooks installed but nothing ever decided: {text}"
+        );
+
+        log::append(
+            &state,
+            &log::Decision {
+                ts: crate::commands::ctx::state::now_secs(),
+                session: "sess-no-decision",
+                verb: "hook",
+                verdict: "n/a",
+                score: 0,
+                action: "dispatch",
+                detail: "",
+                observed_at: None,
+            },
+        )
+        .expect("append");
+
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned(), false).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("zero decisions recorded") && !text.contains("not installed"),
+            "a decision now exists for the only session with a large result: {text}"
+        );
+    }
+
+    /// The fresh-machine fix, end to end: no claude settings.json, no
+    /// ledger rows, no decisions, and no claude project transcript on disk
+    /// at all -- `zirv ctx status` must never print the "not installed"
+    /// hook-health line on a machine that has plainly never run claude.
+    #[test]
+    fn status_end_to_end_hook_not_installed_is_silent_on_a_fresh_machine() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        // No `write_claude_hooks_installed(&home)` call: no settings.json at
+        // all, exactly the fresh-machine state.
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let args = StatusArgs {
+            decisions: 5,
+            brief: false,
+            diff: false,
+            full: false,
+            breakdown: None,
+            json: false,
+        };
+
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned(), false).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("not installed"),
+            "a fresh machine with no usage evidence at all must stay silent: {text}"
+        );
+    }
+
+    /// The same not-installed machine as above, except a claude project
+    /// transcript already exists on disk (issue acceptance's "at least one
+    /// claude session in the registry") -- this is a used machine missing
+    /// its hooks, so the warning must fire once.
+    #[test]
+    fn status_end_to_end_hook_not_installed_warns_once_the_machine_has_been_used() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let project_dir = home.join(".claude").join("projects").join(
+            crate::commands::ctx::permissions::claude_project_dir_name(tmp.path()),
+        );
+        std::fs::create_dir_all(&project_dir).expect("mkdir project dir");
+        std::fs::write(project_dir.join("sess-1.jsonl"), "{}\n").expect("write transcript");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        state.ensure().expect("ensure");
+        let env = env_for(state.root());
+        let args = StatusArgs {
+            decisions: 5,
+            brief: false,
+            diff: false,
+            full: false,
+            breakdown: None,
+            json: false,
+        };
+
+        let mut out = Vec::new();
+        run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned(), false).expect("runs");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("not installed"),
+            "a claude transcript on disk is evidence of use, so the missing hook must warn: \
+             {text}"
+        );
     }
 
     /// Issues #328/#334, posture-aware since issue #358 T8: `orchestrator

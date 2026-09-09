@@ -1,0 +1,864 @@
+diff --git a/src/module_1.rs b/src/module_1.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_1.rs
++++ b/src/module_1.rs
+@@ -10,15 +10,22 @@ impl Module1 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module1 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_2.rs b/src/module_2.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_2.rs
++++ b/src/module_2.rs
+@@ -10,15 +10,22 @@ impl Module2 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module2 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_3.rs b/src/module_3.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_3.rs
++++ b/src/module_3.rs
+@@ -10,15 +10,22 @@ impl Module3 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module3 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_4.rs b/src/module_4.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_4.rs
++++ b/src/module_4.rs
+@@ -10,15 +10,22 @@ impl Module4 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module4 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_5.rs b/src/module_5.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_5.rs
++++ b/src/module_5.rs
+@@ -10,15 +10,22 @@ impl Module5 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module5 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_6.rs b/src/module_6.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_6.rs
++++ b/src/module_6.rs
+@@ -10,15 +10,22 @@ impl Module6 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module6 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_7.rs b/src/module_7.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_7.rs
++++ b/src/module_7.rs
+@@ -10,15 +10,22 @@ impl Module7 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module7 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_8.rs b/src/module_8.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_8.rs
++++ b/src/module_8.rs
+@@ -10,15 +10,22 @@ impl Module8 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module8 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_9.rs b/src/module_9.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_9.rs
++++ b/src/module_9.rs
+@@ -10,15 +10,22 @@ impl Module9 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module9 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_10.rs b/src/module_10.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_10.rs
++++ b/src/module_10.rs
+@@ -10,15 +10,22 @@ impl Module10 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module10 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_11.rs b/src/module_11.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_11.rs
++++ b/src/module_11.rs
+@@ -10,15 +10,22 @@ impl Module11 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module11 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_12.rs b/src/module_12.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_12.rs
++++ b/src/module_12.rs
+@@ -10,15 +10,22 @@ impl Module12 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module12 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_13.rs b/src/module_13.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_13.rs
++++ b/src/module_13.rs
+@@ -10,15 +10,22 @@ impl Module13 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module13 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_14.rs b/src/module_14.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_14.rs
++++ b/src/module_14.rs
+@@ -10,15 +10,22 @@ impl Module14 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module14 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_15.rs b/src/module_15.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_15.rs
++++ b/src/module_15.rs
+@@ -10,15 +10,22 @@ impl Module15 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module15 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_16.rs b/src/module_16.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_16.rs
++++ b/src/module_16.rs
+@@ -10,15 +10,22 @@ impl Module16 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module16 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_17.rs b/src/module_17.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_17.rs
++++ b/src/module_17.rs
+@@ -10,15 +10,22 @@ impl Module17 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module17 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_18.rs b/src/module_18.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_18.rs
++++ b/src/module_18.rs
+@@ -10,15 +10,22 @@ impl Module18 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module18 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_19.rs b/src/module_19.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_19.rs
++++ b/src/module_19.rs
+@@ -10,15 +10,22 @@ impl Module19 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module19 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_20.rs b/src/module_20.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_20.rs
++++ b/src/module_20.rs
+@@ -10,15 +10,22 @@ impl Module20 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module20 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_21.rs b/src/module_21.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_21.rs
++++ b/src/module_21.rs
+@@ -10,15 +10,22 @@ impl Module21 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module21 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_22.rs b/src/module_22.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_22.rs
++++ b/src/module_22.rs
+@@ -10,15 +10,22 @@ impl Module22 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module22 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_23.rs b/src/module_23.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_23.rs
++++ b/src/module_23.rs
+@@ -10,15 +10,22 @@ impl Module23 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module23 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);
+diff --git a/src/module_24.rs b/src/module_24.rs
+index 1a2b3c4..5d6e7f8 100644
+--- a/src/module_24.rs
++++ b/src/module_24.rs
+@@ -10,15 +10,22 @@ impl Module24 {
++    let new_value_1 = compute_updated(1);
+     let shared_line_2 = 2 * 2;
+     let shared_line_3 = 3 * 2;
+-    let old_value_4 = compute_legacy(4);
++    let new_value_5 = compute_updated(5);
+     let shared_line_6 = 6 * 2;
+     let shared_line_7 = 7 * 2;
+-    let old_value_8 = compute_legacy(8);
++    let new_value_9 = compute_updated(9);
+     let shared_line_10 = 10 * 2;
+     let shared_line_11 = 11 * 2;
+-    let old_value_12 = compute_legacy(12);
++    let new_value_13 = compute_updated(13);
+     let shared_line_14 = 14 * 2;
+     let shared_line_15 = 15 * 2;
+@@ -80,10 +87,14 @@ impl Module24 {
++        new_behaviour(1);
+         common(2);
+         common(3);
+-        old_behaviour(4);
++        new_behaviour(5);
+         common(6);
+         common(7);
+-        old_behaviour(8);
++        new_behaviour(9);
+         common(10);
+         common(11);
+-        old_behaviour(12);
++        new_behaviour(13);
+         common(14);
+         common(15);

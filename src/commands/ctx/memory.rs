@@ -1728,7 +1728,7 @@ fn label_to_scope(label: &str) -> MemoryScope {
     }
 }
 
-fn sha256_hex(data: &str) -> String {
+pub(crate) fn sha256_hex(data: &str) -> String {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(data.as_bytes());
     hash.iter().map(|byte| format!("{byte:02x}")).collect()

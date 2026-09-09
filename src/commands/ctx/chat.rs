@@ -615,15 +615,25 @@ pub(crate) fn dash_orchestrator_pane(
     // `quiet` parameter reaches this function, so a caller that silenced the
     // banner (`--quiet` folded into the environment before `CtxConfig::load`
     // ran) already has `cfg.chrome.events == false` here too.
-    super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr()).emit(
-        &super::announce::Event::SandboxPosture {
-            detail: if sandbox_extra.is_empty() {
-                "not applied (operator flags or [sandbox] enabled = false)".to_string()
-            } else {
-                sandbox_extra.join(" ")
-            },
+    let announcer =
+        super::announce::Announcer::new(cfg.chrome.events, console::colors_enabled_stderr());
+    announcer.emit(&super::announce::Event::SandboxPosture {
+        detail: if sandbox_extra.is_empty() {
+            "not applied (operator flags or [sandbox] enabled = false)".to_string()
+        } else {
+            sandbox_extra.join(" ")
         },
-    );
+    });
+    // Issue #420: same seam as every other supervisor-start launch path --
+    // heal any self-healable (`Outdated`) hook entry, then warn at most once
+    // per 24h if something still drifted. Best-effort: no home directory is
+    // not a reason to fail the launch.
+    if let Ok(home) = crate::utils::home_dir() {
+        let _ = super::hook_integrity::heal_outdated(state, &home);
+        if let Some(summary) = super::hook_integrity::drift_warning_if_due(state, &home) {
+            announcer.emit(&super::announce::Event::HookIntegrity { summary });
+        }
+    }
     argv.extend(sandbox_extra);
     argv.extend(prompt_args);
     // R1: a dashboard pane -- and only a dashboard pane -- pins the harness's

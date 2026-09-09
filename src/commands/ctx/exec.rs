@@ -1090,6 +1090,15 @@ fn run_with_clock_inner<W: Write>(
             policy_extra.join(" ")
         },
     });
+    // Issue #420: heal any self-healable (`Outdated`) hook entry, then warn
+    // at most once per 24h if something still drifted. Best-effort: no home
+    // directory is not a reason to fail the launch.
+    if let Ok(home) = crate::utils::home_dir() {
+        let _ = super::hook_integrity::heal_outdated(&state, &home);
+        if let Some(summary) = super::hook_integrity::drift_warning_if_due(&state, &home) {
+            announcer.emit(&super::announce::Event::HookIntegrity { summary });
+        }
+    }
 
     // The probe has to hit the binary that will actually be spawned. When the
     // argv names no program the adapter builds the launch, so there is nothing

@@ -382,13 +382,13 @@ fn home_dir() -> SetupResult<PathBuf> {
     crate::utils::home_dir()
 }
 
-fn claude_config_dir(home: &Path) -> PathBuf {
+pub(crate) fn claude_config_dir(home: &Path) -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".claude"))
 }
 
-fn codex_config_dir(home: &Path) -> PathBuf {
+pub(crate) fn codex_config_dir(home: &Path) -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"))
@@ -433,7 +433,74 @@ fn contains_command(value: &Value, command: &str) -> bool {
     }
 }
 
-fn load_json_object(path: &Path) -> SetupResult<Value> {
+/// Whether `command` is actually installed at its OWN `(event, matcher)`
+/// slot in `settings` -- unlike `contains_command` (which matches `command`
+/// appearing anywhere at all in the JSON tree: an MCP server entry, a
+/// different hook event, the wrong matcher), this only looks under
+/// `hooks[event]`, at entries whose `matcher` field equals `matcher` (or is
+/// absent, when `matcher` is `None`). `install_claude_integration`/
+/// `install_codex_hooks` use this to decide which shapes are safe to
+/// baseline after the `ensure_harness_hook` loop: `ensure_harness_hook`
+/// itself only checks `contains_command` before deciding whether to insert,
+/// so a command already present under the wrong slot is left un-inserted
+/// there while genuinely missing from the slot `hook status` actually reads
+/// -- baselining that shape anyway would make `hook status` call it
+/// `Missing` forever, since nothing at the scoped slot will ever match the
+/// baseline again.
+fn command_live_at_slot(
+    settings: &Value,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+) -> bool {
+    let Some(entries) = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(event))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    entries.iter().any(|entry| {
+        if entry.get("matcher").and_then(Value::as_str) != matcher {
+            return false;
+        }
+        entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|hooks| {
+                hooks.iter().any(|hook| {
+                    hook.get("type").and_then(Value::as_str) == Some("command")
+                        && hook.get("command").and_then(Value::as_str) == Some(command)
+                })
+            })
+    })
+}
+
+/// Issue #424: whether claude's own `settings.json` currently has BOTH the
+/// compact-output `PostToolUse` hook and the safety `PreToolUse` hook
+/// installed -- the two commands `zirv ctx status`'s own bounded
+/// hook-health check treats as "the hook is wired up at all". Resolves its
+/// own home directory rather than taking one, so `status.rs` (a different
+/// module tree) never needs to reach into this module's private
+/// `home_dir`/`claude_config_dir` helpers directly. Read-only: never
+/// touches `HARNESS_HOOKS`'s own install path.
+///
+/// Fails open (`true`, meaning "assume installed, stay silent") only when
+/// the home directory itself cannot be resolved -- an environment this
+/// unusual is not evidence the hook is missing. A resolvable home with no
+/// readable `settings.json` at all is not the same doubt: that genuinely
+/// means neither hook is installed, so it returns `false`.
+pub(crate) fn claude_compaction_and_safety_hooks_installed() -> bool {
+    let Ok(home) = home_dir() else {
+        return true;
+    };
+    let claude_settings = load_json_object(&claude_config_dir(&home).join("settings.json"))
+        .unwrap_or_else(|_| json!({}));
+    contains_command(&claude_settings, CLAUDE_COMPACT_OUTPUT_HOOK.2)
+        && contains_command(&claude_settings, CLAUDE_SAFETY_HOOK.2)
+}
+
+pub(crate) fn load_json_object(path: &Path) -> SetupResult<Value> {
     if !path.exists() {
         return Ok(json!({}));
     }
@@ -663,6 +730,34 @@ fn install_claude_integration(home: &Path, dry_run: bool) -> SetupResult<(usize,
             false,
         )?;
     }
+    if !dry_run {
+        // Issue #420 (review follow-up): `written` only holds hooks *newly
+        // inserted this run* -- an operator with an already-installed file
+        // re-running `zirv setup apply` (the documented remedy for
+        // `NoBaseline`) gets `written == []` and never records a baseline
+        // at all, so drift detection stays inert for every pre-existing
+        // install forever. Every current-shape slot in `HARNESS_HOOKS`/
+        // `CLAUDE_ONLY_HOOKS` is guaranteed present in `settings` at this
+        // point -- `ensure_harness_hook` either found it already there or
+        // just inserted it -- so baseline every one of them, not only the
+        // ones this call happened to add. Best-effort, same as before: a
+        // baseline write failure (e.g. the platform state directory cannot
+        // be determined) must never turn a successful hook install into a
+        // hard `setup apply` failure; it just leaves these entries
+        // `NoBaseline` in `zirv ctx hook status`.
+        let mut current_shapes: Vec<ctx::hook_integrity::HookShape> = HARNESS_HOOKS.to_vec();
+        current_shapes.extend(CLAUDE_ONLY_HOOKS);
+        // Issue #420 (delta-review fix): only baseline a shape that is
+        // actually live at its own scoped slot -- `ensure_harness_hook`
+        // skipped inserting it merely because `contains_command` found the
+        // command string somewhere else in the tree, so it may not be here.
+        current_shapes.retain(|&(event, matcher, command)| {
+            command_live_at_slot(&settings, event, matcher, command)
+        });
+        if let Ok(state) = ctx::state::StateDir::resolve(&ctx::config::env_from_process()) {
+            let _ = ctx::hook_integrity::record_baseline(&state, &settings_path, &current_shapes);
+        }
+    }
     Ok((hooks_added, statusline_added))
 }
 
@@ -694,6 +789,26 @@ fn install_codex_hooks(home: &Path, hooks_path: &Path, dry_run: bool) -> SetupRe
             &(serde_json::to_string_pretty(&hooks)? + "\n"),
             false,
         )?;
+    }
+    if !dry_run {
+        // Issue #420 (review follow-up): same reasoning as
+        // `install_claude_integration`'s own identical block -- baseline
+        // every current-shape slot present in `hooks` (guaranteed by the
+        // `ensure_harness_hook` loop above), not only ones newly inserted
+        // this run, so a re-`apply` over an already-installed `hooks.json`
+        // still records a baseline. Best-effort: a write failure here
+        // leaves these entries `NoBaseline` in `zirv ctx hook status`
+        // instead of failing `setup apply`.
+        if let Ok(state) = ctx::state::StateDir::resolve(&ctx::config::env_from_process()) {
+            // Issue #420 (delta-review fix): same reasoning as
+            // `install_claude_integration`'s own identical filter -- only
+            // baseline a shape actually live at its own scoped slot.
+            let mut current_shapes: Vec<ctx::hook_integrity::HookShape> = HARNESS_HOOKS.to_vec();
+            current_shapes.retain(|&(event, matcher, command)| {
+                command_live_at_slot(&hooks, event, matcher, command)
+            });
+            let _ = ctx::hook_integrity::record_baseline(&state, hooks_path, &current_shapes);
+        }
     }
     Ok(hooks_added)
 }
@@ -4061,6 +4176,150 @@ mod tests {
         assert_eq!(hooks_added_again, 0, "a second apply must add nothing more");
     }
 
+    /// Review follow-up to issue #420: an operator with an already-installed
+    /// `settings.json` re-running `zirv setup apply` -- the documented
+    /// remedy for `NoBaseline` -- must still come out of it with a baseline
+    /// recorded for every current-shape hook slot, not just the ones a
+    /// fresh install happens to add. Before the fix, `hooks_added == 0` on
+    /// the second apply meant `record_baseline` was never even called, so
+    /// `zirv ctx hook status` stayed `NoBaseline` forever.
+    #[test]
+    fn install_claude_integration_records_a_baseline_on_a_reapply_with_no_changes() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let _claude_home = VarGuard::set(&[("CLAUDE_CONFIG_DIR", None)]);
+        let state_dir = home.path().join("state");
+        let _state_env = VarGuard::set(&[(
+            ctx::state::STATE_ENV,
+            Some(state_dir.to_str().expect("utf8 state dir")),
+        )]);
+
+        let (hooks_added, _) = install_claude_integration(home.path(), false).expect("first apply");
+        assert!(hooks_added > 0);
+
+        // The re-apply is the interesting case: nothing left to add.
+        let (hooks_added_again, _) =
+            install_claude_integration(home.path(), false).expect("second apply");
+        assert_eq!(hooks_added_again, 0);
+
+        let state = ctx::state::StateDir::resolve(&ctx::config::env_from_process())
+            .expect("state dir resolves");
+        let rows = ctx::hook_integrity::report(&state, home.path()).expect("report");
+        let claude_rows: Vec<_> = rows.iter().filter(|row| row.provider == "claude").collect();
+        assert_eq!(
+            claude_rows.len(),
+            HARNESS_HOOKS.len() + CLAUDE_ONLY_HOOKS.len()
+        );
+        for row in &claude_rows {
+            assert_eq!(
+                row.state,
+                ctx::hook_integrity::HookState::Ok,
+                "every claude slot must have a baseline after either apply: {row:?}"
+            );
+        }
+    }
+
+    /// Codex counterpart of
+    /// `install_claude_integration_records_a_baseline_on_a_reapply_with_no_changes`.
+    #[test]
+    fn install_codex_integration_records_a_baseline_on_a_reapply_with_no_changes() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let _codex_home = VarGuard::set(&[("CODEX_HOME", None)]);
+        let state_dir = home.path().join("state");
+        let _state_env = VarGuard::set(&[(
+            ctx::state::STATE_ENV,
+            Some(state_dir.to_str().expect("utf8 state dir")),
+        )]);
+
+        let hooks_added = install_codex_integration(home.path(), false).expect("first apply");
+        assert!(hooks_added > 0);
+
+        let hooks_added_again =
+            install_codex_integration(home.path(), false).expect("second apply");
+        assert_eq!(hooks_added_again, 0);
+
+        let state = ctx::state::StateDir::resolve(&ctx::config::env_from_process())
+            .expect("state dir resolves");
+        let rows = ctx::hook_integrity::report(&state, home.path()).expect("report");
+        let codex_rows: Vec<_> = rows.iter().filter(|row| row.provider == "codex").collect();
+        assert_eq!(codex_rows.len(), HARNESS_HOOKS.len());
+        for row in &codex_rows {
+            assert_eq!(
+                row.state,
+                ctx::hook_integrity::HookState::Ok,
+                "every codex slot must have a baseline after either apply: {row:?}"
+            );
+        }
+    }
+
+    /// Delta-review fix for issue #420: `ensure_harness_hook` only checks
+    /// `contains_command` (which matches a command string appearing
+    /// ANYWHERE in the JSON tree) before deciding whether to insert -- so a
+    /// shape whose command string already sits under the WRONG event is
+    /// left un-inserted at its own scoped `hooks.Stop` slot, yet used to get
+    /// baselined anyway because the baseline block replayed the full shape
+    /// list unconditionally. That made `hook status` call the slot
+    /// `Missing` forever (a baseline exists, nothing live matches it) rather
+    /// than the honest `NoBaseline` (nothing was ever really installed).
+    #[test]
+    fn install_claude_integration_does_not_baseline_a_shape_present_only_under_the_wrong_event() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+        let _claude_home = VarGuard::set(&[("CLAUDE_CONFIG_DIR", None)]);
+        let state_dir = home.path().join("state");
+        let _state_env = VarGuard::set(&[(
+            ctx::state::STATE_ENV,
+            Some(state_dir.to_str().expect("utf8 state dir")),
+        )]);
+
+        let stop_command = HARNESS_HOOKS
+            .iter()
+            .find(|(event, ..)| *event == "Stop")
+            .map(|(_, _, command)| *command)
+            .expect("HARNESS_HOOKS has a Stop shape");
+
+        // Pre-seed settings.json with the Stop shape's own command string,
+        // but filed under a different event -- `contains_command` still
+        // finds it (it searches the whole tree), so `ensure_harness_hook`
+        // never inserts it at `hooks.Stop`.
+        let settings_path = claude_config_dir(home.path()).join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": stop_command}]}
+                    ]
+                }
+            }))
+            .expect("json"),
+        )
+        .expect("write settings");
+
+        install_claude_integration(home.path(), false).expect("apply");
+
+        let settings = load_json_object(&settings_path).expect("settings");
+        assert!(
+            !command_live_at_slot(&settings, "Stop", None, stop_command),
+            "the command must still be missing from its own scoped slot: {settings:?}"
+        );
+
+        let state = ctx::state::StateDir::resolve(&ctx::config::env_from_process())
+            .expect("state dir resolves");
+        let rows = ctx::hook_integrity::report(&state, home.path()).expect("report");
+        let stop_row = rows
+            .iter()
+            .find(|row| row.provider == "claude" && row.event == "Stop" && row.matcher.is_none())
+            .expect("Stop row present");
+        assert_eq!(
+            stop_row.state,
+            ctx::hook_integrity::HookState::NoBaseline,
+            "must not be baselined when it was never live at its own scoped slot: {stop_row:?}"
+        );
+    }
+
     #[test]
     fn memory_init_is_bounded_dry_runnable_and_refuses_silent_overwrite() {
         let repo = tempfile::tempdir().expect("repo");
@@ -4568,6 +4827,27 @@ mod tests {
         assert!(
             !contains_command(&codex_hooks, CLAUDE_SAFETY_HOOK.2),
             "the safety hook must not reach codex's hooks.json either: {codex_hooks}"
+        );
+    }
+
+    /// Issue #424: `claude_compaction_and_safety_hooks_installed` reads
+    /// `false` before `zirv setup` has ever run, and `true` once both the
+    /// compact-output and safety hooks are installed -- what `zirv ctx
+    /// status`'s own bounded hook-health check gates on.
+    #[test]
+    fn claude_compaction_and_safety_hooks_installed_reflects_the_settings_file() {
+        let home = tempfile::tempdir().expect("home");
+        let _home = HomeGuard::set(home.path());
+
+        assert!(
+            !claude_compaction_and_safety_hooks_installed(),
+            "neither hook is installed on a fresh home"
+        );
+
+        install_claude_integration(home.path(), false).expect("apply");
+        assert!(
+            claude_compaction_and_safety_hooks_installed(),
+            "both hooks are installed after `zirv setup`"
         );
     }
 

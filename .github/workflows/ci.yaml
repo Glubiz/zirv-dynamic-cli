@@ -27,6 +27,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Issue #428: `fetch-depth: 0` above fetches full history for every
+      # branch and tag, so `origin/${{ github.base_ref }}` already resolves
+      # here without a separate fetch (unlike the shallow `version-bump` job
+      # below, which fetches its own base ref explicitly for that reason).
+      # Runs before the build: a missing test is cheaper to report before
+      # spending the rest of this job's time on it.
+      - name: Test-presence gate (issue #428)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="HEAD~1"
+          fi
+          bash scripts/check-test-presence.sh --base "$base"
+
+      # The gate proves itself on every run, not just when someone remembers
+      # to re-run --self-test locally.
+      - name: Test-presence gate self-test
+        run: bash scripts/check-test-presence.sh --self-test
+
       - name: Set Up Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -186,3 +206,32 @@ jobs:
             echo "::error file=Cargo.toml::Version ($HEAD) is lower than ${{ github.base_ref }}'s ($BASE)."
             exit 1
           fi
+
+  # Issue #429: an ADVISORY nudge, never a gate -- `continue-on-error: true`
+  # on top of the script's own always-0 exit means this job can never fail
+  # the PR no matter what it finds. PR-only (a push has no base commit to
+  # diff against in this repo's rebase-merge workflow) and needs full
+  # history the same way the `test` job's checkout gets it: a depth-1
+  # checkout plus a SEPARATE depth-1 fetch of the base ref (the previous
+  # shape here) leaves the two shallow histories with no common ancestor
+  # object, so `git diff base...HEAD` in security-scan.sh could not find a
+  # merge base and failed -- silently, since that failure was swallowed into
+  # an empty (`|| true`) diff, making the scan a permanent silent no-op on
+  # every PR.
+  security-scan:
+    name: Advisory Security Scan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run advisory scan
+        run: bash scripts/security-scan.sh --base "origin/${{ github.base_ref }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # The scan proves itself on every run too.
+      - name: Advisory scan self-test
+        run: bash scripts/security-scan.sh --self-test

@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-03
+last-verified: 2026-09-08
 ---
 
 # Testing Guide
@@ -64,6 +64,17 @@ own prefix stability) failable at test time. The fixture-driven case
 `#[cfg(unix)]`, like every other real-PTY/real-subprocess test in this
 project — see [[Known Issues]] for why those only run in the Linux Docker
 round, never on Windows.
+
+## Test-presence CI gate (issue #428)
+
+`scripts/check-test-presence.sh` runs early in the `test` job of CI, before
+the build: it diffs the PR (or `HEAD~1` outside a PR) against its base ref
+and fails, listing the offenders, when a changed `src/commands/**/*.rs` or
+`src/script_runner/**/*.rs` file lacks an inline `#[cfg(test)]` block. `mod.rs`
+files, `src/commands/ctx/schemas/**`, and a diff whose hunks touch only
+comment/doc/blank lines are exempt. `--self-test` proves the gate both ways
+against scratch repos and runs as its own CI step so the gate proves itself
+on every run.
 
 ## Quick Reference
 

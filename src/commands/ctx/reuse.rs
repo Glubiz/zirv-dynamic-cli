@@ -229,43 +229,119 @@ impl BlockState {
     /// text may be read for definitions -- true only when the line BEGAN
     /// outside every block, because a column-0 definition inside one is
     /// prose, not code.
+    ///
+    /// Issue #435: a delimiter-shaped substring INSIDE a string literal
+    /// (`"see /* usage"`) or after a `//` line comment (`// see /* usage`)
+    /// is not a real opener, so a single character-level pass scans `line`
+    /// while OUTSIDE a block, skipping whole string literals and anything
+    /// from an unquoted `//` to the end of the line before ever looking for
+    /// [`BLOCK_DELIMITERS`]. None of that applies while INSIDE a block --
+    /// once inside a `/* ... */` comment or a `"""`/`'''` docstring, quotes
+    /// and `//` are just prose, so the closer is searched for in the raw
+    /// text, exactly as before.
     fn admits(&mut self, line: &str) -> bool {
         let outside = self.open.is_none();
-        // A line comment that merely mentions a delimiter (`/// see the
-        // `/* ... */` above`) opens nothing: it ends at the newline. Only
-        // checked outside a block, so a closer on such a line still closes.
-        if outside && line.trim_start().starts_with("//") {
-            return true;
-        }
-        let mut rest = line;
-        loop {
-            match self.open {
-                Some(closer) => match rest.find(closer) {
-                    Some(at) => {
-                        self.open = None;
-                        rest = &rest[at + closer.len()..];
-                    }
-                    None => break,
-                },
-                None => {
-                    let next = BLOCK_DELIMITERS
-                        .iter()
-                        .filter_map(|(opener, closer)| {
-                            rest.find(opener).map(|at| (at, *opener, *closer))
-                        })
-                        .min_by_key(|(at, _, _)| *at);
-                    match next {
-                        Some((at, opener, closer)) => {
-                            self.open = Some(closer);
-                            rest = &rest[at + opener.len()..];
-                        }
-                        None => break,
-                    }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if let Some(closer) = self.open {
+                if matches_at(&chars, i, closer) {
+                    self.open = None;
+                    i += closer.chars().count();
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            // Outside a block: a `//` not inside a string ends the line's
+            // relevance right here -- nothing after it can open a block.
+            if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
+                break;
+            }
+            if chars[i] == '"' || chars[i] == '\'' {
+                let quote = chars[i];
+                // A triple quote is a BLOCK delimiter to this module, not a
+                // string literal -- checked here, before any stripping, so
+                // it falls through to the delimiter search below instead of
+                // being consumed as an (empty) string plus a stray quote.
+                let is_triple =
+                    chars.get(i + 1) == Some(&quote) && chars.get(i + 2) == Some(&quote);
+                // No matching close on this line means it is not a string
+                // at all -- a Rust lifetime or bare char tick like `'a` --
+                // so it falls through and is left as ordinary text rather
+                // than swallowing the rest of the line.
+                if !is_triple && let Some(close) = find_closing_quote(&chars, i + 1, quote) {
+                    // The whole literal, quotes included, is skipped: its
+                    // content may contain `/*`, `*/` or `//`, and none of
+                    // those are real here.
+                    i = close + 1;
+                    continue;
                 }
             }
+            if let Some((opener, closer)) = BLOCK_DELIMITERS
+                .iter()
+                .find(|(opener, _)| matches_at(&chars, i, opener))
+            {
+                self.open = Some(closer);
+                i += opener.chars().count();
+                continue;
+            }
+            i += 1;
         }
         outside
     }
+}
+
+/// Whether `pat` occurs in `chars` starting at exactly `i`.
+fn matches_at(chars: &[char], i: usize, pat: &str) -> bool {
+    let pat: Vec<char> = pat.chars().collect();
+    i + pat.len() <= chars.len() && chars[i..i + pat.len()] == pat[..]
+}
+
+/// The index of the unescaped `quote` character that closes a literal
+/// opened just before `start`, if one exists at or after `start` on the
+/// same line. A backslash escapes the following character, so `\'` or `\"`
+/// never closes the literal early -- this is what lets `"a \" /* b"` still
+/// find its real closing quote instead of the escaped one.
+///
+/// Review round 3, finding 3: for a single quote (`'`) specifically, this
+/// now folds the closing-quote search and the [`BLOCK_DELIMITERS`]
+/// opener search into one forward pass, and only reports a close when it is
+/// found BEFORE any block opener. `'` almost never opens a genuine
+/// multi-character string in the languages this heuristic cares about --
+/// it is a Rust lifetime (`'a`) or a one-character literal (`'a'`, `'\n'`)
+/// -- so the earlier version, which searched only for the closing quote,
+/// let a stray lifetime tick pair with an unrelated LATER apostrophe (an
+/// English contraction like "can't" inside real prose) with a genuine `/*`
+/// sitting in between; treating that whole span as string content skipped
+/// right over the `/*` and the block it should have opened never did.
+/// Once such an opener is seen first, the tick is not a literal at all: the
+/// caller's existing "no close on this line" fallback already treats it as
+/// plain text and lets the normal per-character scan reach -- and open --
+/// the real block opener on its own.
+///
+/// A double quote (`"`) keeps the old, opener-blind search: a `"..."`
+/// string is unambiguous in these languages, and a real one routinely
+/// contains a `/*`-shaped substring (documentation, examples) that must
+/// stay inert -- see `added_definitions_ignores_delimiters_inside_strings_
+/// and_comments`'s own `"see /* usage"` case.
+fn find_closing_quote(chars: &[char], start: usize, quote: char) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() {
+        if quote == '\''
+            && BLOCK_DELIMITERS
+                .iter()
+                .any(|(opener, _)| matches_at(chars, i, opener))
+        {
+            return None;
+        }
+        match chars[i] {
+            '\\' => i += 2,
+            c if c == quote => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Every `(kind, name)` declared on one line, in pattern order, filtered by
@@ -835,6 +911,63 @@ mod tests {
             added_definitions("/// see the `/* ... */` above\npub fn render_widget() {}\n"),
             vec!["render_widget".to_string()],
             "and a line comment mentioning one opens nothing"
+        );
+    }
+
+    /// Issue #435, item 2: a `/*`-shaped substring living inside a string
+    /// literal or after an unquoted `//` is not a real block opener, so it
+    /// must never leave the rest of the file skipped.
+    #[test]
+    fn added_definitions_ignores_delimiters_inside_strings_and_comments() {
+        assert_eq!(
+            added_definitions("let example = \"see /* usage\";\npub fn render_widget() {}\n"),
+            vec!["render_widget".to_string()],
+            "`/*` inside a string literal does not open a block"
+        );
+        assert_eq!(
+            added_definitions("foo(); // see /* usage\npub fn render_widget() {}\n"),
+            vec!["render_widget".to_string()],
+            "an inline `// ... /*` does not open a block"
+        );
+        assert_eq!(
+            added_definitions("let x = \"a \\\" /* b\";\npub fn render_widget() {}\n"),
+            vec!["render_widget".to_string()],
+            "an escaped quote does not end the string early and expose the `/*`"
+        );
+        assert!(
+            added_definitions("pub fn lifetime_example<'a>(x: &'a str) {}\n")
+                .contains(&"lifetime_example".to_string()),
+            "a Rust lifetime tick is not mistaken for an unterminated string"
+        );
+        // A real block comment, and a real triple-quoted docstring, must
+        // still behave exactly as before this fix.
+        assert!(
+            added_definitions("/*\npub fn parse_widget() {}\n*/\n").is_empty(),
+            "a real block comment still opens"
+        );
+        assert!(
+            added_definitions("\"\"\"\ndef compute_widget(x):\n\"\"\"\n").is_empty(),
+            "a real docstring still opens"
+        );
+    }
+
+    /// Review round 3, finding 3: the #435 quote-skip ignored block openers,
+    /// so a stray lifetime tick could pair with an unrelated LATER
+    /// apostrophe (an English contraction like "can't" in real prose) that
+    /// sits after a genuine `/*`. Treating that whole span as string content
+    /// skipped right over the `/*`, so the block never opened and a
+    /// definition on the very next line -- which is really still inside the
+    /// comment -- was wrongly admitted.
+    #[test]
+    fn added_definitions_does_not_let_a_lifetime_tick_swallow_a_real_block_opener() {
+        let definitions = added_definitions(
+            "fn foo<'a>(x: &T) { /* comment can't be simple\n\
+             pub fn should_not_be_seen() {}\n",
+        );
+        assert!(
+            !definitions.contains(&"should_not_be_seen".to_string()),
+            "the `/*` must still open a block despite the lifetime tick and the later \
+             apostrophe in \"can't\", so the next line stays inside the comment: {definitions:?}"
         );
     }
 

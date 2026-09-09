@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::output_markdown;
+use super::output_search;
 use super::output_shape;
 use super::state::{self, StateDir};
 use crate::commands::workflow::verification::{
@@ -663,6 +665,18 @@ const VERBATIM_PROGRAMS: &[&str] = &[
     "strings",
 ];
 
+/// Whether `program` (already bare-named and lower-cased) is one of
+/// [`VERBATIM_PROGRAMS`] -- exposed so `output_search::detect_shape` can
+/// apply the same "any segment naming a reader wins" rule this module's
+/// `classify_segment` already does, as defense in depth: `detect_shape` is
+/// only ever called once `classify_compaction` has already decided `Shape`,
+/// which already guarantees no segment is a reader, but a wrong shape choice
+/// would silently drop a reader's content just the same as a wrong `Shape`
+/// classification would.
+pub(crate) fn is_verbatim_program(program: &str) -> bool {
+    VERBATIM_PROGRAMS.contains(&program)
+}
+
 /// `git` subcommands that are reads of content rather than progress logs.
 /// `diff`/`show` moved to [`DIFF_GIT_SUBCOMMANDS`] (issue #412): a bounded,
 /// lossless-shape summary is possible for those because their grammar is
@@ -709,6 +723,14 @@ pub(crate) enum CompactionScope {
     /// render_diff_summary`), which never shows a hunk, partial or
     /// otherwise.
     Diff,
+    /// Issue #414: a search/listing tool (`rg`/`grep`/`find`/`fd`/`ls`/`dir`/
+    /// `tree`) with `[output] compact_search` opted in -- reached only when
+    /// that operator-only key is set, since these seven stay `Verbatim`
+    /// otherwise. Compacted past `compact_generic_min_bytes`, the same
+    /// threshold `Generic` uses, into a grouped/capped rendering built from
+    /// each program's own known grammar (`output_search`), never a head/tail
+    /// guess.
+    Shape,
 }
 
 /// Global `git` flags that consume a SEPARATE value token (`-C dir`,
@@ -755,6 +777,102 @@ pub(crate) fn bare_program(token: &str) -> String {
         .to_string()
 }
 
+/// The early-return verdict `classify_compaction` would give for ONE
+/// `normalize_segments` candidate, plus whether that candidate names a
+/// modelled build/test/log program (`known`) when it triggers none of them.
+struct SegmentClass {
+    scope: Option<CompactionScope>,
+    known: bool,
+}
+
+fn classify_segment(segment: &str, extra: &[String], compact_search: bool) -> SegmentClass {
+    let collapsed = super::safety::collapse_whitespace(segment);
+    let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
+    let Some(first) = tokens.first() else {
+        return SegmentClass {
+            scope: None,
+            known: false,
+        };
+    };
+    let program = bare_program(first);
+    let sub_index = if program == "git" {
+        git_subcommand_index(&tokens)
+    } else {
+        1
+    };
+    let sub = tokens.get(sub_index).map(|t| t.to_ascii_lowercase());
+    let sub = sub.as_deref();
+
+    if program == "zirv"
+        && sub == Some("ctx")
+        && matches!(
+            tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
+            Some("output")
+        )
+    {
+        return SegmentClass {
+            scope: Some(CompactionScope::Verbatim),
+            known: false,
+        };
+    }
+    if program == "zirv"
+        && sub == Some("ctx")
+        && matches!(
+            tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
+            Some("run")
+        )
+        && tokens.contains(&"--full")
+    {
+        return SegmentClass {
+            scope: Some(CompactionScope::Verbatim),
+            known: false,
+        };
+    }
+    if compact_search
+        && output_search::SEARCH_SHAPE_PROGRAMS.contains(&program.as_str())
+        && !extra.contains(&program)
+    {
+        return SegmentClass {
+            scope: Some(CompactionScope::Shape),
+            known: false,
+        };
+    }
+    if VERBATIM_PROGRAMS.contains(&program.as_str()) || extra.contains(&program) {
+        return SegmentClass {
+            scope: Some(CompactionScope::Verbatim),
+            known: false,
+        };
+    }
+    if program == "git" && sub.is_some_and(|sub| VERBATIM_GIT_SUBCOMMANDS.contains(&sub)) {
+        return SegmentClass {
+            scope: Some(CompactionScope::Verbatim),
+            known: false,
+        };
+    }
+    if program == "git" && sub.is_some_and(|sub| DIFF_GIT_SUBCOMMANDS.contains(&sub)) {
+        return SegmentClass {
+            scope: Some(CompactionScope::Diff),
+            known: false,
+        };
+    }
+    // `git log -p`/`--patch` prints the same unified-diff grammar as
+    // `git diff`/`show` -- issue #412 bounds it the same way, rather than
+    // leaving it verbatim at any size like every other `git log`.
+    if program == "git"
+        && sub == Some("log")
+        && tokens.iter().any(|t| *t == "-p" || *t == "--patch")
+    {
+        return SegmentClass {
+            scope: Some(CompactionScope::Diff),
+            known: false,
+        };
+    }
+
+    let known = KNOWN_PROGRAMS.contains(&program.as_str())
+        && (program != "git" || sub.is_some_and(|sub| KNOWN_GIT_SUBCOMMANDS.contains(&sub)));
+    SegmentClass { scope: None, known }
+}
+
 /// Decides how much of `command`'s output may be replaced.
 ///
 /// Verbatim wins over everything, and it is reached by three independent
@@ -779,7 +897,26 @@ pub(crate) fn bare_program(token: &str) -> String {
 /// bounded per-file listing (never a partial hunk) is possible once the
 /// output passes `[output] diff_max_bytes`. `blame`/`grep` stay full
 /// `Verbatim`, since their output has no such bounded shape.
-pub(crate) fn classify_compaction(command: &str, extra_verbatim: &[String]) -> CompactionScope {
+///
+/// `compact_search` (issue #414, `[output] compact_search`, default `false`)
+/// is a third, narrower carve-out: when an operator opts in, `rg`/`grep`/
+/// `find`/`fd`/`ls`/`dir`/`tree` -- ordinarily `VERBATIM_PROGRAMS` members --
+/// become `CompactionScope::Shape` instead, UNLESS the operator's own
+/// `extra_verbatim` (`[output] verbatim`) also names them: that explicit,
+/// per-program "never compact this" always wins over the blanket opt-in.
+///
+/// Verbatim wins outright over Shape/Diff/Known across EVERY candidate
+/// segment `classify_segment` visits, not just the first one
+/// `normalize_segments` produces: that first candidate is always the whole
+/// unsplit command, so without this a compound command like `rg TODO src &&
+/// cat secrets.txt` classified as `Shape` from its leading `rg` before the
+/// later `cat` segment -- a real reader -- was ever inspected, silently
+/// letting file content through the shape-only renderer.
+pub(crate) fn classify_compaction(
+    command: &str,
+    extra_verbatim: &[String],
+    compact_search: bool,
+) -> CompactionScope {
     if command.contains('|') || command.contains('>') {
         return CompactionScope::Verbatim;
     }
@@ -787,71 +924,29 @@ pub(crate) fn classify_compaction(command: &str, extra_verbatim: &[String]) -> C
         .iter()
         .map(|name| bare_program(name))
         .collect();
-    let mut known = false;
-    for segment in super::safety::normalize_segments(command) {
-        let collapsed = super::safety::collapse_whitespace(&segment);
-        let tokens: Vec<&str> = collapsed.split(' ').filter(|t| !t.is_empty()).collect();
-        let Some(first) = tokens.first() else {
-            continue;
-        };
-        let program = bare_program(first);
-        let sub_index = if program == "git" {
-            git_subcommand_index(&tokens)
-        } else {
-            1
-        };
-        let sub = tokens.get(sub_index).map(|t| t.to_ascii_lowercase());
-        let sub = sub.as_deref();
+    let classes: Vec<SegmentClass> = super::safety::normalize_segments(command)
+        .iter()
+        .map(|segment| classify_segment(segment, &extra, compact_search))
+        .collect();
 
-        if program == "zirv"
-            && sub == Some("ctx")
-            && matches!(
-                tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
-                Some("output")
-            )
-        {
-            return CompactionScope::Verbatim;
-        }
-        if program == "zirv"
-            && sub == Some("ctx")
-            && matches!(
-                tokens.get(2).map(|t| t.to_ascii_lowercase()).as_deref(),
-                Some("run")
-            )
-            && tokens.contains(&"--full")
-        {
-            return CompactionScope::Verbatim;
-        }
-        if VERBATIM_PROGRAMS.contains(&program.as_str()) || extra.contains(&program) {
-            return CompactionScope::Verbatim;
-        }
-        if program == "git" && sub.is_some_and(|sub| VERBATIM_GIT_SUBCOMMANDS.contains(&sub)) {
-            return CompactionScope::Verbatim;
-        }
-        if program == "git" && sub.is_some_and(|sub| DIFF_GIT_SUBCOMMANDS.contains(&sub)) {
-            return CompactionScope::Diff;
-        }
-        // `git log -p`/`--patch` prints the same unified-diff grammar as
-        // `git diff`/`show` -- issue #412 bounds it the same way, rather than
-        // leaving it verbatim at any size like every other `git log`.
-        if program == "git"
-            && sub == Some("log")
-            && tokens.iter().any(|t| *t == "-p" || *t == "--patch")
-        {
-            return CompactionScope::Diff;
-        }
-
-        if KNOWN_PROGRAMS.contains(&program.as_str()) {
-            // Review finding 5: OR'd across every segment/candidate this
-            // loop visits, never assigned outright -- an unrecognised git
-            // subcommand in one candidate (or the same command's own
-            // "whole" candidate) must never erase a `Known` match an
-            // earlier segment already established.
-            known |=
-                program != "git" || sub.is_some_and(|sub| KNOWN_GIT_SUBCOMMANDS.contains(&sub));
-        }
+    // Verbatim wins outright over Shape/Diff/Known -- see the doc comment.
+    if classes
+        .iter()
+        .any(|class| class.scope == Some(CompactionScope::Verbatim))
+    {
+        return CompactionScope::Verbatim;
     }
-    if known {
+    // Failing that, the first candidate (in `normalize_segments` order) to
+    // produce a Shape/Diff verdict wins -- same order-sensitivity as before
+    // this fix, just no longer able to pre-empt a later Verbatim.
+    if let Some(scope) = classes.iter().find_map(|class| class.scope) {
+        return scope;
+    }
+    // Review finding 5 (unchanged): OR'd across every segment/candidate,
+    // never assigned outright -- an unrecognised git subcommand in one
+    // candidate must never erase a `Known` match an earlier segment already
+    // established.
+    if classes.iter().any(|class| class.known) {
         CompactionScope::Known
     } else {
         CompactionScope::Generic
@@ -1021,6 +1116,106 @@ pub(crate) fn summarize_stored(
         return Ok((record, summary));
     }
 
+    // Issue #414: `[output] compact_search` opted a search/listing program
+    // into `Shape` -- a bounded, grouped rendering (`output_search`) rather
+    // than a head/tail guess, dispatched to one of three shapes by the
+    // program `classify_compaction` already recognised.
+    if scope == CompactionScope::Shape {
+        let command_line = command.join(" ");
+        let kind = output_search::detect_shape(&command_line);
+        return match kind {
+            Some(output_search::ShapeKind::Search) => {
+                let shape_scan = output_search::scan_search_file(path);
+                let record = OutputRecord {
+                    schema_version: OUTPUT_SCHEMA_VERSION,
+                    id: id.to_string(),
+                    command: command.to_vec(),
+                    exit_code,
+                    started_at,
+                    lines: shape_scan.total_lines,
+                    bytes: shape_scan.total_bytes,
+                };
+                let _ = state::write_private(
+                    &dir.join(format!("{id}.json")),
+                    &serde_json::to_string(&record)?,
+                );
+                prune_outputs(dir, KEEP_NEWEST_OUTPUTS);
+                if output_shape::sniff_is_binary(path) {
+                    return Ok((record, None));
+                }
+                let summary = output_search::render_search_summary(
+                    id,
+                    &command_line,
+                    exit_code,
+                    &shape_scan,
+                    max_summary_bytes,
+                );
+                Ok((record, summary))
+            }
+            Some(output_search::ShapeKind::Listing) => {
+                let shape_scan = output_search::scan_listing_file(path);
+                let record = OutputRecord {
+                    schema_version: OUTPUT_SCHEMA_VERSION,
+                    id: id.to_string(),
+                    command: command.to_vec(),
+                    exit_code,
+                    started_at,
+                    lines: shape_scan.total_lines,
+                    bytes: shape_scan.total_bytes,
+                };
+                let _ = state::write_private(
+                    &dir.join(format!("{id}.json")),
+                    &serde_json::to_string(&record)?,
+                );
+                prune_outputs(dir, KEEP_NEWEST_OUTPUTS);
+                if output_shape::sniff_is_binary(path) {
+                    return Ok((record, None));
+                }
+                let summary = output_search::render_listing_summary(
+                    id,
+                    &command_line,
+                    exit_code,
+                    &shape_scan,
+                    max_summary_bytes,
+                );
+                Ok((record, summary))
+            }
+            // `Tree`, or an unrecognised program that somehow reached `Shape`
+            // (never happens today: `classify_compaction` only returns
+            // `Shape` for `output_search::SEARCH_SHAPE_PROGRAMS`, and
+            // `detect_shape` recognises every one of them) -- fail open to
+            // the directory-grouping shape's own scan rather than a panic.
+            _ => {
+                let shape_scan = output_search::scan_tree_file(path);
+                let record = OutputRecord {
+                    schema_version: OUTPUT_SCHEMA_VERSION,
+                    id: id.to_string(),
+                    command: command.to_vec(),
+                    exit_code,
+                    started_at,
+                    lines: shape_scan.total_lines,
+                    bytes: shape_scan.total_bytes,
+                };
+                let _ = state::write_private(
+                    &dir.join(format!("{id}.json")),
+                    &serde_json::to_string(&record)?,
+                );
+                prune_outputs(dir, KEEP_NEWEST_OUTPUTS);
+                if output_shape::sniff_is_binary(path) {
+                    return Ok((record, None));
+                }
+                let summary = output_search::render_tree_summary(
+                    id,
+                    &command_line,
+                    exit_code,
+                    &shape_scan,
+                    max_summary_bytes,
+                );
+                Ok((record, summary))
+            }
+        };
+    }
+
     // Pass 1 -- the SHARED classifier: failing test names and whether a
     // `test result:`/`Summary [...]` line was seen anywhere in the full
     // stream. Never a second implementation of either; see this module's own
@@ -1109,6 +1304,33 @@ pub(crate) fn summarize_stored(
     // from them.
     if output_shape::sniff_is_binary(path) {
         return Ok((record, None));
+    }
+
+    // Issue #416: a `gh`/`glab` `pr`/`issue`/`release` `view` result WITHOUT
+    // `--json` is a template body, not a shape zirv otherwise models -- its
+    // own boilerplate (an HTML comment, an empty checklist section, a
+    // `<details>` block's collapsed body) is stripped before anything else
+    // sees it, and every remaining paragraph is shown whole rather than
+    // head/tail cut through it. Falls through to the ordinary passes below
+    // when the command does not match, the filtered body is still too large
+    // to show whole, or the result does not beat the raw byte count.
+    let command_line = command.join(" ");
+    if output_markdown::is_gh_template_view(&command_line) {
+        let raw_text = std::fs::read(path)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        let filtered = output_markdown::filter_markdown_body(&raw_text);
+        if let Some(summary) = output_markdown::render_markdown_summary(
+            id,
+            &command_line,
+            exit_code,
+            &filtered,
+            scan.total_lines,
+            scan.total_bytes as usize,
+            max_summary_bytes,
+        ) {
+            return Ok((record, Some(summary)));
+        }
     }
 
     // Issue #411: a bracket-shaped stored output is tried as JSON before the
@@ -2034,7 +2256,7 @@ mod tests {
             "sh -c 'cat src/lib.rs'",
         ] {
             assert_eq!(
-                classify_compaction(command, &[]),
+                classify_compaction(command, &[], false),
                 CompactionScope::Verbatim,
                 "{command} must never be compacted"
             );
@@ -2045,7 +2267,7 @@ mod tests {
         // `git grep` stays fully `Verbatim` alongside `git blame` above.
         for command in ["git diff HEAD~1", "git show HEAD", "git log -p"] {
             assert_eq!(
-                classify_compaction(command, &[]),
+                classify_compaction(command, &[], false),
                 CompactionScope::Diff,
                 "{command} must be bounded, never a head/tail scan"
             );
@@ -2062,21 +2284,21 @@ mod tests {
             "make all",
         ] {
             assert_eq!(
-                classify_compaction(command, &[]),
+                classify_compaction(command, &[], false),
                 CompactionScope::Known,
                 "{command} is a modelled build/test/log family"
             );
         }
         for command in ["some-tool --report", "./bin/generate"] {
             assert_eq!(
-                classify_compaction(command, &[]),
+                classify_compaction(command, &[], false),
                 CompactionScope::Generic,
                 "{command}"
             );
         }
         // The operator's own list only ever adds.
         assert_eq!(
-            classify_compaction("mydump --all", &["mydump".to_string()]),
+            classify_compaction("mydump --all", &["mydump".to_string()], false),
             CompactionScope::Verbatim
         );
     }
@@ -2090,13 +2312,13 @@ mod tests {
     fn a_git_global_flag_never_hides_the_subcommand() {
         for command in ["git -C some/dir diff", "git --no-pager diff"] {
             assert_eq!(
-                classify_compaction(command, &[]),
+                classify_compaction(command, &[], false),
                 CompactionScope::Diff,
                 "{command} must still be recognised as a content-reading git diff"
             );
         }
         assert_eq!(
-            classify_compaction("git -c a=b log", &[]),
+            classify_compaction("git -c a=b log", &[], false),
             CompactionScope::Known,
             "git -c a=b log must still be recognised as a modelled git subcommand"
         );
@@ -2109,7 +2331,7 @@ mod tests {
     #[test]
     fn known_is_or_ed_across_every_segment_not_overwritten() {
         assert_eq!(
-            classify_compaction("cargo test && git frobnicate-subcommand", &[]),
+            classify_compaction("cargo test && git frobnicate-subcommand", &[], false),
             CompactionScope::Known,
             "an unrecognised git subcommand must never erase an earlier Known match"
         );
@@ -2862,5 +3084,357 @@ mod tests {
         )
         .expect("capture");
         assert!(summary.is_none(), "binary output must never be summarized");
+    }
+
+    // -- Issue #416: gh/glab template boilerplate stripping ----------------
+
+    fn gh_pr_template_fixture() -> String {
+        let mut debug_dump = String::new();
+        for i in 0..500 {
+            debug_dump.push_str(&format!("internal debug line {i} nobody needs to read\n"));
+        }
+        format!(
+            "<!-- Thanks for contributing! Please fill out this template. -->\n\
+             \n\
+             ## Description\n\
+             \n\
+             Fixes the frobnicator to handle the edge case where the widget is null.\n\
+             \n\
+             ## Testing\n\
+             \n\
+             - [ ] Unit tests added\n\
+             - [ ] Manual testing performed\n\
+             \n\
+             <!-- Delete this section if not applicable -->\n\
+             \n\
+             ## Additional context\n\
+             \n\
+             <details>\n\
+             <summary>Internal debug notes</summary>\n\
+             \n\
+             {debug_dump}\
+             </details>\n\
+             \n\
+             ## Screenshots\n\
+             \n\
+             N/A\n"
+        )
+    }
+
+    /// Issue #416 acceptance: a `gh pr view` template body over the
+    /// compaction threshold renders with its boilerplate gone (the leading
+    /// comment, the empty checklist section, the `<details>` dump) while
+    /// every real paragraph survives verbatim.
+    #[test]
+    fn a_gh_pr_view_template_strips_boilerplate_and_keeps_prose_verbatim() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        let raw = gh_pr_template_fixture();
+        assert!(raw.len() > 4096, "{}", raw.len());
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &[
+                "gh".to_string(),
+                "pr".to_string(),
+                "view".to_string(),
+                "123".to_string(),
+            ],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Generic,
+        )
+        .expect("capture");
+        let summary = summary.expect("a filtered summary");
+        assert!(summary.len() <= 4096, "{} bytes", summary.len());
+        assert!(!summary.contains("Thanks for contributing"), "{summary}");
+        assert!(!summary.contains("Unit tests added"), "{summary}");
+        assert!(!summary.contains("internal debug line"), "{summary}");
+        assert!(
+            summary.contains(
+                "Fixes the frobnicator to handle the edge case where the widget is null."
+            ),
+            "{summary}"
+        );
+        assert!(summary.contains("N/A"), "{summary}");
+        assert!(summary.len() < raw.len(), "{summary}");
+    }
+
+    /// Issue #416: `gh pr view --json ...` is JSON, not a template body, and
+    /// must keep using the JSON summarizer untouched by the markdown pass.
+    #[test]
+    fn a_gh_pr_view_with_json_flag_uses_the_json_summarizer() {
+        let (_tmp, state, repo, _home) = capture_rig();
+
+        let items: Vec<serde_json::Value> = (0..500)
+            .map(|i| serde_json::json!({"title": format!("issue {i}"), "body": "x".repeat(50)}))
+            .collect();
+        let raw = serde_json::to_string(&serde_json::Value::Array(items)).expect("json");
+        assert!(raw.len() > 4096, "{}", raw.len());
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &[
+                "gh".to_string(),
+                "pr".to_string(),
+                "view".to_string(),
+                "--json".to_string(),
+                "title,body".to_string(),
+            ],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Generic,
+        )
+        .expect("capture");
+        let summary = summary.expect("a json summary");
+        assert!(summary.contains("json summary:"), "{summary}");
+    }
+
+    // -- Issue #414: opt-in shape-aware search/listing compaction ----------
+
+    /// `[output] compact_search` off: `rg`/`grep`/`find`/`fd`/`ls`/`dir`/
+    /// `tree` classify exactly as `Verbatim`, same as before this feature --
+    /// an 80 KB `rg` result stays untouched.
+    #[test]
+    fn compact_search_off_leaves_search_programs_verbatim() {
+        for command in [
+            "rg TODO src",
+            "grep -r TODO src",
+            "find . -name '*.rs'",
+            "fd .rs",
+            "ls -la /tmp",
+            "dir /tmp",
+            "tree src",
+        ] {
+            assert_eq!(
+                classify_compaction(command, &[], false),
+                CompactionScope::Verbatim,
+                "{command} must stay verbatim when compact_search is off"
+            );
+        }
+    }
+
+    /// `[output] compact_search` on: the same seven programs become `Shape`
+    /// instead of `Verbatim` -- unless the operator's own `[output] verbatim`
+    /// also names them, which always wins.
+    #[test]
+    fn compact_search_on_shapes_search_programs_unless_explicitly_verbatim() {
+        for command in [
+            "rg TODO src",
+            "grep -r TODO src",
+            "find . -name '*.rs'",
+            "fd .rs",
+            "ls -la /tmp",
+            "dir /tmp",
+            "tree src",
+        ] {
+            assert_eq!(
+                classify_compaction(command, &[], true),
+                CompactionScope::Shape,
+                "{command} must shape when compact_search is on"
+            );
+        }
+        assert_eq!(
+            classify_compaction("rg TODO src", &["rg".to_string()], true),
+            CompactionScope::Verbatim,
+            "an operator's own [output] verbatim entry always wins over compact_search"
+        );
+    }
+
+    /// A compound command's first `normalize_segments` candidate is the
+    /// whole unsplit string, so a leading `rg` used to return `Shape` before
+    /// the later `cat` segment -- a real reader -- was ever inspected,
+    /// silently letting `cat secrets.txt`'s content through the shape-only
+    /// renderer. Verbatim must win across every candidate, not just the
+    /// first one visited.
+    #[test]
+    fn a_later_verbatim_segment_beats_an_earlier_shape_candidate() {
+        assert_eq!(
+            classify_compaction("rg TODO src && cat secrets.txt", &[], true),
+            CompactionScope::Verbatim,
+            "cat secrets.txt must never be silently shaped away"
+        );
+        // Unchanged from main: no compact_search opt-in, no shape carve-out
+        // in play at all -- `cargo test` is a modelled Known family and
+        // `cat` is unconditionally verbatim either way.
+        assert_eq!(
+            classify_compaction("cargo test && cat x", &[], false),
+            CompactionScope::Verbatim,
+            "cat must still force verbatim regardless of compact_search"
+        );
+    }
+
+    fn rg_fixture(files: usize, matches_per_file: usize) -> String {
+        let mut text = String::new();
+        for f in 0..files {
+            for m in 0..matches_per_file {
+                text.push_str(&format!(
+                    "src/file{f}.rs:{}:    let todo_{m} = 1; // TODO fix this\n",
+                    m + 1
+                ));
+            }
+        }
+        text
+    }
+
+    /// Issue #414 acceptance, end to end through `capture_text`: a large
+    /// `rg` result under `CompactionScope::Shape` renders grouped by path,
+    /// under the summary budget, and smaller than the raw text.
+    #[test]
+    fn shape_scope_renders_a_grouped_rg_summary_under_budget() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        let raw = rg_fixture(20, 20);
+        assert!(raw.len() > 4096, "{}", raw.len());
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["rg".to_string(), "TODO".to_string(), "src".to_string()],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Shape,
+        )
+        .expect("capture");
+        let summary = summary.expect("a grouped summary");
+        assert!(summary.len() <= 4096, "{} bytes", summary.len());
+        assert!(summary.contains("matches in"), "{summary}");
+        assert!(summary.len() < raw.len(), "{summary}");
+    }
+
+    /// Issue #414 acceptance: an `ls -l` body this pass cannot parse (not
+    /// shaped like `ls -l` output at all) falls back to no summary at all --
+    /// the untouched original is what reaches the model.
+    #[test]
+    fn shape_scope_ls_l_parse_failure_falls_back_verbatim() {
+        let (_tmp, state, repo, _home) = capture_rig();
+        let raw: String = (1..=2000)
+            .map(|i| format!("not an ls -l row {i}\n"))
+            .collect();
+        assert!(raw.len() > 4096, "{}", raw.len());
+
+        let (_, summary) = capture_text(
+            &state,
+            &repo,
+            &["ls".to_string(), "-l".to_string()],
+            Some(0),
+            &raw,
+            4096,
+            CompactionScope::Shape,
+        )
+        .expect("capture");
+        assert!(
+            summary.is_none(),
+            "an unparseable ls -l body must fail open to verbatim: {summary:?}"
+        );
+    }
+
+    /// Issue #426: a compaction-ratio regression test over realistic fixture
+    /// outputs (`tests/fixtures/compaction/`). Drives the exact engine
+    /// `hook::run_posttool` drives for a captured Bash result --
+    /// `classify_compaction` then `capture_text` (which is
+    /// `summarize_stored` plus persistence) -- with the DEFAULT `[output]`
+    /// config, so a change that quietly regresses the achieved compression
+    /// on real-shaped output fails here before it ships. Run with
+    /// `--nocapture` to see the per-fixture ratio table. See
+    /// `tests/fixtures/compaction/README.md` for the floor-raising rule.
+    #[test]
+    fn compaction_ratio_never_regresses_below_the_fixture_floor() {
+        let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compaction");
+        let floor: f64 = std::fs::read_to_string(fixtures_dir.join("floor.txt"))
+            .expect("tests/fixtures/compaction/floor.txt must exist")
+            .trim()
+            .parse()
+            .expect("floor.txt must hold a bare float, e.g. 0.60");
+
+        let (_tmp, state, repo, _home) = capture_rig();
+        let max_summary_bytes =
+            crate::commands::ctx::config::OutputConfig::default().max_summary_bytes;
+
+        let mut fixtures: Vec<PathBuf> = std::fs::read_dir(&fixtures_dir)
+            .expect("fixtures dir")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().is_some_and(|ext| ext == "txt")
+                    && p.file_name().is_some_and(|name| name != "floor.txt")
+            })
+            .collect();
+        fixtures.sort();
+        assert!(
+            fixtures.len() >= 8,
+            "expected at least 8 fixtures under {}, found {}",
+            fixtures_dir.display(),
+            fixtures.len()
+        );
+
+        let mut total_in: u64 = 0;
+        let mut total_out: u64 = 0;
+        println!(
+            "{:<28} {:>10} {:>10} {:>8}",
+            "fixture", "bytes_in", "bytes_out", "ratio"
+        );
+        for fixture in &fixtures {
+            let stem = fixture
+                .file_stem()
+                .expect("stem")
+                .to_string_lossy()
+                .to_string();
+            let cmd_path = fixture.with_extension("cmd");
+            let command = std::fs::read_to_string(&cmd_path)
+                .unwrap_or_else(|e| panic!("{}: missing sibling .cmd ({e})", cmd_path.display()))
+                .trim()
+                .to_string();
+            let content = std::fs::read_to_string(fixture)
+                .unwrap_or_else(|e| panic!("{}: {e}", fixture.display()));
+            let bytes_in = content.len() as u64;
+
+            let scope = classify_compaction(&command, &[], false);
+            let (_, summary) = capture_text(
+                &state,
+                &repo,
+                std::slice::from_ref(&command),
+                None,
+                &content,
+                max_summary_bytes,
+                scope,
+            )
+            .unwrap_or_else(|e| panic!("{stem}: capture_text failed: {e}"));
+            let summary = summary.unwrap_or_else(|| {
+                panic!("{stem}: no summary was produced at all (scope {scope:?})")
+            });
+            let bytes_out = summary.len() as u64;
+
+            assert!(
+                bytes_out < bytes_in,
+                "{stem}: summary ({bytes_out} bytes) did not shrink the fixture ({bytes_in} bytes)"
+            );
+
+            println!(
+                "{:<28} {:>10} {:>10} {:>7.1}%",
+                stem,
+                bytes_in,
+                bytes_out,
+                100.0 * bytes_out as f64 / bytes_in as f64
+            );
+            total_in += bytes_in;
+            total_out += bytes_out;
+        }
+
+        let aggregate_reduction = 1.0 - (total_out as f64 / total_in as f64);
+        println!(
+            "aggregate: {total_in} -> {total_out} bytes ({:.1}% reduction, floor {:.2})",
+            aggregate_reduction * 100.0,
+            floor
+        );
+        assert!(
+            aggregate_reduction >= floor,
+            "aggregate reduction {aggregate_reduction:.4} fell below the floor {floor:.2} in \
+             tests/fixtures/compaction/floor.txt -- if this is a deliberate regression, see that \
+             file's README for the Decision Log requirement before lowering it"
+        );
     }
 }
