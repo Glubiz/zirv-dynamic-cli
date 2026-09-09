@@ -45,6 +45,8 @@
 - [Context Management (zirv ctx)](#context-management-zirv-ctx)
   - [Cross-harness fallback and handover](#cross-harness-fallback-and-handover)
   - [Permission auditing and safe-list proposals](#permission-auditing-and-safe-list-proposals-issue-178)
+- [Supported harnesses and models](#supported-harnesses-and-models)
+  - [Model catalogue](#model-catalogue)
 - [Supported Platforms](#supported-platforms)
 - [Contribution](#contribution)
 - [License](#license)
@@ -447,7 +449,9 @@ to the section or vault page that documents it in depth.
   `codex`, `gemini`, `opencode`, `pi`, `copilot`, `droid`, and `qwen`, each
   enabled or disabled per repo in `.zirv/.settings.toml`. See
   [.settings.toml](#settingstoml) and the vault's
-  [Ctx Adapters](docs/obsidian/Modules/Ctx%20Adapters.md).
+  [Ctx Adapters](docs/obsidian/Modules/Ctx%20Adapters.md). For which models
+  zirv recognises on each harness, see [Supported harnesses and
+  models](#supported-harnesses-and-models).
 - **Dashboard** — several supervised sessions in one terminal, with panes
   for delegated workers, worktree groups, and kill/nudge/send from the
   keyboard. See [The dashboard: multiple sessions in one
@@ -2365,6 +2369,89 @@ propose_enabled = true
 Above a threshold of 5 total requests in one audit, `zirv ctx optimize`'s own
 friction pass surfaces the same summary as a finding, well before a session
 reaches the volume that originally motivated this feature.
+
+## Supported harnesses and models
+
+zirv ships eight harness adapters — `claude`, `codex`, `gemini`, `qwen`,
+`opencode`, `pi`, `copilot`, and `droid` — each enabled or disabled per repo
+in [.settings.toml](#settingstoml). The model list below is what zirv
+*recognises*: it drives tier translation, pricing, review-model escalation,
+and context-window lookups. Each harness's own CLI still decides what
+actually launches — a model zirv does not recognise is passed through
+verbatim but gets no tier translation, since zirv never guesses.
+
+### Models per harness
+
+| Harness | Models | Billing/notes |
+| --- | --- | --- |
+| `claude` | Anthropic ladder (see [Model catalogue](#model-catalogue)) | single vendor |
+| `codex` | OpenAI ladder | single vendor |
+| `gemini` | Google ladder | single vendor |
+| `qwen` | Qwen ladder | single vendor |
+| `opencode` | any catalogue vendor below | model is pinned as `provider/model` (e.g. `anthropic/claude-opus-5`); zirv resolves the vendor from that prefix and id; an unrecognised model falls back to the static `opencode` slug |
+| `pi` | any catalogue vendor below | model is pinned with `--model provider/id`; zirv resolves the vendor from that prefix and id; an unrecognised model falls back to `pi` |
+| `copilot` | any catalogue vendor below (ladder lookups only) | tier, strength and context window are looked up per model, but billing is always the operator's GitHub Copilot subscription (`github`), regardless of which model answered |
+| `droid` | any catalogue vendor below | bare model ids (no `provider/` prefix) resolve directly against the catalogue; `custom:<id>` BYOK ids never match a vendor and fall back to the `factory` slug, with no tier translation |
+
+### Model catalogue
+
+Every vendor's rungs, strongest first. Anthropic is the only vendor whose
+alias differs from its model id; every other vendor's alias and id are the
+same string, so the id is shown only where it differs.
+
+| Vendor | Model | Tier |
+| --- | --- | --- |
+| anthropic | `fable` (`claude-fable-5-1`) | — |
+| anthropic | `mythos` (`claude-mythos-5`) | — |
+| anthropic | `opus` (`claude-opus-5`) | Deep |
+| anthropic | `sonnet` (`claude-sonnet-5`) | Standard |
+| anthropic | `haiku` (`claude-haiku-5`) | Cheap |
+| openai | `gpt-6-astra` | — |
+| openai | `gpt-5.6-sol` | Deep |
+| openai | `gpt-5.6-terra` | Standard |
+| openai | `gpt-5.6-luna` | — |
+| openai | `gpt-5.4-mini` | Cheap |
+| google | `gemini-3.1-pro-preview` | Deep |
+| google | `gemini-3.7-flash` | Standard |
+| google | `gemini-3.5-flash-lite` | Cheap |
+| xai | `grok-4.6` | Deep |
+| xai | `grok-4.3` | Standard |
+| xai | `grok-build-0.1` | Cheap |
+| qwen | `qwen3.8-max` | Deep |
+| qwen | `qwen3-coder-plus` | Standard |
+| qwen | `qwen3.8-flash` | Cheap |
+| moonshot | `kimi-k3` | Deep |
+| moonshot | `kimi-k2.7-code` | Standard |
+| moonshot | `kimi-k2.6` | Cheap |
+| mistral | `devstral-2` | Deep |
+| mistral | `mistral-medium-3.5` | Standard |
+| mistral | `devstral-small-2` | Cheap |
+| deepseek | `deepseek-v4-pro` | Deep |
+| deepseek | `deepseek-v4-flash` | Cheap |
+| zhipu | `glm-5.3` | Deep |
+| zhipu | `glm-4.6` | Standard |
+| zhipu | `glm-4.7-flash` | Cheap |
+| minimax | `minimax-m2.7` | Standard |
+| meta | `muse-spark-1.2` | Standard |
+| meta | `llama-4-maverick` | Cheap |
+| amazon | `nova-premier` | Deep |
+| amazon | `nova-pro` | Standard |
+| amazon | `nova-lite` | Cheap |
+
+`deepseek` has no `Standard` rung, `minimax` has only its one `Standard`
+rung, and `meta` has no `Deep` rung — not every vendor fills all three tiers.
+Beyond the ladder, zirv also recognises `claude-fable-5` and the `[1m]`
+long-context variants `claude-fable-5[1m]`, `claude-fable-5-1[1m]`,
+`claude-mythos-5[1m]` and `claude-opus-5[1m]` on Anthropic, and
+`gpt-5-codex` on OpenAI; none of these six ids is a ladder rung in its own
+right. `gpt-6-astra` sits at the top of the OpenAI ladder alongside
+`gpt-5.6-sol`, and like `fable`/`mythos` carries no tier of its own but
+classifies as deep for cross-harness fallback. The catalogue for every
+vendor other than anthropic/openai is a survey dated 2026-09-07.
+
+See [Cross-harness fallback and
+handover](#cross-harness-fallback-and-handover) for how these tiers drive
+rerouting between harnesses.
 
 ## Supported Platforms
 - Windows (see the platform note under [Context Management](#context-management-zirv-ctx): `zirv ctx` supervision is unix only)

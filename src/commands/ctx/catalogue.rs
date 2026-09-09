@@ -54,8 +54,9 @@ pub enum Tier {
 /// operator types (`opus`, `sonnet`); `id` is the canonical model string a
 /// real transcript or `--model` flag carries. Claude's `fable`/`mythos`
 /// orchestrator-tier aliases are two separate `Rung`s at the same
-/// `strength` -- see [`rung_below`] for why that is enough to keep both
-/// resolving identically.
+/// `strength` -- openai's `gpt-6-astra` shares the top `strength` with
+/// `gpt-5.6-sol` the same way -- see [`rung_below`] for why that is enough
+/// to keep both resolving identically.
 ///
 /// `context_window` is `None` when this specific rung has no verified
 /// capacity -- the same "never guess" rule `AgentAdapter::context_window_
@@ -199,8 +200,18 @@ const MINI: ModelPrice = ModelPrice {
 // keeps the trait default `None` for `context_window_tokens`, and every
 // rung here matches that with its own `None` rather than an invented number
 // (see `Rung`'s own doc comment for why that is a per-rung answer, not just
-// a per-vendor one).
+// a per-vendor one). `gpt-6-astra` leads the ladder at the same strength as
+// `gpt-5.6-sol` and, like claude's `fable`/`mythos`, carries `tier: None` --
+// `rung_below`'s and `tier_model(Tier::Deep)`'s answers stay on `sol`.
 const OPENAI_RUNGS: &[Rung] = &[
+    Rung {
+        alias: "gpt-6-astra",
+        id: "gpt-6-astra",
+        strength: 4,
+        context_window: None,
+        price: Some(SOL),
+        tier: None,
+    },
     Rung {
         alias: "gpt-5.6-sol",
         id: "gpt-5.6-sol",
@@ -606,7 +617,7 @@ const VENDORS: &[Vendor] = &[
         slug: "openai",
         rungs: OPENAI_RUNGS,
         default_context_window: None,
-        extra_prices: &[("gpt-5-codex", TERRA), ("gpt-6-astra", SOL)],
+        extra_prices: &[("gpt-5-codex", TERRA)],
         as_of: None,
     },
     Vendor {
@@ -712,8 +723,8 @@ pub fn rung_of(vendor: &Vendor, model: &str) -> Option<&'static Rung> {
 /// the same top strength as far as review escalation is concerned, and the
 /// practical top an unrecognised seat should assume is the rung below them.
 /// The same shape gives codex's unset seat `gpt-5.6-terra`, one below
-/// `gpt-5.6-sol`. A seat already on the floor rung maps to itself rather
-/// than falling off the ladder.
+/// `gpt-6-astra`/`gpt-5.6-sol`. A seat already on the floor rung maps to
+/// itself rather than falling off the ladder.
 pub fn rung_below(vendor: &Vendor, seat: Option<&str>) -> &'static str {
     let rungs = vendor.rungs;
     if rungs.is_empty() {
@@ -954,6 +965,20 @@ mod tests {
             None,
             "a two-rung vendor may leave a tier unfilled"
         );
+    }
+
+    #[test]
+    fn openai_ladder_gains_gpt_6_astra_as_a_ranked_rung() {
+        let o = openai();
+        let rung = rung_of(o, "gpt-6-astra").expect("gpt-6-astra is now a ranked rung");
+        assert_eq!(rung.strength, 4);
+        assert_eq!(rung.tier, None);
+        assert_eq!(
+            tier_model(o, Tier::Deep),
+            Some("gpt-5.6-sol"),
+            "astra shares the top strength but carries no tier of its own"
+        );
+        assert_eq!(rung_below(o, Some("gpt-6-astra")), "gpt-5.6-terra");
     }
 
     #[test]
