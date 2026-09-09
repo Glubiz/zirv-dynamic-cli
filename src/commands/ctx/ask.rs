@@ -9,8 +9,13 @@
 //! The one-shot distiller child this spawns is exactly `handoff::run_model`
 //! -- a fresh, sandboxed, stdin-to-stdout model call with no session
 //! environment of its own (see that function's doc comment) -- so asking a
-//! question costs one model call and touches no state-dir file at all: no
-//! registry record, no nudge marker, no mail, no stored handoff.
+//! question costs one model call and writes nothing about the target
+//! session: no registry record, no nudge marker, no mail, no stored handoff.
+//! The only side effects are the ones every read verb (`status`, `score`)
+//! already has: the registry sweep of already-dead records inside
+//! `sessions::list`, and an adapter's own transcript-discovery caches
+//! (codex/gemini rollout pins, opencode shadow sync, a distiller's
+//! read-only policy file). None of them touch the live session asked about.
 
 use std::io::Write;
 use std::path::Path;
