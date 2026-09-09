@@ -2025,7 +2025,7 @@ pub fn run_kill_with<W: Write>(args: &KillArgs, w: &mut W, env: EnvLookup<'_>) -
     // is released by that dashboard's own reap, so ask the owner first and
     // signal the bare pid only if no owner answers.
     if record.verb == Verb::Dash
-        && let Some(ack) = kill_via_dashboard(&state, &record)
+        && let Some(ack) = kill_via_dashboard(&state, &record, env)
     {
         if ack.ok {
             writeln!(
@@ -2061,31 +2061,48 @@ pub fn run_kill_with<W: Write>(args: &KillArgs, w: &mut W, env: EnvLookup<'_>) -
 /// `Record::owner_pid` is the dashboard's own pid for a pane (`Pane::new`
 /// registers from inside the dashboard process -- see that field's own doc
 /// comment), and each `<state>/dash/<short>-<token>/owner.pid` holds that
-/// same pid, so the owning channel is identified rather than guessed. `None`
-/// -- no `owner_pid`, no live dashboard claiming it, the request could not be
-/// written, or nobody answered within the timeout -- means the caller falls
-/// back to signalling the bare pid itself.
+/// same pid, so a LIVE owner is confirmed before anything is written. `None`
+/// -- no `owner_pid`, no live dashboard claiming it, no channel of our own to
+/// write on, the request could not be written, or nobody answered within the
+/// timeout -- means the caller falls back to signalling the bare pid itself.
+///
+/// SECURITY (issue #435 item 1): the request is written into `DASH_REQUESTS_
+/// ENV`, THIS process's own pane intake channel, never the dashboard's
+/// shared one -- the dashboard now refuses every `kill` that arrives on its
+/// shared channel outright (`KILL_SHARED_CHANNEL_REFUSAL`), since that
+/// directory is a fixed sibling of every pane's own intake directory and
+/// proves no identity at all. `DASH_REQUESTS_ENV` is set only when this
+/// process is itself a pane's child, naming its own channel; a bare operator
+/// terminal (no dashboard pane owns it) has none, so there is no channel
+/// this request could ever be honoured on, and this returns `None` before
+/// writing anything -- the caller's fallback signals the pid directly, which
+/// an ordinary, unsandboxed terminal can do without this dashboard's help.
 fn kill_via_dashboard(
     state: &StateDir,
     record: &Record,
+    env: EnvLookup<'_>,
 ) -> Option<super::dash::spawnreq::SpawnAck> {
     use super::dash::spawnreq;
 
     let owner = record.owner_pid?;
-    let dir = super::dash::discover_live_dash_dirs(state)
+    // A live dashboard must actually own the target pane, or there is
+    // nothing on the other end of any channel to answer this.
+    super::dash::discover_live_dash_dirs(state)
         .into_iter()
         .find(|candidate| {
             matches!(candidate.status, super::dash::CandidateStatus::Live { pid, .. } if pid == owner)
-        })?
-        .requests_dir;
+        })?;
+    let dir = non_empty(env(spawnreq::DASH_REQUESTS_ENV))?;
+    let dir = Path::new(&dir);
+
     let req = spawnreq::SpawnRequest {
         kill: Some(record.short.clone()),
         requested_by: "ctx kill".to_string(),
         ..Default::default()
     };
-    let path = spawnreq::write_request(&dir, &req).ok()?;
+    let path = spawnreq::write_request(dir, &req).ok()?;
     let stem = spawnreq::request_stem(&path)?;
-    let ack = spawnreq::wait_for_ack(&dir, &stem, super::agent::DASH_ACK_TIMEOUT);
+    let ack = spawnreq::wait_for_ack(dir, &stem, super::agent::DASH_ACK_TIMEOUT);
     if ack.is_none() {
         // Nobody answered in time. Withdraw the request so a dashboard that
         // only gets to it later cannot kill a pane this command has already
@@ -4403,6 +4420,86 @@ mod tests {
         );
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains(&short), "names what it killed: {text}");
+    }
+
+    /// SECURITY (issue #435 item 1): `kill_via_dashboard` writes into THIS
+    /// process's own pane channel (`DASH_REQUESTS_ENV`), never the owning
+    /// dashboard's shared one -- the dashboard now refuses every `kill` that
+    /// arrives on its shared channel outright, so writing there would just
+    /// be a wasted round-trip. The fake dashboard here is only a live
+    /// `owner.pid` naming this test's own pid (so `discover_live_dash_dirs`
+    /// sees a live owner); nothing ever drains its shared `requests`
+    /// directory, and this test asserts the request never lands there.
+    #[test]
+    fn kill_via_dashboard_writes_the_request_on_the_callers_own_channel_not_the_shared_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let repo = tmp.path().join("repo");
+
+        let token_dir = state.dash().join("faketoken");
+        std::fs::create_dir_all(&token_dir).expect("mkdir token dir");
+        std::fs::write(token_dir.join("owner.pid"), std::process::id().to_string())
+            .expect("write owner.pid");
+        let shared_requests_dir = token_dir.join("requests");
+
+        let own_channel = tmp.path().join("own-channel");
+        let env = env_map(&[(
+            super::super::dash::spawnreq::DASH_REQUESTS_ENV,
+            own_channel.to_str().expect("utf8"),
+        )]);
+
+        let mut record = record_for("ffffffff-2222-4333-8444-555555555555", &repo, Verb::Dash);
+        record.owner_pid = Some(std::process::id());
+        let target_short = record.short.clone();
+
+        let handle = std::thread::spawn({
+            let state = state.clone();
+            let record = record.clone();
+            let env = env.clone();
+            move || kill_via_dashboard(&state, &record, &|k| env.get(k).cloned())
+        });
+
+        // Poll the requester's own channel for the request `kill_via_
+        // dashboard` should have written there, then answer it exactly as a
+        // real dashboard's `drain_one_channel` would -- this test exercises
+        // only where the client writes, not the dashboard side.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = None;
+        while std::time::Instant::now() < deadline {
+            let batch = super::super::dash::spawnreq::take_requests(&own_channel);
+            if let Some(pair) = batch.into_iter().next() {
+                found = Some(pair);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (path, req) = found.expect("the request arrives on the caller's own channel");
+        assert_eq!(req.kill.as_deref(), Some(target_short.as_str()));
+        let stem = super::super::dash::spawnreq::request_stem(&path).expect("stem");
+        super::super::dash::spawnreq::write_ack(
+            &own_channel,
+            &stem,
+            &super::super::dash::spawnreq::SpawnAck {
+                ok: true,
+                short: Some(target_short.clone()),
+                reason: None,
+                retryable: false,
+                budget_exhausted: false,
+                capability_warnings: Vec::new(),
+            },
+        )
+        .expect("write ack");
+
+        let ack = handle
+            .join()
+            .expect("thread")
+            .expect("an ack came back over the caller's own channel");
+        assert!(ack.ok);
+        assert_eq!(ack.short.as_deref(), Some(target_short.as_str()));
+        assert!(
+            !shared_requests_dir.exists(),
+            "the owning dashboard's own shared channel never received anything"
+        );
     }
 
     /// Security review round 2 (Finding 7): the POSIX `ps -o etime=` shapes,
