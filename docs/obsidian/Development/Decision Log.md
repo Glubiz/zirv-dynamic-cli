@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-08
+last-verified: 2026-09-09
 ---
 
 # Decision Log
@@ -32,6 +32,34 @@ This replaces only the finding #14 absolute "never mid-turn" rollover wait assoc
 - If the entry is longer than the cap, the "why" is a spec, not an ADR — write it under `docs/superpowers/specs/` and link to it.
 
 ## Decisions
+
+### 2026-09-09 -- `output.compact_search` is `REPO_FORBIDDEN` outright, not narrow-only
+**Context:** Issue #414 lets `rg`/`grep`/`find`/`fd`/`ls`/`dir`/`tree` opt into `CompactionScope::Shape` instead of staying `Verbatim`. `output.diff_max_bytes` (issue #412), the most recent sibling key in the same `[output]` table, is narrow-only (a repo may only lower it) rather than `REPO_FORBIDDEN`, raising the question of whether `compact_search` should follow that precedent since it is also a compaction-scope decision.
+**Decision:** `compact_search` is forbidden in BOTH directions, the same treatment as `output.compact`/`compact_min_bytes`/`compact_generic_min_bytes` right above it, not `diff_max_bytes`'s narrow-only fold.
+**Rejected:** Narrow-only (a repo may only turn it off) -- `diff_max_bytes` is narrow-only because lowering it can only ever protect a session's context window MORE; `compact_search` has no such one-directional safety, since turning it ON is what changes behavior, and a repo checkout enabling it would be choosing, for every session run against that checkout, that its own search/listing results reach the model only through a zirv-authored summary instead of the verbatim text a model reads before searching or listing again.
+**Consequences:** Only the operator's own `~/.zirv/ctx.toml` or `ZIRV_CTX_OUTPUT_COMPACT_SEARCH` may turn this on; a repo checkout gets the same behavior whether or not it sets the key at all.
+**Spec / link:** Issue #414; [[Untrusted Configuration]], [[Ctx Subsystem]]'s output-search section, `src/commands/ctx/config.rs`.
+
+### 2026-09-09 -- Hook self-heal patches the command string textually, never re-serializes `settings.json`/`hooks.json`
+**Context:** Issue #420's self-heal (`zirv ctx hook status --heal`) needs to replace one hook's `"command"` value in place inside an operator's live `settings.json`/`hooks.json` without disturbing anything else in the file. Parsing into `serde_json::Value` and rewriting via `to_string_pretty` was the obvious first approach.
+**Decision:** `heal_target` patches the raw file TEXT directly (`replace_command_value`, a `"command":` key-anchored search-and-replace tolerant of both pretty and compact whitespace), then re-parses the result and re-checks every targeted slot before writing anything.
+**Rejected:** Parse-modify-reserialize via `serde_json::Value` -- this crate's `serde_json` has no `preserve_order` feature (other code depends on the resulting `BTreeMap` key ordering), so a round-trip through `Value` would reorder every object's keys alphabetically and re-indent the whole file for what should be a one-string patch, silently destroying any manual formatting or key order an operator's own file had.
+**Consequences:** The heal touches only the bytes of the one command string it replaces; a re-parse-and-verify step after patching is mandatory (a patch that leaves a legacy command still live anywhere is discarded and the file is left untouched) since a purely textual patch is not otherwise self-checking.
+**Spec / link:** Issue #420; [[Ctx Subsystem]]'s "Hook Integrity" section, `src/commands/ctx/hook_integrity.rs`.
+
+### 2026-09-09 -- `zirv ctx discover` scans claude transcripts only
+**Context:** Issue #423's `discover` verb lists large `Bash` results that reached the model uncompacted, joined against the compaction ledger by `tool_use_id`. `hook::run_posttool`/`run_pretool` (the only things that ever write a ledger row) are claude-only hooks; codex has its own differently-shaped rollout JSONL with no equivalent hook or ledger row at all.
+**Decision:** `discover` scans only claude transcripts (`search::claude_candidates`, the same discovery `zirv ctx search`/`measure.rs` already share); `--all` widens scope to every claude project on the machine, never to another harness.
+**Rejected:** Also scanning codex's rollout JSONL and reporting every large tool result as unconditionally "estimated, no hook exists" -- codex genuinely has no compaction mechanism to report on, so every row would be the same uninformative bucket; scoping the whole command to the one harness with a real signal is more honest than padding the report with a harness this feature cannot say anything meaningful about.
+**Consequences:** A codex-only shop gets no `discover` output at all today; extending scope to a second harness needs that harness's own verified transcript shape and its own compaction hook first, not just a wider file glob.
+**Spec / link:** Issue #423; [[Ctx Subsystem]]'s `discover` verb entry, `src/commands/ctx/discover.rs`.
+
+### 2026-09-09 -- The compaction fixture floor is a ratchet, not a fixed target
+**Context:** Issue #426's regression test (`compaction_ratio_never_regresses_below_the_fixture_floor`) drives eleven realistic fixtures through the real compaction engine and asserts the aggregate byte reduction clears `tests/fixtures/compaction/floor.txt`. A fixed threshold (e.g. "must exceed 0.60 forever") was the simpler alternative to a value the test itself instructs contributors to edit.
+**Decision:** `floor.txt` only ever moves up, and only in response to a measured improvement (rounded down to the nearest `0.05`, so the floor stays a value every subsequent run can actually clear); it may be lowered only alongside a Decision Log entry explaining why the aggregate ratio regressed on purpose.
+**Rejected:** A fixed floor with no ratchet -- would let the aggregate ratio silently drift down over time as compaction passes evolve, with nothing forcing a contributor to notice or justify the regression; a fixed floor also gives no credit (and no visible incentive) for a genuine improvement.
+**Consequences:** Every PR that touches the compaction engine either clears the existing floor or must consciously raise or justify-and-lower it -- there is no quiet middle path where the aggregate ratio drifts unnoticed.
+**Spec / link:** Issue #426; `tests/fixtures/compaction/README.md`, `src/commands/ctx/output.rs`.
 
 ### 2026-09-08 -- Windows console code-page decoding (#415) stays out of the 3.36.0 compaction round; the `PostToolUse` hook never needs it
 **Context:** Issue #415 proposes a shared `decode_process_output` so a legacy code page (CP850/CP1252/etc.) doesn't turn into `U+FFFD` mojibake inside a compact summary. This release added several new compaction shaping passes (#408-#411) that already touch decoding (binary sniffing, lossy-decode masking), raising the question of whether #415's fix belonged in the same round.

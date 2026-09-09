@@ -1,5 +1,5 @@
 ---
-last-verified: 2026-09-07
+last-verified: 2026-09-09
 ---
 
 # Known Issues
@@ -14,6 +14,7 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated YYYY-MM-DD (branch, state): what changed -->
 ```
 
+<!-- Updated 2026-09-09 (release/3.37.0-observability): filed issue #440 -- a prepared orchestrator rollover transaction that is neither committed nor failed leaves the source pane simply lost instead of parked -->
 <!-- Updated 2026-09-07 (feat/adapters-waves-1-2, issues #384-#389, umbrella #396): recorded four residuals from the six wave-1/2 harness adapters -- OpenCode's own repo-committed opencode.json can override the zirv-injected system-prompt/read-only agent (widens, not narrows); copilot's verified events.jsonl row shapes carry no assistant final-text event at all; droid's real token usage lives in a sibling .settings.json the transcript_usage trait method never receives; and none of the six was smoke-tested against a live installed process (droid excepted, verified live against a local BYOK mock model server) -->
 <!-- Updated 2026-09-07 (feat/adapters-wave-1-catalogue, issues #381/#382): recorded that catalogue.rs's OpenAI rungs carry no verified context window (matching the pre-catalogue answer) and that normalize_id/vendor_of have no production caller yet -- both wait on the wave-1 adapter tracks (issues #384-#386) -->
 <!-- Updated 2026-09-07 (fix/3.30.0-input-latency-defender, v3.30.0): recorded a third Windows dev-machine test baseline name, commands::ctx::dash::pane::tests::a_signal_less_pane_stays_uninjectable_for_a_full_window_after_its_own_injection, failing on unmodified main at 09f913a -->
@@ -108,6 +109,10 @@ Each entry gets a changelog comment at the top of the file, newest first:
 <!-- Updated 2026-08-13 (feat/dashboard, docs sweep): dashboard panes carry no rot score yet -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, review round): markdown header absorption; registry short is a stable address; supervision env scrubbed on every spawn -->
 <!-- Updated 2026-08-13 (feat/agent-coordination, console-safety round): portable-pty do_kill inversion; ConPTY control-byte broadcast; empty nudge prefixes -->
+
+## Issue #440 -- a prepared orchestrator rollover that is neither committed nor failed loses the source pane instead of parking it
+
+Recorded 2026-09-09 (`release/3.37.0-observability`). Filed this session against the automatic orchestrator-seat rollover transaction (`rollover.rs`, issue #358): the transaction prepares a successor on another harness, then either commits (the source seat is retired, the successor takes over the registry short id) or fails (the prepared successor is torn down and the source seat keeps running). An interrupted transaction that lands in neither state -- the process is killed, or a supervision failure fires mid-transaction, between `orchestrator-rollover-prepared` and either `-committed` or `-failed` being logged -- currently leaves the ORIGINAL source pane simply gone rather than parked in a recoverable state: nothing re-attaches to it, and nothing retries the commit or the rollback. Not yet investigated for a root cause or a fix; parking (rather than losing) an interrupted transaction's source pane would need its own state-machine work in `rollover.rs`. See [[Ctx Supervisors]] for the rollover driver and [[Ctx Subsystem]]'s "Elastic scheduling's own action vocabulary" section for the decision-log rows this transaction already emits.
 
 ## Windows Defender false positive on zirv.exe
 
