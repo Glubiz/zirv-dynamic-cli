@@ -162,6 +162,40 @@ impl Evaluation {
 /// session at that address ends, since a seat outlives nothing: a short id
 /// is derived from a session id, and a new launch gets a new one.
 pub fn forget(state: &StateDir, seat_short: &str) {
+    // Issue #440: a PARKED seat is the one kind that outlives its session on
+    // purpose -- it is the record of a rollover that failed and a source
+    // waiting out its own window. A relaunch that could not bring the source
+    // back leaves the pane `Ended`, and the reap behind it used to delete the
+    // park along with everything else. A restore reuses the same session id,
+    // so the short id matches and `seat::register` (which preserves `phase`)
+    // hands the restored pane its park back.
+    let seat = seat::load(state, seat_short);
+    if seat
+        .as_ref()
+        .is_some_and(|seat| matches!(seat.phase, seat::Phase::Parked { .. }))
+    {
+        return;
+    }
+    // Issue #440: a session released with a rollover still OPEN ends that
+    // transaction here. Both teardown paths reach this seam -- the
+    // dashboard's own shutdown sweep and wrap's session-end release -- and
+    // neither settles a pending rollover of its own, so quitting inside the
+    // prepare-to-ready window used to leave `prepared` followed by silence,
+    // the incident signature exactly.
+    if let Some(open) = seat.as_ref()
+        && let seat::Phase::Prepared { generation, .. } = open.phase
+    {
+        terminate(
+            state,
+            "release",
+            seat_short,
+            generation,
+            super::state::now_secs(),
+            FAILED,
+            "the session holding this seat was released with a rollover still open",
+            Some(open),
+        );
+    }
     seat::remove(state, seat_short);
     let _ = std::fs::remove_file(pool_state_path(state, seat_short));
 }
@@ -556,6 +590,7 @@ pub fn evaluate(
                             // one: the structural packet is what actually
                             // survives an exhausted provider.
                             structural_only: reactive,
+                            resume_session: None,
                         },
                         generation,
                         cause,
@@ -891,6 +926,7 @@ pub fn commit(
                 &reason,
                 known.as_ref(),
             );
+            release_prepared(state, seat_short, generation, now);
             return Err(e);
         }
     };
@@ -948,7 +984,31 @@ pub fn fail(
         &reason,
         outcome.as_ref().ok().or(before.as_ref()),
     );
+    if outcome.is_err() {
+        release_prepared(state, seat_short, generation, now);
+    }
     outcome.ok()
+}
+
+/// Issue #440: a transaction that ended in the log must not stay open on
+/// disk. A seat left `Prepared` refuses every future `seat::prepare`, is
+/// skipped by [`evaluate`] (not `Idle`) and ignored by [`on_resume`] (not
+/// `Parked`), so the seat could never roll again until a supervisor restart
+/// happened to run [`on_startup`] against it.
+///
+/// Deliberately a no-op unless the OPEN transaction is the one that just
+/// ended: a seat holds one transaction at a time, so a caller closing a
+/// generation the seat is no longer on is holding a stale handle, and
+/// clearing the phase for it would let that stale caller cancel a live
+/// rollover somebody else owns. Goes through `seat::abort` rather than
+/// writing the record directly, so the seat lock still covers the change.
+fn release_prepared(state: &StateDir, seat_short: &str, generation: u64, now: u64) {
+    let ours = seat::load(state, seat_short).is_some_and(|seat| {
+        matches!(seat.phase, seat::Phase::Prepared { generation: open, .. } if open == generation)
+    });
+    if ours {
+        let _ = seat::abort(state, seat_short, generation, now);
+    }
 }
 
 /// Writes the one terminal row a prepared rollover always ends with, from
@@ -1087,6 +1147,7 @@ pub fn on_resume(
         automatic: true,
         generation: Some(generation),
         structural_only: true,
+        resume_session: None,
     })
 }
 
@@ -1467,7 +1528,11 @@ mod tests {
         register_seat(&state);
         let generation =
             seat::prepare(&state, SHORT, "codex", None, seat::Cause::Manual, NOW).expect("prepare");
-        forget(&state, SHORT);
+        // The record vanished under the transaction. `forget` is no longer
+        // the way to stage this -- it now ends an open transaction itself
+        // (see `forget_on_a_prepared_seat_writes_exactly_one_terminal_row`),
+        // so this drops the record the way any other loss would.
+        seat::remove(&state, SHORT);
 
         assert!(
             fail(
@@ -1496,12 +1561,57 @@ mod tests {
             row.contains(&format!("generation\\\":{generation}")),
             "{row}"
         );
+        assert_eq!(
+            logged.matches(FAILED).count(),
+            1,
+            "exactly one terminal row, never two: {logged}"
+        );
     }
 
-    /// Issue #440: a commit the seat refuses (a generation that no longer
-    /// matches, a phase that is no longer `Prepared`) is still an ending.
+    /// Issue #440: a session released with a rollover still open ends that
+    /// transaction. Both teardown paths reach `forget` -- the dashboard's own
+    /// shutdown sweep and wrap's session-end release -- and neither settles a
+    /// pending rollover, so quitting inside the prepare-to-ready window used
+    /// to leave `prepared` followed by silence.
     #[test]
-    fn a_commit_the_seat_refuses_still_ends_the_transaction() {
+    fn forget_on_a_prepared_seat_writes_exactly_one_terminal_row() {
+        let (_dir, state) = temp_state();
+        register_seat(&state);
+        let generation =
+            seat::prepare(&state, SHORT, "codex", None, seat::Cause::Manual, NOW).expect("prepare");
+
+        forget(&state, SHORT);
+
+        assert!(seat::load(&state, SHORT).is_none(), "the seat is released");
+        let logged = std::fs::read_to_string(state.logs().join(log::LOG_FILE)).expect("log");
+        assert_eq!(logged.matches(FAILED).count(), 1, "{logged}");
+        assert_eq!(logged.matches(COMMITTED).count(), 0, "{logged}");
+        let row = logged
+            .lines()
+            .find(|line| line.contains(FAILED))
+            .expect("a terminal row");
+        assert!(
+            row.contains(&format!("generation\\\":{generation}")),
+            "{row}"
+        );
+        assert!(row.contains("released with a rollover still open"), "{row}");
+
+        let (_dir2, state2) = temp_state();
+        register_seat(&state2);
+        forget(&state2, SHORT);
+        assert!(
+            !state2.logs().join(log::LOG_FILE).exists(),
+            "releasing a seat with nothing open logs nothing"
+        );
+    }
+
+    /// Issue #440: a commit the seat refuses is still an ending -- and the
+    /// transaction the seat is ACTUALLY on stays open for the caller that
+    /// owns it. A seat holds one transaction at a time, so a caller closing a
+    /// generation the seat has moved past is holding a stale handle; clearing
+    /// the phase for it would let that stale caller cancel a live rollover.
+    #[test]
+    fn a_refused_commit_ends_in_the_log_and_leaves_the_open_transaction_alone() {
         let (_dir, state) = temp_state();
         register_seat(&state);
         let generation =
@@ -1511,11 +1621,27 @@ mod tests {
             .expect_err("a mismatched generation is refused");
 
         let logged = std::fs::read_to_string(state.logs().join(log::LOG_FILE)).expect("log");
-        assert!(logged.contains(FAILED), "{logged}");
-        assert!(
-            !logged.contains(COMMITTED),
+        assert_eq!(logged.matches(FAILED).count(), 1, "{logged}");
+        assert_eq!(
+            logged.matches(COMMITTED).count(),
+            0,
             "a refused commit never claims the seat: {logged}"
         );
+        assert!(
+            matches!(
+                seat::load(&state, SHORT).map(|seat| seat.phase),
+                Some(seat::Phase::Prepared { generation: open, .. }) if open == generation
+            ),
+            "the live transaction belongs to its own generation"
+        );
+
+        // Its rightful owner can still finish it, so the seat is not wedged.
+        let committed = commit(&state, "wrap", SHORT, generation, "session-b", NOW)
+            .expect("the owning generation commits");
+        assert!(matches!(committed.phase, seat::Phase::Idle));
+        assert_eq!(committed.generation, generation);
+        seat::prepare(&state, SHORT, "claude", None, seat::Cause::Manual, NOW)
+            .expect("a later rollover can be prepared");
     }
 
     /// Issue #440: a supervisor starting on a seat left `Prepared` by one
@@ -1546,8 +1672,10 @@ mod tests {
             row.contains(&format!("generation\\\":{generation}")),
             "{row}"
         );
-        assert!(
-            !logged.contains(COMMITTED),
+        assert_eq!(logged.matches(FAILED).count(), 1, "{logged}");
+        assert_eq!(
+            logged.matches(COMMITTED).count(),
+            0,
             "a successor that is not alive never commits: {logged}"
         );
     }

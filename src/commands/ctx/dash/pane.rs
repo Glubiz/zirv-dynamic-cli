@@ -2401,20 +2401,34 @@ impl Pane {
         size: (u16, u16),
     ) -> CtxResult<()> {
         let (new_adapter, mut extra) = super::super::handover::resolve_swap_launch(cfg, req)?;
+        // Issue #440: whether `resolve_swap_launch` above actually appended
+        // this adapter's resume flags. A resumed conversation already holds
+        // everything a handoff packet could only summarise -- the unsaved
+        // in-flight state a cold relaunch provably cannot carry -- so it is
+        // launched in the verified restore shape (`roster::restore_argv`):
+        // resume args, no handoff prompt layered on top.
+        let resuming = req
+            .resume_session
+            .as_deref()
+            .is_some_and(|session| new_adapter.resume_args(session).is_some());
         let new_argv: Vec<String> = {
             // Issue #220: the same off-argv delivery `wrap`'s own restart uses
             // -- a handover packet is multi-line too, so on a Windows `.cmd`
             // install it was refused by `guard_cmd_shim_reparse` below and a
             // large one could overflow the command line outright.
-            let prompt_text = super::super::prompt::interactive_handoff_prompt(
-                new_adapter.as_ref(),
-                &[],
-                &mut extra,
-                &wrap::restart_prompt(handoff_note, &cfg.screen.thresholds()),
-                &self.state_dir,
-                &self.session_id,
-            );
-            let command = new_adapter.interactive_cmd(Some(&prompt_text), &extra);
+            let command = if resuming {
+                new_adapter.interactive_cmd(None, &extra)
+            } else {
+                let prompt_text = super::super::prompt::interactive_handoff_prompt(
+                    new_adapter.as_ref(),
+                    &[],
+                    &mut extra,
+                    &wrap::restart_prompt(handoff_note, &cfg.screen.thresholds()),
+                    &self.state_dir,
+                    &self.session_id,
+                );
+                new_adapter.interactive_cmd(Some(&prompt_text), &extra)
+            };
             std::iter::once(command.get_program().to_string_lossy().to_string())
                 .chain(command.get_args().map(|a| a.to_string_lossy().to_string()))
                 .collect()
@@ -4015,6 +4029,7 @@ pub(crate) mod tests {
             automatic: false,
             generation: None,
             structural_only: false,
+            resume_session: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -4104,6 +4119,7 @@ pub(crate) mod tests {
             automatic: false,
             generation: None,
             structural_only: false,
+            resume_session: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -4267,6 +4283,7 @@ pub(crate) mod tests {
             automatic: false,
             generation: None,
             structural_only: false,
+            resume_session: None,
         };
         pane.handover(
             &cfg,
@@ -4594,6 +4611,7 @@ pub(crate) mod tests {
             automatic: false,
             generation: None,
             structural_only: false,
+            resume_session: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -4692,6 +4710,7 @@ pub(crate) mod tests {
             automatic: false,
             generation: None,
             structural_only: false,
+            resume_session: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -4780,6 +4799,7 @@ pub(crate) mod tests {
             automatic: false,
             generation: None,
             structural_only: false,
+            resume_session: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
@@ -4866,6 +4886,7 @@ pub(crate) mod tests {
             automatic: false,
             generation: None,
             structural_only: false,
+            resume_session: None,
         };
         let handoff_note = crate::commands::ctx::handoff::Handoff::default();
 
