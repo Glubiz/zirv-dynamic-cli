@@ -2,6 +2,24 @@ use super::config::PaceConfig;
 use super::event::{ModelChange, NormalizedEvent, ProviderErrorClass};
 use super::window::{FIVE_HOUR_SECS, SEVEN_DAY_SECS, UsageWindows, Window, age_secs};
 
+/// Issue #395: true for a provider that can never have a usage-window
+/// collector at all -- any catalogue vendor other than the two native
+/// accounts zirv actually polls (`anthropic`'s Keychain/statusline tee,
+/// `openai`'s codex rollout scan). An operator `[endpoint.<agent>]` override
+/// resolves `provider()`/`provider_for_model()` to the endpoint vendor's own
+/// slug (see `adapters::claude`/`adapters::codex`), so by the time a caller
+/// here has a provider string in hand, "not anthropic or openai" already
+/// means "this is a vendor endpoint override, not a missing/broken native
+/// collector." Used by `zirv ctx status`'s and `zirv ctx usage`'s own "no
+/// usage source" lines to soften that absence from a scary-sounding
+/// "unknown"/"no source" into the honest, expected "spend-only, no window to
+/// poll for this vendor." Deliberately bounded: this does not touch the
+/// allocator/pool view, which already never reserves against a provider it
+/// has no window data for.
+pub fn is_spend_only_provider(provider: &str) -> bool {
+    !matches!(provider, "anthropic" | "openai")
+}
+
 /// Provider rate limits found in transcript events enter the same park path as
 /// the established stdout wording scan. Overflow and other provider failures
 /// stay out: rot and ordinary failure handling own those respectively.
@@ -2959,6 +2977,26 @@ mod tests {
             "be honest when nothing is known: {}",
             describe(&PaceDecision::Unknown)
         );
+    }
+
+    /// Issue #395, item 8: a spend-only provider is any catalogue vendor
+    /// other than the two native accounts zirv actually polls -- an
+    /// endpoint override resolves `provider()` to exactly one of these
+    /// slugs, so this classification is what lets `zirv ctx status`/`zirv
+    /// ctx usage` render "spend-only" instead of the scarier native-
+    /// collector wording (see the end-to-end coverage in `status.rs`'s
+    /// `status_shows_the_endpoint_line_without_the_secret_and_spend_only_
+    /// usage_wording`).
+    #[test]
+    fn is_spend_only_provider_classifies_native_accounts_and_vendor_endpoints() {
+        assert!(!is_spend_only_provider("anthropic"));
+        assert!(!is_spend_only_provider("openai"));
+        for vendor in ["zhipu", "deepseek", "moonshot", "qwen", "ollama", "vllm"] {
+            assert!(
+                is_spend_only_provider(vendor),
+                "{vendor} must be spend-only"
+            );
+        }
     }
 
     #[test]

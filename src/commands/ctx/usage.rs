@@ -472,7 +472,17 @@ pub fn run_with<W: Write>(
             if window::has_no_usage_source(&state, provider)
                 && provider != window::LEGACY_USAGE_PROVIDER
             {
-                writeln!(w, "{provider}: no usage source")?;
+                // Issue #395: a provider reached only through an operator
+                // `[endpoint.<agent>]` override structurally never has a
+                // usage-window collector -- render that as the expected,
+                // permanent "spend-only" fact, mirroring `zirv ctx
+                // status`'s identical wording, rather than the same line a
+                // broken NATIVE collector would get.
+                if pace::is_spend_only_provider(provider) {
+                    writeln!(w, "{provider}: spend-only (no usage window for {provider})")?;
+                } else {
+                    writeln!(w, "{provider}: no usage source")?;
+                }
                 if provider != window::CODEX_USAGE_PROVIDER {
                     report_codex_rollout(w, &state, now)?;
                 }

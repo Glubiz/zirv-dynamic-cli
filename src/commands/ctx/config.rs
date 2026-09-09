@@ -1783,6 +1783,91 @@ pub struct HandoverConfig {
     pub codex: HandoverTierConfig,
 }
 
+/// Issue #395: an operator-only endpoint override pointing one harness at an
+/// Anthropic-/OpenAI-compatible vendor endpoint (GLM, Kimi, DeepSeek, Qwen,
+/// Mistral, MiniMax, a local Ollama/LM Studio/vLLM runtime) instead of that
+/// harness's own native account. `vendor` names a `catalogue::vendor` slug
+/// (validated at load, see `CtxConfig::load`'s own endpoint validation block
+/// below), so once loaded `catalogue::vendor(&target.vendor)` is infallible
+/// in practice -- callers still treat a lookup failure as "fall back to the
+/// adapter's native provider" rather than panic, since a stale in-memory
+/// config outliving a catalogue change is cheap insurance, not a real
+/// expected path.
+///
+/// `credential_env` is the NAME of an environment variable holding the
+/// vendor's API key -- never the secret itself. It is read fresh at launch
+/// time (`AgentAdapter::ready()`'s own check, mirrored by `base()`'s env
+/// injection for claude and codex's own `env_key` config for the vendor
+/// account), and it is never logged, printed, or persisted anywhere.
+///
+/// `model` is the launch model pinned for this endpoint: the operator's own
+/// choice when set, else the vendor's strongest catalogue rung id
+/// (`EndpointTarget::pin_model`) -- required at load time for a vendor with
+/// no catalogue rungs at all (a local runtime like `ollama`), since there is
+/// then no ladder to default from. `wire_api` (codex only) is `"chat"`
+/// (default) or `"responses"`.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EndpointTarget {
+    pub vendor: String,
+    pub base_url: String,
+    pub credential_env: String,
+    pub model: Option<String>,
+    pub wire_api: Option<String>,
+}
+
+impl EndpointTarget {
+    /// Resolves the actual launch model for this endpoint: the operator's
+    /// own `model` when it is set, else the vendor's strongest catalogue rung
+    /// id (rungs are stored strongest-first, so the first entry is it). A
+    /// `requested` model (an interactive `chat.model`, a handoff ladder tier,
+    /// an operator `--model`) is honoured only when it resolves on THIS
+    /// endpoint vendor's own ladder, by alias or id -- otherwise it is
+    /// silently replaced by the endpoint default, so an Anthropic alias like
+    /// `opus` can never reach a GLM endpoint, and a codex ladder tier can
+    /// never reach a DeepSeek one. `requested: None` always returns the
+    /// endpoint default. Used by both adapters' `model_args` -- the one
+    /// place both `claude.rs` and `codex.rs` funnel every `--model`/`-m`
+    /// emission through.
+    pub fn pin_model(&self, requested: Option<&str>) -> String {
+        if let Some(model) = requested
+            && let Some(vendor) = super::catalogue::vendor(&self.vendor)
+            && super::catalogue::rung_of(vendor, model).is_some()
+        {
+            return model.to_string();
+        }
+        self.default_model()
+    }
+
+    /// The endpoint's own default model, with no requested model in hand:
+    /// the operator's `model` override, else the vendor's strongest rung id,
+    /// else empty (only reachable for a rungless vendor whose `model` load-
+    /// time validation already made mandatory, so this is never actually
+    /// empty for a loaded config).
+    fn default_model(&self) -> String {
+        if let Some(model) = self.model.as_deref() {
+            return model.to_string();
+        }
+        super::catalogue::vendor(&self.vendor)
+            .and_then(|v| v.rungs.first())
+            .map(|r| r.id.to_string())
+            .unwrap_or_default()
+    }
+}
+
+/// Issue #395: the two harnesses `[endpoint.<agent>]` may retarget. Operator-
+/// only (see `REPO_FORBIDDEN`'s whole-table `endpoint` entry): choosing which
+/// vendor account a seat spends is the same trust asymmetry `agent`/
+/// `review.*`/`worker.*`/`handover.*` above already hold to, applied to the
+/// endpoint a harness's own native account is replaced with rather than to
+/// which native account is used.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EndpointConfig {
+    pub claude: Option<EndpointTarget>,
+    pub codex: Option<EndpointTarget>,
+}
+
 /// zirv's own shipped-default launch posture (2026-08-22 decision,
 /// harness/model parity round): **sandboxed, no prompts**. Commands run
 /// freely inside the repository workspace; anything reaching outside it
@@ -2074,6 +2159,7 @@ pub struct CtxConfig {
     pub review: ReviewConfig,
     pub worker: WorkerConfig,
     pub handover: HandoverConfig,
+    pub endpoint: EndpointConfig,
     pub fallback: FallbackConfig,
     pub sandbox: SandboxConfig,
     pub objective: ObjectiveConfig,
@@ -3731,6 +3817,21 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
     // `worker` above), so this one entry blocks the whole `[handover]`
     // table -- both agents, all three tiers -- together.
     (&["handover"], "ZIRV_CTX_HANDOVER_CLAUDE_CHEAP"),
+    // Issue #395: `[endpoint.claude]`/`[endpoint.codex]` choose which vendor
+    // ACCOUNT a harness spends -- picking the account is the same trust
+    // asymmetry `agent`/`review.*`/`worker.*`/`handover.*` above already
+    // hold to, applied to a whole-endpoint retarget rather than a model
+    // choice within one native account. `value_at` matches a table node the
+    // same way it matches a leaf (see `handover` right above), so this one
+    // entry blocks the whole `[endpoint]` table, both agents, every field.
+    // Deliberately no `ENV_MAP` entry backs this: an endpoint override is
+    // `~/.zirv/ctx.toml`-only by design (see `EndpointConfig`'s own doc
+    // comment), so there is no environment variable to name here the way
+    // every other entry in this table names one.
+    (
+        &["endpoint"],
+        "the operator's own ~/.zirv/ctx.toml (there is no environment override for endpoint.*)",
+    ),
     // `safety.allow`/`safety.default` (issue #83): unlike `safety.deny`/
     // `safety.ask` (lifted out and unioned across layers -- see
     // `super::safety`'s module doc, the identical narrowing-fold treatment
@@ -5053,6 +5154,20 @@ impl CtxConfig {
             validate_model_str("handover.codex.deep", model)?;
         }
 
+        // Issue #395: `[endpoint.claude]`/`[endpoint.codex]` are `REPO_
+        // FORBIDDEN` outright (see that entry's own comment), so by this
+        // point either is `Some` only from the operator's own home layer.
+        // Validated here, once, rather than at every read site: a launch
+        // that reaches `AgentAdapter::ready()`/`base()`/`model_args` with a
+        // resolved `EndpointTarget` in hand can trust `vendor` names a real
+        // catalogue vendor without re-checking.
+        if let Some(target) = cfg.endpoint.claude.as_ref() {
+            validate_endpoint_target("endpoint.claude", target)?;
+        }
+        if let Some(target) = cfg.endpoint.codex.as_ref() {
+            validate_endpoint_target("endpoint.codex", target)?;
+        }
+
         cfg.agents = crate::settings::AgentGate::load(repo, env)?;
         cfg.policy = super::policy::resolve(home_policy, repo_policy, env)?;
         cfg.safety = super::safety::resolve(home_safety, repo_safety, env)?;
@@ -5338,6 +5453,83 @@ pub(crate) fn validate_model_str(key: &str, model: &str) -> CtxResult<()> {
         )
         .into());
     }
+    Ok(())
+}
+
+/// Issue #395: load-time validation for one `[endpoint.claude]`/`[endpoint.
+/// codex]` table. Named errors -- `key` prefixes every message with the
+/// dotted table path (`"endpoint.claude"`), so an operator with both tables
+/// misconfigured sees which one failed. Never reads or prints
+/// `credential_env`'s VALUE -- only its own name is validated, and only as a
+/// shell-identifier shape (`AgentAdapter::ready()` is what checks the named
+/// variable actually resolves to a non-empty secret, at launch time, not
+/// here).
+fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> CtxResult<()> {
+    let vendor = super::catalogue::vendor(&target.vendor).ok_or_else(|| {
+        let known: Vec<&str> = super::catalogue::vendors().iter().map(|v| v.slug).collect();
+        format!(
+            "{key}: vendor \"{}\" is not a catalogue vendor (known: {})",
+            target.vendor,
+            known.join(", ")
+        )
+    })?;
+
+    if !target.base_url.starts_with("http://") && !target.base_url.starts_with("https://") {
+        return Err(format!(
+            "{key}: base_url must be an http(s) URL, got \"{}\"",
+            target.base_url
+        )
+        .into());
+    }
+
+    if target.credential_env.is_empty()
+        || target.credential_env.contains('=')
+        || !target
+            .credential_env
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "{key}: credential_env must be a non-empty environment variable NAME (ASCII \
+             letters, digits, underscore, never `=` or the secret itself), got \"{}\"",
+            target.credential_env
+        )
+        .into());
+    }
+
+    if let Some(wire_api) = target.wire_api.as_deref()
+        && wire_api != "chat"
+        && wire_api != "responses"
+    {
+        return Err(format!(
+            "{key}: wire_api must be \"chat\" or \"responses\", got \"{wire_api}\""
+        )
+        .into());
+    }
+
+    match target.model.as_deref() {
+        Some(model) => {
+            if !vendor.rungs.is_empty() && super::catalogue::rung_of(vendor, model).is_none() {
+                return Err(format!(
+                    "{key}: model \"{model}\" does not resolve (by alias or id) on vendor \
+                     \"{}\"'s catalogue ladder",
+                    target.vendor
+                )
+                .into());
+            }
+        }
+        None => {
+            if vendor.rungs.is_empty() {
+                return Err(format!(
+                    "{key}: model is required for vendor \"{}\", which has no catalogue rungs \
+                     to default from",
+                    target.vendor
+                )
+                .into());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -5725,6 +5917,127 @@ mod tests {
         let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
         assert_eq!(cfg.score.token_floor, Some(50_000));
         assert_eq!(cfg.score.token_ceiling, Some(900_000));
+    }
+
+    /// Issue #395, item 5: a repository checkout may not set `[endpoint.*]`
+    /// at all -- choosing which vendor account a seat spends is the same
+    /// trust asymmetry `agent`/`handover.*` already hold to.
+    #[test]
+    fn a_repo_ctx_toml_cannot_set_an_endpoint_override() {
+        let repo = tempfile::tempdir().expect("repo");
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[endpoint.claude]\nvendor = \"zhipu\"\nbase_url = \"https://api.z.ai/api/anthropic\"\ncredential_env = \"ZHIPU_API_KEY\"\n",
+        )
+        .expect("write");
+        let empty: HashMap<String, String> = HashMap::new();
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repo may not set [endpoint.*]");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "must be a security refusal: {err}"
+        );
+    }
+
+    /// Issue #395, item 5 (operator half): the identical table loads fine
+    /// from the operator's own home layer.
+    #[test]
+    fn an_operator_endpoint_override_loads_from_the_home_layer() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[endpoint.claude]\nvendor = \"zhipu\"\nbase_url = \"https://api.z.ai/api/anthropic\"\ncredential_env = \"ZHIPU_API_KEY\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        let target = cfg.endpoint.claude.expect("endpoint.claude must load");
+        assert_eq!(target.vendor, "zhipu");
+        assert_eq!(target.base_url, "https://api.z.ai/api/anthropic");
+        assert_eq!(target.credential_env, "ZHIPU_API_KEY");
+        assert_eq!(target.model, None);
+        assert_eq!(cfg.endpoint.codex, None);
+    }
+
+    /// Issue #395, item 6: every load-time validation error `validate_
+    /// endpoint_target` can raise, each named clearly enough to fix without
+    /// re-reading the source.
+    #[test]
+    fn endpoint_validation_rejects_every_documented_shape() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "[endpoint.claude]\nvendor = \"no-such-vendor\"\nbase_url = \"https://x\"\ncredential_env = \"X\"\n",
+                "not a catalogue vendor",
+            ),
+            (
+                "[endpoint.claude]\nvendor = \"zhipu\"\nbase_url = \"ftp://x\"\ncredential_env = \"X\"\n",
+                "base_url must be an http(s) URL",
+            ),
+            (
+                "[endpoint.codex]\nvendor = \"deepseek\"\nbase_url = \"https://api.deepseek.com\"\ncredential_env = \"DEEPSEEK_API_KEY\"\nwire_api = \"grpc\"\n",
+                "wire_api must be",
+            ),
+            (
+                // ollama has no catalogue rungs at all, so `model` is required.
+                "[endpoint.claude]\nvendor = \"ollama\"\nbase_url = \"http://localhost:11434\"\ncredential_env = \"OLLAMA_KEY\"\n",
+                "model is required",
+            ),
+            (
+                "[endpoint.claude]\nvendor = \"zhipu\"\nbase_url = \"https://api.z.ai/api/anthropic\"\ncredential_env = \"ZHIPU_API_KEY\"\nmodel = \"claude-opus-5\"\n",
+                "does not resolve",
+            ),
+        ];
+        for (home_toml, expected_fragment) in cases {
+            let home = tempfile::tempdir().expect("home");
+            std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+            std::fs::write(home.path().join(".zirv/ctx.toml"), home_toml).expect("write");
+            let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+            let repo = tempfile::tempdir().expect("repo");
+            let empty: HashMap<String, String> = HashMap::new();
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err(&format!("must be rejected: {home_toml}"));
+            assert!(
+                !is_repo_forbidden(err.as_ref()),
+                "a schema/validation error is not a REPO_FORBIDDEN rejection: {err}"
+            );
+            assert!(
+                err.to_string().contains(expected_fragment),
+                "expected {expected_fragment:?} in {err} (config: {home_toml})"
+            );
+        }
+    }
+
+    /// Issue #395: a rungless local-runtime vendor (`ollama`) accepts an
+    /// explicit `model` with no ladder to validate it against.
+    #[test]
+    fn endpoint_validation_accepts_an_explicit_model_for_a_rungless_vendor() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".zirv/ctx.toml"),
+            "[endpoint.claude]\nvendor = \"ollama\"\nbase_url = \"http://localhost:11434\"\ncredential_env = \"OLLAMA_KEY\"\nmodel = \"llama3.1\"\n",
+        )
+        .expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("repo");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert_eq!(
+            cfg.endpoint
+                .claude
+                .expect("endpoint.claude must load")
+                .model,
+            Some("llama3.1".to_string())
+        );
     }
 
     #[test]

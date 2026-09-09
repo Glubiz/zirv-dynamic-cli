@@ -1525,6 +1525,7 @@ checkout:
 | `worker.default_depth` | `ZIRV_CTX_WORKER_DEFAULT_DEPTH` |
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
+| `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
