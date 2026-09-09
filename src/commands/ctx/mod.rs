@@ -31,6 +31,7 @@ pub mod handover;
 pub mod hook;
 pub(crate) mod hook_integrity;
 pub mod judge;
+pub mod learn;
 pub mod ledger;
 pub mod log;
 pub mod mail;
@@ -522,6 +523,10 @@ pub enum CtxVerb {
     /// compaction ledger where a row exists, estimated from today's config
     /// otherwise (issue #423). Read-only: never changes config.
     Discover(discover::DiscoverArgs),
+    /// Promotes a recurring fail-then-fix command correction from recent
+    /// transcripts into one `learned:`-prefixed private memory entry
+    /// (issue #425). Read-only with `--dry-run`.
+    Learn(learn::LearnArgs),
 }
 
 /// What a clap parse failure costs, which is not the same for every verb.
@@ -648,6 +653,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         CtxVerb::Swarm(a) => task::run_swarm(a, &mut out),
         CtxVerb::Measure(a) => measure::run(a, &mut out),
         CtxVerb::Discover(a) => discover::run(a, &mut out),
+        CtxVerb::Learn(a) => learn::run(a, &mut out),
     };
 
     match result {

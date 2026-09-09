@@ -179,6 +179,7 @@ const MUTATING: &[&str] = &[
     "zirv ctx send",
     "zirv ctx remember",
     "zirv ctx forget",
+    "zirv ctx learn",
     "zirv ctx nudge",
     "zirv ctx kill",
     "zirv ctx handover",
