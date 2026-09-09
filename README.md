@@ -525,8 +525,9 @@ to the section or vault page that documents it in depth.
   [Environment variables worth
   knowing](#environment-variables-worth-knowing).
 - **Hooks** — `hook` wires zirv into Claude Code's and Codex's own lifecycle
-  events (stop, prompt, pre-compact, pretool/posttool, notify,
-  session-start, plus a read-only status/audit pair). See [Hook
+  events (stop, prompt, pre-compact, pretool/posttool, permission, notify,
+  session-start), audits recorded decisions, and checks or heals the
+  installed hook entries against their baseline. See [Hook
   registration (Claude Code)](#hook-registration-claude-code) and the
   vault's [Ctx
   Subsystem](docs/obsidian/Modules/Ctx%20Subsystem.md#hook-integrity-issue-420).
@@ -592,8 +593,9 @@ to the section or vault page that documents it in depth.
 - **Bug and feature reports** — `report` (`bug`/`feature`) files a Zirv
   issue on GitHub, optionally attaching a redacted `snapshot`.
 - **Workflow artifacts** — `artifact` registers and inspects workflow
-  artifacts (`list`, `present`, `render`, `show`) with static-first
-  fallback selection. See [Frontend quality](#frontend-quality).
+  artifacts (`list`, `present`, `render`, `show`); presentation prefers an
+  adapter's native mechanism and falls back to a static file. See
+  [Frontend quality](#frontend-quality).
 - **Bundled orientation** — `skill` (`--json`) prints the bundled operator
   orientation skill for this binary (also `zirv --skill`).
 - **Command inventory** — `commands` (`--json`) lists every command this
