@@ -11,16 +11,15 @@
 use super::config::OutputFilterRule;
 
 /// A line made ONLY of progress-bar glyphs, whitespace, numbers, percentages,
-/// byte-rate tokens (`1.2M/s`, `62 kB`, `4.0 MiB`) and `eta` markers, which
-/// must contain at least one digit or a run of three bar glyphs -- shared
-/// by every bundled rule below and by the `progress-noise` catch-all as the
-/// one pattern that strips a spinner/progress-bar line without ever
-/// touching a line holding an ordinary word. Letters are only allowed
-/// inside those size/rate/eta tokens, so `steps:`, `set -e` or `1 test`
-/// never match; a bare timestamp or version number does, which a summary of
-/// an already-oversized result can afford to lose. `progress_token!` is one
-/// alternative of it: a bar/punctuation glyph, a size or rate (`62 kB`,
-/// `1.2M/s`, `4.0 MiB`), an `eta` marker, or a digit.
+/// byte-size/rate tokens (`1.2M/s`, `62 kB`, `4.0 MiB`), durations and `eta`
+/// markers, which must also contain a percentage, a run of three bar glyphs,
+/// a byte size/rate or an `eta` marker -- shared by every bundled rule below
+/// and by the `progress-noise` catch-all as the one pattern that strips a
+/// progress-bar line without ever touching a line holding an ordinary word
+/// or a bare number (`steps:`, `set -e`, `1 test`, `2026-09-09` and `3.41.0`
+/// all survive). `progress_token!` is one alternative of it: a
+/// bar/punctuation glyph, a size, rate or duration, an `eta` marker, or a
+/// digit.
 macro_rules! progress_token {
     () => {
         concat!(
@@ -34,7 +33,7 @@ macro_rules! progress_token {
 const PROGRESS_LINE: &str = concat!(
     r"^(?:",
     progress_token!(),
-    r")*(?:\d|[=#░█▓▒]{3})(?:",
+    r")*(?:\d+(?:\.\d+)?\s*%|[=#░█▓▒]{3}|\d+(?:\.\d+)?\s*(?:[KMGTkmgt]i?[Bb]|[KMGTkmgt](?:/s|ps))\b|\b(?:eta|ETA)\b)(?:",
     progress_token!(),
     r")*$"
 );
@@ -159,7 +158,6 @@ mod tests {
             "######## 12.3%",
             "  50% [=====>   ] 1.2M/s eta 3s",
             "  62 kB / 4.0 MiB (1%)",
-            "⣾ 12/300",
             "==========>",
         ] {
             assert!(re.is_match(sample), "expected match: {sample:?}");
@@ -179,6 +177,9 @@ mod tests {
             "1 test",
             "meta: base",
             "Compiling foo v0.1.0",
+            "2026-09-09",
+            "3.41.0",
+            "12/300",
         ] {
             assert!(!re.is_match(sample), "expected no match: {sample:?}");
         }

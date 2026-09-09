@@ -5336,6 +5336,11 @@ pub(crate) fn degrade_to_operator_only(env: EnvLookup<'_>) -> CtxConfig {
     };
     cfg.supervise.orchestrator_writes = OrchestratorWrites::Deny;
     cfg.prompt.orchestrator_writes = OrchestratorWrites::Deny;
+    // The bundled `[[output.filter]]` rules are `load`'s doing, not
+    // `OutputConfig::default()`'s, so a degraded config adds them itself:
+    // they only ever strip noise from a summary, so a config that could not
+    // be read still compacts the way an absent one does.
+    cfg.output.filter = super::output_filters::bundled_output_filter_rules();
     cfg
 }
 
@@ -8108,6 +8113,17 @@ mod tests {
             degraded.prompt.orchestrator_writes,
             OrchestratorWrites::Deny,
             "the synced `prompt` copy must agree with `supervise`"
+        );
+    }
+
+    #[test]
+    fn degrade_to_operator_only_keeps_the_bundled_output_filter_rules() {
+        let empty = env_map(&[]);
+        let degraded = degrade_to_operator_only(&|k| empty.get(k).cloned());
+        assert_eq!(
+            degraded.output.filter,
+            super::super::output_filters::bundled_output_filter_rules(),
+            "a failed config load must compact the way an absent config does"
         );
     }
 
