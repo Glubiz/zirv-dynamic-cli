@@ -29,7 +29,7 @@ The complete set of `zirv ctx <verb>` names, kept in sync with `CtxVerb` (`src/c
 
 | id | invariant | module |
 |---|---|---|
-| `ZCHK-VERSION-BUMP` | `Cargo.toml`'s version is above the base branch's (`git merge-base`); `Cargo.lock`'s own `zirv` entry matches | `version_bump.rs` |
+| `ZCHK-VERSION-BUMP` | when the diff vs. base touches `src/`/`Cargo.toml`/`Cargo.lock`/`build.rs`, `Cargo.toml`'s version is above base's (`git merge-base`) and `Cargo.lock`'s `zirv` entry matches; a docs/CI-only diff needs no bump (operator decision, 2026-09-09) | `version_bump.rs` |
 | `ZCHK-ARGV-CODEX-EXEC` | codex's headless argv opens with `exec`, carries the prompt, and adds `--sandbox` when `shell_exec` is denied | `argv.rs` |
 | `ZCHK-ARGV-CLAUDE-HEADLESS` | claude's headless argv carries `-p`/`--session-id`/the prompt, and no `--dangerously-*` flag under the default policy | `argv.rs` |
 | `ZCHK-FORBIDDEN-WIDENING` | every `ctx.toml` key `config.rs`'s `ENV_MAP` enumerates is `REPO_FORBIDDEN` or on an explicit narrow-only allow-list | `forbidden.rs` |
