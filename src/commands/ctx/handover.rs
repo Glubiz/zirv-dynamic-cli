@@ -261,6 +261,17 @@ pub struct HandoverRequest {
     /// so spending the round trip only delays the swap.
     #[serde(default)]
     pub structural_only: bool,
+    /// Issue #440: resume THIS conversation natively rather than starting a
+    /// fresh one, when the target adapter has a verified resume mechanism
+    /// (`AgentAdapter::resume_args`). Set only where the swap is putting a
+    /// session back where it already was -- recovering the source after a
+    /// rollover successor died -- never for an ordinary swap onto a
+    /// different harness, which has no conversation of its own to resume. A
+    /// cold launch carrying the structural packet is the fallback whenever
+    /// the adapter has no resume story, and unsaved in-flight state is
+    /// exactly what that fallback cannot carry.
+    #[serde(default)]
+    pub resume_session: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -344,6 +355,15 @@ pub fn resolve_swap_launch(
     );
     if let Some(model) = &req.target_model {
         extra.extend(new_adapter.model_args(model));
+    }
+    // Issue #440: a source recovery resumes the conversation it already had.
+    // `resume_args` is `None` for an adapter with no verified mechanism, so
+    // this silently degrades to the cold launch above rather than guessing a
+    // flag -- the same rule the dashboard's own restore roster follows.
+    if let Some(session) = &req.resume_session
+        && let Some(args) = new_adapter.resume_args(session)
+    {
+        extra.extend(args);
     }
     Ok((new_adapter, extra))
 }
@@ -547,6 +567,7 @@ pub fn run_with<W: Write>(
         automatic: false,
         generation: None,
         structural_only: false,
+        resume_session: None,
     };
     // T4 (C-3): a previous handover attempt (or an automatic rollover that
     // wrote one before this fix) can leave an ack sitting next to the
@@ -943,6 +964,7 @@ mod tests {
             automatic: false,
             generation: None,
             structural_only: false,
+            resume_session: None,
         };
         write_request(&state, "abcd1234", &req).expect("write");
         let claimed = take_request(&state, "abcd1234").expect("present");
@@ -1055,12 +1077,55 @@ mod tests {
             automatic: false,
             generation: None,
             structural_only: false,
+            resume_session: None,
         };
         let (_, extra) = resolve_swap_launch(&cfg, &req).expect("resolves");
         assert!(
             extra.contains(&"--permission-mode".to_string())
                 && extra.contains(&"dontAsk".to_string()),
             "a non-interactive handover request must not get the permissive interactive posture: got {extra:?}"
+        );
+    }
+
+    /// Issue #440: recovering the source after a rollover successor died
+    /// resumes its OWN conversation, so the unsaved in-flight state a
+    /// structural packet provably cannot carry survives. An adapter with no
+    /// verified resume mechanism degrades to the cold launch instead of
+    /// guessing a flag.
+    #[test]
+    fn a_resume_request_carries_the_adapters_verified_resume_flag() {
+        let cfg = CtxConfig::default();
+        let session = "11111111-2222-4333-8444-555555555555";
+        let cold = HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+            interactive: true,
+            automatic: true,
+            generation: None,
+            structural_only: true,
+            resume_session: None,
+        };
+        let (_, extra) = resolve_swap_launch(&cfg, &cold).expect("resolves");
+        assert!(
+            !extra.contains(&"--resume".to_string()),
+            "an ordinary swap has no conversation of its own to resume: {extra:?}"
+        );
+
+        let resumed = HandoverRequest {
+            resume_session: Some(session.to_string()),
+            ..cold
+        };
+        let (_, extra) = resolve_swap_launch(&cfg, &resumed).expect("resolves");
+        let at = extra
+            .iter()
+            .position(|arg| arg == "--resume")
+            .expect("claude's verified resume flag");
+        assert_eq!(
+            extra.get(at + 1).map(String::as_str),
+            Some(session),
+            "the flag must name the SOURCE session id: {extra:?}"
         );
     }
 

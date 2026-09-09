@@ -492,17 +492,25 @@ fn compact_plan<'a>(
     })
 }
 
+/// Review round 1 (issue #303): `session` must carry the launch's own `cwd`,
+/// not just its id -- `adapter.resume_target` needs both to recover an
+/// adapter-minted id (codex) that has nothing to do with zirv's own. Fails
+/// closed (`None`) whenever `resume_target` cannot recover a target at all,
+/// exactly like the pre-existing honest-refusal default on `headless_resume_
+/// cmd` itself: never resume a conversation this session did not verifiably
+/// start.
 pub(crate) fn headless_resume_launch(
     adapter: &dyn adapters::AgentAdapter,
     prompt: &str,
-    session: &SessionId,
+    session: &SessionRef,
     extra: &[String],
     prompt_via_stdin: bool,
 ) -> Option<(Command, Option<String>)> {
-    let probe = adapter.headless_resume_cmd(Some(prompt), session.as_str(), extra)?;
+    let target = adapter.resume_target(session)?;
+    let probe = adapter.headless_resume_cmd(Some(prompt), &target, extra)?;
     let argv_total_len = headless_argv_len(&probe);
     if headless_prompt_via_stdin(prompt_via_stdin, argv_total_len)
-        && let Some(command) = adapter.headless_resume_cmd(None, session.as_str(), extra)
+        && let Some(command) = adapter.headless_resume_cmd(None, &target, extra)
     {
         return Some((command, Some(prompt.to_string())));
     }
@@ -1776,10 +1784,14 @@ fn run_with_clock_inner<W: Write>(
                 Duration::from_millis(cfg.wrap.inject_timeout_ms),
                 poll,
                 |compact_prompt| {
+                    let session_ref = SessionRef {
+                        id: session.clone(),
+                        cwd: repo.to_path_buf(),
+                    };
                     let (mut compact, stdin_prompt) = headless_resume_launch(
                         adapter.as_ref(),
                         compact_prompt,
-                        &session,
+                        &session_ref,
                         &extra,
                         prompt_via_stdin,
                     )?;
@@ -1796,10 +1808,14 @@ fn run_with_clock_inner<W: Write>(
                     "{prompt_text}\n\nContinue the same task after the verified in-place \
                      compaction without redoing completed work."
                 );
+                let session_ref = SessionRef {
+                    id: session.clone(),
+                    cwd: repo.to_path_buf(),
+                };
                 let (mut command, stdin_prompt) = headless_resume_launch(
                     adapter.as_ref(),
                     &continuation,
-                    &session,
+                    &session_ref,
                     &extra,
                     prompt_via_stdin,
                 )
@@ -5123,6 +5139,12 @@ mod tests {
         );
     }
 
+    /// Issue #303 gave codex a real `headless_resume_cmd` (`codex exec
+    /// resume`), but deliberately left `supports_headless_compact` `false`:
+    /// no verified in-place compaction directive exists to pair the resume
+    /// with (see `CodexAdapter::compact_command`'s own doc comment). This
+    /// pins that a codex `Verdict::Compact` still restarts, unchanged by
+    /// that issue.
     #[test]
     fn codex_compact_verdict_restarts_without_arming_the_compact_budget() {
         let codex = crate::commands::ctx::adapters::codex::CodexAdapter::new(None);

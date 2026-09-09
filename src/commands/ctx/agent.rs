@@ -2059,8 +2059,11 @@ fn report_back_message(
 /// is now valid -- the caller re-reads the transcript and re-validates
 /// itself. `Err` covers the adapter having no resume support at all (never
 /// reached in practice: callers check `headless_resume_cmd(..).is_some()`
-/// first, since a resume attempt on codex would spend a retry the bounded
-/// budget never gets back) and the command failing to start or run.
+/// first, since a resume attempt on an adapter with no resume support at
+/// all would spend a retry the bounded budget never gets back -- issue
+/// #303 gave codex its own real `headless_resume_cmd`, so it now takes
+/// this same bounded retry like any other resume-capable adapter) and the
+/// command failing to start or run.
 fn run_contract_retry(
     adapter: &dyn AgentAdapter,
     session: &SessionId,
@@ -2071,8 +2074,12 @@ fn run_contract_retry(
     env_pairs: &[(String, String)],
 ) -> Result<(), String> {
     let prompt_via_stdin = exec::prompt_delivery_via_stdin(adapter, session);
+    let session_ref = SessionRef {
+        id: session.clone(),
+        cwd: launch_repo.to_path_buf(),
+    };
     let (mut command, stdin_prompt) =
-        exec::headless_resume_launch(adapter, retry_prompt, session, extra, prompt_via_stdin)
+        exec::headless_resume_launch(adapter, retry_prompt, &session_ref, extra, prompt_via_stdin)
             .ok_or_else(|| {
                 format!(
                     "adapter '{}' cannot resume a headless session in place",
@@ -3851,10 +3858,11 @@ pub fn run_with<W: Write>(
             let result_adapter: &dyn AgentAdapter =
                 reselected.as_deref().unwrap_or_else(|| adapter.as_ref());
             let session_ref = SessionId::parse(&final_session);
-            let transcript_path = result_adapter.transcript_path(&SessionRef {
+            let session_ref_full = SessionRef {
                 id: session_ref.clone(),
                 cwd: launch_repo.clone(),
-            });
+            };
+            let transcript_path = result_adapter.transcript_path(&session_ref_full);
             let read_last_text = |path: &Path| -> Option<String> {
                 let jsonl = std::fs::read_to_string(path).unwrap_or_default();
                 result_adapter
@@ -3885,15 +3893,22 @@ pub fn run_with<W: Write>(
 
             // One bounded retry, only when the adapter that actually ran
             // this delegation can resume a headless conversation at all
-            // (codex cannot: `CodexAdapter::headless_resume_cmd` is the
-            // trait's own honest-refusal default) -- a worker with no
-            // resume support gets exactly one attempt, never a synthetic
-            // second chance it cannot structurally receive.
+            // (some adapters still cannot: any still on the trait's own
+            // honest-refusal `headless_resume_cmd` default, e.g. droid,
+            // gemini, pi, opencode, copilot -- codex gained a real one in
+            // issue #303) AND a real target session can be resolved for it
+            // (review round 1: codex's own `resume_target` fails closed when
+            // its minted rollout cannot be recovered, which `headless_
+            // resume_cmd` alone -- a pure argv builder -- has no way to
+            // detect) -- a worker that fails either check gets exactly one
+            // attempt, never a synthetic second chance it cannot
+            // structurally receive.
             if validated.is_none()
                 && let Some(first_errors) = attempts.first()
                 && result_adapter
                     .headless_resume_cmd(Some("probe"), &final_session, &[])
                     .is_some()
+                && result_adapter.resume_target(&session_ref_full).is_some()
             {
                 let retry_prompt = result_schema::build_retry_message(first_errors);
                 let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(300));
@@ -8118,17 +8133,21 @@ mod tests {
         );
     }
 
-    /// Issue #318: codex has no verified `headless_resume_cmd` (the trait's
-    /// own honest-refusal default), so a worker on it gets exactly ONE
-    /// contract attempt, never a synthetic retry it cannot structurally
-    /// receive. `fake-agent.sh` always writes a claude-shaped transcript
-    /// regardless of which adapter invoked it, and codex's own
-    /// `transcript_path` looks under `.codex/sessions/`, so this run's
-    /// worker transcript is genuinely unreadable to the codex adapter --
-    /// exactly the "no final text at all" case a real codex worker that
-    /// crashed before replying would also produce.
+    /// Issue #303 gave codex a real `headless_resume_cmd` (`codex exec
+    /// resume`), but review round 1 found it targeted zirv's own session id
+    /// instead of codex's own minted one -- a wasted resume against a
+    /// conversation codex never created. The fix (`CodexAdapter::
+    /// resume_target`) recovers codex's real id from its own rollout file
+    /// and fails closed (`None`) whenever that rollout cannot be resolved,
+    /// which is exactly what happens here: this test's `fake-agent.sh` never
+    /// writes anything codex-shaped under `.codex/sessions/`, so no rollout
+    /// exists to recover an id from. The structural capability
+    /// (`headless_resume_cmd`) is real, but the gate now ALSO requires
+    /// `resume_target` to resolve -- and it cannot, so this stays exactly
+    /// ONE attempt, never a resume aimed at a session that was never
+    /// verified to exist.
     #[test]
-    fn a_headless_run_on_an_adapter_with_no_resume_support_gets_exactly_one_attempt() {
+    fn a_headless_run_on_codex_stays_one_attempt_when_its_own_rollout_cannot_be_resolved() {
         let tmp = crate::commands::ctx::testenv::repo();
         let home = tmp.path().join("home");
         let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
@@ -8149,11 +8168,65 @@ mod tests {
         unsafe {
             std::env::remove_var("FAKE_AGENT_MODE");
         }
-        // Codex's own `headless_cmd` mints its own session id and passes no
-        // `--session-id` flag at all -- `fake-agent.sh` refuses outright
-        // without one (exit 64), which is exactly the "worker produced no
-        // final text" case this test wants: the exit code itself is not
-        // what is under test here, only the contract outcome below is.
+        code.expect("runs");
+        let printed = String::from_utf8_lossy(&out);
+        assert!(
+            printed.contains("result: contract_failed (1 errors)"),
+            "got {printed}"
+        );
+
+        let state_dir = crate::commands::ctx::state::StateDir::from_root(state);
+        let results_dir = state_dir.logs().join("delegation-results");
+        let files: Vec<_> = std::fs::read_dir(&results_dir)
+            .expect("results dir exists")
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1);
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(files[0].path()).expect("read"))
+                .expect("json");
+        assert_eq!(record["outcome"], "contract_failed");
+        let errors = record["errors"].as_array().expect("errors array");
+        assert_eq!(
+            errors.len(),
+            1,
+            "an unresolvable rollout means exactly one attempt, never a resume aimed at an \
+             unverified session: {errors:?}"
+        );
+    }
+
+    /// Restores the original issue #318 guarantee: an adapter still on the
+    /// trait's own honest-refusal `headless_resume_cmd` default (droid,
+    /// confirmed by `droid.rs`'s own module doc -- "no verified headless
+    /// compact-then-resume flow") gets exactly ONE contract attempt, never a
+    /// synthetic retry it cannot structurally receive. Droid's own
+    /// `headless_cmd` (`exec -o stream-json <prompt>`) matches none of
+    /// `fake-agent.sh`'s recognized flags either, so this run's transcript is
+    /// genuinely unreadable the same way codex's own no-`--session-id`
+    /// launch is -- exactly the "no final text at all" case a real crashed
+    /// worker would also produce.
+    #[test]
+    fn a_headless_run_on_an_adapter_with_no_resume_support_gets_exactly_one_attempt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state = tmp.path().join("state");
+        let mut env = base_env(&state);
+        env.insert(
+            crate::commands::ctx::adapters::SESSION_ENV.to_string(),
+            "aaaaaaaa-1111-4222-8333-444444444444".to_string(),
+        );
+        unsafe {
+            std::env::set_var("FAKE_AGENT_MODE", "healthy");
+        }
+
+        let mut args = args_for("droid", "do the work");
+        args.result_kind = Some("review".to_string());
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned());
+        unsafe {
+            std::env::remove_var("FAKE_AGENT_MODE");
+        }
         code.expect("runs");
         let printed = String::from_utf8_lossy(&out);
         assert!(

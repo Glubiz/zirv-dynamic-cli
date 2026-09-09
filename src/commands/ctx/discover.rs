@@ -326,9 +326,10 @@ fn classify_rows(
 
 /// Renders `n` bytes as a short human-readable size -- the identical
 /// rounding/unit choice `ledger.rs`'s own `human_bytes` uses, kept as its own
-/// small copy for the same reason that module's doc comment already gives:
-/// this exact formatter only ever needs to match its own callers.
-fn human_bytes(n: u64) -> String {
+/// small copy for the same reason that module's doc comment already gives.
+/// `pub(crate)` so `learn.rs` (issue #425 review) prints the identical
+/// "stopped after ... narrow --since" wording rather than a second copy.
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [(&str, f64); 4] = [
         ("GiB", 1024.0 * 1024.0 * 1024.0),
         ("MiB", 1024.0 * 1024.0),
@@ -489,14 +490,17 @@ fn render<W: Write>(rows: &[DiscoverRow], args: &DiscoverArgs, w: &mut W) -> Ctx
 /// and a multi-GB corpus of uncompacted (by definition -- that is what this
 /// command looks for) transcripts read whole would OOM or stall it. 256 MiB
 /// comfortably covers a normal `--since` window while still bounding the
-/// worst case.
-const TRANSCRIPT_SCAN_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+/// worst case. `pub(crate)`: `learn.rs` (issue #425 review) scans the same
+/// claude/codex transcript candidates and shares this exact budget rather
+/// than hardcoding a second number that could drift from this one.
+pub(crate) const TRANSCRIPT_SCAN_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
 
 /// How many candidate transcript files [`run_with`] will open at most,
 /// independent of [`TRANSCRIPT_SCAN_BYTE_BUDGET`] -- a `--all` scan of a
 /// machine with thousands of small, stale transcripts must not pay a
 /// filesystem `open` for every one of them just to find they are all empty.
-const MAX_TRANSCRIPT_CANDIDATES: usize = 500;
+/// `pub(crate)`, same reasoning as `TRANSCRIPT_SCAN_BYTE_BUDGET` above.
+pub(crate) const MAX_TRANSCRIPT_CANDIDATES: usize = 500;
 
 /// What one bounded scan across candidate transcripts found -- [`render`]
 /// only ever sees `raw`; `files_scanned`/`bytes_scanned`/`truncated` exist

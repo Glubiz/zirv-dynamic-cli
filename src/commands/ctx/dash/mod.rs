@@ -3881,6 +3881,7 @@ fn push_error(errors: &mut ErrorLog, message: String) {
 /// (`rollover::evaluate`) and the operator's own picker are executed by the
 /// exact same code -- including the seat transaction `req.generation` names.
 /// Returns whether the swap actually happened.
+#[allow(clippy::too_many_arguments)]
 fn handover_pane(
     pane: &mut Pane,
     req: &handover::HandoverRequest,
@@ -3888,10 +3889,21 @@ fn handover_pane(
     repo: &Path,
     state: &StateDir,
     errors: &mut ErrorLog,
+    // Issue #440: whose transcript the outgoing context is read from, as
+    // `(agent, session id)`. `None` -- every ordinary swap -- means this
+    // pane's own current agent and session, which is what is leaving. A
+    // SOURCE recovery is the exception: the pane is running the dead
+    // successor by then, so reading `pane.agent()` there would build the
+    // packet from the successor's own (usually empty) transcript rather than
+    // from the source whose context is the thing actually being carried.
+    context: Option<(&str, &str)>,
 ) -> bool {
-    let old_agent_name = pane.agent().to_string();
+    let (old_agent_name, context_session) = match context {
+        Some((agent, session)) => (agent.to_string(), session.to_string()),
+        None => (pane.agent().to_string(), pane.session_id().to_string()),
+    };
     let Ok(old_adapter) = adapters::select(Some(&old_agent_name), &[], cfg) else {
-        let reason = format!("could not resolve this pane's own agent '{old_agent_name}'");
+        let reason = format!("could not resolve the outgoing agent '{old_agent_name}'");
         if let Some(generation) = req.generation {
             let _ = super::rollover::fail(
                 state,
@@ -3906,7 +3918,7 @@ fn handover_pane(
         return false;
     };
     let transcript_path = old_adapter.transcript_path(&SessionRef {
-        id: SessionId::parse(pane.session_id()),
+        id: SessionId::parse(&context_session),
         cwd: repo.to_path_buf(),
     });
     let jsonl = std::fs::read_to_string(&transcript_path).unwrap_or_default();
@@ -4017,7 +4029,7 @@ fn rollover_sweep(
         }
         return;
     }
-    if handover_pane(&mut panes[idx], &req, cfg, repo, state, errors)
+    if handover_pane(&mut panes[idx], &req, cfg, repo, state, errors, None)
         && let Some(generation) = req.generation
     {
         *pending = Some((short, generation, Instant::now()));
@@ -4033,8 +4045,10 @@ fn rollover_sweep(
 fn settle_pending_rollover(
     panes: &mut [Pane],
     cfg: &CtxConfig,
+    repo: &Path,
     state: &StateDir,
     pending: &mut Option<(String, u64, Instant)>,
+    errors: &mut ErrorLog,
 ) {
     let Some((short, generation, started)) = pending.clone() else {
         return;
@@ -4068,7 +4082,26 @@ fn settle_pending_rollover(
             *pending = None;
         }
         super::rollover::Readiness::Dead => {
-            let _ = super::rollover::fail(
+            // Issue #440: `Pane::handover` has already quit the source child
+            // by the time a successor can die, so without this arm the
+            // dashboard simply reaped the pane and the operator's
+            // orchestrator was gone -- the incident this whole fix exists
+            // for. The seat still names the SOURCE (a failed rollover never
+            // commits), so relaunching it in this same pane, through the very
+            // seam the swap itself used, gives the seat its own harness back
+            // at the same short id. Structural handoff only: the source is
+            // the harness that just proved it cannot answer a distiller call.
+            let source = super::seat::load(state, &short);
+            let reactive = source.as_ref().is_some_and(|seat| {
+                matches!(
+                    &seat.phase,
+                    super::seat::Phase::Prepared {
+                        cause: super::seat::Cause::Reactive { .. },
+                        ..
+                    }
+                )
+            });
+            super::rollover::fail(
                 state,
                 "dash",
                 &short,
@@ -4077,6 +4110,73 @@ fn settle_pending_rollover(
                 now,
             );
             *pending = None;
+            // Issue #440: resume the source's OWN conversation where the
+            // adapter has a verified mechanism for it. A cold relaunch
+            // carrying a structural packet cannot carry unsaved in-flight
+            // state, and that state is exactly what the incident lost.
+            let resume = source.as_ref().and_then(|seat| {
+                adapters::select(Some(&seat.agent), &[], cfg)
+                    .ok()
+                    .filter(|adapter| adapter.resume_args(&seat.session).is_some())
+                    .map(|_| seat.session.clone())
+            });
+            let restored = source
+                .filter(|seat| !seat.agent.eq_ignore_ascii_case(pane.agent()))
+                .is_some_and(|seat| {
+                    handover_pane(
+                        pane,
+                        &handover::HandoverRequest {
+                            target_agent: seat.agent.clone(),
+                            target_model: seat.model.clone(),
+                            force: true,
+                            requested_at: now,
+                            interactive: true,
+                            automatic: true,
+                            // No seat transaction: the seat already names this
+                            // agent, so there is nothing to prepare or commit.
+                            generation: None,
+                            structural_only: true,
+                            resume_session: resume.clone(),
+                        },
+                        cfg,
+                        repo,
+                        state,
+                        errors,
+                        Some((seat.agent.as_str(), seat.session.as_str())),
+                    )
+                });
+            // A source that is hard-blocked waits out its own window rather
+            // than being re-rolled on the next sweep. A proactive rollover is
+            // left alone: it still has candidates worth trying, and parking
+            // would strand the seat until a reset it never needed.
+            let parked = reactive
+                .then(|| {
+                    super::rollover::park_source(
+                        state,
+                        cfg,
+                        "dash",
+                        &short,
+                        now,
+                        "the rollover successor exited before it answered",
+                    )
+                })
+                .flatten();
+            let outcome = match (restored, resume.is_some()) {
+                (true, true) => "the previous session is resumed here",
+                (true, false) => "the previous harness is relaunched here",
+                (false, _) => "the previous harness could not be brought back",
+            };
+            let seat_state = match parked {
+                Some(until) => format!(
+                    "parked until the limit resets in {}",
+                    crate::style::format_age(until.saturating_sub(now))
+                ),
+                None => "the seat is free to try another harness".to_string(),
+            };
+            push_error(
+                errors,
+                format!("rollover failed -- {outcome}; {seat_state}"),
+            );
         }
         super::rollover::Readiness::TimedOut => {
             // Finding #13 (issue #358 review): unlike `wrap`'s identical
@@ -6945,11 +7045,22 @@ fn handle_spawn_requests(
 /// as a clean finish.
 const EXIT_KILLED: i32 = 143;
 
-/// SECURITY (review round 2, 2026-09-08): the refusal a `kill` request gets
-/// when it arrives on a channel that proves a pane's identity rather than on
-/// the dashboard's own shared one -- see [`drain_one_channel`].
-const KILL_OFF_CHANNEL_REFUSAL: &str =
-    "kill requests are accepted only on the dashboard's own channel";
+/// SECURITY (issue #435 item 1, superseding review round 2's original rule):
+/// the refusal a `kill` request gets when it arrives on the dashboard's own
+/// SHARED channel. That directory used to be trusted precisely because it
+/// is not attributed to any one pane -- but it is a fixed sibling of every
+/// pane's own intake directory (`Pane::intake_dir`), so any pane's child
+/// tree can derive its path just as easily as `zirv ctx kill` can, and
+/// nothing arriving there proves who wrote it. See [`kill_allowed`].
+const KILL_SHARED_CHANNEL_REFUSAL: &str = "kill requests are refused on the dashboard's shared channel -- ask through the requester's own pane channel instead";
+
+/// SECURITY (issue #435 item 1): the refusal a `kill` request gets when it
+/// arrives on a pane's own channel (identifying that pane as the honest
+/// requester -- see [`kill_allowed`]'s own doc comment for the issue #179
+/// caveat) but names a target that is neither that pane itself nor a pane
+/// it spawned, directly or transitively. See [`kill_allowed`].
+const KILL_UNRELATED_PANE_REFUSAL: &str =
+    "kill requests may only target the requester's own pane or a pane it spawned";
 
 /// Issue #403: stops one pane THIS dashboard owns, on behalf of a `zirv ctx
 /// kill` that would otherwise have to signal the pane's pid from outside.
@@ -6969,6 +7080,58 @@ fn stop_owned_pane(short: &str, panes: &mut [Pane]) -> Result<(), String> {
         return Err(format!("no pane {short} is running on this dashboard"));
     };
     pane.stop_now(EXIT_KILLED).map_err(|e| e.to_string())
+}
+
+/// SECURITY (issue #435 item 1): whether a `kill` naming `target` is
+/// honoured, arriving on `requester`'s channel (`None` for the dashboard's
+/// own shared one, `Some(short)` for a pane's own intake channel -- see
+/// [`intake_channels`]). Pure and testable without a running dashboard: the
+/// only state it needs is `kept_requests`, the very map `drain_one_channel`
+/// already threads through every spawn to make `restore_ended_row` possible.
+///
+/// The shared channel identifies no requester at all, so it is refused
+/// outright regardless of target. A pane's own channel identifies which
+/// pane an HONEST requester is -- only that pane's own child tree was ever
+/// handed the path -- and a kill arriving there is trusted for that pane
+/// itself or for any pane it spawned, directly or through a chain of
+/// further spawns: found by walking `target`'s own `requested_by` ancestry
+/// (`kept_requests[short].1`) upward looking for `requester`. Anything else
+/// -- an unrelated sibling, an ancestor, a pane this dashboard never kept a
+/// request for -- is refused.
+///
+/// Trust boundary (issue #179, the same residual the `parent_session` gate
+/// above and `spawnreq::pane_request_dir_for`'s own doc comment already
+/// carry): this narrows to the honest requester, it does not authenticate
+/// the writer. A same-uid pane can list the parent token directory,
+/// discover a sibling's `p-<pane_token>` channel, and write a forged kill
+/// request straight into it, being attributed that sibling's identity --
+/// indistinguishable here from a genuine one. Accepted for this release;
+/// socket-peer-credential hardening is tracked in issue #179.
+fn kill_allowed(
+    requester: Option<&str>,
+    target: &str,
+    kept_requests: &HashMap<String, (spawnreq::SpawnRequest, Option<String>)>,
+) -> Result<(), &'static str> {
+    let Some(requester) = requester else {
+        return Err(KILL_SHARED_CHANNEL_REFUSAL);
+    };
+    if requester == target {
+        return Ok(());
+    }
+    let mut current = target;
+    // A real chain can be at most as long as `kept_requests` itself -- bound
+    // the walk by that rather than a magic constant, so corrupted or cyclic
+    // state can never loop forever.
+    for _ in 0..kept_requests.len() {
+        let Some(parent) = kept_requests.get(current).and_then(|(_, p)| p.as_deref()) else {
+            break;
+        };
+        if parent == requester {
+            return Ok(());
+        }
+        current = parent;
+    }
+    Err(KILL_UNRELATED_PANE_REFUSAL)
 }
 
 /// One intake channel's own queue: every request in `dir`, each answered with
@@ -7003,23 +7166,58 @@ fn drain_one_channel(
         // spawn gates below have anything to say about it, and it is answered
         // with the same ack shape before any of them run.
         //
-        // SECURITY (review round 2, 2026-09-08): honoured ONLY on this
-        // dashboard's own shared channel (`requester.is_none()`, the one
-        // `zirv ctx kill` writes to). A pane-attributed channel
-        // (`Pane::intake_dir`) is reachable by that pane's own low-trust
-        // child tree, and #403 exists precisely because a sandboxed shell
-        // CANNOT signal a pane process itself (`EPERM`) -- so honouring
-        // `kill` there would hand a worker the very cross-pane stop the
-        // sandbox denies it, against a pane it does not own. `stop_owned_
-        // pane` matches on the short id alone and would not notice.
+        // SECURITY (issue #435 item 1, superseding review round 2's original
+        // rule): honoured ONLY on the REQUESTER'S OWN pane channel
+        // (`requester` identifies that pane as the honest requester --
+        // see `kill_allowed`'s own doc comment for the issue #179 caveat: a
+        // same-uid sibling can still forge a request into it), naming that
+        // pane itself or a pane spawned through it, directly or
+        // transitively (`kill_allowed`, which follows the `requested_by`
+        // chain `kept_requests` keeps for every spawn). The dashboard's own
+        // SHARED channel identifies no requester at all -- it is a fixed
+        // sibling of every pane's own intake directory, so any pane's child
+        // tree can derive its path too -- and is refused outright,
+        // regardless of target. Without this gate `stop_owned_pane` matches
+        // on the short id alone and would not notice a pane killing one it
+        // does not own.
         if let Some(target) = req.kill.clone() {
-            let stopped = if requester.is_some() {
-                Err((KILL_OFF_CHANNEL_REFUSAL.to_string(), false))
-            } else {
+            let stopped = match kill_allowed(requester, &target, kept_requests) {
                 // The requester's fallback is signalling the pid itself,
-                // which a refusal from THIS branch says nothing against.
-                stop_owned_pane(&target, panes).map_err(|reason| (reason, true))
+                // which a refusal from either arm here says nothing against.
+                Ok(()) => stop_owned_pane(&target, panes).map_err(|reason| (reason, true)),
+                Err(reason) => Err((reason.to_string(), false)),
             };
+            if let Err((reason, _)) = &stopped {
+                // R6, exactly as for a refused spawn: no pane was stopped
+                // and none will be, so the claim no longer stands for
+                // anything a requester that timed out could read.
+                spawnreq::remove_claim(dir, &stem);
+                // SECURITY (issue #435 item 1): `kill_allowed` refuses every
+                // shared-channel kill unconditionally, and no supported
+                // client writes one there any more (`zirv ctx kill` uses its
+                // own pane channel now -- see `sessions::kill_via_
+                // dashboard`), so nothing on the shared channel ever polls
+                // for this ack. Writing one anyway would just leave an
+                // `ack-req-<uuid>.json` neither `spawnreq::take_requests`
+                // nor `wait_for_ack` ever sweeps back up. The refusal is
+                // still surfaced -- into the dashboard's own error log
+                // rather than a file nobody reads.
+                if requester.is_none() {
+                    // Review round 2: the pushed message must not vary with
+                    // `target` -- a same-uid process can name a different
+                    // (even nonexistent) short id on every forged kill, and
+                    // `ErrorLog::record`'s own adjacent-message dedup only
+                    // collapses BYTE-IDENTICAL text, so a varying target
+                    // would let repeated forged kills evict every real error
+                    // out of the ring (`MAX_KEPT_ERRORS` slots) indefinitely.
+                    // `reason` alone is already constant here (`kill_
+                    // allowed` returns the same `&'static str` for every
+                    // shared-channel kill), so repeats collapse onto one
+                    // slot for free.
+                    push_error(errors, format!("kill refused: {reason}"));
+                    continue;
+                }
+            }
             let ack = match stopped {
                 Ok(()) => spawnreq::SpawnAck {
                     ok: true,
@@ -7029,20 +7227,14 @@ fn drain_one_channel(
                     budget_exhausted: false,
                     capability_warnings: Vec::new(),
                 },
-                Err((reason, retryable)) => {
-                    // R6, exactly as for a refused spawn: no pane was stopped
-                    // and none will be, so the claim no longer stands for
-                    // anything a requester that timed out could read.
-                    spawnreq::remove_claim(dir, &stem);
-                    spawnreq::SpawnAck {
-                        ok: false,
-                        short: None,
-                        reason: Some(reason),
-                        retryable,
-                        budget_exhausted: false,
-                        capability_warnings: Vec::new(),
-                    }
-                }
+                Err((reason, retryable)) => spawnreq::SpawnAck {
+                    ok: false,
+                    short: None,
+                    reason: Some(reason),
+                    retryable,
+                    budget_exhausted: false,
+                    capability_warnings: Vec::new(),
+                },
             };
             if let Err(e) = spawnreq::write_ack(dir, &stem, &ack) {
                 push_error(errors, format!("kill ack: {e}"));
@@ -10604,6 +10796,23 @@ pub fn run_dashboard(
         for pane in panes.iter_mut() {
             pane.on_turn_signal();
         }
+        // Issue #440: ahead of EVERY step below that can release a seat --
+        // the two enforcement sweeps (`Pane::shutdown`/`stop_now`) and the
+        // reap (`Pane::finish_shutdown`), all of which reach `rollover::
+        // forget`. Settled after any of them, a successor that died was
+        // settled against a seat that no longer existed: `seat::abort`
+        // failed, the prepared transaction ended with no terminal row at
+        // all, and neither the source relaunch nor the park could run.
+        if cfg.auto_orchestrator_rollover() {
+            settle_pending_rollover(
+                &mut panes,
+                cfg,
+                repo,
+                state,
+                &mut pending_rollover,
+                &mut errors,
+            );
+        }
         enforce_pane_token_budgets(
             &mut panes,
             cfg,
@@ -10730,37 +10939,35 @@ pub fn run_dashboard(
             report_back_reminder_sweep(&mut panes, state, &mut errors);
         }
         // Issue #358 (task 5): the orchestrator pane's automatic rollover.
-        // Both halves live on their own cadence -- the readiness watch is
-        // pure in-memory state, the evaluation costs a capacity snapshot --
-        // and both are no-ops until `fallback.auto_orchestrator_rollover`
-        // is on.
-        if cfg.auto_orchestrator_rollover() {
-            settle_pending_rollover(&mut panes, cfg, state, &mut pending_rollover);
-            if pending_rollover.is_none()
-                && due(
-                    last_rollover_eval,
-                    sweep_now,
-                    super::rollover::evaluate_interval(cfg, reactive_pending),
-                )
-            {
-                last_rollover_eval = sweep_now;
-                rollover_sweep(
-                    &mut panes,
-                    cfg,
-                    repo,
-                    state,
-                    &mut pending_rollover,
-                    &mut errors,
-                );
-                reactive_pending = panes
-                    .iter()
-                    .find(|pane| pane.role() == prompt::PromptRole::Orchestrator)
-                    .and_then(|pane| super::seat::load(state, pane.short()))
-                    .and_then(|seat| seat.pending)
-                    .is_some_and(|pending| {
-                        matches!(pending.cause, super::seat::Cause::Reactive { .. })
-                    });
-            }
+        // The evaluation half costs a capacity snapshot, so it runs on its own
+        // cadence; its readiness watch is pure in-memory state and runs every
+        // tick, above the reap (issue #440). Both are no-ops until
+        // `fallback.auto_orchestrator_rollover` is on.
+        if cfg.auto_orchestrator_rollover()
+            && pending_rollover.is_none()
+            && due(
+                last_rollover_eval,
+                sweep_now,
+                super::rollover::evaluate_interval(cfg, reactive_pending),
+            )
+        {
+            last_rollover_eval = sweep_now;
+            rollover_sweep(
+                &mut panes,
+                cfg,
+                repo,
+                state,
+                &mut pending_rollover,
+                &mut errors,
+            );
+            reactive_pending = panes
+                .iter()
+                .find(|pane| pane.role() == prompt::PromptRole::Orchestrator)
+                .and_then(|pane| super::seat::load(state, pane.short()))
+                .and_then(|seat| seat.pending)
+                .is_some_and(|pending| {
+                    matches!(pending.cause, super::seat::Cause::Reactive { .. })
+                });
         }
         deliver_queued_nudges(&mut panes, &mut nudge_queues, &mut errors);
         // F1/F2: every tick, not throttled -- see `drain_pending_submits`'s
@@ -11521,11 +11728,13 @@ pub fn run_dashboard(
                                                             automatic: false,
                                                             generation: None,
                                                             structural_only: false,
+                                                            resume_session: None,
                                                         },
                                                         cfg,
                                                         repo,
                                                         state,
                                                         &mut errors,
+                                                        None,
                                                     );
                                                 }
                                                 Some(_) => push_error(
@@ -16685,7 +16894,14 @@ mod tests {
         let mut panes = vec![pane];
         let mut pending = Some((short.clone(), generation, Instant::now()));
 
-        settle_pending_rollover(&mut panes, &cfg, &state, &mut pending);
+        settle_pending_rollover(
+            &mut panes,
+            &cfg,
+            &repo,
+            &state,
+            &mut pending,
+            &mut ErrorLog::default(),
+        );
 
         assert!(pending.is_none(), "the timed-out transaction must close");
         let seat = super::seat::load(&state, &short).expect("seat still exists");
@@ -16700,6 +16916,288 @@ mod tests {
         assert_eq!(seat.session, session_id);
 
         panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    /// Issue #440: the incident itself. A rollover's successor dies right
+    /// after the swap, so `Pane::handover` has already quit the source child
+    /// and the dashboard used to reap the pane -- leaving the operator with
+    /// no orchestrator at all and, before the terminal-row fix, no
+    /// explanation either. The seat still names the SOURCE (a failed rollover
+    /// never commits), so the source harness is relaunched in this same pane
+    /// at the same short id, and a seat whose cause was a hard block waits
+    /// out its own window instead of being re-rolled on the next sweep.
+    #[test]
+    fn a_dead_successor_relaunches_the_source_and_parks_a_hard_blocked_seat() {
+        use crate::commands::ctx::window;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        // The successor that never answered: a child that exits immediately.
+        let session_id = "66666666-3333-4444-8888-555555555555";
+        let short = sessions::short_id(session_id);
+        let spec = PaneSpec {
+            agent_name: "codex".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: session_id.to_string(),
+            title: "orch".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let now = super::super::state::now_secs();
+        window::store_for(
+            &state,
+            "anthropic",
+            &window::UsageWindows {
+                five_hour: Some(window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: true,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store the exhausted source window");
+
+        // The seat as `handover_pane` left it: still naming the source, with
+        // an open reactive transaction naming the successor above.
+        super::seat::register(
+            &state,
+            &short,
+            session_id,
+            "claude",
+            None,
+            "anthropic",
+            prompt::PromptRole::Orchestrator.label(),
+            false,
+            now,
+        )
+        .expect("register seat");
+        let generation = super::seat::prepare(
+            &state,
+            &short,
+            "codex",
+            None,
+            super::seat::Cause::Reactive {
+                detail: "provider=anthropic, five_hour reached=true".to_string(),
+                observed_at: now,
+            },
+            now,
+        )
+        .expect("prepare rollover");
+
+        let relaunched = tmp.path().join("relaunched.sh");
+        std::fs::write(&relaunched, "#!/bin/sh\nsleep 30\n").expect("write relaunch script");
+        let mut cfg = CtxConfig {
+            agent_bin: Some(format!("sh {}", relaunched.display())),
+            ..CtxConfig::default()
+        };
+        cfg.pace.estimator = false;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !matches!(pane.state(), PaneState::Ended(_)) {
+            pane.drain();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            matches!(pane.state(), PaneState::Ended(_)),
+            "sanity: the successor child must have exited"
+        );
+
+        let mut panes = vec![pane];
+        let mut pending = Some((short.clone(), generation, Instant::now()));
+        let mut errors = ErrorLog::default();
+
+        settle_pending_rollover(&mut panes, &cfg, &repo, &state, &mut pending, &mut errors);
+
+        assert!(pending.is_none(), "the dead transaction must close");
+        assert_eq!(
+            panes[0].agent(),
+            "claude",
+            "the source harness must be running in this pane again, not left dead"
+        );
+        assert!(
+            !matches!(panes[0].state(), PaneState::Ended(_)),
+            "the relaunched source is a live child, so the pane is not reaped"
+        );
+
+        let seat = super::seat::load(&state, &short).expect("seat still exists");
+        let super::seat::Phase::Parked { until, .. } = seat.phase else {
+            panic!("a hard-blocked source must park until its window resets, got {seat:?}");
+        };
+        assert_eq!(until, now + 3_600);
+        assert_eq!(seat.agent, "claude", "the successor never took the seat");
+
+        let logged =
+            std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE)).expect("log");
+        assert_eq!(
+            logged.matches(super::super::rollover::FAILED).count(),
+            1,
+            "the transaction ends in exactly one terminal row: {logged}"
+        );
+        assert!(
+            errors
+                .entries
+                .iter()
+                .any(|entry| entry.text.contains("rollover failed")
+                    && entry.text.contains("resumed")
+                    && entry.text.contains("parked until")),
+            "the pane says the source was resumed and the seat parked: {errors:?}"
+        );
+
+        panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    /// Issue #440 (codex review, finding 1): the relaunch is best-effort, so
+    /// it can fail -- and when it does the pane stays `Ended` and the reap
+    /// behind it runs `finish_shutdown` -> `rollover::forget`. The park is
+    /// the record of a rollover that failed and a source owed a window, so
+    /// `forget` must leave a PARKED seat alone; a restore reuses the same
+    /// session id, and `seat::register` preserves `phase`.
+    #[test]
+    fn a_failed_source_relaunch_keeps_the_parked_seat_through_the_reap() {
+        use crate::commands::ctx::window;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        let session_id = "55555555-3333-4444-8888-555555555555";
+        let short = sessions::short_id(session_id);
+        let spec = PaneSpec {
+            agent_name: "codex".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: session_id.to_string(),
+            title: "orch".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let now = super::super::state::now_secs();
+        window::store_for(
+            &state,
+            "anthropic",
+            &window::UsageWindows {
+                five_hour: Some(window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: true,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store the exhausted source window");
+        super::seat::register(
+            &state,
+            &short,
+            session_id,
+            "claude",
+            None,
+            "anthropic",
+            prompt::PromptRole::Orchestrator.label(),
+            false,
+            now,
+        )
+        .expect("register seat");
+        let generation = super::seat::prepare(
+            &state,
+            &short,
+            "codex",
+            None,
+            super::seat::Cause::Reactive {
+                detail: "provider=anthropic, five_hour reached=true".to_string(),
+                observed_at: now,
+            },
+            now,
+        )
+        .expect("prepare rollover");
+
+        // A binary that cannot be spawned: the relaunch fails inside
+        // `Pane::handover`, leaving the pane exactly as dead as it was.
+        let mut cfg = CtxConfig {
+            agent_bin: Some(tmp.path().join("no-such-harness").display().to_string()),
+            ..CtxConfig::default()
+        };
+        cfg.pace.estimator = false;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !matches!(pane.state(), PaneState::Ended(_)) {
+            pane.drain();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(matches!(pane.state(), PaneState::Ended(_)), "sanity");
+
+        let mut panes = vec![pane];
+        let mut pending = Some((short.clone(), generation, Instant::now()));
+        let mut errors = ErrorLog::default();
+        settle_pending_rollover(&mut panes, &cfg, &repo, &state, &mut pending, &mut errors);
+
+        assert_eq!(
+            panes[0].agent(),
+            "codex",
+            "sanity: the relaunch must have failed, leaving the dead successor named"
+        );
+        let logged =
+            std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE)).expect("log");
+        assert_eq!(
+            logged.matches(super::super::rollover::FAILED).count(),
+            1,
+            "{logged}"
+        );
+        assert!(
+            matches!(
+                super::seat::load(&state, &short).map(|seat| seat.phase),
+                Some(super::seat::Phase::Parked { .. })
+            ),
+            "the blocked source is parked even though the relaunch failed"
+        );
+
+        // The reap's own teardown, which is what used to delete the park.
+        panes[0].finish_shutdown().expect("shutdown");
+        let seat = super::seat::load(&state, &short)
+            .expect("a parked seat outlives the session that was sitting in it");
+        assert!(
+            matches!(seat.phase, super::seat::Phase::Parked { .. }),
+            "got {seat:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE))
+                .expect("log")
+                .matches(super::super::rollover::FAILED)
+                .count(),
+            1,
+            "the reap neither drops the terminal row nor adds a second one"
+        );
     }
 
     /// Codex review finding 1, on the real reap path (not just the pure
@@ -26222,14 +26720,252 @@ mod tests {
         }
     }
 
-    /// Issue #403: `zirv ctx kill` against a dashboard pane asks the
-    /// dashboard that owns it, over this same channel, rather than signalling
-    /// the pane's pid from outside -- the owner is the child's real parent
-    /// (so no `EPERM` from a sandboxed shell) and the only thing that can
-    /// release the pane's writer permit, which its own reap does once the
-    /// child is seen to exit.
+    fn kept(parent: Option<&str>) -> (spawnreq::SpawnRequest, Option<String>) {
+        (
+            spawnreq::SpawnRequest::default(),
+            parent.map(str::to_string),
+        )
+    }
+
+    /// Issue #435 item 1: `kill_allowed` walks `target`'s ancestry looking
+    /// for `requester` -- the DESCENDANT direction only. A worker naming its
+    /// own orchestrator as the kill target is the reverse: the orchestrator
+    /// is `requester`'s own PARENT (`kept_requests[requester]` names it, not
+    /// the other way around), so nothing in `target`'s ancestry ever equals
+    /// `requester`, and the request is refused exactly as an unrelated
+    /// sibling's would be.
     #[test]
-    fn a_kill_request_stops_the_named_pane_and_is_acked() {
+    fn kill_allowed_refuses_a_worker_naming_its_own_orchestrator_as_the_target() {
+        let mut kept_requests = HashMap::new();
+        kept_requests.insert("worker01".to_string(), kept(Some("orch0001")));
+
+        assert_eq!(
+            kill_allowed(Some("worker01"), "orch0001", &kept_requests),
+            Err(KILL_UNRELATED_PANE_REFUSAL)
+        );
+    }
+
+    /// Issue #435 item 1: a `requested_by` chain corrupted into a cycle
+    /// (`a` names `b` as parent, `b` names `a`) must never spin the ancestry
+    /// walk forever -- the loop is bounded by `kept_requests.len()`, so it
+    /// visits every entry at most once and then refuses, the same answer an
+    /// unrelated pane gets.
+    #[test]
+    fn kill_allowed_terminates_and_refuses_on_a_cyclic_requested_by_chain() {
+        let mut kept_requests = HashMap::new();
+        kept_requests.insert("pane-a01".to_string(), kept(Some("pane-b01")));
+        kept_requests.insert("pane-b01".to_string(), kept(Some("pane-a01")));
+
+        assert_eq!(
+            kill_allowed(Some("requester"), "pane-a01", &kept_requests),
+            Err(KILL_UNRELATED_PANE_REFUSAL)
+        );
+    }
+
+    /// Issue #435 item 1: `zirv ctx kill` writes into the REQUESTER's own
+    /// pane channel now, never the dashboard's shared one (see
+    /// `sessions::kill_via_dashboard`), so this is the shape a real kill
+    /// takes: a pane naming itself on its own channel, honoured because that
+    /// channel identifies it as the honest requester (issue #179: a same-uid
+    /// sibling could still forge one in, this is not authentication) -- the
+    /// owner is the child's real parent (so no `EPERM` from a sandboxed
+    /// shell) and the only thing that can release the pane's writer permit,
+    /// which its own reap does once the child is seen to exit.
+    #[test]
+    fn a_kill_request_on_the_panes_own_channel_stops_itself_and_is_acked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = tmp.path().join("requests");
+
+        let spec = PaneSpec {
+            agent_name: "test-agent".to_string(),
+            argv: silent_long_lived_argv(),
+            role: prompt::PromptRole::Worker,
+            verb: sessions::Verb::Dash,
+            session_id: "bbbbbbbb-2222-4333-8444-555555555555".to_string(),
+            title: "wrk test".to_string(),
+        };
+        let mut errors = ErrorLog::default();
+        let mut panes = vec![
+            Pane::spawn(
+                spec,
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn"),
+        ];
+        panes[0].set_intake_dir(mint_pane_channel(&requests_dir, &mut errors));
+        let short = panes[0].short().to_string();
+        assert!(
+            sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "the pane registers before the kill"
+        );
+        let own_channel = panes[0]
+            .intake_dir()
+            .expect("the pane has its own channel")
+            .to_path_buf();
+
+        let path = spawnreq::write_request(&own_channel, &kill_request(&short)).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new()];
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+
+        let ack = spawnreq::wait_for_ack(&own_channel, &stem, Duration::from_millis(50))
+            .expect("the kill is acked");
+        assert!(
+            ack.ok,
+            "a pane naming itself on its own channel is honoured: {ack:?}"
+        );
+        assert_eq!(ack.short.as_deref(), Some(short.as_str()));
+        assert!(
+            matches!(panes[0].state(), PaneState::Ended(_)),
+            "and the pane is left ready for this tick's reap, not lingering live"
+        );
+        assert!(
+            !sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "with its registry record released by the owner"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.finish_shutdown();
+        }
+    }
+
+    /// Issue #435 item 1: honoured not just for self, but for any pane
+    /// spawned through the requester's own channel -- directly, or (as here)
+    /// transitively through a chain of further spawns. Two levels deep:
+    /// `requester` spawned `child`, `child` spawned `grandchild`
+    /// (`grandchild`'s own `requested_by` in `kept_requests` names `child`,
+    /// `child`'s names `requester`), and a kill for `grandchild` arriving on
+    /// `requester`'s own channel is still honoured.
+    #[test]
+    fn a_kill_request_on_the_owning_panes_channel_stops_a_descendant_two_levels_deep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let requests_dir = tmp.path().join("requests");
+
+        let mut errors = ErrorLog::default();
+        let mut panes: Vec<Pane> = Vec::new();
+        for session_id in [
+            "aaaaaaaa-4444-4555-8666-777777777777",
+            "bbbbbbbb-4444-4555-8666-777777777777",
+            "cccccccc-4444-4555-8666-777777777777",
+        ] {
+            let mut pane = Pane::spawn(
+                PaneSpec {
+                    agent_name: "test-agent".to_string(),
+                    argv: silent_long_lived_argv(),
+                    role: prompt::PromptRole::Worker,
+                    verb: sessions::Verb::Dash,
+                    session_id: session_id.to_string(),
+                    title: "wrk test".to_string(),
+                },
+                &state,
+                &repo,
+                &repo,
+                (80, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn");
+            pane.set_intake_dir(mint_pane_channel(&requests_dir, &mut errors));
+            panes.push(pane);
+        }
+        let requester = panes[0].short().to_string();
+        let child = panes[1].short().to_string();
+        let grandchild = panes[2].short().to_string();
+        let requester_channel = panes[0]
+            .intake_dir()
+            .expect("the requester has its own channel")
+            .to_path_buf();
+
+        let mut kept_requests: HashMap<String, (spawnreq::SpawnRequest, Option<String>)> =
+            HashMap::new();
+        kept_requests.insert(
+            child.clone(),
+            (spawnreq::SpawnRequest::default(), Some(requester.clone())),
+        );
+        kept_requests.insert(
+            grandchild.clone(),
+            (spawnreq::SpawnRequest::default(), Some(child.clone())),
+        );
+
+        let path =
+            spawnreq::write_request(&requester_channel, &kill_request(&grandchild)).expect("write");
+        let stem = spawnreq::request_stem(&path).expect("stem");
+        let mut queues: Vec<VecDeque<String>> = vec![VecDeque::new(); panes.len()];
+        handle_spawn_requests(
+            &requests_dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut kept_requests,
+        );
+
+        let ack = spawnreq::wait_for_ack(&requester_channel, &stem, Duration::from_millis(50))
+            .expect("the kill is acked on the channel it arrived on");
+        assert!(
+            ack.ok,
+            "a descendant two levels down the requester's own spawn chain is honoured: {ack:?}"
+        );
+        assert_eq!(ack.short.as_deref(), Some(grandchild.as_str()));
+        assert!(
+            matches!(panes[2].state(), PaneState::Ended(_)),
+            "the grandchild was stopped"
+        );
+        assert!(
+            !matches!(panes[0].state(), PaneState::Ended(_))
+                && !matches!(panes[1].state(), PaneState::Ended(_)),
+            "requester and child are untouched"
+        );
+
+        for pane in panes.iter_mut() {
+            let _ = pane.shutdown("");
+        }
+    }
+
+    /// SECURITY (issue #435 item 1): a `kill` dropped on the dashboard's own
+    /// SHARED channel is refused outright, regardless of target -- that
+    /// directory is a fixed sibling of every pane's own intake directory, so
+    /// any pane's child tree can derive its path just as easily as `zirv ctx
+    /// kill` can, and nothing arriving there identifies who wrote it. `zirv
+    /// ctx kill` itself no longer uses this channel at all (see
+    /// `sessions::kill_via_dashboard`); this is the shape a same-uid process
+    /// deriving the shared path by hand would be reduced to.
+    ///
+    /// Review round 2: no supported client ever polls THIS channel for an
+    /// ack any more, so `drain_one_channel` no longer writes one for this
+    /// refusal -- it would just be an `ack-req-<uuid>.json` neither
+    /// `spawnreq::take_requests` nor `wait_for_ack` ever sweeps back up. The
+    /// refusal is surfaced into the dashboard's own error log instead.
+    #[test]
+    fn a_kill_request_on_the_shared_channel_is_refused_and_stops_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
@@ -26258,10 +26994,6 @@ mod tests {
             .expect("spawn"),
         ];
         let short = panes[0].short().to_string();
-        assert!(
-            sessions::list(&state).iter().any(|(r, _)| r.short == short),
-            "the pane registers before the kill"
-        );
 
         let path = spawnreq::write_request(&dir, &kill_request(&short)).expect("write");
         let stem = spawnreq::request_stem(&path).expect("stem");
@@ -26280,34 +27012,91 @@ mod tests {
             &mut HashMap::new(),
         );
 
-        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
-            .expect("the kill is acked");
-        assert!(ack.ok, "the owner stopped its own pane: {ack:?}");
-        assert_eq!(ack.short.as_deref(), Some(short.as_str()));
-        assert!(
-            matches!(panes[0].state(), PaneState::Ended(_)),
-            "and the pane is left ready for this tick's reap, not lingering live"
+        assert_eq!(
+            spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50)),
+            None,
+            "no supported client polls the shared channel for a kill ack any more, so none is written"
         );
         assert!(
-            !sessions::list(&state).iter().any(|(r, _)| r.short == short),
-            "with its registry record released by the owner"
+            !dir.join(format!("ack-{stem}.json")).exists(),
+            "and no ack file is left behind on disk either"
+        );
+        assert!(
+            errors
+                .last()
+                .is_some_and(|e| e.contains(KILL_SHARED_CHANNEL_REFUSAL)),
+            "the refusal is still surfaced, in the dashboard's own error log: {:?}",
+            errors.last()
+        );
+        assert!(
+            !matches!(panes[0].state(), PaneState::Ended(_)),
+            "the named pane is untouched"
+        );
+        assert!(
+            sessions::list(&state).iter().any(|(r, _)| r.short == short),
+            "and still registered"
         );
 
         for pane in panes.iter_mut() {
-            let _ = pane.finish_shutdown();
+            let _ = pane.shutdown("");
         }
     }
 
-    /// SECURITY (review round 2, finding 1): a `kill` request is honoured
-    /// ONLY on the dashboard's own shared channel. A pane's attributed
-    /// intake channel is writable by that pane's own low-trust child tree,
-    /// and #403 exists precisely because a sandboxed shell cannot signal a
-    /// pane process itself -- so honouring one there handed a worker exactly
-    /// the cross-pane stop its sandbox denies it, against a pane it does not
-    /// own: the request names nothing but a short id, and `stop_owned_pane`
-    /// matches on that alone.
+    /// Review round 2: `push_error`'s own message must not vary with the
+    /// refused kill's `target`, or a same-uid process naming a different
+    /// (even nonexistent) short id on every forged kill would defeat
+    /// `ErrorLog::record`'s adjacent-message dedup and evict every genuine
+    /// error out of the ring (`MAX_KEPT_ERRORS`, 5 slots) one forged kill at
+    /// a time. Two refusals in a row, naming two DIFFERENT targets, still
+    /// collapse onto the one slot identical adjacent text already gets.
     #[test]
-    fn a_kill_request_on_a_panes_own_channel_is_refused_and_stops_nothing() {
+    fn two_shared_channel_kill_refusals_in_a_row_leave_one_error_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let dir = tmp.path().join("requests");
+
+        spawnreq::write_request(&dir, &kill_request("deadbeef")).expect("write");
+        spawnreq::write_request(&dir, &kill_request("feedface")).expect("write");
+
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut queues: Vec<VecDeque<String>> = Vec::new();
+        let mut errors = ErrorLog::default();
+        handle_spawn_requests(
+            &dir,
+            &mut panes,
+            &mut queues,
+            &CtxConfig::default(),
+            &state,
+            &repo,
+            (80, 24),
+            &mut errors,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+
+        let messages: Vec<String> = errors.messages().collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "two forged kills naming different targets must not evict each other's slot: \
+             {messages:?}"
+        );
+        assert!(
+            messages[0].ends_with("\u{d7}2"),
+            "both refusals are still counted, just onto the same slot: {messages:?}"
+        );
+    }
+
+    /// SECURITY (issue #435 item 1, was review round 2 finding 1): a `kill`
+    /// arriving on a pane's own channel is honoured only for that pane
+    /// itself or a pane it spawned -- naming an unrelated sibling (no
+    /// `requested_by` chain connects them) is refused, even though the
+    /// channel itself identifies the requester (issue #179: that
+    /// identification is not authentication).
+    #[test]
+    fn a_kill_request_on_a_panes_own_channel_targeting_an_unrelated_pane_is_refused() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
@@ -26375,7 +27164,7 @@ mod tests {
             !ack.retryable,
             "and it is final -- no channel this request may be re-sent on exists: {ack:?}"
         );
-        assert_eq!(ack.reason.as_deref(), Some(KILL_OFF_CHANNEL_REFUSAL));
+        assert_eq!(ack.reason.as_deref(), Some(KILL_UNRELATED_PANE_REFUSAL));
         assert!(
             !matches!(panes[0].state(), PaneState::Ended(_)),
             "the named pane is untouched"
@@ -26394,22 +27183,30 @@ mod tests {
 
     /// Issue #403: a kill naming a pane this dashboard does not have is
     /// refused, retryably -- the requester's own fallback is signalling the
-    /// pid directly, and this refusal says nothing against that.
+    /// pid directly, and this refusal says nothing against that. Exercised
+    /// on the requester's own channel, naming itself: `kill_allowed` passes
+    /// (self is always allowed), so this is `stop_owned_pane`'s own
+    /// not-found branch, not the ownership gate -- and needs `drain_one_
+    /// channel` directly, since `handle_spawn_requests`/`intake_channels`
+    /// only ever attribute a channel to a pane that actually exists.
     #[test]
     fn a_kill_request_naming_an_unknown_pane_is_refused() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("mkdir repo");
-        let dir = tmp.path().join("requests");
+        let requests_dir = tmp.path().join("requests");
+        let own_channel = tmp.path().join("p-deadbeef-token");
 
-        let path = spawnreq::write_request(&dir, &kill_request("deadbeef")).expect("write");
+        let path = spawnreq::write_request(&own_channel, &kill_request("deadbeef")).expect("write");
         let stem = spawnreq::request_stem(&path).expect("stem");
         let mut panes: Vec<Pane> = Vec::new();
         let mut queues: Vec<VecDeque<String>> = Vec::new();
         let mut errors = ErrorLog::default();
-        handle_spawn_requests(
-            &dir,
+        drain_one_channel(
+            &own_channel,
+            Some("deadbeef"),
+            &requests_dir,
             &mut panes,
             &mut queues,
             &CtxConfig::default(),
@@ -26421,7 +27218,7 @@ mod tests {
             &mut HashMap::new(),
         );
 
-        let ack = spawnreq::wait_for_ack(&dir, &stem, Duration::from_millis(50))
+        let ack = spawnreq::wait_for_ack(&own_channel, &stem, Duration::from_millis(50))
             .expect("the refusal is acked");
         assert!(!ack.ok);
         assert!(ack.retryable, "so the requester may signal the pid itself");
@@ -26432,7 +27229,7 @@ mod tests {
             "and says why: {ack:?}"
         );
         assert!(
-            !spawnreq::is_claimed(&dir, &stem),
+            !spawnreq::is_claimed(&own_channel, &stem),
             "a refusal withdraws its own claim, kill or spawn"
         );
         assert!(panes.is_empty(), "and nothing was spawned");
