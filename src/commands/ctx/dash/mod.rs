@@ -4024,6 +4024,26 @@ fn rollover_sweep(
     }
 }
 
+/// Issue #440: the one operator-facing line a failed rollover leaves in the
+/// pane, naming both halves of what was done about it -- whether the source
+/// harness is running again in this pane, and whether the seat is waiting out
+/// a window rather than trying again.
+fn rollover_failure_notice(restored: bool, parked: Option<u64>, now: u64) -> String {
+    let seat = match parked {
+        Some(until) => format!(
+            "parked until the limit resets in {}",
+            crate::style::format_age(until.saturating_sub(now))
+        ),
+        None => "the seat is free to try another harness".to_string(),
+    };
+    let source = if restored {
+        "the previous harness is running again here"
+    } else {
+        "the previous harness could not be relaunched"
+    };
+    format!("rollover failed -- {source}; {seat}")
+}
+
 /// The other half: an open rollover transaction is committed only once the
 /// successor pane has actually answered, and aborted when it never does.
 /// `Pane::handover` spawns the successor before it touches the old child, so
@@ -4033,8 +4053,10 @@ fn rollover_sweep(
 fn settle_pending_rollover(
     panes: &mut [Pane],
     cfg: &CtxConfig,
+    repo: &Path,
     state: &StateDir,
     pending: &mut Option<(String, u64, Instant)>,
+    errors: &mut ErrorLog,
 ) {
     let Some((short, generation, started)) = pending.clone() else {
         return;
@@ -4068,7 +4090,26 @@ fn settle_pending_rollover(
             *pending = None;
         }
         super::rollover::Readiness::Dead => {
-            let _ = super::rollover::fail(
+            // Issue #440: `Pane::handover` has already quit the source child
+            // by the time a successor can die, so without this arm the
+            // dashboard simply reaped the pane and the operator's
+            // orchestrator was gone -- the incident this whole fix exists
+            // for. The seat still names the SOURCE (a failed rollover never
+            // commits), so relaunching it in this same pane, through the very
+            // seam the swap itself used, gives the seat its own harness back
+            // at the same short id. Structural handoff only: the source is
+            // the harness that just proved it cannot answer a distiller call.
+            let source = super::seat::load(state, &short);
+            let reactive = source.as_ref().is_some_and(|seat| {
+                matches!(
+                    &seat.phase,
+                    super::seat::Phase::Prepared {
+                        cause: super::seat::Cause::Reactive { .. },
+                        ..
+                    }
+                )
+            });
+            super::rollover::fail(
                 state,
                 "dash",
                 &short,
@@ -4077,6 +4118,46 @@ fn settle_pending_rollover(
                 now,
             );
             *pending = None;
+            let restored = source
+                .filter(|seat| !seat.agent.eq_ignore_ascii_case(pane.agent()))
+                .is_some_and(|seat| {
+                    handover_pane(
+                        pane,
+                        &handover::HandoverRequest {
+                            target_agent: seat.agent.clone(),
+                            target_model: seat.model.clone(),
+                            force: true,
+                            requested_at: now,
+                            interactive: true,
+                            automatic: true,
+                            // No seat transaction: the seat already names this
+                            // agent, so there is nothing to prepare or commit.
+                            generation: None,
+                            structural_only: true,
+                        },
+                        cfg,
+                        repo,
+                        state,
+                        errors,
+                    )
+                });
+            // A source that is hard-blocked waits out its own window rather
+            // than being re-rolled on the next sweep. A proactive rollover is
+            // left alone: it still has candidates worth trying, and parking
+            // would strand the seat until a reset it never needed.
+            let parked = reactive
+                .then(|| {
+                    super::rollover::park_source(
+                        state,
+                        cfg,
+                        "dash",
+                        &short,
+                        now,
+                        "the rollover successor exited before it answered",
+                    )
+                })
+                .flatten();
+            push_error(errors, rollover_failure_notice(restored, parked, now));
         }
         super::rollover::Readiness::TimedOut => {
             // Finding #13 (issue #358 review): unlike `wrap`'s identical
@@ -10636,7 +10717,14 @@ pub fn run_dashboard(
         // failed, and the prepared transaction ended with no terminal row at
         // all. Settled here, the `Readiness::Dead` arm still sees both.
         if cfg.auto_orchestrator_rollover() {
-            settle_pending_rollover(&mut panes, cfg, state, &mut pending_rollover);
+            settle_pending_rollover(
+                &mut panes,
+                cfg,
+                repo,
+                state,
+                &mut pending_rollover,
+                &mut errors,
+            );
         }
         let reap_confirmations = reap_ended_panes(
             &mut panes,
@@ -16692,7 +16780,14 @@ mod tests {
         let mut panes = vec![pane];
         let mut pending = Some((short.clone(), generation, Instant::now()));
 
-        settle_pending_rollover(&mut panes, &cfg, &state, &mut pending);
+        settle_pending_rollover(
+            &mut panes,
+            &cfg,
+            &repo,
+            &state,
+            &mut pending,
+            &mut ErrorLog::default(),
+        );
 
         assert!(pending.is_none(), "the timed-out transaction must close");
         let seat = super::seat::load(&state, &short).expect("seat still exists");
@@ -16705,6 +16800,150 @@ mod tests {
         assert_eq!(seat.model.as_deref(), Some("gpt5"));
         assert_eq!(seat.provider, "openai");
         assert_eq!(seat.session, session_id);
+
+        panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    /// Issue #440: the incident itself. A rollover's successor dies right
+    /// after the swap, so `Pane::handover` has already quit the source child
+    /// and the dashboard used to reap the pane -- leaving the operator with
+    /// no orchestrator at all and, before the terminal-row fix, no
+    /// explanation either. The seat still names the SOURCE (a failed rollover
+    /// never commits), so the source harness is relaunched in this same pane
+    /// at the same short id, and a seat whose cause was a hard block waits
+    /// out its own window instead of being re-rolled on the next sweep.
+    #[test]
+    fn a_dead_successor_relaunches_the_source_and_parks_a_hard_blocked_seat() {
+        use crate::commands::ctx::window;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        // The successor that never answered: a child that exits immediately.
+        let session_id = "66666666-3333-4444-8888-555555555555";
+        let short = sessions::short_id(session_id);
+        let spec = PaneSpec {
+            agent_name: "codex".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: session_id.to_string(),
+            title: "orch".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let now = super::super::state::now_secs();
+        window::store_for(
+            &state,
+            "anthropic",
+            &window::UsageWindows {
+                five_hour: Some(window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: false,
+                    limit_reached: true,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store the exhausted source window");
+
+        // The seat as `handover_pane` left it: still naming the source, with
+        // an open reactive transaction naming the successor above.
+        super::seat::register(
+            &state,
+            &short,
+            session_id,
+            "claude",
+            None,
+            "anthropic",
+            prompt::PromptRole::Orchestrator.label(),
+            false,
+            now,
+        )
+        .expect("register seat");
+        let generation = super::seat::prepare(
+            &state,
+            &short,
+            "codex",
+            None,
+            super::seat::Cause::Reactive {
+                detail: "provider=anthropic, five_hour reached=true".to_string(),
+                observed_at: now,
+            },
+            now,
+        )
+        .expect("prepare rollover");
+
+        let relaunched = tmp.path().join("relaunched.sh");
+        std::fs::write(&relaunched, "#!/bin/sh\nsleep 30\n").expect("write relaunch script");
+        let mut cfg = CtxConfig {
+            agent_bin: Some(format!("sh {}", relaunched.display())),
+            ..CtxConfig::default()
+        };
+        cfg.pace.estimator = false;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !matches!(pane.state(), PaneState::Ended(_)) {
+            pane.drain();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            matches!(pane.state(), PaneState::Ended(_)),
+            "sanity: the successor child must have exited"
+        );
+
+        let mut panes = vec![pane];
+        let mut pending = Some((short.clone(), generation, Instant::now()));
+        let mut errors = ErrorLog::default();
+
+        settle_pending_rollover(&mut panes, &cfg, &repo, &state, &mut pending, &mut errors);
+
+        assert!(pending.is_none(), "the dead transaction must close");
+        assert_eq!(
+            panes[0].agent(),
+            "claude",
+            "the source harness must be running in this pane again, not left dead"
+        );
+        assert!(
+            !matches!(panes[0].state(), PaneState::Ended(_)),
+            "the relaunched source is a live child, so the pane is not reaped"
+        );
+
+        let seat = super::seat::load(&state, &short).expect("seat still exists");
+        let super::seat::Phase::Parked { until, .. } = seat.phase else {
+            panic!("a hard-blocked source must park until its window resets, got {seat:?}");
+        };
+        assert_eq!(until, now + 3_600);
+        assert_eq!(seat.agent, "claude", "the successor never took the seat");
+
+        let logged =
+            std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE)).expect("log");
+        assert!(
+            logged.contains(super::super::rollover::FAILED),
+            "the transaction still ends in a terminal row: {logged}"
+        );
+        assert!(
+            errors
+                .entries
+                .iter()
+                .any(|entry| entry.text.contains("rollover failed")
+                    && entry.text.contains("parked until")),
+            "the pane says what happened: {errors:?}"
+        );
 
         panes[0].finish_shutdown().expect("shutdown");
     }

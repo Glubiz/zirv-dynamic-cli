@@ -634,12 +634,60 @@ fn park_for_reset(
     reason: &str,
     base: PoolEvent,
 ) -> Evaluation {
+    let Some((choice, detail)) = park_until_reset(state, cfg, seat_short, current, now, reason)
+    else {
+        // Issue #440: both dead ends -- no reset time known for any harness,
+        // and a park that could not be written -- are refusals an operator
+        // has to be able to read, never a silent return.
+        record(
+            state,
+            &current.session,
+            verb,
+            REFUSED,
+            &PoolEvent {
+                reason: format!("{reason}; the seat could not be parked until a reset"),
+                ..base
+            },
+        );
+        return Evaluation::Skip(reason.to_string());
+    };
+    record(
+        state,
+        &current.session,
+        verb,
+        EXHAUSTED,
+        &PoolEvent {
+            target_agent: Some(choice.selected.clone()),
+            reason: detail.clone(),
+            ..base
+        },
+    );
+    Evaluation::Park {
+        until: choice.reset_at,
+        window: choice.window.to_string(),
+        reason: detail,
+    }
+}
+
+/// The park itself: the earliest window any admissible harness the seat has
+/// not already tried resets, and the seat moved into `Phase::Parked` until
+/// then. Shared by [`park_for_reset`]'s own reactive dead end and by
+/// [`park_source`], so a seat parked after a failed handover waits exactly
+/// the same window an exhausted evaluation would have chosen.
+fn park_until_reset(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    seat_short: &str,
+    current: &seat::Seat,
+    now: u64,
+    reason: &str,
+) -> Option<(fallback::ResetChoice, String)> {
     let visited: Vec<String> = current
         .visited
         .iter()
         .map(|visit| visit.agent.clone())
         .collect();
-    let Some(choice) = fallback::earliest_reset_choice(
+    let choice = fallback::earliest_reset_choice(
         state,
         cfg,
         fallback::RouteRequest {
@@ -656,54 +704,51 @@ fn park_for_reset(
             requester: None,
         },
         &visited,
-    ) else {
-        record(
-            state,
-            &current.session,
-            verb,
-            REFUSED,
-            &PoolEvent {
-                reason: format!("{reason}; no reset time is known for any harness"),
-                ..base
-            },
-        );
-        return Evaluation::Skip(reason.to_string());
-    };
-
-    let window = choice.window.to_string();
+    )?;
     let detail = format!("{reason}; {}", choice.detail());
-    if let Err(e) = seat::park(state, seat_short, choice.reset_at, &window, &detail, now) {
-        // Issue #440: the park is the whole point of this arm, so a park that
-        // could not be written is a refusal an operator has to be able to
-        // read, not a silent return.
-        record(
-            state,
-            &current.session,
-            verb,
-            REFUSED,
-            &PoolEvent {
-                reason: format!("{detail}; the seat could not be parked: {e}"),
-                ..base
-            },
-        );
-        return Evaluation::Skip(e.to_string());
-    }
+    seat::park(
+        state,
+        seat_short,
+        choice.reset_at,
+        choice.window,
+        &detail,
+        now,
+    )
+    .ok()?;
+    Some((choice, detail))
+}
+
+/// Issue #440: parks a seat whose rollover could not complete at all, so a
+/// source that is hard-blocked waits out its own window instead of being
+/// re-rolled (or, in the dashboard, torn down) the moment the next evaluation
+/// comes round. Returns the reset the seat is parked until, for the pane
+/// banner the supervisor shows. Deliberately NOT called from [`fail`]: a
+/// proactive rollover whose successor died still has candidates worth trying,
+/// and parking would strand the seat until a reset it never needed to wait for.
+pub fn park_source(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    verb: &str,
+    seat_short: &str,
+    now: u64,
+    reason: &str,
+) -> Option<u64> {
+    let current = seat::load(state, seat_short)?;
+    let (choice, detail) = park_until_reset(state, cfg, seat_short, &current, now, reason)?;
     record(
         state,
         &current.session,
         verb,
         EXHAUSTED,
         &PoolEvent {
+            snapshot_at: now,
+            source_agent: current.agent.clone(),
             target_agent: Some(choice.selected.clone()),
-            reason: detail.clone(),
-            ..base
+            reason: detail,
+            ..PoolEvent::default()
         },
     );
-    Evaluation::Park {
-        until: choice.reset_at,
-        window,
-        reason: detail,
-    }
+    Some(choice.reset_at)
 }
 
 /// Edge-triggered pool telemetry: which harnesses in `fallback.order` are
