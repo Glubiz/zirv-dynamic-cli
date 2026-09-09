@@ -498,8 +498,10 @@ to the section or vault page that documents it in depth.
   cross-session memory bank from inside a session; the standalone
   `zirv memory` (`memory`) surface (`init`, `status`, `list`, `recall`, `remember`,
   `forget`, `verify`, plus `promote`/`rollback`/`optimize`) manages it
-  without starting one. See [`zirv memory`](#zirv-memory) and [Memory
-  bank](#memory-bank).
+  without starting one; `learn` promotes a recurring fail-then-fix command
+  correction from recent transcripts into one private memory entry. See
+  [`zirv memory`](#zirv-memory), [Memory bank](#memory-bank), and the
+  vault's [Ctx Subsystem](docs/obsidian/Modules/Ctx%20Subsystem.md#the-verb-tree).
 - **Delegation controls** — `group`, `objective`, `spend`, `savings`,
   `worktree`, `task`, and `swarm` bound, account for, and reclaim delegated
   work; `permissions` (`audit`/`compile`/`propose`) and `safety`
