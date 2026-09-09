@@ -501,21 +501,28 @@ const MAX_TRANSCRIPT_CANDIDATES: usize = 500;
 /// What one bounded scan across candidate transcripts found -- [`render`]
 /// only ever sees `raw`; `files_scanned`/`bytes_scanned`/`truncated` exist
 /// purely so `run_with` can print one honest "stopped early" note when the
-/// scan did not cover every candidate.
+/// scan did not cover every candidate. `unreadable` counts candidates that
+/// failed to open (e.g. a stale path, a permissions error) -- those are
+/// never a truncation (the scan did not stop early because of them, they
+/// simply contributed nothing) and get their own note instead.
 struct ScanOutcome {
     raw: Vec<RawResult>,
     files_scanned: usize,
     bytes_scanned: u64,
     truncated: bool,
+    unreadable: usize,
 }
 
 /// Scans `candidates` (path, mtime-seconds pairs) newest-first, stopping
 /// once `max_files` have been opened or `byte_budget` bytes have been read --
 /// whichever comes first. Newest-first so a truncated scan on a machine with
 /// more history than the budget allows still favours the results an operator
-/// most likely cares about right now. `truncated` is set whenever any
-/// candidate was left unscanned, whatever the reason (file cap, byte budget,
-/// or a single file alone exceeding the remaining budget).
+/// most likely cares about right now. `truncated` is set only at a real
+/// cutoff -- the file cap, the byte budget, or a single file alone
+/// exceeding the remaining budget -- never merely because a candidate
+/// failed to open; those are counted in `unreadable` instead so `run_with`
+/// does not tell an operator to "narrow --since" when nothing was actually
+/// cut off.
 fn scan_candidates(
     mut candidates: Vec<(std::path::PathBuf, u64)>,
     min_bytes: u64,
@@ -523,12 +530,12 @@ fn scan_candidates(
     max_files: usize,
 ) -> ScanOutcome {
     candidates.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
-    let total = candidates.len();
 
     let mut raw = Vec::new();
     let mut files_scanned = 0usize;
     let mut bytes_scanned: u64 = 0;
     let mut truncated = false;
+    let mut unreadable = 0usize;
 
     for (path, _mtime) in &candidates {
         if files_scanned >= max_files {
@@ -541,6 +548,7 @@ fn scan_candidates(
             break;
         }
         let Ok(file) = std::fs::File::open(path) else {
+            unreadable += 1;
             continue;
         };
         files_scanned += 1;
@@ -554,15 +562,13 @@ fn scan_candidates(
             break;
         }
     }
-    if files_scanned < total {
-        truncated = true;
-    }
 
     ScanOutcome {
         raw,
         files_scanned,
         bytes_scanned,
         truncated,
+        unreadable,
     }
 }
 
@@ -649,6 +655,13 @@ fn run_with_budget<W: Write>(
             "note: stopped after {} files / {}; narrow --since",
             outcome.files_scanned,
             human_bytes(outcome.bytes_scanned)
+        )?;
+    }
+    if outcome.unreadable > 0 {
+        writeln!(
+            w,
+            "note: {} transcripts could not be read",
+            outcome.unreadable
         )?;
     }
 
@@ -1001,6 +1014,50 @@ mod tests {
             "the newest file must be the one scanned: {}",
             outcome.raw[0].command
         );
+    }
+
+    /// An unopenable candidate (a stale path that no longer exists on disk)
+    /// must be counted in `unreadable`, not mistaken for a cutoff: the scan
+    /// still covers every other candidate and nothing was left unscanned
+    /// because of a cap or the byte budget, so `truncated` must stay false.
+    #[test]
+    fn scan_candidates_does_not_treat_an_unreadable_candidate_as_truncated() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = CtxConfig::default();
+        let min_bytes = cfg.output.compact_min_bytes as u64;
+        let big = "x".repeat(cfg.output.compact_generic_min_bytes + 1_000);
+
+        let jsonl = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[\
+             {{\"type\":\"tool_use\",\"id\":\"tu\",\"name\":\"Bash\",\"input\":{{\"command\":\"cat readable.log\"}}}}\
+             ]}}}}\n\
+             {{\"type\":\"user\",\"message\":{{\"content\":[\
+             {{\"type\":\"tool_result\",\"tool_use_id\":\"tu\",\"content\":\"{big}\"}}\
+             ]}}}}\n"
+        );
+        let readable_path = tmp.path().join("readable.jsonl");
+        std::fs::write(&readable_path, &jsonl).expect("write");
+
+        // Never written -- `File::open` fails on it, but this is not a
+        // truncation: the scan simply could not read this one candidate.
+        let missing_path = tmp.path().join("missing.jsonl");
+
+        let candidates = vec![(readable_path, 2_000u64), (missing_path, 1_000u64)];
+
+        let outcome = scan_candidates(
+            candidates,
+            min_bytes,
+            TRANSCRIPT_SCAN_BYTE_BUDGET,
+            MAX_TRANSCRIPT_CANDIDATES,
+        );
+
+        assert!(
+            !outcome.truncated,
+            "no file cap or byte budget was hit -- an unreadable candidate must not set truncated"
+        );
+        assert_eq!(outcome.unreadable, 1);
+        assert_eq!(outcome.files_scanned, 1);
+        assert_eq!(outcome.raw.len(), 1);
     }
 
     /// End to end through `run_with_budget`: a tiny injected byte budget

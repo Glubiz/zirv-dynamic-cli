@@ -1066,15 +1066,18 @@ const HOOK_HEALTH_SESSION_LIMIT: usize = 20;
 /// EXPECTED to be there, so the acceptance criterion for this check (silent
 /// on a fresh machine) requires this line stay silent too, not just the
 /// "installed but not firing" branch below it which already had its own
-/// `any` guard.
+/// `any` guard. Taken as a closure, not a plain `bool`: computing it may walk
+/// every claude project on the machine (`search::claude_candidates(repo,
+/// true)`), so it must never be paid for when `hook_installed` is `true` --
+/// the value this branch alone reads.
 fn hook_health_warning(
     hook_installed: bool,
-    machine_has_been_used: bool,
+    machine_has_been_used: impl FnOnce() -> bool,
     recent_sessions_with_large_results: &[String],
     has_decision: impl Fn(&str) -> bool,
 ) -> Option<String> {
     if !hook_installed {
-        if !machine_has_been_used {
+        if !machine_has_been_used() {
             return None;
         }
         return Some(
@@ -1354,13 +1357,18 @@ fn render_report<W: Write>(
                 // claude session transcript on disk, any compaction-ledger
                 // row (any size, not only the large ones scanned above), or
                 // any decision ever recorded (within the bounded tail
-                // above).
-                let machine_has_been_used = !decision_sessions.is_empty()
-                    || ledger::has_any_row(&state)
-                    || !search::claude_candidates(repo, true).is_empty();
+                // above). Computed lazily: `search::claude_candidates(repo,
+                // true)` may walk every claude project on the machine, and
+                // `hook_health_warning` only ever reads this when `hook_
+                // installed` is false, so a healthy machine must never pay
+                // for the walk.
                 if let Some(line) = hook_health_warning(
                     hook_installed,
-                    machine_has_been_used,
+                    || {
+                        !decision_sessions.is_empty()
+                            || ledger::has_any_row(&state)
+                            || !search::claude_candidates(repo, true).is_empty()
+                    },
                     &recent_sessions,
                     |s| decision_sessions.contains(s),
                 ) {
@@ -4316,24 +4324,49 @@ mod tests {
     #[test]
     fn hook_health_warning_covers_not_installed_healthy_and_silently_broken() {
         assert!(
-            hook_health_warning(false, true, &["s1".to_string()], |_| true)
+            hook_health_warning(false, || true, &["s1".to_string()], |_| true)
                 .expect("not installed, on a used machine, always warns")
                 .contains("not installed")
         );
         assert_eq!(
-            hook_health_warning(true, true, &[], |_| false),
+            hook_health_warning(true, || true, &[], |_| false),
             None,
             "nothing yet to judge the hook by is not a warning"
         );
         assert_eq!(
-            hook_health_warning(true, true, &["s1".to_string(), "s2".to_string()], |s| s
-                == "s2"),
+            hook_health_warning(
+                true,
+                || true,
+                &["s1".to_string(), "s2".to_string()],
+                |s| s == "s2"
+            ),
             None,
             "short-circuits healthy the moment any scanned session has a decision"
         );
-        let warning = hook_health_warning(true, true, &["s1".to_string()], |_| false)
+        let warning = hook_health_warning(true, || true, &["s1".to_string()], |_| false)
             .expect("installed but zero decisions across sessions with large results warns");
         assert!(warning.contains("zero decisions"));
+    }
+
+    /// The lazy-probe fix: when the hook is installed, `hook_health_warning`
+    /// must never call `machine_has_been_used` at all -- a probe that would
+    /// walk every claude project on the machine (`search::claude_candidates`)
+    /// must not be paid for on the common, healthy path.
+    #[test]
+    fn hook_health_warning_never_calls_the_probe_when_the_hook_is_installed() {
+        let called = std::cell::Cell::new(false);
+        let probe = || {
+            called.set(true);
+            true
+        };
+        assert_eq!(
+            hook_health_warning(true, probe, &["s1".to_string()], |_| true),
+            None
+        );
+        assert!(
+            !called.get(),
+            "the machine-usage probe must not run when hook_installed is true"
+        );
     }
 
     /// The fresh-machine fix: not-installed must stay SILENT when there is
@@ -4345,12 +4378,12 @@ mod tests {
     #[test]
     fn hook_health_warning_is_silent_not_installed_on_a_fresh_machine() {
         assert_eq!(
-            hook_health_warning(false, false, &[], |_| false),
+            hook_health_warning(false, || false, &[], |_| false),
             None,
             "no evidence of use at all: not-installed must not warn on a fresh machine"
         );
         assert!(
-            hook_health_warning(false, true, &[], |_| false)
+            hook_health_warning(false, || true, &[], |_| false)
                 .expect("the same not-installed state warns once there is usage evidence")
                 .contains("not installed")
         );

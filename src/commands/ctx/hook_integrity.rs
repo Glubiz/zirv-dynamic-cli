@@ -441,20 +441,25 @@ pub(crate) fn drift_warning_if_due(state: &StateDir, home: &Path) -> Option<Stri
     Some(summarize(&rows))
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct HealSummary {
     pub healed: usize,
+    /// One `"hook heal refused: <reason>"` line per target whose whole-file
+    /// semantic verification (see [`heal_target`]) failed -- the heal was
+    /// skipped and that target's file was left byte-for-byte untouched.
+    pub refused: Vec<String>,
 }
 
 /// Replaces every textual occurrence of a `"command":` value in `text` that
 /// is exactly `from_encoded` (a `serde_json::to_string`-encoded JSON string)
-/// with `to_encoded`, keeping whatever run of ASCII spaces separated the key
-/// from the value (serde's pretty printer emits one, its compact form emits
-/// none, and a hand-formatted file may have its own convention) -- so
-/// nothing else in `text`, not even its own whitespace, changes. Only ever
-/// matches inside a value position (it anchors on the `"command":` key
-/// text first), so this can never mistake a key for a value. Returns the
-/// patched text and how many occurrences were replaced.
+/// with `to_encoded`, keeping whatever run of ASCII whitespace separated the
+/// key from the value (serde's pretty printer emits one space, its compact
+/// form emits none, and a hand-formatted file may use a tab or put the value
+/// on its own line) -- so nothing else in `text`, not even its own
+/// whitespace, changes. Only ever matches inside a value position (it
+/// anchors on the `"command":` key text first), so this can never mistake a
+/// key for a value. Returns the patched text and how many occurrences were
+/// replaced.
 fn replace_command_value(text: &str, from_encoded: &str, to_encoded: &str) -> (String, usize) {
     const KEY: &str = "\"command\":";
     let mut result = String::with_capacity(text.len());
@@ -465,7 +470,10 @@ fn replace_command_value(text: &str, from_encoded: &str, to_encoded: &str) -> (S
         result.push_str(before);
         result.push_str(KEY);
         let after_key = &at_key[KEY.len()..];
-        let ws_len = after_key.len() - after_key.trim_start_matches(' ').len();
+        let ws_len = after_key.len()
+            - after_key
+                .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                .len();
         let (ws, after_ws) = after_key.split_at(ws_len);
         result.push_str(ws);
         match after_ws.strip_prefix(from_encoded) {
@@ -481,13 +489,58 @@ fn replace_command_value(text: &str, from_encoded: &str, to_encoded: &str) -> (S
     (result, count)
 }
 
+/// Applies the intended replacement structurally, in place, at the scoped
+/// path `hooks[event][*matcher==matcher].hooks[*].command` -- used only to
+/// build the *expected* document [`heal_target`] compares the textually
+/// patched-and-reparsed document against; never used to produce the file
+/// zirv actually writes (that stays the textual patch, to preserve
+/// formatting). Returns how many command values were replaced.
+fn apply_scoped_replacement(
+    value: &mut Value,
+    event: &str,
+    matcher: Option<&str>,
+    legacy_commands: &[&str],
+    to: &str,
+) -> usize {
+    let mut count = 0;
+    let Some(entries) = value
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut(event))
+        .and_then(Value::as_array_mut)
+    else {
+        return count;
+    };
+    for entry in entries {
+        if entry.get("matcher").and_then(Value::as_str) != matcher {
+            continue;
+        }
+        let Some(hooks) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for hook in hooks {
+            if hook.get("type").and_then(Value::as_str) != Some("command") {
+                continue;
+            }
+            let is_legacy = hook
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|c| legacy_commands.contains(&c));
+            if is_legacy {
+                hook["command"] = Value::String(to.to_string());
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 /// Heals every self-healable slot in one target file, writing the result
 /// atomically (temp file + rename in the same directory via
-/// `state::write_atomic`) only when at least one entry actually changed.
-/// A no-op -- and never even opens `target` -- when nothing in `shapes` has
-/// a legacy shape to heal from, so a target that was never installed (and
-/// does not exist on disk) is never an error while `LEGACY_HOOK_SHAPES` is
-/// empty.
+/// `state::write_atomic`) only when at least one entry actually changed and
+/// the whole-file verification below passes. A no-op -- and never even opens
+/// `target` -- when nothing in `shapes` has a legacy shape to heal from, so a
+/// target that was never installed (and does not exist on disk) is never an
+/// error while `LEGACY_HOOK_SHAPES` is empty.
 ///
 /// Patches the raw file text directly rather than parsing into a
 /// `serde_json::Value` and rewriting the whole tree: this crate's
@@ -499,68 +552,85 @@ fn replace_command_value(text: &str, from_encoded: &str, to_encoded: &str) -> (S
 /// legacy command string it might be healing *from* is JSON-encoded and
 /// searched for textually via [`replace_command_value`], which tolerates
 /// the exact whitespace variants `serde_json`'s pretty and compact printers
-/// produce. The result is re-parsed and checked -- every shape that was
-/// targeted must no longer show a legacy command live -- before anything is
-/// written; a patch that fails that check is discarded and `target` is left
-/// byte-for-byte untouched.
+/// produce -- but a purely textual search cannot tell a targeted slot's
+/// `"command"` value apart from an unrelated one elsewhere in the file (an
+/// MCP server entry, another hook's entry) that happens to hold the exact
+/// same string. So the patch is never trusted on faith: the *whole* file is
+/// verified semantically, not just the targeted slot -- the original text is
+/// parsed into a `Value`, the intended replacement is applied structurally
+/// at only the scoped `hooks[event][*matcher==matcher].hooks[*].command`
+/// path(s) via [`apply_scoped_replacement`] to get the expected document,
+/// the patched text is parsed into a second `Value`, and the two must be
+/// equal. Anything else -- invalid JSON, or any difference anywhere in the
+/// tree -- means the textual patch touched something the structural
+/// detection did not intend, so the heal is refused: returns `(0, Some(
+/// reason))` and `target` is left byte-for-byte untouched.
 fn heal_target(
     target: &Path,
     shapes: &[HookShape],
     legacy_shapes: &[HookShape],
-) -> CtxResult<usize> {
+) -> CtxResult<(usize, Option<String>)> {
     let has_legacy_shape = shapes.iter().any(|(event, matcher, current)| {
         legacy_shapes
             .iter()
             .any(|(e, m, c)| e == event && m == matcher && c != current)
     });
     if !has_legacy_shape || !target.is_file() {
-        return Ok(0);
+        return Ok((0, None));
     }
     let raw = std::fs::read_to_string(target)?;
-    if !serde_json::from_str::<Value>(&raw)?.is_object() {
+    let original: Value = serde_json::from_str(&raw)?;
+    if !original.is_object() {
         return Err(format!("{} must contain a JSON object", target.display()).into());
     }
 
     let mut patched = raw.clone();
     let mut applied = 0;
+    // Every shape this pass actually targeted, kept alongside the legacy
+    // commands it heals from -- reused below to build the expected document.
+    let mut targeted: Vec<(&str, Option<&str>, &str, Vec<&str>)> = Vec::new();
     for (event, matcher, current_command) in shapes {
         let legacy_commands = legacy_commands_for(event, *matcher, current_command, legacy_shapes);
         if legacy_commands.is_empty() {
             continue;
         }
         let to = serde_json::to_string(current_command)?;
-        for legacy in legacy_commands {
+        for legacy in &legacy_commands {
             let from = serde_json::to_string(legacy)?;
             let (next, count) = replace_command_value(&patched, &from, &to);
             patched = next;
             applied += count;
         }
+        targeted.push((*event, *matcher, *current_command, legacy_commands));
     }
     if applied == 0 {
-        return Ok(0);
+        return Ok((0, None));
     }
 
-    // Refuse to trust a purely textual patch on faith: re-parse and confirm
-    // every shape this pass targeted no longer shows a legacy command live.
-    // Anything else -- invalid JSON, or a legacy command somehow still
-    // present -- means the text patch does not match what the structural
-    // detection above expected, so leave `target` untouched.
     let Ok(reparsed) = serde_json::from_str::<Value>(&patched) else {
-        return Ok(0);
+        return Ok((0, Some("the patched text is not valid JSON".to_string())));
     };
-    for (event, matcher, current_command) in shapes {
-        let legacy_commands = legacy_commands_for(event, *matcher, current_command, legacy_shapes);
-        if legacy_commands.is_empty() {
-            continue;
-        }
-        let live = live_commands_for(&reparsed, event, *matcher);
-        if live.iter().any(|c| legacy_commands.contains(&c.as_str())) {
-            return Ok(0);
-        }
+
+    let mut expected = original;
+    for (event, matcher, current_command, legacy_commands) in &targeted {
+        apply_scoped_replacement(
+            &mut expected,
+            event,
+            *matcher,
+            legacy_commands,
+            current_command,
+        );
+    }
+
+    if expected != reparsed {
+        return Ok((
+            0,
+            Some("the patch changed something outside the targeted hook slot(s)".to_string()),
+        ));
     }
 
     state::write_atomic(target, &patched, false)?;
-    Ok(applied)
+    Ok((applied, None))
 }
 
 fn heal_outdated_with_legacy(
@@ -569,10 +639,17 @@ fn heal_outdated_with_legacy(
     legacy_shapes: &[HookShape],
 ) -> CtxResult<HealSummary> {
     let mut total = 0;
+    let mut refused = Vec::new();
     let mut baseline = Baseline::load(state);
     let mut baseline_dirty = false;
     for target in targets_for(home) {
-        let healed = heal_target(&target.path, &target.shapes, legacy_shapes)?;
+        let (healed, refusal) = heal_target(&target.path, &target.shapes, legacy_shapes)?;
+        if let Some(reason) = refusal {
+            refused.push(format!(
+                "hook heal refused: {reason} ({})",
+                target.path.display()
+            ));
+        }
         if healed == 0 {
             continue;
         }
@@ -599,7 +676,10 @@ fn heal_outdated_with_legacy(
         // freshly-healed slot `NoBaseline` instead of `Ok`.
         let _ = baseline.save(state);
     }
-    Ok(HealSummary { healed: total })
+    Ok(HealSummary {
+        healed: total,
+        refused,
+    })
 }
 
 /// `zirv ctx hook status --heal`, and the automatic heal at supervisor
@@ -903,8 +983,9 @@ mod tests {
             }),
         );
 
-        let healed = heal_target(&target, &shapes(), &legacy_table()).expect("heal");
+        let (healed, refused) = heal_target(&target, &shapes(), &legacy_table()).expect("heal");
         assert_eq!(healed, 1);
+        assert!(refused.is_none(), "got {refused:?}");
 
         let after: Value =
             serde_json::from_str(&std::fs::read_to_string(&target).expect("read")).expect("json");
@@ -933,8 +1014,9 @@ mod tests {
         let original = "{\n  \"permissions\": {\n    \"allow\": [\n      \"Read\"\n    ]\n  },\n  \"hooks\": {\n    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"zirv-ctx hook stop\"\n          }\n        ]\n      }\n    ]\n  }\n}\n";
         std::fs::write(&target, original).expect("write");
 
-        let healed = heal_target(&target, &shapes(), &legacy_table()).expect("heal");
+        let (healed, refused) = heal_target(&target, &shapes(), &legacy_table()).expect("heal");
         assert_eq!(healed, 1);
+        assert!(refused.is_none(), "got {refused:?}");
 
         let after = std::fs::read_to_string(&target).expect("read");
         let expected = original.replace("zirv-ctx hook stop", "zirv ctx hook stop");
@@ -953,19 +1035,92 @@ mod tests {
         });
         write_settings(&target, &original);
 
-        let healed = heal_target(&target, &shapes(), &legacy_table()).expect("heal");
+        let (healed, refused) = heal_target(&target, &shapes(), &legacy_table()).expect("heal");
         assert_eq!(healed, 0);
+        assert!(refused.is_none(), "got {refused:?}");
         let after: Value =
             serde_json::from_str(&std::fs::read_to_string(&target).expect("read")).expect("json");
         assert_eq!(after, original);
+    }
+
+    /// Finding: `heal_target`'s textual patch matches every `"command":`
+    /// value in the whole file byte-for-byte equal to the legacy encoded
+    /// string, not just the targeted `(event, matcher)` slot -- so a legacy
+    /// command string that also happens to appear as an unrelated
+    /// `"command"` value elsewhere (an MCP server entry here) would get
+    /// rewritten too. The whole-file semantic verification must catch that
+    /// and refuse the heal rather than silently touching more than the
+    /// scoped hook slot.
+    #[test]
+    fn heal_target_refuses_when_the_legacy_command_also_appears_as_an_unrelated_command_value() {
+        let home = tempfile::tempdir().expect("home");
+        let target = home.path().join("settings.json");
+        let original = "{\n  \"hooks\": {\n    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"zirv-ctx hook stop\"\n          }\n        ]\n      }\n    ]\n  },\n  \"mcpServers\": {\n    \"foo\": {\n      \"command\": \"zirv-ctx hook stop\"\n    }\n  }\n}\n";
+        std::fs::write(&target, original).expect("write");
+
+        let (healed, refused) = heal_target(&target, &shapes(), &legacy_table()).expect("heal");
+        assert_eq!(healed, 0, "the heal must be refused, not partially applied");
+        assert!(
+            refused
+                .as_deref()
+                .is_some_and(|r| r.contains("outside the targeted")),
+            "got {refused:?}"
+        );
+
+        let after = std::fs::read_to_string(&target).expect("read");
+        assert_eq!(
+            after, original,
+            "a refused heal must leave the file byte-identical"
+        );
+    }
+
+    /// Finding: `replace_command_value` only trimmed ASCII spaces between
+    /// `"command":` and its value, so a tab or newline there silently
+    /// skipped the occurrence and `heal_target` reported nothing to heal.
+    #[test]
+    fn replace_command_value_tolerates_a_tab_between_the_key_and_the_value() {
+        let text = "{\"command\":\t\"zirv-ctx hook stop\"}";
+        let from = serde_json::to_string("zirv-ctx hook stop").expect("json");
+        let to = serde_json::to_string("zirv ctx hook stop").expect("json");
+        let (patched, count) = replace_command_value(text, &from, &to);
+        assert_eq!(count, 1);
+        assert_eq!(patched, "{\"command\":\t\"zirv ctx hook stop\"}");
+    }
+
+    #[test]
+    fn replace_command_value_tolerates_a_newline_and_indent_between_the_key_and_the_value() {
+        let text = "{\"command\":\n    \"zirv-ctx hook stop\"}";
+        let from = serde_json::to_string("zirv-ctx hook stop").expect("json");
+        let to = serde_json::to_string("zirv ctx hook stop").expect("json");
+        let (patched, count) = replace_command_value(text, &from, &to);
+        assert_eq!(count, 1);
+        assert_eq!(patched, "{\"command\":\n    \"zirv ctx hook stop\"}");
+    }
+
+    /// End to end: a hand-edited file with a tab before the command value
+    /// must still be healed, not silently skipped.
+    #[test]
+    fn heal_target_heals_a_command_value_separated_by_a_tab() {
+        let home = tempfile::tempdir().expect("home");
+        let target = home.path().join("settings.json");
+        let original = "{\n\t\"hooks\": {\n\t\t\"Stop\": [\n\t\t\t{\n\t\t\t\t\"hooks\": [\n\t\t\t\t\t{\n\t\t\t\t\t\t\"type\": \"command\",\n\t\t\t\t\t\t\"command\":\t\"zirv-ctx hook stop\"\n\t\t\t\t\t}\n\t\t\t\t]\n\t\t\t}\n\t\t]\n\t}\n}\n";
+        std::fs::write(&target, original).expect("write");
+
+        let (healed, refused) = heal_target(&target, &[CURRENT], &legacy_table()).expect("heal");
+        assert_eq!(
+            healed, 1,
+            "a tab between the key and value must not hide the occurrence"
+        );
+        assert!(refused.is_none(), "got {refused:?}");
     }
 
     #[test]
     fn heal_target_is_a_no_op_on_a_missing_file_when_nothing_could_heal_it() {
         let home = tempfile::tempdir().expect("home");
         let target = home.path().join("does-not-exist.json");
-        let healed = heal_target(&target, &shapes(), &[]).expect("heal");
+        let (healed, refused) = heal_target(&target, &shapes(), &[]).expect("heal");
         assert_eq!(healed, 0);
+        assert!(refused.is_none(), "got {refused:?}");
         assert!(!target.exists());
     }
 

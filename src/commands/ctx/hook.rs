@@ -3129,12 +3129,17 @@ fn run_hook_status<W: Write>(w: &mut W, heal: bool, env: EnvLookup<'_>) -> CtxRe
     let state = StateDir::resolve(env)?;
     if heal {
         match super::hook_integrity::heal_outdated(&state, &home) {
-            Ok(summary) => writeln!(
-                w,
-                "healed {} hook entr{}",
-                summary.healed,
-                if summary.healed == 1 { "y" } else { "ies" }
-            )?,
+            Ok(summary) => {
+                writeln!(
+                    w,
+                    "healed {} hook entr{}",
+                    summary.healed,
+                    if summary.healed == 1 { "y" } else { "ies" }
+                )?;
+                for reason in &summary.refused {
+                    writeln!(w, "{reason}")?;
+                }
+            }
             Err(error) => writeln!(w, "heal failed: {error}")?,
         }
     }
