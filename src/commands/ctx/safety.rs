@@ -2008,19 +2008,21 @@ pub(crate) fn collapse_whitespace(s: &str) -> String {
     out
 }
 
-/// Splits `command` on shell separators (`;`, `&`, `&&`, `||`, `|`, newline)
-/// while keeping quoted data together. An outer shell wrapper is unwrapped
-/// and passed through this function again, so `bash -c 'a; b'` still yields
-/// both executable nodes without treating a harmless `printf 'a; b'` string
-/// as code. `&&`/`||` are matched before their lone forms, so a two-character
-/// operator is never split in half. Shell redirections (`2>&1` and `&>`) keep
-/// their ampersand because it does not introduce another executable node.
-fn split_segments(command: &str) -> Vec<String> {
+/// Splits `command` on shell separators (`;`, `&`, `&&`, `||`, `|`, `|&`,
+/// newline) while keeping quoted data together, recording whether each
+/// segment was preceded by a pipe (`|`/`|&`) rather than a chain operator --
+/// issue #334's `git apply`/`git am` carve-out needs that. [`split_segments`]
+/// and [`split_segments_with_pipe_marker`] are thin views over this one
+/// scan. `&&`/`||`/`|&` are matched before their lone forms so a two-
+/// character operator is never split in half -- `|&` composes into ONE pipe
+/// marker instead of a stray `|` plus a stray background `&`.
+fn tokenize_segments(command: &str) -> Vec<(String, bool)> {
     let chars: Vec<char> = command.chars().collect();
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
     let mut escaped = false;
+    let mut preceded_by_pipe = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -2044,25 +2046,41 @@ fn split_segments(command: &str) -> Vec<String> {
             current.push(c);
             i += 1;
         } else if c == ';' || c == '\n' {
-            segments.push(std::mem::take(&mut current));
+            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            preceded_by_pipe = false;
             i += 1;
+        } else if c == '|' && next == Some('&') {
+            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            preceded_by_pipe = true;
+            i += 2;
         } else if (c == '&' && next == Some('&')) || (c == '|' && next == Some('|')) {
-            segments.push(std::mem::take(&mut current));
+            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            preceded_by_pipe = false;
             i += 2;
         } else if (c == '|' && !current.ends_with('>'))
             || (c == '&'
                 && !matches!(current.chars().next_back(), Some('>' | '<'))
                 && next != Some('>'))
         {
-            segments.push(std::mem::take(&mut current));
+            let is_pipe = c == '|';
+            segments.push((std::mem::take(&mut current), preceded_by_pipe));
+            preceded_by_pipe = is_pipe;
             i += 1;
         } else {
             current.push(c);
             i += 1;
         }
     }
-    segments.push(current);
+    segments.push((current, preceded_by_pipe));
     segments
+}
+
+/// See [`tokenize_segments`], which this is a thin view over.
+fn split_segments(command: &str) -> Vec<String> {
+    tokenize_segments(command)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
 }
 
 const MAX_STRUCTURAL_DEPTH: usize = 16;
@@ -2275,13 +2293,14 @@ pub(crate) struct QuotedToken {
     end: usize,
 }
 
-/// Splits `chars` into whitespace-separated tokens, treating a `'`/`"`-
-/// quoted run (backslash-escaped characters skipped, matching every other
-/// quote tracker in this module) as part of the SAME token even when it
-/// contains embedded whitespace -- so a huge, multi-line quoted commit
-/// message is one token, exactly as a real shell would see it, not many.
-pub(crate) fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
-    let mut tokens = Vec::new();
+/// Quote-aware whitespace token spans over `chars`. [`token_spans`] and
+/// [`tokenize_quoted`] are thin views over this one scan (issue #421 -- the
+/// two used to be independent, near-identical copies). `escape_aware` keeps
+/// each caller's own PRE-EXISTING answer (only [`tokenize_quoted`] treated a
+/// backslash as an escape) rather than unifying onto one, which could shift
+/// a verdict.
+fn whitespace_token_spans(chars: &[char], escape_aware: bool) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
     let mut i = 0usize;
     while i < chars.len() {
         while i < chars.len() && chars[i].is_whitespace() {
@@ -2295,12 +2314,12 @@ pub(crate) fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
         let mut escaped = false;
         while i < chars.len() {
             let c = chars[i];
-            if escaped {
+            if escape_aware && escaped {
                 escaped = false;
                 i += 1;
                 continue;
             }
-            if c == '\\' && quote != Some('\'') {
+            if escape_aware && c == '\\' && quote != Some('\'') {
                 escaped = true;
                 i += 1;
                 continue;
@@ -2322,13 +2341,23 @@ pub(crate) fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
             }
             i += 1;
         }
-        tokens.push(QuotedToken {
-            text: chars[start..i].iter().collect(),
-            start,
-            end: i,
-        });
+        spans.push((start, i));
     }
-    tokens
+    spans
+}
+
+/// See [`whitespace_token_spans`], which this is a thin, escape-aware view
+/// over. `pub(crate)`: `learn.rs` reuses this exact tokenizer (issue #425
+/// review) rather than a second, independent copy.
+pub(crate) fn tokenize_quoted(chars: &[char]) -> Vec<QuotedToken> {
+    whitespace_token_spans(chars, true)
+        .into_iter()
+        .map(|(start, end)| QuotedToken {
+            text: chars[start..end].iter().collect(),
+            start,
+            end,
+        })
+        .collect()
 }
 
 /// Whether `tokens`' leading two tokens name one of the commit-message-
@@ -2877,44 +2906,10 @@ fn find_cmd_inline_command_flag(rest: &str) -> Option<String> {
     None
 }
 
-/// Quote-aware argv token spans over `chars`: one `(start, end)` char-index
-/// pair per whitespace-separated token, a quoted run kept whole. Shared by
-/// every inline-command-flag scanner in this module so they cannot disagree
-/// about where one token ends and the next begins.
+/// Quote-aware argv token spans over `chars`. Shared by every inline-
+/// command-flag scanner in this module. See [`whitespace_token_spans`].
 fn token_spans(chars: &[char]) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut i = 0usize;
-    while i < chars.len() {
-        while i < chars.len() && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= chars.len() {
-            break;
-        }
-        let start = i;
-        let mut quote: Option<char> = None;
-        while i < chars.len() {
-            let c = chars[i];
-            if let Some(active) = quote {
-                if c == active {
-                    quote = None;
-                }
-                i += 1;
-                continue;
-            }
-            if matches!(c, '\'' | '"') {
-                quote = Some(c);
-                i += 1;
-                continue;
-            }
-            if c.is_whitespace() {
-                break;
-            }
-            i += 1;
-        }
-        spans.push((start, i));
-    }
-    spans
+    whitespace_token_spans(chars, false)
 }
 
 /// Whether `name` (a switch token with its leading `-`/`/` already removed,
@@ -6280,66 +6275,12 @@ fn filesystem_repo_root_of(path: &str) -> Option<String> {
 }
 
 /// Like [`split_segments`], but each segment also carries whether the
-/// separator immediately before it was a bare pipe `|` (not `||`) --
-/// issue #334's `git apply`/`git am`/`patch` carve-out needs to tell
-/// "piped from the previous stage" apart from "chained by `;`/`&&`/`||`/
-/// newline", which `split_segments` itself does not preserve. Quote/escape
-/// handling mirrors `split_segments` exactly (same branches, same order)
-/// so the two can never disagree about where a segment starts or ends --
-/// only the extra per-segment `bool` is new.
+/// separator immediately before it was a pipe (`|` or `|&`, not `||`) --
+/// issue #334's `git apply`/`git am`/`patch` carve-out needs that. A direct
+/// alias for [`tokenize_segments`], which already returns exactly this
+/// shape.
 fn split_segments_with_pipe_marker(command: &str) -> Vec<(String, bool)> {
-    let chars: Vec<char> = command.chars().collect();
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    let mut i = 0;
-    let mut preceded_by_pipe = false;
-    while i < chars.len() {
-        let c = chars[i];
-        let next = chars.get(i + 1).copied();
-        if escaped {
-            current.push(c);
-            escaped = false;
-            i += 1;
-        } else if c == '\\' && quote != Some('\'') {
-            current.push(c);
-            escaped = true;
-            i += 1;
-        } else if let Some(active) = quote {
-            current.push(c);
-            if c == active {
-                quote = None;
-            }
-            i += 1;
-        } else if matches!(c, '\'' | '"' | '`') {
-            quote = Some(c);
-            current.push(c);
-            i += 1;
-        } else if c == ';' || c == '\n' {
-            segments.push((std::mem::take(&mut current), preceded_by_pipe));
-            preceded_by_pipe = false;
-            i += 1;
-        } else if (c == '&' && next == Some('&')) || (c == '|' && next == Some('|')) {
-            segments.push((std::mem::take(&mut current), preceded_by_pipe));
-            preceded_by_pipe = false;
-            i += 2;
-        } else if (c == '|' && !current.ends_with('>'))
-            || (c == '&'
-                && !matches!(current.chars().next_back(), Some('>' | '<'))
-                && next != Some('>'))
-        {
-            let is_pipe = c == '|';
-            segments.push((std::mem::take(&mut current), preceded_by_pipe));
-            preceded_by_pipe = is_pipe;
-            i += 1;
-        } else {
-            current.push(c);
-            i += 1;
-        }
-    }
-    segments.push((current, preceded_by_pipe));
-    segments
+    tokenize_segments(command)
 }
 
 /// The sentinel label [`orchestrator_repo_write_target`] reports for a
@@ -9297,6 +9238,19 @@ mod tests {
                 &roots
             ),
             "the shape issue #321 added this carve-out for must still qualify"
+        );
+        // Issue #421: `|&` composes into one pipe token exactly like a bare
+        // `|`, so this segments identically to the `&&` form above and must
+        // reach the same verdict, not the pre-#421 three-segment split with
+        // a spurious empty middle segment that always returned false.
+        assert!(
+            is_mixed_confined_write_and_read_only_escape_safe(
+                &policy,
+                "mkdir -p /tmp/claude/x |& gh issue view 1 --json body",
+                Verdict::Allow,
+                &roots
+            ),
+            "|& must qualify the same way && and | already do"
         );
     }
 
@@ -13194,6 +13148,59 @@ mod tests {
                 "a redirection is not a hidden executable: {command}"
             );
         }
+    }
+
+    /// Issue #421: `|&` composes into ONE pipe marker, not a stray `|` plus
+    /// a stray background `&`, and the `git apply`/`git am` pipe carve-out
+    /// treats it exactly like a bare `|`.
+    #[test]
+    fn pipe_and_stderr_operator_composes_into_one_pipe_token() {
+        assert_eq!(
+            split_segments("a |& b"),
+            vec!["a ".to_string(), " b".to_string()]
+        );
+        assert_eq!(
+            split_segments_with_pipe_marker("a |& b"),
+            vec![("a ".to_string(), false), (" b".to_string(), true)]
+        );
+        assert_eq!(
+            orchestrator_repo_write_target(
+                "git diff main |& git apply -",
+                "/work/repo",
+                &fake_repo_root_of,
+                &|_| None
+            ),
+            None
+        );
+    }
+
+    /// Issue #421: an operator inside quotes is data, not structure.
+    #[test]
+    fn quoted_shell_operators_stay_one_argument() {
+        assert_eq!(
+            split_segments(r#"echo "a && b""#),
+            vec![r#"echo "a && b""#.to_string()]
+        );
+        let outcome = evaluate(
+            &SafetyPolicy::default(),
+            r#"echo "a && b""#,
+            LaunchMode::Interactive,
+        );
+        assert_eq!(outcome.verdict, Verdict::Allow);
+    }
+
+    /// Issue #421: the `MAX_STRUCTURAL_DEPTH` guard still holds past it.
+    #[test]
+    fn nested_command_substitution_past_the_depth_guard_still_terminates() {
+        let mut command = "rm -rf /".to_string();
+        for _ in 0..40 {
+            command = format!("$(echo {command})");
+        }
+        let outcome = evaluate(&SafetyPolicy::default(), &command, LaunchMode::Interactive);
+        assert!(matches!(
+            outcome.verdict,
+            Verdict::Allow | Verdict::Ask | Verdict::Deny
+        ));
     }
 
     #[test]
