@@ -1426,6 +1426,12 @@ mod tests {
             Some("cheap")
         );
         assert_eq!(
+            tier_for_model("codex", "gpt-6-astra", &cfg),
+            Some("deep"),
+            "astra shares sol's top strength so it classifies as deep too"
+        );
+        assert_eq!(tier_for_model("codex", "gpt-5.6-sol", &cfg), Some("deep"));
+        assert_eq!(
             equivalent_model("droid", Some("fable"), true, "codex", &cfg),
             Some("operator-deep".to_string())
         );

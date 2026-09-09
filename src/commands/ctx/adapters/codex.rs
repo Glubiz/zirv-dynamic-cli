@@ -3018,6 +3018,7 @@ mod tests {
         let adapter = CodexAdapter::new(None);
         for (seat, expected) in [
             (Some("gpt-5.6-sol"), "gpt-5.6-terra"),
+            (Some("gpt-6-astra"), "gpt-5.6-terra"),
             (Some("gpt-5.6-terra"), "gpt-5.6-luna"),
             (Some("gpt-5.6-luna"), "gpt-5.4-mini"),
             (Some("gpt-5.4-mini"), "gpt-5.4-mini"),
@@ -3028,6 +3029,7 @@ mod tests {
         }
         for (model, expected) in [
             ("gpt-5.6-sol", Some(4)),
+            ("gpt-6-astra", Some(4)),
             ("gpt-5.6-terra", Some(3)),
             ("gpt-5.6-luna", Some(2)),
             ("gpt-5.4-mini", Some(1)),
