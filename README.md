@@ -2404,10 +2404,15 @@ or the explicit opt-out below do.
   unclassified commands, `ask` only for the closed dangerous list, and `deny`
   for the shorter refusal list. Zirv ships conservative Design B: no blanket
   native `Bash(*)` allow. On macOS, Linux, and WSL2 the same launch layer
-  enables Claude's OS sandbox in auto-allow mode, fails closed if it cannot
-  start, blocks common credential paths, and scrubs cloud credentials from
-  subprocesses. Native Windows receives the hook and credential rules but no
-  unsupported OS-sandbox setting.
+  requests Claude's OS sandbox in auto-allow mode to block common credential
+  paths, and scrubs cloud credentials from subprocesses. On Linux the OS
+  sandbox requires bubblewrap (`bwrap`) and `socat`; install them with
+  `sudo apt install bubblewrap socat` on Debian/Ubuntu to enable it. When they
+  are missing, Zirv still launches Claude Code, which prints "Sandbox disabled"
+  and runs Bash without OS sandboxing; Zirv's permission mode, allowed/disallowed
+  tools and `zirv ctx safety check` PreToolUse hook remain in force.
+  macOS uses the built-in `sandbox-exec`. Native Windows has no OS sandbox
+  and receives the hook and credential rules.
 - **Claude headless:** `--permission-mode dontAsk`; ordinary allow rules are
   pre-approved and both deny and ask rules are disallowed, so no prompt can
   stall automation.
