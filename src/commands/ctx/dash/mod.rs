@@ -2986,7 +2986,7 @@ fn reap_fixup(removed: usize, focused: usize, selected: usize) -> (usize, usize)
     (focused, selected)
 }
 
-/// A failed worker launch includes the last visible output line. Reaping
+/// A failed pane launch includes the last visible output line. Reaping
 /// removes the pane, so the header receives this message only once.
 fn early_pane_failure(
     agent: &str,
@@ -3360,18 +3360,15 @@ fn reap_ended_panes(
             panes[index].budget_tokens(),
         );
         let retained_writer = writer_text(panes[index].holds_writer_permit(), panes[index].cwd());
-        let early_failure = (panes[index].role() != prompt::PromptRole::Orchestrator)
-            .then(|| panes[index].exited_after())
-            .flatten()
-            .and_then(|elapsed| {
-                early_pane_failure(
-                    panes[index].agent(),
-                    panes[index].short(),
-                    code,
-                    elapsed,
-                    &panes[index].last_line(),
-                )
-            });
+        let early_failure = panes[index].exited_after().and_then(|elapsed| {
+            early_pane_failure(
+                panes[index].agent(),
+                panes[index].short(),
+                code,
+                elapsed,
+                &panes[index].last_line(),
+            )
+        });
         if let Err(e) = panes[index].finish_shutdown() {
             push_error(errors, format!("reap {}: {e}", panes[index].short()));
         }
@@ -17602,71 +17599,78 @@ mod tests {
     /// A failed launch reports its output once, even if the reap runs again.
     #[cfg(unix)]
     #[test]
-    fn early_worker_pane_failure_reports_the_output_tail_once() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let state = StateDir::from_root(tmp.path().join("state"));
-        let cfg = CtxConfig::default();
-        let mut pane = Pane::spawn(
-            PaneSpec {
-                agent_name: "test-agent".to_string(),
-                argv: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "printf 'first\nlaunch failed\n\n'; exit 2".to_string(),
-                ],
-                role: prompt::PromptRole::Worker,
-                verb: sessions::Verb::Dash,
-                session_id: "77774444-2222-4333-8444-555555555555".to_string(),
-                title: "failed launch".to_string(),
-            },
-            &state,
-            tmp.path(),
-            tmp.path(),
-            (200, 24),
-            &[],
-            true,
-            pane::DEFAULT_IDLE_QUIET,
-        )
-        .expect("spawn");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            pane.drain();
-            if matches!(pane.state(), PaneState::Ended(2)) && pane.last_line() == "launch failed" {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert_eq!(pane.state(), PaneState::Ended(2));
-        assert_eq!(pane.last_line(), "launch failed");
-        let short = pane.short().to_string();
-        let mut panes = vec![pane];
-        let mut queues = vec![VecDeque::new()];
-        let mut errors = ErrorLog::default();
-        for _ in 0..2 {
-            reap_ended_panes(
-                &mut panes,
-                &mut queues,
-                &cfg,
+    fn early_worker_and_orchestrator_pane_failure_reports_the_output_tail_once() {
+        for (role, verb) in [
+            (prompt::PromptRole::Worker, sessions::Verb::Dash),
+            (prompt::PromptRole::Orchestrator, sessions::Verb::Chat),
+        ] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = StateDir::from_root(tmp.path().join("state"));
+            let cfg = CtxConfig::default();
+            let mut pane = Pane::spawn(
+                PaneSpec {
+                    agent_name: "test-agent".to_string(),
+                    argv: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf 'first\nlaunch failed\n\n'; exit 2".to_string(),
+                    ],
+                    role,
+                    verb,
+                    session_id: "77774444-2222-4333-8444-555555555555".to_string(),
+                    title: "failed launch".to_string(),
+                },
                 &state,
                 tmp.path(),
-                &mut 0,
-                &mut 0,
-                &mut errors,
-                &mut Vec::new(),
-                &mut HashSet::new(),
-                &mut None,
-                &mut VecDeque::new(),
-                &mut HashMap::new(),
+                tmp.path(),
+                (200, 24),
+                &[],
+                true,
+                pane::DEFAULT_IDLE_QUIET,
+            )
+            .expect("spawn");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                pane.drain();
+                if matches!(pane.state(), PaneState::Ended(2))
+                    && pane.last_line() == "launch failed"
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(pane.state(), PaneState::Ended(2));
+            assert_eq!(pane.last_line(), "launch failed");
+            let short = pane.short().to_string();
+            let mut panes = vec![pane];
+            let mut queues = vec![VecDeque::new()];
+            let mut errors = ErrorLog::default();
+            for _ in 0..2 {
+                reap_ended_panes(
+                    &mut panes,
+                    &mut queues,
+                    &cfg,
+                    &state,
+                    tmp.path(),
+                    &mut 0,
+                    &mut 0,
+                    &mut errors,
+                    &mut Vec::new(),
+                    &mut HashSet::new(),
+                    &mut None,
+                    &mut VecDeque::new(),
+                    &mut HashMap::new(),
+                );
+            }
+            assert!(panes.is_empty());
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            let error = errors.iter().next().expect("one error");
+            assert!(
+                error.starts_with(&format!("test-agent pane {short} exited with code 2 ")),
+                "{error}"
             );
+            assert!(error.ends_with("s after launch: launch failed"), "{error}");
         }
-        assert!(panes.is_empty());
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        let error = errors.iter().next().expect("one error");
-        assert!(
-            error.starts_with(&format!("test-agent pane {short} exited with code 2 ")),
-            "{error}"
-        );
-        assert!(error.ends_with("s after launch: launch failed"), "{error}");
     }
 
     /// A1-1: the budget sweep reads (and parses) every budgeted pane's whole

@@ -1582,12 +1582,11 @@ fn launch_settings_value(
         settings["env"]["SSH_AUTH_SOCK"] = serde_json::json!(socket);
     }
 
-    // Claude's OS sandbox is currently supported on macOS, Linux and WSL2,
-    // but not native Windows. On supported hosts it is the hard containment
-    // boundary beneath Zirv's semantic classifier: compatible Bash commands
-    // need no prompt, initialization fails closed, and an incompatible
-    // command may leave the sandbox only through the safety hook's own
-    // escape gate above.
+    // Request Claude's OS sandbox when Claude Code can provide it (macOS,
+    // Linux and WSL2, not native Windows). Linux needs bubblewrap (`bwrap`)
+    // and socat; if missing, Claude Code warns and runs without OS sandboxing.
+    // Zirv's `--permission-mode default`, allowed/disallowed tools and
+    // `zirv ctx safety check` PreToolUse hook still apply.
     #[cfg(not(windows))]
     if let Some(object) = settings.as_object_mut() {
         let mut filesystem = serde_json::json!({
@@ -1612,7 +1611,7 @@ fn launch_settings_value(
             "autoAllowBashIfSandboxed": true,
             "allowUnsandboxedCommands": true,
             "excludedCommands": sandbox_exclusions,
-            "failIfUnavailable": true,
+            "failIfUnavailable": false,
             "filesystem": filesystem
         });
         #[cfg(target_os = "macos")]
@@ -2350,9 +2349,10 @@ impl AgentAdapter for ClaudeAdapter {
     /// rules still narrow them. Every projected launch carries the Zirv-owned
     /// `--settings` layer
     /// that attests this hook for the process. On macOS/Linux/WSL2 it enables
-    /// Claude's OS sandbox in auto-allow mode, fails closed if that boundary
-    /// cannot start, denies common credential paths to Bash and the built-in
-    /// Read tool, and scrubs cloud credentials from child environments.
+    /// Claude's OS sandbox in auto-allow mode when available; Claude Code
+    /// warns and runs without it if unavailable. The sandbox denies common
+    /// credential paths to Bash; the launch settings also deny them to the
+    /// built-in Read tool and scrub cloud credentials from child environments.
     /// Native Windows receives the hook/read/env layer but no unsupported
     /// sandbox key.
     fn default_sandbox_args(
