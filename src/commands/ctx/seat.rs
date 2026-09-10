@@ -103,6 +103,37 @@ impl Cause {
     }
 }
 
+/// The harness a rollover moved this seat OFF, kept so the seat can be
+/// returned to it once its own pressure clears -- the "park the original
+/// session, do not close it" half of a rollover.
+///
+/// A rollover has to quit the source child (one seat, one live pane), but
+/// quitting a harness does not destroy its conversation: `conversation` is
+/// the harness's OWN conversation id, observed at a turn boundary
+/// (`sessions::native_conversation`, issue #462), which a later return
+/// resumes natively instead of starting the operator over. `None` means no
+/// turn boundary ever recorded one (an unsupervised or never-answered
+/// session, or a harness with no resume mechanism at all), and a return then
+/// degrades to the cold launch it always was.
+///
+/// Recorded by [`commit`] for a `Proactive`/`Reactive` rollover only -- a
+/// `Reclaim` IS the return, and a `Manual` swap is the operator's own
+/// decision to move, not a displacement owed anything. An already-owed entry
+/// is never overwritten: the harness the seat was FIRST displaced from is
+/// the one it wants back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Displaced {
+    pub agent: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// zirv's own session uuid for the displaced run, which is what
+    /// `sessions::native_conversation` is keyed by alongside `agent`.
+    pub session: String,
+    #[serde(default)]
+    pub conversation: Option<String>,
+    pub since: u64,
+}
+
 /// A seat's own state machine. `Idle` is the steady state a seat spends
 /// almost all of its life in; `Prepared` is the narrow, transactional window
 /// between deciding to roll over and either `commit`ting or `abort`ing that
@@ -166,6 +197,10 @@ pub struct Seat {
     pub last_rollover_at: Option<u64>,
     #[serde(default)]
     pub pending: Option<Pending>,
+    /// The harness this seat was rolled off and still wants back, with the
+    /// conversation a return should resume -- see [`Displaced`].
+    #[serde(default)]
+    pub displaced: Option<Displaced>,
     pub created_at: u64,
     pub updated_at: u64,
 }
@@ -270,6 +305,7 @@ pub fn register(
             short: short.to_string(),
             session: session.to_string(),
             generation: 1,
+            displaced: None,
             agent: agent.to_string(),
             model: model.map(str::to_string),
             provider: provider.to_string(),
@@ -399,8 +435,11 @@ pub fn commit(
         .into());
     }
     let old_agent = seat.agent.clone();
+    let old_model = seat.model.clone();
+    let old_session = seat.session.clone();
+    let previously_displaced = seat.displaced.clone();
     seat.visited.push(Visit {
-        agent: old_agent,
+        agent: old_agent.clone(),
         epoch: cause.observed_at().unwrap_or(now),
         at: now,
     });
@@ -409,6 +448,35 @@ pub fn commit(
     seat.agent = successor_agent;
     seat.model = successor_model;
     seat.session = session_of_successor.to_string();
+    // The source harness is parked, not closed: the seat remembers which
+    // harness it left and which conversation that harness was in, so a later
+    // return resumes it rather than starting the operator over. Coming home
+    // (the successor IS the harness we were displaced from) pays the debt;
+    // otherwise a first displacement is recorded and an existing one is left
+    // alone -- see [`Displaced`].
+    let coming_home = previously_displaced
+        .as_ref()
+        .is_some_and(|displaced| displaced.agent.eq_ignore_ascii_case(&seat.agent));
+    seat.displaced = if coming_home {
+        None
+    } else if matches!(cause, Cause::Proactive { .. } | Cause::Reactive { .. }) {
+        previously_displaced.or_else(|| {
+            Some(Displaced {
+                agent: old_agent.clone(),
+                model: old_model,
+                conversation: super::sessions::native_conversation(
+                    state,
+                    short,
+                    &old_agent,
+                    &old_session,
+                ),
+                session: old_session,
+                since: now,
+            })
+        })
+    } else {
+        previously_displaced
+    };
     seat.last_rollover_at = Some(now);
     seat.phase = Phase::Idle;
     seat.pending = None;
@@ -923,11 +991,164 @@ mod tests {
         CtxConfig::default()
     }
 
+    /// A rollover parks the harness it leaves rather than closing it: the
+    /// seat remembers that harness, its model, and the conversation a turn
+    /// boundary observed for it, so a later return resumes that conversation
+    /// instead of starting the operator over. Coming home clears the debt.
+    #[test]
+    fn a_rollover_parks_the_source_harness_and_the_return_pays_it_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let zirv_session = "6c967beb-0b72-46e9-9d3e-504a03f741b3";
+        let native = "49195b07-217f-4401-8681-c857fcea294e";
+        let short = super::super::sessions::short_id(zirv_session);
+
+        register(
+            &state,
+            &short,
+            zirv_session,
+            "claude",
+            Some("opus"),
+            "anthropic",
+            "orchestrator",
+            false,
+            1_700_000_000,
+        )
+        .expect("register");
+        // What claude itself reported at its own turn boundaries.
+        super::super::sessions::record_native_conversation(
+            &state,
+            &short,
+            "claude",
+            zirv_session,
+            native,
+        );
+
+        let generation = prepare(
+            &state,
+            &short,
+            "codex",
+            Some("gpt5"),
+            Cause::Reactive {
+                detail: "provider=anthropic, five_hour reached=true".to_string(),
+                observed_at: 1_700_000_000,
+            },
+            1_700_000_000,
+        )
+        .expect("prepare");
+        let rolled = commit(&state, &short, generation, "codex-session", 1_700_000_100)
+            .expect("commit the rollover");
+
+        let displaced = rolled
+            .displaced
+            .expect("the source harness is parked, not closed");
+        assert_eq!(displaced.agent, "claude");
+        assert_eq!(displaced.model.as_deref(), Some("opus"));
+        assert_eq!(displaced.session, zirv_session);
+        assert_eq!(
+            displaced.conversation.as_deref(),
+            Some(native),
+            "the parked conversation is the harness's own id, never zirv's uuid"
+        );
+
+        // The return: the seat moves back onto claude, so nothing is owed.
+        let generation = prepare(
+            &state,
+            &short,
+            "claude",
+            Some("opus"),
+            Cause::Reclaim {
+                headroom_pct: 12.0,
+                observed_at: 1_700_003_600,
+            },
+            1_700_003_600,
+        )
+        .expect("prepare the return");
+        let home = commit(&state, &short, generation, zirv_session, 1_700_003_601)
+            .expect("commit the return");
+        assert_eq!(home.agent, "claude");
+        assert!(
+            home.displaced.is_none(),
+            "the seat is home; nothing is owed a return: {home:?}"
+        );
+    }
+
+    /// Only a displacement is owed a return. A `Reclaim` IS the return, and a
+    /// `Manual` swap is the operator moving the seat themselves -- neither
+    /// leaves a harness waiting to be resumed. A second displacement never
+    /// overwrites the first: the harness the seat originally lost is the one
+    /// it wants back.
+    #[test]
+    fn a_manual_or_reclaim_swap_owes_no_return_and_the_first_displacement_wins() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let short = "orch0001";
+
+        register(
+            &state,
+            short,
+            "session-a",
+            "claude",
+            None,
+            "anthropic",
+            "orchestrator",
+            false,
+            1_000,
+        )
+        .expect("register");
+        let generation =
+            prepare(&state, short, "codex", None, Cause::Manual, 1_000).expect("prepare");
+        let manual = commit(&state, short, generation, "session-b", 1_001).expect("commit");
+        assert!(
+            manual.displaced.is_none(),
+            "an operator's own handover owes nobody a return: {manual:?}"
+        );
+
+        let generation = prepare(
+            &state,
+            short,
+            "gemini",
+            None,
+            Cause::Reactive {
+                detail: "blocked".to_string(),
+                observed_at: 2_000,
+            },
+            2_000,
+        )
+        .expect("prepare");
+        let first = commit(&state, short, generation, "session-c", 2_001).expect("commit");
+        assert_eq!(
+            first.displaced.as_ref().map(|d| d.agent.as_str()),
+            Some("codex"),
+            "the harness this rollover left is parked: {first:?}"
+        );
+
+        let generation = prepare(
+            &state,
+            short,
+            "copilot",
+            None,
+            Cause::Proactive {
+                headroom_pct: 5.0,
+                observed_at: 3_000,
+            },
+            3_000,
+        )
+        .expect("prepare");
+        let second = commit(&state, short, generation, "session-d", 3_001).expect("commit");
+        assert_eq!(
+            second.displaced.as_ref().map(|d| d.agent.as_str()),
+            Some("codex"),
+            "a later hop must not overwrite the harness first displaced: {second:?}"
+        );
+    }
+
     fn base_seat() -> Seat {
         Seat {
             short: "abcd1234".to_string(),
             session: "session-a".to_string(),
             generation: 1,
+            displaced: None,
             agent: "claude".to_string(),
             model: None,
             provider: "claude".to_string(),

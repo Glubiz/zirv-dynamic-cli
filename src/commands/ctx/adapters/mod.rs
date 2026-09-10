@@ -1988,6 +1988,21 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
+    /// Whether this harness accepts an initial prompt *alongside* its own
+    /// resume flags, so one launch can both continue an existing
+    /// conversation and say something new in it. `false` -- the default --
+    /// means resuming and prompting are mutually exclusive here as far as
+    /// this codebase has verified, and a caller that must deliver a handoff
+    /// packet has to choose the cold launch instead of the resume.
+    ///
+    /// This is what makes a RETURN to a parked harness possible: that
+    /// conversation missed everything the interim harness did, so it may
+    /// only be resumed by a launch that can also carry the interim's own
+    /// handoff packet.
+    fn resume_accepts_prompt(&self) -> bool {
+        false
+    }
+
     /// Issue #462: whether `session` names a conversation this harness could
     /// actually be resumed into, when that is knowable from what the harness
     /// itself has on disk. `None` -- the default -- means this adapter has no

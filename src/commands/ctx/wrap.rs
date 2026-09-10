@@ -3043,7 +3043,10 @@ fn perform_handover_swap(
     // old child is touched, so an unknown target agent (a race against the
     // operator's own config change, or a stale request) fails before
     // anything is torn down.
-    let (new_adapter, new_extra_flags) = super::handover::resolve_swap_launch(cfg, req)?;
+    // `relaunch` below always hands the successor the handoff packet as its
+    // initial prompt, so this launch can only resume a conversation on a
+    // harness that accepts both.
+    let (new_adapter, new_extra_flags) = super::handover::resolve_swap_launch(cfg, req, true)?;
     // Finding #10 (issue #358 review): the successor must carry a fencing
     // generation of its own. `req.generation` is the PREPARED generation an
     // automatic swap's `seat::commit` is about to promote to `Seat::
