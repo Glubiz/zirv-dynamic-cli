@@ -148,6 +148,57 @@ having a separate one, not a bug in the alias routing itself.
   terminal (announced in one line) when none is. Pass `-` as the prompt to
   read it from stdin instead.
 
+#### Delegation receipt (`--json`)
+
+`--json` prints one machine-readable receipt to stdout instead of the human
+lines, so a scripted orchestrator does not have to scrape prose:
+
+```bash
+zirv agent codex "fix the failing test" --json
+```
+
+```json
+{
+  "schema_version": 1,
+  "harness": "codex",
+  "model": "gpt-5.6-terra",
+  "mode": "inline",
+  "state": "reported_validated",
+  "exit_code": 0,
+  "session": "abcd1234",
+  "workdir": "/repo",
+  "result_path": "/state/logs/delegation-results/<session>.json",
+  "report_truncated": false,
+  "mail_delivered": true,
+  "note": "full report stored at result_path"
+}
+```
+
+Every optional field is omitted rather than written as `null` or `[]` when
+it has nothing to say: `model` (unresolved), `exit_code` (no result yet),
+`session`, `task`, `workdir`, `result_path` (nothing persisted), `reason`
+(no launch failure), and `errors`/`capability_warnings` (empty). Exit codes
+are unchanged by `--json`; it only changes what reaches stdout, and stderr
+notices still print normally.
+
+- **`mode`** — `dashboard_pane` (a live dashboard admitted or fulfilled the
+  request) or `inline` (this process supervised the worker itself).
+- **`state`** — `launched` (a pane was admitted/claimed; nothing has run
+  yet — check `zirv ctx inbox` later for the worker's own report),
+  `launch_failed` (refused, or the worker process never started at all —
+  see `reason`), `exited_no_report` (the process exited but no final
+  assistant text could be extracted — treat the task as unverified),
+  `reported` (final text extracted, no `--result-schema`/`--result-kind`
+  contract declared), `reported_validated` (a declared contract was
+  satisfied), `reported_contract_failed` (a declared contract failed even
+  after the one bounded retry — see `errors`).
+- **`result_path`** — where the worker's full report was persisted, when
+  one was (see [Sending mail between sessions](#sending-mail-between-sessions)
+  below for the file's own shape).
+
+Only `zirv ctx agent`/`zirv agent` (a one-shot delegation) has `--json` today
+— `zirv ctx exec`/`zirv ctx loop` do not.
+
 #### Nested sessions are refused
 
 `zirv chat` (and `zirv ctx wrap`) refuse to start when they can tell they are
@@ -312,6 +363,28 @@ never the message body itself, the same "advisory, not authority" rule
 `--to-session`: unlike the config knobs elsewhere in this document, session
 addressing is a per-invocation argument, not something an operator or a repo
 would want to pin as a default.
+
+A body over `[mail] max_message_bytes`/`max_delivered_bytes` is still stored,
+truncated, rather than failing the send — but the cut text is no longer just
+lost. The full original body is written to a sidecar file under the
+mailbox's own `full/` subdirectory (capped at 1 MiB of its own, with a
+trailing `[truncated]` marker if even that is exceeded), and the stored
+message's own `[truncated]` marker becomes `[truncated; full body: <path>]`,
+naming that sidecar. `full/` is a dedicated directory nothing else ever
+moves a message into or out of — unlike the message itself, a sidecar is
+never relocated into `read/` on consume or into a dead-letter directory once
+its TTL expires, so a marker's path always stays valid for as long as the
+sidecar exists. It is pruned to the same `[mail] keep` as the mailbox
+itself, in its own pass, so it does not accumulate forever either.
+
+A delegated worker's own final report is persisted before any report-back
+mail is sent, at
+`<state>/logs/delegation-results/<session>.json` (capped at 1 MiB, with a
+`report_truncated` flag when cut) — whether or not the delegation declared a
+`--result-schema`/`--result-kind` contract. The report-back mail for a
+contract-declared delegation names that file as a trailing `full report:
+<path>` line, and `zirv ctx agent --json`'s own receipt carries it as
+`result_path` (see [Delegation receipt](#delegation-receipt---json) above).
 
 ### Session registry and nudging
 

@@ -9674,35 +9674,57 @@ fn report_settled_pane_with(
         .as_deref()
         .map(str::to_owned)
         .unwrap_or_else(|| pane.screen_tail());
-    if recovered.is_some()
-        && let Some(schema) = &pane.result_schema
-    {
-        match super::result_schema::Schema::from_json(schema) {
-            Ok(schema) => {
-                let mut undeclared = Vec::new();
-                let evaluation =
-                    super::agent::evaluate_report(&schema, &tail, pane.cwd(), &mut undeclared);
-                let (validated, errors) = match evaluation {
-                    Ok(value) => (Some(value), Vec::new()),
-                    Err(errors) => {
-                        tail = format!("contract_failed:\n- {}\n\n{tail}", errors.join("\n- "));
-                        (None, vec![errors])
+    if recovered.is_some() {
+        let report_text = tail.clone();
+        match &pane.result_schema {
+            Some(schema) => match super::result_schema::Schema::from_json(schema) {
+                Ok(schema) => {
+                    let mut undeclared = Vec::new();
+                    let evaluation =
+                        super::agent::evaluate_report(&schema, &tail, pane.cwd(), &mut undeclared);
+                    let (validated, errors) = match evaluation {
+                        Ok(value) => (Some(value), Vec::new()),
+                        Err(errors) => {
+                            tail = format!("contract_failed:\n- {}\n\n{tail}", errors.join("\n- "));
+                            (None, vec![errors])
+                        }
+                    };
+                    let (report, report_truncated) = super::agent::cap_report(Some(&report_text));
+                    super::agent::store_result(
+                        state,
+                        pane.short(),
+                        pane.agent(),
+                        &validated,
+                        &errors,
+                        &undeclared,
+                        report.as_deref(),
+                        report_truncated,
+                    );
+                    if !undeclared.is_empty() {
+                        tail.push_str(&format!("\nundeclared changes: {}", undeclared.join(", ")));
                     }
-                };
-                super::agent::store_result(
+                }
+                Err(error) => {
+                    tail = format!("contract_failed: invalid result schema: {error}\n\n{tail}")
+                }
+            },
+            // Issue #452 (review round 1): no `--result-schema`/`--result-
+            // kind` was declared for this delegation, but the pane's own
+            // final text was recovered from its transcript (`recovered`,
+            // via the `final_message` extraction the caller already ran for
+            // the schema branch above -- reused here, not duplicated).
+            // Persisted the same way an inline no-contract delegation's
+            // report is, via `store_report_only`, so a pane worker's report
+            // is durable on disk exactly like a headless one's.
+            None => {
+                let (report, report_truncated) = super::agent::cap_report(Some(&report_text));
+                super::agent::store_report_only(
                     state,
                     pane.short(),
                     pane.agent(),
-                    &validated,
-                    &errors,
-                    &undeclared,
+                    report.as_deref().unwrap_or_default(),
+                    report_truncated,
                 );
-                if !undeclared.is_empty() {
-                    tail.push_str(&format!("\nundeclared changes: {}", undeclared.join(", ")));
-                }
-            }
-            Err(error) => {
-                tail = format!("contract_failed: invalid result schema: {error}\n\n{tail}")
             }
         }
     }

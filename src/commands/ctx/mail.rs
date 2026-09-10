@@ -1044,12 +1044,61 @@ pub fn store(
     store_to(state, repo_slug, repo_slug, msg, cfg)
 }
 
+/// Issue #454: the cap on an oversized message's own `.full` sidecar --
+/// independent of `cap` (a mailbox's configured `max_message_bytes`, which
+/// can be much smaller): the sidecar exists so a truncated message is never
+/// actually lost, so it gets a fixed, generous ceiling of its own rather
+/// than inheriting the mailbox's tighter one.
+const FULL_BODY_SIDECAR_CAP: usize = 1024 * 1024;
+
+/// Issue #454: claims `<dir>/full/<base>.full` (or a `_NNN`-suffixed
+/// sibling on a same-second collision, exactly like an ordinary message --
+/// see `claim_and_write`) for `body`'s full, untruncated text, capped at
+/// [`FULL_BODY_SIDECAR_CAP`] with a trailing `[truncated]` marker of its own
+/// if even that is exceeded. `full/` is a dedicated subdirectory of the
+/// mailbox that `consume`/`expire_deliveries` never move a message into or
+/// out of, so a sidecar's own path, once named, stays valid for the life of
+/// the mailbox -- unlike an earlier version of this fix, which put the
+/// sidecar next to its message and went stale the moment that message was
+/// read or expired.
+///
+/// `None` on any failure to create the directory or claim the file --
+/// `store_into` falls back to the plain `"[truncated]"` marker rather than
+/// ever naming a sidecar that was not actually written.
+fn claim_full_body_sidecar(dir: &Path, base: &str, body: &str) -> Option<PathBuf> {
+    let full_dir = dir.join("full");
+    super::state::create_private_dir_all(&full_dir).ok()?;
+    let sidecar_body = if body.len() > FULL_BODY_SIDECAR_CAP {
+        const MARKER: &str = "\n[truncated]";
+        let room = FULL_BODY_SIDECAR_CAP.saturating_sub(MARKER.len());
+        let mut capped = crate::utils::truncate_bytes(body.to_string(), Some(room));
+        capped.push_str(MARKER);
+        capped
+    } else {
+        body.to_string()
+    };
+    claim_and_write(&full_dir, base, &sidecar_body).ok()
+}
+
 /// Shared store body for `store_to`/`store_fanout`: writes `msg` into `dir`,
 /// truncating an oversized body (never failing the store) and pruning the
 /// directory down to the newest unread messages. `dest_slug`/`sender_slug`
 /// feed `limits_for` exactly as they always have; `dir` is the only thing
 /// that differs between an ordinary mailbox and its `fanout/` subdirectory
 /// (see `store_fanout`).
+///
+/// Issue #454: a truncated body no longer just loses the cut text. The full
+/// original body is claimed into `<dir>/full/` (see
+/// [`claim_full_body_sidecar`]) BEFORE the message itself is claimed, so the
+/// exact `"[truncated; full body: <path>]"` marker naming it is known up
+/// front and the truncated body is written once -- never rewritten in place
+/// the way an earlier version of this fix had to, because that version could
+/// not know the sidecar's own name (`claim_and_write`'s `_NNN` collision
+/// suffix) until after the message had already claimed its own. The message
+/// and sidecar may end up with different `_NNN` suffixes on a same-second
+/// collision; that is fine, since the marker carries the sidecar's actual
+/// path rather than assuming it matches the message's own. `full/` is
+/// pruned to the same `keep` as the mailbox itself, in its own pass.
 fn store_into(
     dir: PathBuf,
     dest_slug: &str,
@@ -1061,15 +1110,6 @@ fn store_into(
 
     let (keep, cap) = limits_for(cfg, dest_slug, sender_slug);
     let mut msg = msg.clone();
-    if msg.body.len() > cap {
-        const MARKER: &str = "\n[truncated]";
-        // `room`, not `keep`: the outer `keep` is the directory's message
-        // count, and shadowing it here with a byte budget would be a trap.
-        let room = cap.saturating_sub(MARKER.len());
-        let mut truncated = crate::utils::truncate_bytes(msg.body.clone(), Some(room));
-        truncated.push_str(MARKER);
-        msg.body = truncated;
-    }
 
     let short: String = msg
         .from_session
@@ -1078,9 +1118,42 @@ fn store_into(
         .take(8)
         .collect();
     let base = format!("{:010}-{}", now_secs(), short);
+
+    if msg.body.len() > cap {
+        const PLAIN_MARKER: &str = "\n[truncated]";
+        let sidecar = claim_full_body_sidecar(&dir, &base, &msg.body);
+        let mut marker = sidecar
+            .as_deref()
+            .map(|sidecar| format!("\n[truncated; full body: {}]", sidecar.display()))
+            .unwrap_or_else(|| PLAIN_MARKER.to_string());
+        // A path-bearing marker that would consume the whole cap (or more)
+        // leaves no room for any actual body content -- an operator-set
+        // `max_message_bytes` has no enforced minimum, so this is reachable
+        // with an ordinary mailbox path and a small enough cap. Fall back to
+        // the plain marker exactly as a failed sidecar claim already does,
+        // and best-effort remove the sidecar this store no longer
+        // references rather than leaving it orphaned.
+        if marker.len() >= cap {
+            if let Some(sidecar) = &sidecar {
+                let _ = std::fs::remove_file(sidecar);
+            }
+            marker = PLAIN_MARKER.to_string();
+        }
+        // `room`, not `keep`: the outer `keep` is the directory's message
+        // count, and shadowing it here with a byte budget would be a trap.
+        let room = cap.saturating_sub(marker.len());
+        let mut truncated = crate::utils::truncate_bytes(msg.body.clone(), Some(room));
+        truncated.push_str(&marker);
+        msg.body = truncated;
+    }
+
     let path = claim_and_write(&dir, &base, &msg.to_markdown())?;
 
     super::state::prune_to_newest(&dir, keep);
+    let full_dir = dir.join("full");
+    if full_dir.is_dir() {
+        super::state::prune_to_newest(&full_dir, keep);
+    }
     Ok(path)
 }
 
@@ -1153,8 +1226,9 @@ fn agent_matches(msg: &Message, for_agent: Option<&str>) -> bool {
 /// seconds prefix in each file name sorts lexicographic order into
 /// chronological order, the same convention `state::now_secs` documents for
 /// handoffs and log lines. A sibling directory (`read/`, `fanout/`, a
-/// fan-out message's own `<base>.read/` marker directory) is excluded by the
-/// `is_file` filter, same as it always has been.
+/// fan-out message's own `<base>.read/` marker directory, issue #454's own
+/// `full/` sidecar directory) is excluded by the `is_file` filter, same as
+/// it always has been.
 fn scan_md_files(dir: &Path) -> CtxResult<Vec<PathBuf>> {
     let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
         .flatten()
@@ -1924,6 +1998,7 @@ pub fn run_send_with<W: Write>(
             Ok(value) => (Some(value.clone()), Vec::new()),
             Err(errors) => (None, vec![errors.clone()]),
         };
+        let (report, report_truncated) = super::agent::cap_report(Some(&body));
         super::agent::store_result(
             &state,
             &short,
@@ -1931,6 +2006,8 @@ pub fn run_send_with<W: Write>(
             &validated,
             &errors,
             &undeclared,
+            report.as_deref(),
+            report_truncated,
         );
         match evaluation {
             Ok(_) => {
@@ -2972,28 +3049,174 @@ mod tests {
         );
     }
 
+    /// Where `store_into`'s own `"[truncated; full body: <path>]"` marker
+    /// names its sidecar -- parsed back out of the marker text itself
+    /// (rather than re-deriving `claim_and_write`'s own naming/collision
+    /// rules a second, independently drifting way) since the exact stem is
+    /// an implementation detail this test has no business depending on.
+    fn sidecar_path_from_marker(body: &str) -> PathBuf {
+        const PREFIX: &str = "[truncated; full body: ";
+        let start = body.find(PREFIX).expect("marker present") + PREFIX.len();
+        PathBuf::from(&body[start..body.len() - 1])
+    }
+
     #[test]
-    fn a_message_longer_than_the_cap_is_truncated_and_says_so() {
+    fn a_message_longer_than_the_cap_is_truncated_and_names_its_full_sidecar() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = StateDir::from_root(tmp.path().join("state"));
         let mut cfg = CtxConfig::default();
-        cfg.mail.max_message_bytes = 50;
+        cfg.mail.max_message_bytes = 512;
 
         let mut msg = sample("s1", 1);
-        msg.body = "x".repeat(500);
+        msg.body = "x".repeat(5_000);
 
         let path =
             store(&state, "-work-repo", &msg, &cfg).expect("store must not fail on oversize");
         let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
         assert!(
-            stored.body.len() <= 50,
-            "body respects the cap: {} bytes",
+            stored.body.len() <= cfg.mail.max_message_bytes,
+            "the stored body respects the cap: {} bytes",
+            stored.body.len()
+        );
+
+        let sidecar = sidecar_path_from_marker(&stored.body);
+        let full_dir = state.mail().join("-work-repo").join("full");
+        assert!(
+            sidecar.starts_with(&full_dir),
+            "the sidecar lives in the mailbox's own never-moved `full/` subdirectory, not next \
+             to the message: {}",
+            sidecar.display()
+        );
+        assert!(sidecar.is_file(), "the sidecar file actually exists");
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).expect("read sidecar"),
+            "x".repeat(5_000),
+            "the sidecar carries the full, untruncated original body"
+        );
+    }
+
+    /// Issue #454 (fix round 3): `[mail] max_message_bytes` has no enforced
+    /// minimum, so a small enough cap makes the path-bearing
+    /// `"[truncated; full body: <path>]"` marker itself longer than the cap
+    /// -- there is no room left for it, let alone any body content. This
+    /// must fall back to the plain `"[truncated]"` marker (never emit a
+    /// stored body longer than `cap`) and must not leave an orphaned
+    /// sidecar file behind under `full/`.
+    #[test]
+    fn a_marker_that_would_not_fit_the_cap_falls_back_to_the_plain_marker() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.mail.max_message_bytes = 40;
+
+        let mut msg = sample("s1", 1);
+        msg.body = "x".repeat(5_000);
+
+        let path =
+            store(&state, "-work-repo", &msg, &cfg).expect("store must not fail on oversize");
+        let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
+        assert!(
+            stored.body.len() <= cfg.mail.max_message_bytes,
+            "the stored body respects the cap even when the path-bearing marker alone would \
+             not have: {} bytes",
             stored.body.len()
         );
         assert!(
-            stored.body.ends_with("[truncated]"),
-            "says it was truncated: {}",
+            stored.body.ends_with("[truncated]") && !stored.body.contains("full body:"),
+            "falls back to the plain marker rather than a path-bearing one it cannot fit: {}",
             stored.body
+        );
+
+        let full_dir = state.mail().join("-work-repo").join("full");
+        let leftover = std::fs::read_dir(&full_dir)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(
+            leftover, 0,
+            "no orphaned sidecar file is left behind under full/"
+        );
+    }
+
+    #[test]
+    fn a_message_within_the_cap_produces_no_full_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut msg = sample("s1", 1);
+        msg.body = "well within the default cap".to_string();
+
+        let path = store(&state, "-work-repo", &msg, &cfg).expect("store");
+        let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
+        assert_eq!(stored.body, msg.body, "an in-cap body is stored verbatim");
+        assert!(
+            !state.mail().join("-work-repo").join("full").exists(),
+            "no `full/` subdirectory is ever created for a message that was never truncated"
+        );
+    }
+
+    /// Issue #454 (fix round 2): the whole point of putting sidecars in
+    /// their own never-moved `full/` subdirectory rather than next to their
+    /// message is that reading the message -- `zirv ctx inbox`'s own
+    /// `consume`, which moves it into `read/` -- must never strand the
+    /// marker pointing at a path that no longer exists.
+    #[test]
+    fn the_full_sidecar_survives_consuming_its_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.mail.max_message_bytes = 512;
+
+        let mut msg = sample("s1", 1);
+        msg.body = "y".repeat(5_000);
+
+        let path = store(&state, "-work-repo", &msg, &cfg).expect("store");
+        let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
+        let sidecar = sidecar_path_from_marker(&stored.body);
+        assert!(sidecar.is_file(), "sidecar exists before consume");
+
+        consume(&state, "-work-repo", &path).expect("consume");
+        assert!(!path.is_file(), "the message itself moves into read/");
+        assert!(
+            sidecar.is_file(),
+            "the sidecar, living in its own directory `consume` never touches, is still \
+             exactly where the marker said it would be: {}",
+            sidecar.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).expect("read sidecar"),
+            "y".repeat(5_000),
+            "and still holds the full body"
+        );
+    }
+
+    #[test]
+    fn the_full_sidecar_directory_is_pruned_to_the_same_keep_as_the_mailbox() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.mail.keep = 3;
+        cfg.mail.max_message_bytes = 512;
+
+        for index in 0..5u32 {
+            let mut msg = sample(&format!("s{index}"), 1);
+            msg.body = "z".repeat(5_000);
+            store(&state, "-work-repo", &msg, &cfg).expect("store");
+        }
+
+        let full_dir = state.mail().join("-work-repo").join("full");
+        let remaining: Vec<_> = std::fs::read_dir(&full_dir)
+            .expect("read_dir")
+            .flatten()
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            cfg.mail.keep,
+            "the sidecar directory is pruned to the same `keep` as the mailbox itself: {:?}",
+            remaining
+                .iter()
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>()
         );
     }
 

@@ -26,6 +26,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::Serialize;
+
 use super::CtxResult;
 use super::adapters::{self, AgentAdapter};
 use super::announce::{Announcer, Event};
@@ -241,6 +243,11 @@ pub struct AgentArgs {
     /// respawn_decision` instead of ever marking it `Done` silently.
     #[arg(long)]
     pub task: Option<String>,
+    /// Issue #452: print a machine-readable delegation receipt instead of
+    /// the human lines -- see [`DelegationReceipt`]. Exit codes are
+    /// unchanged; this only changes what reaches stdout.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `--attach-artifact`'s CLI spelling for `workflow::engine::ArtifactStage`.
@@ -273,6 +280,208 @@ impl From<ArtifactStageArg> for crate::commands::workflow::engine::ArtifactStage
             ArtifactStageArg::Spec => ArtifactStage::Spec,
             ArtifactStageArg::Plan => ArtifactStage::Plan,
         }
+    }
+}
+
+/// Issue #452: which of the two visible delegation shapes (see this module's
+/// own doc comment) a [`DelegationReceipt`] describes. No `Headless` variant:
+/// `--headless` was removed 2026-09-06 and nothing in this module
+/// distinguishes a third shape today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationMode {
+    DashboardPane,
+    Inline,
+}
+
+/// Issue #452: a [`DelegationReceipt`]'s own read of how far this
+/// delegation got. `Launched` and `LaunchFailed` both mean "nothing has
+/// actually run yet" (a dashboard pane admitted/claimed the request, or an
+/// inline attempt never reached a worker at all); the rest all mean an
+/// inline worker process actually ran to some exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationState {
+    /// A dashboard pane was admitted (or claimed) for this request; nothing
+    /// has run yet.
+    Launched,
+    /// A dashboard pane refused this request with no inline fallback, or an
+    /// inline attempt could not reach a worker process at all.
+    LaunchFailed,
+    /// An inline worker process exited and no final assistant text could be
+    /// extracted from its transcript.
+    ExitedNoReport,
+    /// Final text was extracted; no `--result-schema`/`--result-kind`
+    /// contract was declared.
+    Reported,
+    /// A declared contract was satisfied, after the one bounded retry when
+    /// applicable.
+    ReportedValidated,
+    /// A declared contract was not satisfied even after the bounded retry.
+    ReportedContractFailed,
+}
+
+/// Issue #452: a typed, machine-readable summary of one `zirv ctx agent`
+/// delegation, printed as the sole stdout line when `--json` is passed
+/// (`AgentArgs::json`). Built once, at the end of whichever of the three
+/// paths this delegation actually took (a dashboard answer, an inline
+/// completion, or a pre-launch/launch failure) -- see [`print_receipt`] and
+/// its callers, never sprinkled piecemeal alongside the human-facing prints
+/// those same paths already make.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DelegationReceipt {
+    pub schema_version: u32,
+    pub harness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub mode: DelegationMode,
+    pub state: DelegationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_path: Option<PathBuf>,
+    pub report_truncated: bool,
+    pub mail_delivered: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub capability_warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub note: String,
+}
+
+/// One sentence of orchestrator guidance derived purely from `state` --
+/// short and factual, never repeating fields the receipt already carries
+/// structurally.
+fn receipt_note(state: DelegationState) -> String {
+    match state {
+        DelegationState::Launched => {
+            "nothing has run yet; the worker's report arrives as mail -- run `zirv ctx inbox` \
+             at your next checkpoint"
+                .to_string()
+        }
+        DelegationState::LaunchFailed => {
+            "the delegation could not be launched; see reason".to_string()
+        }
+        DelegationState::ExitedNoReport => {
+            "process exited; no report is available -- treat the task as unverified".to_string()
+        }
+        DelegationState::Reported | DelegationState::ReportedValidated => {
+            "full report stored at result_path".to_string()
+        }
+        DelegationState::ReportedContractFailed => {
+            "report did not satisfy the contract; errors listed".to_string()
+        }
+    }
+}
+
+/// The `"<capability> -- <mechanism>: <detail>"` line this module already
+/// prints, one per capability warning, on both the pane-ack surface
+/// (`answer_for_ack`) and the inline completion surface (the loop at the end
+/// of `run_with`) -- shared so a [`DelegationReceipt`]'s own
+/// `capability_warnings` always carries the identical text a watching caller
+/// would have read on stdout.
+pub(crate) fn capability_warning_lines(warnings: &[policy::CapabilityWarning]) -> Vec<String> {
+    warnings
+        .iter()
+        .map(|w| format!("{} -- {}: {}", w.capability, w.mechanism, w.detail))
+        .collect()
+}
+
+/// Prints exactly one pretty JSON object -- `receipt` -- to `w`, the sole
+/// stdout output a `--json` delegation ever produces.
+fn print_receipt<W: Write>(w: &mut W, receipt: &DelegationReceipt) -> CtxResult<()> {
+    let json = serde_json::to_string_pretty(receipt)?;
+    writeln!(w, "{json}")?;
+    Ok(())
+}
+
+/// Issue #452: the shared shape every "nothing ran" / "the worker never
+/// launched" receipt takes -- three pre-DISPATCH refusals reached before
+/// this delegation even knows whether it would have joined a dashboard or
+/// run inline (a malformed envelope, delegation depth 0, a `--task` claim
+/// failure -- none of which have a `worker_session`/`workdir` to report
+/// yet, hence the `Option`s), the three pre-LAUNCH refusals reached once
+/// `try_join_dashboard` has already resolved to [`Dispatch::Inline`]
+/// (`resolve_worker_budget` admission-exhausted, the delegation envelope
+/// refused, a writer permit refused), and the one genuine launch failure
+/// (`exec::run_with_report` returning `Err`) -- `mode` is always `Inline`
+/// here since a dashboard-pane refusal has its own
+/// [`dashboard_answer_receipt`].
+#[allow(clippy::too_many_arguments)]
+fn launch_failure_receipt(
+    args: &AgentArgs,
+    model: Option<&str>,
+    worker_session: Option<&str>,
+    workdir: Option<&Path>,
+    exit_code: Option<i32>,
+    reason: String,
+    capability_warnings: &[policy::CapabilityWarning],
+) -> DelegationReceipt {
+    DelegationReceipt {
+        schema_version: 1,
+        harness: args.name.clone(),
+        model: model.map(str::to_string),
+        mode: DelegationMode::Inline,
+        state: DelegationState::LaunchFailed,
+        exit_code,
+        session: worker_session.map(super::sessions::short_id),
+        task: args.task.clone(),
+        workdir: workdir.map(Path::to_path_buf),
+        result_path: None,
+        report_truncated: false,
+        mail_delivered: false,
+        errors: Vec::new(),
+        capability_warnings: capability_warning_lines(capability_warnings),
+        reason: Some(reason),
+        note: receipt_note(DelegationState::LaunchFailed),
+    }
+}
+
+/// Issue #452 (review round 1): the `--json` receipt for a delegation
+/// `try_join_dashboard` answered definitively, built from the [`AnswerFacts`]
+/// `answer_for_ack`/`wait_out_a_claimed_request` computed directly from the
+/// `SpawnAck`/timeout data they already held -- never inferred from `code`
+/// alone (`EXIT_DASH_UNCONFIRMED` and a plain non-retryable refusal are both
+/// `1`; only `facts.launched` tells them apart) and never parsed back out of
+/// the human lines those functions print (an earlier version of this fix did
+/// exactly that).
+fn dashboard_answer_receipt(
+    args: &AgentArgs,
+    model: Option<&str>,
+    code: i32,
+    facts: &AnswerFacts,
+) -> DelegationReceipt {
+    let state = if facts.launched {
+        DelegationState::Launched
+    } else {
+        DelegationState::LaunchFailed
+    };
+    DelegationReceipt {
+        schema_version: 1,
+        harness: args.name.clone(),
+        model: model.map(str::to_string),
+        mode: DelegationMode::DashboardPane,
+        state,
+        exit_code: Some(code),
+        session: facts.short.clone(),
+        task: args.task.clone(),
+        workdir: args.workdir.clone(),
+        result_path: None,
+        report_truncated: false,
+        mail_delivered: false,
+        errors: Vec::new(),
+        capability_warnings: facts.capability_warnings.clone(),
+        reason: facts.reason.clone(),
+        note: receipt_note(state),
     }
 }
 
@@ -1201,6 +1410,99 @@ pub(crate) fn evaluate_report(
     Ok(value)
 }
 
+/// Issue #452: the typed shape [`store_result`]/[`store_report_only`] write
+/// to `<state>/logs/delegation-results/<session>.json` -- kept alongside the
+/// writer purely so a reader (a test, or a future consumer) has one
+/// authoritative shape to deserialize into. Every field but `outcome`/
+/// `agent`/`ts` is `#[serde(default)]`: a record written by an OLDER zirv
+/// binary, before `report`/`report_truncated` existed, still deserializes
+/// cleanly.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub(crate) struct DelegationResultRecord {
+    pub outcome: String,
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub errors: Vec<Vec<String>>,
+    pub agent: String,
+    pub ts: u64,
+    #[serde(default)]
+    pub undeclared_changes: Vec<String>,
+    #[serde(default)]
+    pub report: Option<String>,
+    #[serde(default)]
+    pub report_truncated: bool,
+}
+
+/// The cap [`cap_report`] holds a worker's own final report text to before
+/// it is persisted to disk -- generous enough for any real final message, a
+/// hard ceiling so an adversarial or runaway worker cannot grow a
+/// delegation-results file without bound.
+const MAX_STORED_REPORT_BYTES: usize = 1024 * 1024;
+
+/// Caps `text` at [`MAX_STORED_REPORT_BYTES`] on a real `char` boundary,
+/// returning the (possibly capped) text and whether it was actually cut.
+/// `None` in, `None` out: there is nothing to cap when no report was
+/// extracted at all.
+pub(crate) fn cap_report(text: Option<&str>) -> (Option<String>, bool) {
+    let Some(text) = text else {
+        return (None, false);
+    };
+    if text.len() <= MAX_STORED_REPORT_BYTES {
+        return (Some(text.to_string()), false);
+    }
+    let mut end = MAX_STORED_REPORT_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (Some(text[..end].to_string()), true)
+}
+
+/// Shared writer for [`store_result`]/[`store_report_only`]: both persist
+/// the identical record shape (`DelegationResultRecord`) to the identical
+/// path, differing only in what `outcome`/`validated`/`errors`/`undeclared`
+/// mean for the delegation that produced them. Returns the path written to,
+/// regardless of whether the write itself actually succeeded (best-effort,
+/// like every other piece of state-dir housekeeping in this module) -- a
+/// [`DelegationReceipt`]'s own `result_path` names where the record was
+/// *meant* to land.
+#[allow(clippy::too_many_arguments)]
+fn write_delegation_result(
+    state: &super::state::StateDir,
+    session: &str,
+    agent: &str,
+    outcome: &str,
+    validated: &Option<serde_json::Value>,
+    errors: &[Vec<String>],
+    undeclared: &[String],
+    report: Option<&str>,
+    report_truncated: bool,
+) -> PathBuf {
+    let results_dir = state.logs().join("delegation-results");
+    let _ = super::state::create_private_dir_all(&results_dir);
+    let record = DelegationResultRecord {
+        outcome: outcome.to_string(),
+        result: validated.clone(),
+        errors: errors.to_vec(),
+        agent: agent.to_string(),
+        ts: super::state::now_secs(),
+        undeclared_changes: undeclared.to_vec(),
+        report: report.map(str::to_string),
+        report_truncated,
+    };
+    let path = results_dir.join(format!("{session}.json"));
+    let _ = super::state::write_private(
+        &path,
+        &serde_json::to_string_pretty(&record).unwrap_or_default(),
+    );
+    path
+}
+
+/// Issue #318 (extended by #452 with `report`/`report_truncated`): persists
+/// a contract-declared delegation's own validation outcome. `outcome` is
+/// derived from `validated` exactly as before this issue: `"validated"` when
+/// the worker's report satisfied the schema, `"contract_failed"` otherwise.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn store_result(
     state: &super::state::StateDir,
     session: &str,
@@ -1208,23 +1510,62 @@ pub(crate) fn store_result(
     validated: &Option<serde_json::Value>,
     errors: &[Vec<String>],
     undeclared: &[String],
-) {
-    let results_dir = state.logs().join("delegation-results");
-    let _ = super::state::create_private_dir_all(&results_dir);
-    let mut record = serde_json::json!({
-        "outcome": if validated.is_some() { "validated" } else { "contract_failed" },
-        "result": validated,
-        "errors": errors,
-        "agent": agent,
-        "ts": super::state::now_secs(),
-    });
-    if !undeclared.is_empty() {
-        record["undeclared_changes"] = serde_json::json!(undeclared);
+    report: Option<&str>,
+    report_truncated: bool,
+) -> PathBuf {
+    let outcome = if validated.is_some() {
+        "validated"
+    } else {
+        "contract_failed"
+    };
+    write_delegation_result(
+        state,
+        session,
+        agent,
+        outcome,
+        validated,
+        errors,
+        undeclared,
+        report,
+        report_truncated,
+    )
+}
+
+/// Issue #452: persists a plain (no `--result-schema`/`--result-kind`
+/// declared) delegation's own extracted final report -- the no-contract
+/// counterpart to [`store_result`]. `outcome` is always `"reported"`: there
+/// is no contract to have validated or failed against.
+pub(crate) fn store_report_only(
+    state: &super::state::StateDir,
+    session: &str,
+    agent: &str,
+    report: &str,
+    report_truncated: bool,
+) -> PathBuf {
+    write_delegation_result(
+        state,
+        session,
+        agent,
+        "reported",
+        &None,
+        &[],
+        &[],
+        Some(report),
+        report_truncated,
+    )
+}
+
+/// Issue #452: the human `result: ...` line an inline no-contract
+/// delegation prints -- pure so it is testable without spawning a real
+/// harness process. `Some(path)` is the extracted-and-stored case
+/// (`code` is not part of that message); `None` is the "the worker exited
+/// but no final assistant text could be found" case, where `code` is the
+/// only evidence left to report.
+pub(crate) fn no_contract_result_line(result_path: Option<&Path>, code: i32) -> String {
+    match result_path {
+        Some(path) => format!("result: report stored at {}", path.display()),
+        None => format!("result: none (exit {code}, no report)"),
     }
-    let _ = super::state::write_private(
-        &results_dir.join(format!("{session}.json")),
-        &serde_json::to_string_pretty(&record).unwrap_or_default(),
-    );
 }
 
 pub(crate) fn recorded_contract_exit(
@@ -2235,6 +2576,32 @@ fn workdir_visibility_hint(
     ))
 }
 
+/// Issue #452 (review round 1): the concrete facts a `--json` delegation
+/// receipt needs about how a dashboard answered this request -- computed
+/// directly from the `SpawnAck`/timeout data `answer_for_ack`/
+/// `wait_out_a_claimed_request` already hold, never inferred from the exit
+/// code alone. That distinction matters: [`EXIT_DASH_UNCONFIRMED`] and
+/// `answer_for_ack`'s own non-retryable, non-budget refusal code are BOTH
+/// `1`, but the first means "the dashboard took this request and may still
+/// be spawning it" (`launched: true`) and the second means "nothing is
+/// running or ever will" (`launched: false`) -- a code-only reading (or a
+/// text-parse of the human lines these functions print, an earlier version
+/// of this fix did exactly that) cannot tell the two apart.
+#[derive(Debug, Clone, Default)]
+struct AnswerFacts {
+    /// Whether the dashboard actually took this request: a pane was
+    /// admitted (`ack.ok`), or the request was claimed and not yet
+    /// confirmed. `false` only for a definitive refusal.
+    launched: bool,
+    /// The pane's own short session id, when [`Self::launched`] came from a
+    /// confirmed spawn.
+    short: Option<String>,
+    capability_warnings: Vec<String>,
+    /// The claimed-but-unconfirmed notice, or the refusal reason. `None`
+    /// only for a confirmed, successful spawn.
+    reason: Option<String>,
+}
+
 /// The requester's own reading of one [`spawnreq::SpawnAck`].
 ///
 /// O2: `ok: false` is two different answers. A policy refusal ends the
@@ -2247,7 +2614,7 @@ fn answer_for_ack<W: Write>(
     ack: spawnreq::SpawnAck,
     w: &mut W,
     workdir_hint: Option<&str>,
-) -> Option<CtxResult<i32>> {
+) -> Option<(CtxResult<i32>, AnswerFacts)> {
     if ack.ok {
         let short = ack.short.unwrap_or_default();
         // Issue #230 item 3: the same stdout result surface the headless
@@ -2260,20 +2627,26 @@ fn answer_for_ack<W: Write>(
                 "capability warning: {} -- {}: {}",
                 warning.capability, warning.mechanism, warning.detail
             ) {
-                return Some(Err(e.into()));
+                return Some((Err(e.into()), AnswerFacts::default()));
             }
         }
         if let Err(e) = writeln!(w, "{DASH_SPAWN_ACK_PREFIX}{short}") {
-            return Some(Err(e.into()));
+            return Some((Err(e.into()), AnswerFacts::default()));
         }
         // Issue #307.3: a nudge for THIS session (the delegator), not the
         // spawned worker -- see `workdir_visibility_hint`'s own doc comment.
         if let Some(hint) = workdir_hint
             && let Err(e) = writeln!(w, "{hint}")
         {
-            return Some(Err(e.into()));
+            return Some((Err(e.into()), AnswerFacts::default()));
         }
-        return Some(Ok(0));
+        let facts = AnswerFacts {
+            launched: true,
+            short: Some(short),
+            capability_warnings: capability_warning_lines(&ack.capability_warnings),
+            reason: None,
+        };
+        return Some((Ok(0), facts));
     }
     let reason = ack
         .reason
@@ -2287,7 +2660,16 @@ fn answer_for_ack<W: Write>(
     } else {
         1
     };
-    Some(writeln!(w, "{reason}").map(|_| code).map_err(|e| e.into()))
+    let facts = AnswerFacts {
+        launched: false,
+        short: None,
+        capability_warnings: Vec::new(),
+        reason: Some(reason.clone()),
+    };
+    Some((
+        writeln!(w, "{reason}").map(|_| code).map_err(|e| e.into()),
+        facts,
+    ))
 }
 
 /// O3: a request that was claimed but not acked within [`DASH_ACK_TIMEOUT`]
@@ -2305,18 +2687,28 @@ fn wait_out_a_claimed_request<W: Write>(
     extension: Duration,
     w: &mut W,
     workdir_hint: Option<&str>,
-) -> Option<CtxResult<i32>> {
+) -> Option<(CtxResult<i32>, AnswerFacts)> {
     match spawnreq::wait_for_ack(dir, stem, extension) {
         Some(ack) => answer_for_ack(ack, w, workdir_hint),
-        None => Some(
-            writeln!(
-                w,
-                "dashboard claimed the request but never confirmed; check zirv ctx status / the \
-                 dashboard"
-            )
-            .map(|_| EXIT_DASH_UNCONFIRMED)
-            .map_err(|e| e.into()),
-        ),
+        None => {
+            const NOTICE: &str = "dashboard claimed the request but never confirmed; check zirv \
+                                   ctx status / the dashboard";
+            let facts = AnswerFacts {
+                // The dashboard DID take this request (it is claimed, just
+                // not yet confirmed) -- see this function's own doc comment
+                // and `AnswerFacts`'s own on why this is `true`, not `false`.
+                launched: true,
+                short: None,
+                capability_warnings: Vec::new(),
+                reason: Some(NOTICE.to_string()),
+            };
+            Some((
+                writeln!(w, "{NOTICE}")
+                    .map(|_| EXIT_DASH_UNCONFIRMED)
+                    .map_err(|e| e.into()),
+                facts,
+            ))
+        }
     }
 }
 
@@ -2331,8 +2723,10 @@ enum Dispatch {
     /// A live dashboard gave a definitive answer -- a pane was spawned, the
     /// request was refused on policy grounds, or it was *claimed* and then
     /// never confirmed even after `DASH_CLAIM_EXTENSION` (O3). The caller
-    /// returns this verbatim and never runs the task itself.
-    Answered(CtxResult<i32>),
+    /// returns the result verbatim and never runs the task itself; the
+    /// [`AnswerFacts`] alongside it are what a `--json` delegation builds its
+    /// receipt from.
+    Answered(CtxResult<i32>, AnswerFacts),
     /// The caller runs the supervised child in this process instead
     /// ([`exec::run_with_report`], unchanged). `no_dashboard` is true only
     /// when no live dashboard could be found anywhere on this machine, which
@@ -2351,7 +2745,7 @@ impl Dispatch {
 
     fn expect_answer(self, message: &str) -> CtxResult<i32> {
         match self {
-            Dispatch::Answered(result) => result,
+            Dispatch::Answered(result, _) => result,
             Dispatch::Inline { no_dashboard } => {
                 panic!("{message} (fell through inline, no_dashboard={no_dashboard})")
             }
@@ -2567,7 +2961,7 @@ fn try_join_dashboard<W: Write>(
     };
     match spawnreq::wait_for_ack(&dir, &stem, ack_timeout) {
         Some(ack) => match answer_for_ack(ack, w, workdir_hint.as_deref()) {
-            Some(result) => Dispatch::Answered(result),
+            Some((result, facts)) => Dispatch::Answered(result, facts),
             None => inline,
         },
         // F10: `take_requests` takes the request the moment the dashboard
@@ -2610,7 +3004,7 @@ fn try_join_dashboard<W: Write>(
                 w,
                 workdir_hint.as_deref(),
             ) {
-                Some(result) => Dispatch::Answered(result),
+                Some((result, facts)) => Dispatch::Answered(result, facts),
                 None => inline,
             }
         }
@@ -3058,8 +3452,11 @@ pub fn run_with<W: Write>(
     }
     // Issue #328: printed on stdout ahead of either fork (pane ack or
     // inline supervised result) so the delegating session reads it whichever
-    // path runs the task.
-    if let Some(hint) = same_harness_hint(args, env) {
+    // path runs the task. Issue #452: suppressed under `--json`, which
+    // prints exactly one JSON object and nothing else to stdout.
+    if !args.json
+        && let Some(hint) = same_harness_hint(args, env)
+    {
         writeln!(w, "{hint}")?;
     }
 
@@ -3082,15 +3479,44 @@ pub fn run_with<W: Write>(
     let parent_envelope = match resolve_parent_envelope(&cfg, env) {
         Ok(envelope) => envelope,
         Err(reason) => {
-            writeln!(w, "agent: {reason}")?;
+            // Issue #452 (review round 1): reached before `try_join_dashboard`
+            // ever runs, so there is no worker session/workdir/model to
+            // report yet -- `launch_failure_receipt`'s `Option` parameters
+            // exist for exactly this.
+            if args.json {
+                let receipt = launch_failure_receipt(
+                    args,
+                    None,
+                    None,
+                    canonical_workdir.as_deref(),
+                    Some(2),
+                    reason.clone(),
+                    &[],
+                );
+                print_receipt(w, &receipt)?;
+            } else {
+                writeln!(w, "agent: {reason}")?;
+            }
             return Ok(2);
         }
     };
     if parent_envelope.delegation_depth == 0 {
-        writeln!(
-            w,
-            "agent: this session's delegation envelope has depth 0; it may not run `zirv agent` itself"
-        )?;
+        let reason =
+            "this session's delegation envelope has depth 0; it may not run `zirv agent` itself";
+        if args.json {
+            let receipt = launch_failure_receipt(
+                args,
+                None,
+                None,
+                canonical_workdir.as_deref(),
+                Some(2),
+                reason.to_string(),
+                &[],
+            );
+            print_receipt(w, &receipt)?;
+        } else {
+            writeln!(w, "agent: {reason}")?;
+        }
         return Ok(2);
     }
 
@@ -3141,7 +3567,20 @@ pub fn run_with<W: Write>(
     if let Some(task_id) = &args.task
         && let Err(refusal) = claim_task_for_delegation(&state, repo, task_id, env, now)
     {
-        writeln!(w, "agent: {refusal}")?;
+        if args.json {
+            let receipt = launch_failure_receipt(
+                args,
+                None,
+                None,
+                canonical_workdir.as_deref(),
+                Some(2),
+                refusal.clone(),
+                &[],
+            );
+            print_receipt(w, &receipt)?;
+        } else {
+            writeln!(w, "agent: {refusal}")?;
+        }
         return Ok(2);
     }
     let requested_adapter = adapters::select(Some(&args.name), &[], &cfg)?;
@@ -3374,22 +3813,46 @@ pub fn run_with<W: Write>(
     // pane whenever any live dashboard can host it, and the supervised child
     // runs in this terminal only when none can (`Dispatch::Inline`, which
     // announces itself). It is never an invisible stdout-captured child.
-    match try_join_dashboard(
-        args,
-        &prompt,
-        w,
-        repo,
-        env,
-        DASH_ACK_TIMEOUT,
-        DASH_CLAIM_EXTENSION,
-        result_schema.as_ref(),
-    ) {
+    //
+    // Issue #452: under `--json` the human lines `try_join_dashboard` would
+    // otherwise print (capability warnings, the spawn-ack line, the workdir
+    // hint, a claimed-but-unconfirmed notice, a plain refusal reason) are
+    // captured into `dash_buf` instead of reaching real stdout, and then
+    // discarded -- purely the mechanism that suppresses them, never read
+    // back. The one JSON receipt this delegation prints is built from the
+    // structured `AnswerFacts` alongside `Dispatch::Answered` below
+    // (`dashboard_answer_receipt`), not from this buffer's text.
+    let mut dash_buf: Vec<u8> = Vec::new();
+    let dispatch = if args.json {
+        try_join_dashboard(
+            args,
+            &prompt,
+            &mut dash_buf,
+            repo,
+            env,
+            DASH_ACK_TIMEOUT,
+            DASH_CLAIM_EXTENSION,
+            result_schema.as_ref(),
+        )
+    } else {
+        try_join_dashboard(
+            args,
+            &prompt,
+            w,
+            repo,
+            env,
+            DASH_ACK_TIMEOUT,
+            DASH_CLAIM_EXTENSION,
+            result_schema.as_ref(),
+        )
+    };
+    match dispatch {
         Dispatch::Inline { no_dashboard } => {
             if no_dashboard {
                 eprintln!("{}", inline_notice(&args.name));
             }
         }
-        Dispatch::Answered(result) => {
+        Dispatch::Answered(result, facts) => {
             // Finding 4: the dashboard answered definitively, and only `Ok(0)`
             // (`answer_for_ack`'s spawned-a-pane arm) means work actually
             // started. A refusal spawned nothing, so a group minted for it
@@ -3422,6 +3885,12 @@ pub fn run_with<W: Write>(
             }
             if !matches!(result, Ok(0)) {
                 discard_minted_group();
+            }
+            if args.json
+                && let Ok(code) = &result
+            {
+                let receipt = dashboard_answer_receipt(args, effective_model, *code, &facts);
+                print_receipt(w, &receipt)?;
             }
             return result;
         }
@@ -3539,8 +4008,33 @@ pub fn run_with<W: Write>(
             discard_minted_group();
             if super::group::is_admission_exhausted(e.as_ref()) {
                 let code = exec::EXIT_BUDGET_EXHAUSTED;
-                writeln!(w, "{}: {e}", delegation_outcome(code))?;
+                if args.json {
+                    let receipt = launch_failure_receipt(
+                        args,
+                        model.as_deref(),
+                        Some(&worker_session),
+                        Some(&launch_repo),
+                        Some(code),
+                        e.to_string(),
+                        &capability_warnings,
+                    );
+                    print_receipt(w, &receipt)?;
+                } else {
+                    writeln!(w, "{}: {e}", delegation_outcome(code))?;
+                }
                 return Ok(code);
+            }
+            if args.json {
+                let receipt = launch_failure_receipt(
+                    args,
+                    model.as_deref(),
+                    Some(&worker_session),
+                    Some(&launch_repo),
+                    None,
+                    e.to_string(),
+                    &capability_warnings,
+                );
+                print_receipt(w, &receipt)?;
             }
             return Err(e);
         }
@@ -3633,7 +4127,20 @@ pub fn run_with<W: Write>(
             Err(err) => {
                 discard_minted_group();
                 release_reservation();
-                writeln!(w, "failed: delegation envelope refused: {err}")?;
+                if args.json {
+                    let receipt = launch_failure_receipt(
+                        args,
+                        model.as_deref(),
+                        Some(&worker_session),
+                        Some(&launch_repo),
+                        Some(2),
+                        format!("delegation envelope refused: {err}"),
+                        &capability_warnings,
+                    );
+                    print_receipt(w, &receipt)?;
+                } else {
+                    writeln!(w, "failed: delegation envelope refused: {err}")?;
+                }
                 return Ok(2);
             }
         };
@@ -3693,7 +4200,20 @@ pub fn run_with<W: Write>(
                     );
                 }
                 let code = exec::EXIT_WRITER_BUSY;
-                writeln!(w, "{reason}")?;
+                if args.json {
+                    let receipt = launch_failure_receipt(
+                        args,
+                        model.as_deref(),
+                        Some(&worker_session),
+                        Some(&launch_repo),
+                        Some(code),
+                        reason,
+                        &capability_warnings,
+                    );
+                    print_receipt(w, &receipt)?;
+                } else {
+                    writeln!(w, "{reason}")?;
+                }
                 return Ok(code);
             }
         }
@@ -3781,6 +4301,18 @@ pub fn run_with<W: Write>(
                     "launch failed",
                     super::state::now_secs(),
                 );
+                if args.json {
+                    let receipt = launch_failure_receipt(
+                        args,
+                        model.as_deref(),
+                        Some(&worker_session),
+                        Some(&launch_repo),
+                        None,
+                        e.to_string(),
+                        &capability_warnings,
+                    );
+                    print_receipt(w, &receipt)?;
+                }
                 return Err(e);
             }
         };
@@ -3807,6 +4339,19 @@ pub fn run_with<W: Write>(
     // hardening: exec now reports every vendor-backed segment of one logical
     // delegation, so a cross-harness continuation is neither charged to the
     // wrong agent nor omitted from the cost tree.
+    // Issue #452: this delegation's own `--json` receipt state, threaded
+    // through (and, in the common case, set inside) the block below --
+    // declared out here so the final receipt built just before this
+    // function's own `Ok(code)` return can see it regardless of which
+    // branch inside that block actually ran. The defaults describe the
+    // (practically unreachable) case where `StateDir::resolve` itself
+    // fails: nothing was extracted or persisted, so there is no report.
+    let mut delegation_state = DelegationState::ExitedNoReport;
+    let mut result_path: Option<PathBuf> = None;
+    let mut report_truncated = false;
+    let mut mail_delivered = false;
+    let mut contract_errors: Vec<String> = Vec::new();
+
     if let Ok(state_dir) = super::state::StateDir::resolve(&env) {
         let parent_session = super::mail::session_identity(&env).unwrap_or_default();
         // Issue #317: `--task`'s own completion signal. Without a declared
@@ -3825,6 +4370,50 @@ pub fn run_with<W: Write>(
             None
         };
 
+        // Issue #452: the final-assistant-text extraction used to live only
+        // inside the `--result-schema` branch below; hoisted out so a plain
+        // delegation (no contract declared) can persist and report its own
+        // worker's final text too, through the identical extraction the
+        // contract path already trusted -- never a second, independently
+        // drifting copy of it.
+        let repo_slug = super::state::repo_slug(repo);
+        let final_session = execution_report
+            .segments
+            .last()
+            .map(|segment| segment.session.clone())
+            .unwrap_or_else(|| worker_session.clone());
+        let final_agent_name = execution_report
+            .segments
+            .last()
+            .map(|segment| segment.agent.clone())
+            .unwrap_or_else(|| args.name.clone());
+        // Re-selects only when a cross-harness fallback actually landed
+        // this delegation on a different adapter mid-run; the ordinary
+        // case (no restart, or a same-harness restart) reuses `adapter`
+        // as-is rather than paying a second, redundant `select`.
+        let reselected = if final_agent_name == args.name {
+            None
+        } else {
+            adapters::select(Some(&final_agent_name), &[], &cfg).ok()
+        };
+        let result_adapter: &dyn AgentAdapter =
+            reselected.as_deref().unwrap_or_else(|| adapter.as_ref());
+        let session_ref = SessionId::parse(&final_session);
+        let session_ref_full = SessionRef {
+            id: session_ref.clone(),
+            cwd: launch_repo.clone(),
+        };
+        let transcript_path = result_adapter.transcript_path(&session_ref_full);
+        let read_last_text = |path: &Path| -> Option<String> {
+            let jsonl = std::fs::read_to_string(path).unwrap_or_default();
+            result_adapter
+                .structural_context(&jsonl, 1)
+                .assistant_texts
+                .last()
+                .cloned()
+        };
+        let first_text = read_last_text(&transcript_path);
+
         // Issue #318: when a schema was declared, the report-back mail and
         // its own outcome supersede the plain success/failure report below
         // entirely -- a worker's report is only ever "done" once it has
@@ -3835,49 +4424,11 @@ pub fn run_with<W: Write>(
         // failed) whether or not it was watching this delegation
         // synchronously.
         if let Some(schema) = &result_schema {
-            let repo_slug = super::state::repo_slug(repo);
-            let final_session = execution_report
-                .segments
-                .last()
-                .map(|segment| segment.session.clone())
-                .unwrap_or_else(|| worker_session.clone());
-            let final_agent_name = execution_report
-                .segments
-                .last()
-                .map(|segment| segment.agent.clone())
-                .unwrap_or_else(|| args.name.clone());
-            // Re-selects only when a cross-harness fallback actually landed
-            // this delegation on a different adapter mid-run; the ordinary
-            // case (no restart, or a same-harness restart) reuses `adapter`
-            // as-is rather than paying a second, redundant `select`.
-            let reselected = if final_agent_name == args.name {
-                None
-            } else {
-                adapters::select(Some(&final_agent_name), &[], &cfg).ok()
-            };
-            let result_adapter: &dyn AgentAdapter =
-                reselected.as_deref().unwrap_or_else(|| adapter.as_ref());
-            let session_ref = SessionId::parse(&final_session);
-            let session_ref_full = SessionRef {
-                id: session_ref.clone(),
-                cwd: launch_repo.clone(),
-            };
-            let transcript_path = result_adapter.transcript_path(&session_ref_full);
-            let read_last_text = |path: &Path| -> Option<String> {
-                let jsonl = std::fs::read_to_string(path).unwrap_or_default();
-                result_adapter
-                    .structural_context(&jsonl, 1)
-                    .assistant_texts
-                    .last()
-                    .cloned()
-            };
-
             let mut attempts: Vec<Vec<String>> = Vec::new();
             let mut last_candidate = String::new();
             let mut validated: Option<serde_json::Value> = None;
             let mut undeclared = Vec::new();
 
-            let first_text = read_last_text(&transcript_path);
             if let Some(text) = first_text.as_deref() {
                 last_candidate = result_schema::extract_json_candidate(text).unwrap_or_default();
             }
@@ -3961,19 +4512,46 @@ pub fn run_with<W: Write>(
             } else {
                 super::task::ExitKind::SilentZero
             });
+            delegation_state = if validated.is_some() {
+                DelegationState::ReportedValidated
+            } else {
+                DelegationState::ReportedContractFailed
+            };
+            contract_errors = attempts.last().cloned().unwrap_or_default();
 
-            writeln!(
-                w,
-                "result: {}",
-                if validated.is_some() {
-                    "validated".to_string()
-                } else {
-                    format!(
-                        "contract_failed ({} errors)",
-                        attempts.last().map(Vec::len).unwrap_or(0)
-                    )
-                }
-            )?;
+            let (stored_report, stored_truncated) = cap_report(first_text.as_deref());
+            report_truncated = stored_truncated;
+            let path = store_result(
+                &state_dir,
+                &worker_session,
+                &args.name,
+                &validated,
+                &attempts,
+                &undeclared,
+                stored_report.as_deref(),
+                stored_truncated,
+            );
+            result_path = Some(path.clone());
+
+            if !args.json {
+                // Issue #452 (review round 1): restored byte-identical to
+                // the pre-#452 line -- an exact-match consumer must not see
+                // this change -- with `full report: <path>` as its own
+                // following line instead of a suffix on this one.
+                writeln!(
+                    w,
+                    "result: {}",
+                    if validated.is_some() {
+                        "validated".to_string()
+                    } else {
+                        format!(
+                            "contract_failed ({} errors)",
+                            attempts.last().map(Vec::len).unwrap_or(0)
+                        )
+                    }
+                )?;
+                writeln!(w, "full report: {}", path.display())?;
+            }
 
             let mut body = format!(
                 "zirv ctx agent: {} finished: {} (exit {code})",
@@ -3998,6 +4576,12 @@ pub fn run_with<W: Write>(
             if !undeclared.is_empty() {
                 body.push_str(&format!("\nundeclared changes: {}", undeclared.join(", ")));
             }
+            // Issue #452: names where the worker's own full report landed,
+            // so an orchestrator reading `zirv ctx inbox` can open it -- the
+            // body above already embeds the validated JSON or the
+            // contract_failed errors/raw candidate, never the full raw
+            // report text itself.
+            body.push_str(&format!("\nfull report: {}", path.display()));
             let to_session = super::mail::session_identity(&env)
                 .filter(|id| super::prompt::is_addressable_short(id));
             let msg = super::mail::Message {
@@ -4008,42 +4592,64 @@ pub fn run_with<W: Write>(
                 sent: super::state::now_secs(),
                 body,
             };
-            let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
+            mail_delivered =
+                super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg).is_ok();
+        } else {
+            // Issue #452: the no-contract counterpart of the branch above --
+            // no schema was declared, so there is nothing to validate, but
+            // the worker's own final report is still worth persisting: an
+            // orchestrator that only watches mail, or that dispatched under
+            // `--json`, otherwise has no durable record of what a plain
+            // (unvalidated) delegation actually said.
+            delegation_state = match first_text.as_deref() {
+                Some(_) => DelegationState::Reported,
+                None => DelegationState::ExitedNoReport,
+            };
+            if let Some(text) = first_text.as_deref() {
+                let (stored_report, stored_truncated) = cap_report(Some(text));
+                report_truncated = stored_truncated;
+                let path = store_report_only(
+                    &state_dir,
+                    &worker_session,
+                    &args.name,
+                    stored_report.as_deref().unwrap_or_default(),
+                    stored_truncated,
+                );
+                if !args.json {
+                    writeln!(w, "{}", no_contract_result_line(Some(&path), code))?;
+                }
+                result_path = Some(path);
+            } else if !args.json {
+                writeln!(w, "{}", no_contract_result_line(None, code))?;
+            }
 
-            store_result(
-                &state_dir,
-                &worker_session,
-                &args.name,
-                &validated,
-                &attempts,
-                &undeclared,
-            );
-        } else if code != 0
-            && let Some(parent_short) = super::mail::session_identity(&env)
-            && super::prompt::is_addressable_short(&parent_short)
-        {
-            // Issue #227: on a supervisor-detected failure, send a
-            // report-back mail to the spawning session with the same
-            // structured reason the stderr note (`exit_note`) already
-            // carries. The worker's own self-reported "tell your requester
-            // when you're done" instruction (dash panes only, see
-            // `prompt::with_report_back_layer`) never fires when the child
-            // died before reaching it -- a plain headless failure used to
-            // leave the requester with nothing but a bare exit code, no
-            // mail at all. Best-effort: a mail failure must never turn a
-            // completed delegation into a failed one, and this never
-            // touches the success path -- a clean run already has nothing
-            // new to say here (the caller's own `Ok(code)` return is that
-            // report).
-            let msg = report_back_message(
-                code,
-                &worker_session,
-                &args.name,
-                &parent_short,
-                &capability_warnings,
-            );
-            let repo_slug = super::state::repo_slug(repo);
-            let _ = super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg);
+            if code != 0
+                && let Some(parent_short) = super::mail::session_identity(&env)
+                && super::prompt::is_addressable_short(&parent_short)
+            {
+                // Issue #227: on a supervisor-detected failure, send a
+                // report-back mail to the spawning session with the same
+                // structured reason the stderr note (`exit_note`) already
+                // carries. The worker's own self-reported "tell your requester
+                // when you're done" instruction (dash panes only, see
+                // `prompt::with_report_back_layer`) never fires when the child
+                // died before reaching it -- a plain headless failure used to
+                // leave the requester with nothing but a bare exit code, no
+                // mail at all. Best-effort: a mail failure must never turn a
+                // completed delegation into a failed one, and this never
+                // touches the success path -- a clean run already has nothing
+                // new to say here (the caller's own `Ok(code)` return is that
+                // report).
+                let msg = report_back_message(
+                    code,
+                    &worker_session,
+                    &args.name,
+                    &parent_short,
+                    &capability_warnings,
+                );
+                mail_delivered =
+                    super::mail::store_to(&state_dir, &repo_slug, &repo_slug, &msg, &cfg).is_ok();
+            }
         }
         let outcome = delegation_outcome(code);
         let envelope_sha256 = envelope::digest(&child_envelope).ok();
@@ -4156,16 +4762,38 @@ pub fn run_with<W: Write>(
     }
     worktree_guard.disarm();
 
-    // Issue #230 item 3: the delegator captures `zirv agent`'s synchronous
-    // stdout result, so each warning rides here with capability, mechanism
-    // and detail, only when non-empty. `zirv agent` has no structured/JSON
-    // result form to carry the full `CapabilityWarning` into.
-    for warning in &capability_warnings {
-        writeln!(
-            w,
-            "capability warning: {} -- {}: {}",
-            warning.capability, warning.mechanism, warning.detail
-        )?;
+    if args.json {
+        let receipt = DelegationReceipt {
+            schema_version: 1,
+            harness: args.name.clone(),
+            model,
+            mode: DelegationMode::Inline,
+            state: delegation_state,
+            exit_code: Some(code),
+            session: Some(super::sessions::short_id(&worker_session)),
+            task: args.task.clone(),
+            workdir: Some(launch_repo.clone()),
+            result_path,
+            report_truncated,
+            mail_delivered,
+            errors: contract_errors,
+            capability_warnings: capability_warning_lines(&capability_warnings),
+            reason: None,
+            note: receipt_note(delegation_state),
+        };
+        print_receipt(w, &receipt)?;
+    } else {
+        // Issue #230 item 3: the delegator captures `zirv agent`'s synchronous
+        // stdout result, so each warning rides here with capability, mechanism
+        // and detail, only when non-empty. `zirv agent` has no structured/JSON
+        // result form to carry the full `CapabilityWarning` into.
+        for warning in &capability_warnings {
+            writeln!(
+                w,
+                "capability warning: {} -- {}: {}",
+                warning.capability, warning.mechanism, warning.detail
+            )?;
+        }
     }
 
     Ok(code)
@@ -6145,6 +6773,8 @@ mod tests {
             &None,
             &[vec!["deliverable missing: absent".into()]],
             &["Cargo.lock".into()],
+            None,
+            false,
         );
         let code = recorded_contract_exit(&state, "worker01", 0);
         assert_eq!(code, exec::EXIT_CONTRACT_FAILED);
@@ -6165,8 +6795,162 @@ mod tests {
             &Some(serde_json::json!({"status":"done"})),
             &[],
             &[],
+            None,
+            false,
         );
         assert_eq!(recorded_contract_exit(&state, "worker01", 0), 0);
+    }
+
+    /// Issue #452: `store_result` round-trips its own typed record --
+    /// including the new `report`/`report_truncated` fields -- and an
+    /// OLDER-shape record (written before those fields existed, so neither
+    /// key is present at all) still deserializes cleanly via
+    /// `#[serde(default)]`.
+    #[test]
+    fn delegation_result_record_round_trips_and_reads_the_old_shape() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = super::super::state::StateDir::from_root(tmp.path().to_path_buf());
+        let path = store_result(
+            &state,
+            "worker02",
+            "claude",
+            &Some(serde_json::json!({"status": "done"})),
+            &[],
+            &[],
+            Some("the worker's full final message"),
+            false,
+        );
+        let record: DelegationResultRecord =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read"))
+                .expect("round-trip deserialize");
+        assert_eq!(record.outcome, "validated");
+        assert_eq!(
+            record.report.as_deref(),
+            Some("the worker's full final message")
+        );
+        assert!(!record.report_truncated);
+
+        let old_shape = serde_json::json!({
+            "outcome": "validated",
+            "result": {"status": "done"},
+            "errors": [],
+            "agent": "claude",
+            "ts": 1_700_000_000u64,
+        });
+        let record: DelegationResultRecord =
+            serde_json::from_str(&old_shape.to_string()).expect("old-shape deserialize");
+        assert_eq!(record.outcome, "validated");
+        assert_eq!(record.report, None);
+        assert!(!record.report_truncated);
+        assert!(record.undeclared_changes.is_empty());
+    }
+
+    /// Issue #452: a report over `MAX_STORED_REPORT_BYTES` is cut on a char
+    /// boundary and the truncated flag says so; a report under the cap is
+    /// left untouched with the flag clear; `None` in is `None` out.
+    #[test]
+    fn cap_report_cuts_oversized_text_and_flags_it() {
+        let small = "a short final report";
+        let (capped, truncated) = cap_report(Some(small));
+        assert_eq!(capped.as_deref(), Some(small));
+        assert!(!truncated);
+
+        let huge = "x".repeat(MAX_STORED_REPORT_BYTES + 4096);
+        let (capped, truncated) = cap_report(Some(&huge));
+        let capped = capped.expect("capped text");
+        assert!(truncated);
+        assert!(capped.len() <= MAX_STORED_REPORT_BYTES);
+
+        assert_eq!(cap_report(None), (None, false));
+    }
+
+    /// Issue #452: the pure `result:` line an inline no-contract delegation
+    /// prints -- extracted so it is testable without spawning a real
+    /// harness process (see this function's own doc comment).
+    #[test]
+    fn no_contract_result_line_names_the_report_path_or_says_there_is_none() {
+        let path = PathBuf::from("/tmp/delegation-results/abcd1234.json");
+        assert_eq!(
+            no_contract_result_line(Some(&path), 0),
+            format!("result: report stored at {}", path.display())
+        );
+        assert_eq!(
+            no_contract_result_line(None, 7),
+            "result: none (exit 7, no report)"
+        );
+    }
+
+    /// Issue #452: a `Launched` receipt (the "nothing has run yet" pane-ack
+    /// shape) and a `ReportedContractFailed` receipt (the "an inline worker
+    /// ran and its report failed the contract" shape) both serialize with
+    /// the exact `state`/`mode` strings the brief specifies, and every
+    /// `None`/empty-`Vec` field is omitted rather than written as `null`/
+    /// `[]`.
+    #[test]
+    fn delegation_receipt_serializes_state_and_mode_and_omits_absent_fields() {
+        let launched = DelegationReceipt {
+            schema_version: 1,
+            harness: "codex".to_string(),
+            model: None,
+            mode: DelegationMode::DashboardPane,
+            state: DelegationState::Launched,
+            exit_code: Some(0),
+            session: Some("abcd1234".to_string()),
+            task: None,
+            workdir: None,
+            result_path: None,
+            report_truncated: false,
+            mail_delivered: false,
+            errors: Vec::new(),
+            capability_warnings: Vec::new(),
+            reason: None,
+            note: receipt_note(DelegationState::Launched),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string_pretty(&launched).unwrap()).unwrap();
+        assert_eq!(value["mode"], "dashboard_pane");
+        assert_eq!(value["state"], "launched");
+        assert_eq!(value["session"], "abcd1234");
+        for absent in ["model", "task", "workdir", "result_path", "reason"] {
+            assert!(!value.as_object().unwrap().contains_key(absent), "{absent}");
+        }
+        assert!(!value.as_object().unwrap().contains_key("errors"));
+        assert!(
+            !value
+                .as_object()
+                .unwrap()
+                .contains_key("capability_warnings")
+        );
+
+        let failed = DelegationReceipt {
+            schema_version: 1,
+            harness: "claude".to_string(),
+            model: Some("sonnet".to_string()),
+            mode: DelegationMode::Inline,
+            state: DelegationState::ReportedContractFailed,
+            exit_code: Some(exec::EXIT_CONTRACT_FAILED),
+            session: Some("efgh5678".to_string()),
+            task: Some("t-1".to_string()),
+            workdir: Some(PathBuf::from("/repo")),
+            result_path: Some(PathBuf::from("/state/delegation-results/efgh5678.json")),
+            report_truncated: true,
+            mail_delivered: true,
+            errors: vec!["missing field: status".to_string()],
+            capability_warnings: vec!["shell_exec -- sandbox: downgraded".to_string()],
+            reason: None,
+            note: receipt_note(DelegationState::ReportedContractFailed),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string_pretty(&failed).unwrap()).unwrap();
+        assert_eq!(value["mode"], "inline");
+        assert_eq!(value["state"], "reported_contract_failed");
+        assert_eq!(value["report_truncated"], true);
+        assert_eq!(value["mail_delivered"], true);
+        assert_eq!(
+            value["errors"],
+            serde_json::json!(["missing field: status"])
+        );
+        assert!(!value.as_object().unwrap().contains_key("reason"));
     }
 
     /// Issue #252: `dash::worker_pane_extra_args` has always appended these
@@ -6405,6 +7189,7 @@ mod tests {
             no_network: false,
             depth: None,
             task: None,
+            json: false,
         }
     }
 
@@ -9368,7 +10153,7 @@ mod tests {
     #[test]
     fn dashboard_budget_refusal_returns_the_budget_exhausted_exit() {
         let mut out = Vec::new();
-        let result = answer_for_ack(
+        let (result, facts) = answer_for_ack(
             spawnreq::SpawnAck {
                 ok: false,
                 short: None,
@@ -9380,14 +10165,96 @@ mod tests {
             &mut out,
             None,
         )
-        .expect("a policy refusal is final")
-        .expect("writes the result");
+        .expect("a policy refusal is final");
+        let result = result.expect("writes the result");
 
         assert_eq!(result, exec::EXIT_BUDGET_EXHAUSTED);
         assert!(
             String::from_utf8(out)
                 .expect("utf8")
                 .contains("budget-exhausted")
+        );
+        // Issue #452 (review round 1): a refusal never launched anything --
+        // this is exactly the fact `dashboard_answer_receipt` needs to avoid
+        // reporting `launched` for a plain policy refusal.
+        assert!(!facts.launched);
+        assert_eq!(
+            facts.reason.as_deref(),
+            Some("budget-exhausted: work group budget is spent")
+        );
+    }
+
+    /// Issue #452 (review round 1): `dashboard_answer_receipt` reads `state`
+    /// off `AnswerFacts::launched`, never off the exit code -- a refusal
+    /// reports `launch_failed` and carries the refusal `reason`, regardless
+    /// of which non-zero code it exited with.
+    #[test]
+    fn dashboard_answer_receipt_reports_launch_failed_for_unlaunched_facts() {
+        let facts = AnswerFacts {
+            launched: false,
+            short: None,
+            capability_warnings: Vec::new(),
+            reason: Some("claude is disabled by .zirv/.settings.toml".to_string()),
+        };
+        let receipt = dashboard_answer_receipt(&args_for("claude", "go"), None, 1, &facts);
+        assert_eq!(receipt.mode, DelegationMode::DashboardPane);
+        assert_eq!(receipt.state, DelegationState::LaunchFailed);
+        assert_eq!(receipt.exit_code, Some(1));
+        assert_eq!(receipt.session, None);
+        assert_eq!(
+            receipt.reason.as_deref(),
+            Some("claude is disabled by .zirv/.settings.toml")
+        );
+    }
+
+    /// Issue #452 (review round 1): a `--json` delegation refused before
+    /// `try_join_dashboard` even runs (delegation depth 0, here) must still
+    /// print exactly one JSON receipt -- and nothing else -- to stdout, with
+    /// `state: launch_failed`. This is the cheapest such path: no process
+    /// spawn, no dashboard, no `--task` card to seed.
+    #[test]
+    fn a_json_delegation_refused_before_dispatch_prints_only_one_launch_failed_receipt() {
+        let tmp = crate::commands::ctx::testenv::repo();
+        let home = tmp.path().join("home");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(&home);
+        let state_path = tmp.path().join("state");
+
+        let depth_zero = envelope::WorkerEnvelope {
+            delegation_depth: 0,
+            ..root_envelope(&CtxConfig::default())
+        };
+        let mut env = base_env(&state_path);
+        env.insert(
+            ENVELOPE_ENV.to_string(),
+            envelope::canonical_json(&depth_zero).expect("serialize envelope"),
+        );
+
+        let args = AgentArgs {
+            json: true,
+            ..args_for("claude", "go")
+        };
+        let mut out = Vec::new();
+        let code = run_with(&args, &mut out, tmp.path(), &|k| env.get(k).cloned())
+            .expect("a depth-0 refusal returns Ok(2), never a hard Err");
+        assert_eq!(code, 2);
+
+        let stdout = String::from_utf8(out).expect("utf8");
+        // The whole point of `--json` is that stdout is ONE parseable JSON
+        // value and nothing else -- `serde_json::from_str` on a `Value`
+        // refuses trailing non-whitespace content, so a stray human line
+        // ahead of or after the receipt fails this parse, not just a
+        // `.contains` check.
+        let receipt: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("stdout must be exactly one JSON value: {e}\n{stdout}"));
+        assert_eq!(receipt["state"], "launch_failed");
+        assert_eq!(receipt["mode"], "inline");
+        assert_eq!(receipt["exit_code"], 2);
+        assert!(
+            receipt["reason"]
+                .as_str()
+                .expect("reason present")
+                .contains("depth 0"),
+            "got {receipt}"
         );
     }
 
