@@ -5,9 +5,6 @@
 - For the cross-harness review worker on a substantial diff, codex-cli is
   installed at `~/AppData/Local/Programs/OpenAI/Codex/bin` even when a roster
   line claims it is not.
-- Run the `vault-keeper` agent before pushing a PR whose diff changes
-  behaviour, contract, or architecture; it enforces the doc-update contract
-  in `.zirv/context/common.md`.
 
 ## This Windows dev machine
 

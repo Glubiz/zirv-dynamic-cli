@@ -141,7 +141,7 @@ fn find_script_in_dir(
 /// never drive-relative (`C:x`, which `has_root` does *not* catch -- see
 /// below), and never containing a `..` component. `.shortcuts.yaml` is
 /// repo-owned,
-/// untrusted config (see `Untrusted Configuration` in the vault) that must
+/// untrusted config (see the README's "Trust boundary" section) that must
 /// only ever narrow, never widen, what a lookup can reach.
 ///
 /// Before issue #212, the mapped file was joined straight against the

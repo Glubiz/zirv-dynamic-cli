@@ -1897,7 +1897,8 @@ pub struct EndpointConfig {
 /// fails rather than prompting a human. `AgentAdapter::default_sandbox_
 /// args()` is each adapter's own honest mapping of this posture -- see that
 /// method's own doc comment, `adapters::policy_launch_args` (the seam every
-/// real launch calls), and `docs/obsidian/Modules/Ctx Adapters.md`.
+/// real launch calls), and the README's "Command safety policy" section
+/// (issue #83).
 ///
 /// Independent of `[policy]`/`EffectivePolicy`: that table stays all-`Allow`
 /// by default ("zirv's per-capability policy declares nothing"), unchanged
@@ -10529,14 +10530,13 @@ mod tests {
 
     /// Companion to the exhaustiveness test above, guarding the *other*
     /// direction: every entry in `REPO_FORBIDDEN` must have its own row in
-    /// both hand-maintained trust-boundary tables (README.md, and
-    /// `docs/obsidian/Concepts/Untrusted Configuration.md`). A repo-forbidden
-    /// key with no doc row is invisible to anyone reading either table to
-    /// find out what's blocked and why. This drift already happened once
-    /// (Task 1's round 1 review caught `memory.shared_enabled` missing from
-    /// both tables); this test exists so a NEW `REPO_FORBIDDEN` entry can
-    /// never repeat it silently. Only presence is checked, not wording: each
-    /// table's own prose explains the rationale in its own voice.
+    /// README.md's hand-maintained trust-boundary table. A repo-forbidden
+    /// key with no doc row is invisible to anyone reading the table to find
+    /// out what's blocked and why. This drift already happened once (Task
+    /// 1's round 1 review caught `memory.shared_enabled` missing from it);
+    /// this test exists so a NEW `REPO_FORBIDDEN` entry can never repeat it
+    /// silently. Only presence is checked, not wording: the table's own
+    /// prose explains the rationale in its own voice.
     ///
     /// The needle is anchored to the actual table-row shape
     /// (`` | `key` ``, a markdown table cell), not a bare backtick-wrapped
@@ -10545,16 +10545,9 @@ mod tests {
     /// count as "documented in the table" -- a fix-round review caught this
     /// weaker check passing on prose alone.
     #[test]
-    fn every_repo_forbidden_key_has_a_row_in_both_trust_boundary_tables() {
+    fn every_repo_forbidden_key_has_a_row_in_the_readme_trust_boundary_table() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let readme = std::fs::read_to_string(repo.join("README.md")).expect("read README.md");
-        let untrusted_config = std::fs::read_to_string(
-            repo.join("docs")
-                .join("obsidian")
-                .join("Concepts")
-                .join("Untrusted Configuration.md"),
-        )
-        .expect("read Untrusted Configuration.md");
 
         for (path, _env_var) in REPO_FORBIDDEN {
             let canonical = path.join(".");
@@ -10562,10 +10555,6 @@ mod tests {
             assert!(
                 readme.contains(&needle),
                 "README.md's trust-boundary table is missing a row for `{canonical}`"
-            );
-            assert!(
-                untrusted_config.contains(&needle),
-                "Untrusted Configuration.md's forbidden-key table is missing a row for `{canonical}`"
             );
         }
     }

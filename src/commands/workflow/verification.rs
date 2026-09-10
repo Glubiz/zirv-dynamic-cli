@@ -2969,9 +2969,9 @@ pub fn run_test(args: &TestArgs, writer: &mut impl Write) -> CtxResult<i32> {
 
 /// Renders a builtin check's Fail/Inconclusive detail lines (`proves:`/
 /// `fix:`/`origin:`), scrubbed like every other operator-facing string this
-/// module prints -- `docs.rs`'s/`decision_graph.rs`'s own `details` can
-/// quote text extracted from committed vault docs, which, like a repo
-/// check's `command`, is text this process did not author.
+/// module prints -- `docs.rs`'s own `details` can quote text extracted from
+/// committed README prose, which, like a repo check's `command`, is text
+/// this process did not author.
 fn write_builtin_lines(
     writer: &mut impl Write,
     builtins: &[super::checks::BuiltinCheckResult],
@@ -3371,9 +3371,9 @@ mod tests {
         assert!(!report.passed(), "a skipped check is not a passing check");
     }
 
-    /// The builtin registry mostly checks zirv's own source and vault files.
-    /// In any other repository those inputs are absent, and a repo cannot opt
-    /// out (`workflow.builtin_checks_exclude` is REPO_FORBIDDEN), so counting
+    /// The builtin registry mostly checks zirv's own source and README
+    /// files. In any other repository those inputs are absent, and a repo
+    /// cannot opt out (`workflow.builtin_checks_exclude` is REPO_FORBIDDEN), so counting
     /// their absence against the run made `zirv verify` unable to exit 0
     /// anywhere outside the zirv checkout even with a fully passing
     /// `verify.toml`.

@@ -10,7 +10,6 @@
 //! fails without the fix, not be added freely.
 
 pub mod argv;
-pub mod decision_graph;
 pub mod docs;
 pub mod eol;
 pub mod forbidden;
@@ -31,7 +30,7 @@ use serde::Serialize;
 /// available", "no base branch", "the doc's anchor comments are missing").
 ///
 /// `NotApplicable` is the fourth verdict and the only non-blocking one
-/// besides `Pass`: most checks here guard zirv's OWN source and vault
+/// besides `Pass`: most checks here guard zirv's OWN source and README
 /// invariants, which are a statement about this repository and no other. See
 /// [`is_zirv_repo`], which decides that once, for every such check.
 /// `Inconclusive` stays reserved for an input this repository is supposed to
@@ -151,7 +150,7 @@ impl BuiltinCheckResult {
 /// it reads is simply not there.
 pub fn absent_input(path: &Path) -> String {
     format!(
-        "{} is absent -- this check reads zirv's own source/vault files",
+        "{} is absent -- this check reads zirv's own source/README files",
         path.display()
     )
 }
@@ -161,11 +160,11 @@ pub fn absent_input(path: &Path) -> String {
 /// Review round 1 (R9): every zirv-specific check keyed `NotApplicable` on
 /// its input FILE being absent, which answers the wrong question in both
 /// directions -- an ordinary repository that happens to own a
-/// `.gitattributes` (or a `Decision Log.md`) was judged against zirv's
-/// invariants and FAILED, while deleting one of those files inside the zirv
-/// checkout made the check that guards it silently pass. Applicability is a
-/// fact about the repository, so it is decided here, once, before any input
-/// is read; an absent input inside the zirv repo stays `Inconclusive`.
+/// `.gitattributes` was judged against zirv's invariants and FAILED, while
+/// deleting one of those files inside the zirv checkout made the check that
+/// guards it silently pass. Applicability is a fact about the repository, so
+/// it is decided here, once, before any input is read; an absent input
+/// inside the zirv repo stays `Inconclusive`.
 pub fn is_zirv_repo(repo: &Path) -> bool {
     std::fs::read_to_string(repo.join("Cargo.toml"))
         .ok()
@@ -179,7 +178,7 @@ pub fn is_zirv_repo(repo: &Path) -> bool {
 /// about the repository rather than about the invariant.
 pub fn not_the_zirv_repo(repo: &Path) -> String {
     format!(
-        "{} is not the zirv repository -- this check guards zirv's own source/vault invariants",
+        "{} is not the zirv repository -- this check guards zirv's own source/README invariants",
         repo.display()
     )
 }
@@ -191,11 +190,8 @@ pub const ALL_IDS: &[&str] = &[
     argv::CODEX_ID,
     argv::CLAUDE_ID,
     forbidden::ID,
-    docs::UNIX_TESTS_ID,
-    docs::DOC_VERBS_ID,
     docs::DOC_EXIT_CODES_ID,
     docs::DOC_RESERVED_ID,
-    decision_graph::ID,
     hooks::ID,
     eol::ID,
 ];
@@ -211,11 +207,8 @@ pub fn run_all(repo: &Path, exclude: &[String]) -> Vec<BuiltinCheckResult> {
         argv::run_codex_exec(repo),
         argv::run_claude_headless(repo),
         forbidden::run(repo),
-        docs::run_unix_tests_doc(repo),
-        docs::run_doc_verbs(repo),
         docs::run_doc_exit_codes(repo),
         docs::run_doc_reserved(repo),
-        decision_graph::run(repo),
         hooks::run(repo),
         eol::run(repo),
     ];
@@ -253,7 +246,7 @@ mod tests {
     }
 
     /// Most of these checks read zirv's OWN files (`src/commands/ctx/
-    /// config.rs`, `docs/obsidian/...`, `.gitattributes`). In any other
+    /// config.rs`, `README.md`, `.gitattributes`). In any other
     /// repository those inputs are simply absent, which says nothing about
     /// that repository -- reporting it as `Inconclusive` (or, for the version
     /// bump, `Fail`) made `zirv verify` unable to exit 0 anywhere outside the
@@ -287,11 +280,8 @@ mod tests {
             vec![
                 version_bump::ID,
                 forbidden::ID,
-                docs::UNIX_TESTS_ID,
-                docs::DOC_VERBS_ID,
                 docs::DOC_EXIT_CODES_ID,
                 docs::DOC_RESERVED_ID,
-                decision_graph::ID,
                 eol::ID,
             ],
             "the repo-independent checks (argv, hooks) must still report a real verdict"
@@ -302,22 +292,15 @@ mod tests {
 
     /// Review round 1 (R9): keying `NotApplicable` on the input FILE being
     /// absent answers the wrong question. An ordinary repository that happens
-    /// to own a `.gitattributes` (or a `Decision Log.md`) was judged against
-    /// zirv's own invariants and FAILED -- the very "cannot exit 0 anywhere
-    /// outside the zirv checkout" symptom the verdict was added to fix, just
-    /// moved to the repositories that do have such a file.
+    /// to own a `.gitattributes` was judged against zirv's own invariants and
+    /// FAILED -- the very "cannot exit 0 anywhere outside the zirv checkout"
+    /// symptom the verdict was added to fix, just moved to the repositories
+    /// that do have such a file.
     #[test]
     fn a_non_zirv_repo_that_owns_a_lookalike_input_is_still_not_applicable() {
         let repo = tempfile::tempdir().unwrap();
         manifest(repo.path(), "some-other-crate");
         std::fs::write(repo.path().join(".gitattributes"), "* text=auto\n").unwrap();
-        std::fs::create_dir_all(repo.path().join("docs/obsidian/Development")).unwrap();
-        std::fs::write(
-            repo.path()
-                .join("docs/obsidian/Development/Decision Log.md"),
-            "# Decisions\n",
-        )
-        .unwrap();
 
         let produced = run_all(repo.path(), &[]);
         let blocking: Vec<(&str, &str, &str)> = produced
@@ -342,11 +325,8 @@ mod tests {
         let produced = run_all(repo.path(), &[]);
         for id in [
             forbidden::ID,
-            docs::UNIX_TESTS_ID,
-            docs::DOC_VERBS_ID,
             docs::DOC_EXIT_CODES_ID,
             docs::DOC_RESERVED_ID,
-            decision_graph::ID,
             eol::ID,
         ] {
             let check = produced

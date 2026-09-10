@@ -14630,7 +14630,7 @@ mod tests {
 
     /// Issue #136's own reproduction: a commit message built from a
     /// single-quoted heredoc (`$(cat <<'EOF' ...prose... EOF)`), the shape
-    /// zirv's own vault-keeper/commit workflow actually generates for a
+    /// zirv's own commit workflow actually generates for a
     /// multi-paragraph message. The heredoc body is POSIX-literal DATA fed
     /// to `cat`'s stdin, never executable structure, even though it names
     /// every deny-listed primitive by name.
