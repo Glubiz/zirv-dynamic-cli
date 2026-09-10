@@ -2619,6 +2619,17 @@ impl AgentAdapter for ClaudeAdapter {
         vec!["--session-id".to_string(), session.to_string()]
     }
 
+    /// Issue #462: claude keeps one JSONL file per conversation, named by
+    /// the conversation id, and [`transcript_path`](Self::transcript_path)
+    /// resolves exactly that file (computing it from the cwd slug, then
+    /// scanning `~/.claude/projects` for the same `<id>.jsonl` name) -- so
+    /// its existence IS the proof that `--resume <id>` has something to
+    /// resolve. A `false` here is the case that closed an orchestrator:
+    /// zirv's own seat uuid, which claude never adopted.
+    fn conversation_exists(&self, session: &SessionRef) -> Option<bool> {
+        Some(self.transcript_path(session).is_file())
+    }
+
     fn register_turn_signal(&self, session: &SessionRef, socket: &Path) -> TurnSignalSetup {
         TurnSignalSetup {
             env: vec![
@@ -3596,6 +3607,35 @@ mod tests {
             cwd: std::path::PathBuf::from("/work/repo"),
         };
         assert_eq!(adapter.transcript_path(&session), actual);
+    }
+
+    /// Issue #462: the conversation probe answers from the same file
+    /// `transcript_path` resolves -- present means `--resume <id>` has
+    /// something to find, absent means it does not, which is exactly the
+    /// case (zirv's own seat uuid, never adopted by claude) that killed a
+    /// restored orchestrator pane.
+    #[test]
+    fn conversation_exists_follows_the_transcript_claude_actually_wrote() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join(".claude/projects/-work-repo");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("49195b07-217f-4401-8681-c857fcea294e.jsonl"), "")
+            .expect("write transcript");
+
+        let adapter = ClaudeAdapter::new(None).with_home(home.path().to_path_buf());
+        let session_for = |id: &str| SessionRef {
+            id: SessionId::parse(id),
+            cwd: std::path::PathBuf::from("/work/repo"),
+        };
+        assert_eq!(
+            adapter.conversation_exists(&session_for("49195b07-217f-4401-8681-c857fcea294e")),
+            Some(true),
+        );
+        assert_eq!(
+            adapter.conversation_exists(&session_for("6c967beb-0b72-46e9-9d3e-504a03f741b3")),
+            Some(false),
+            "zirv's own seat uuid is not a conversation claude ever minted"
+        );
     }
 
     #[test]
