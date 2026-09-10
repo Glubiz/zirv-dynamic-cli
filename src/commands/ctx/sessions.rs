@@ -1620,6 +1620,84 @@ pub fn clear_stall_marker(state: &StateDir, short: &str) {
     let _ = std::fs::remove_file(stall_marker_path(state, short));
 }
 
+/// Issue #462: the conversation id the HARNESS itself minted for a
+/// supervised session, recorded from the one place both identities are
+/// known at once -- an adapter lifecycle hook, whose payload carries the
+/// harness's native conversation id while `adapters::SESSION_ENV` carries
+/// zirv's own uuid for the same session.
+///
+/// These two are equal only when the launch was pinned
+/// (`AgentAdapter::session_pin_args`); a `zirv chat -- --resume <id>` launch,
+/// or any harness with no pin flag, mints its own id and zirv's uuid is a
+/// zirv-side handle that no `--resume` can ever resolve. Recovery paths that
+/// need to put a seat back into its OWN conversation (`dash::
+/// settle_pending_rollover`'s failed-rollover arm) must resume THIS id.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NativeConversation {
+    /// The harness this conversation belongs to, so a short id that has since
+    /// been rolled over to a different agent never resumes the old harness's
+    /// conversation.
+    agent: String,
+    /// zirv's own uuid for the session that observed it, so a marker left
+    /// behind by an earlier session at this same (stable) short address is
+    /// never mistaken for the current one's conversation.
+    session: String,
+    /// The harness's own conversation id.
+    conversation: String,
+}
+
+fn conversation_marker_path(state: &StateDir, short: &str) -> PathBuf {
+    state.sessions().join(format!("{short}.conversation"))
+}
+
+/// Records `conversation` as the native conversation id `agent` is actually
+/// running for zirv session `session` (short address `short`). Best-effort in
+/// every direction, like every other marker in this module: a marker that
+/// fails to write only costs a later recovery its resume, never this turn.
+///
+/// Written on every turn boundary rather than once at launch: a harness can
+/// mint a fresh conversation mid-session (claude's own `/clear`), and the
+/// most recent turn is the conversation a recovery should resume.
+pub fn record_native_conversation(
+    state: &StateDir,
+    short: &str,
+    agent: &str,
+    session: &str,
+    conversation: &str,
+) {
+    if agent.is_empty() || session.is_empty() || conversation.is_empty() {
+        return;
+    }
+    let record = NativeConversation {
+        agent: agent.to_string(),
+        session: session.to_string(),
+        conversation: conversation.to_string(),
+    };
+    let Ok(body) = serde_json::to_string(&record) else {
+        return;
+    };
+    let _ = super::state::create_private_dir_all(&state.sessions());
+    let _ = super::state::write_private(&conversation_marker_path(state, short), &body);
+}
+
+/// The native conversation id recorded for `short`, but only when the marker
+/// names this exact `agent` AND this exact zirv `session`. `None` for a
+/// missing, unreadable, malformed or mismatched marker -- the caller then has
+/// no proof about which conversation the harness is in, which is a reason to
+/// relaunch cold, never to guess.
+pub fn native_conversation(
+    state: &StateDir,
+    short: &str,
+    agent: &str,
+    session: &str,
+) -> Option<String> {
+    let body = std::fs::read_to_string(conversation_marker_path(state, short)).ok()?;
+    let record: NativeConversation = serde_json::from_str(&body).ok()?;
+    (record.agent.eq_ignore_ascii_case(agent) && record.session == session)
+        .then_some(record.conversation)
+        .filter(|conversation| !conversation.is_empty())
+}
+
 /// The `for_session` filter a supervisor passes to `mail::list` when listing
 /// mail *for itself*.
 ///
@@ -2259,6 +2337,59 @@ mod tests {
         assert_eq!(
             before, after,
             "a screening write must never touch the record file's own bytes"
+        );
+    }
+
+    /// Issue #462: the marker answers only for the exact (agent, zirv
+    /// session) pair that recorded it. A short id is a STABLE address that
+    /// outlives both a rollover to another harness and the session that
+    /// happened to hold it, so answering for either would hand a recovery
+    /// somebody else's conversation.
+    #[test]
+    fn native_conversation_answers_only_for_the_agent_and_session_that_recorded_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let zirv_session = "6c967beb-0b72-46e9-9d3e-504a03f741b3";
+        let native = "49195b07-217f-4401-8681-c857fcea294e";
+
+        record_native_conversation(&state, "orch0001", "claude", zirv_session, native);
+        assert_eq!(
+            native_conversation(&state, "orch0001", "claude", zirv_session).as_deref(),
+            Some(native),
+        );
+        assert_eq!(
+            native_conversation(&state, "orch0001", "Claude", zirv_session).as_deref(),
+            Some(native),
+            "an agent name differing only in case is the same harness"
+        );
+        assert_eq!(
+            native_conversation(&state, "orch0001", "codex", zirv_session),
+            None,
+            "a seat rolled over to another harness must not resume claude's conversation"
+        );
+        assert_eq!(
+            native_conversation(&state, "orch0001", "claude", "some-other-session"),
+            None,
+            "a marker left by an earlier session at this address is not this one's"
+        );
+        assert_eq!(
+            native_conversation(&state, "orch0002", "claude", zirv_session),
+            None,
+            "no marker at all is no answer, never a guess"
+        );
+    }
+
+    /// An empty id is not evidence: recording one must leave nothing behind
+    /// for a recovery to read back as a conversation.
+    #[test]
+    fn record_native_conversation_ignores_empty_identities() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        record_native_conversation(&state, "orch0003", "claude", "sess", "");
+        record_native_conversation(&state, "orch0003", "", "sess", "conv");
+        assert_eq!(
+            native_conversation(&state, "orch0003", "claude", "sess"),
+            None
         );
     }
 

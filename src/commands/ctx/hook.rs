@@ -1464,6 +1464,25 @@ pub fn run_stop<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxResu
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| super::sessions::short_id(&payload.session_id));
+        // Issue #462: a lifecycle hook is the one place both identities are
+        // known at once -- `session` is zirv's own uuid (`SESSION_ENV`),
+        // while `payload.session_id` is the conversation the HARNESS
+        // actually minted, and the two are equal only for a pinned launch.
+        // Recorded on every turn boundary so a failed rollover can put this
+        // seat back into its OWN conversation rather than `--resume` zirv's
+        // uuid, which the harness has never heard of ("No conversation found
+        // with session ID: <zirv uuid>", the incident this exists for).
+        // Gated on `AGENT_ENV`: an unsupervised launch has no seat for a
+        // recovery to restore, so there is nothing to record it for.
+        if let Some(agent) = env(adapters::AGENT_ENV) {
+            super::sessions::record_native_conversation(
+                &state,
+                &stable_short,
+                &agent,
+                &session,
+                &payload.session_id,
+            );
+        }
         // Issue #349: a Stop hook is exactly a `Working -> Settled` turn
         // boundary -- the agent has finished its response and is back at an
         // idle prompt. `Attention::None` here is deliberate, not a no-op:
@@ -4382,6 +4401,49 @@ mod tests {
 
         let log = std::fs::read_to_string(state.join("logs/decisions.jsonl")).expect("log");
         assert!(log.contains("screening:"), "got {log}");
+    }
+
+    /// Issue #462: a supervised turn boundary is the one moment both
+    /// identities are visible at once, and it must persist the HARNESS's own
+    /// conversation id against zirv's uuid. Without this, a failed rollover
+    /// had nothing but zirv's uuid to resume, and claude answered "No
+    /// conversation found with session ID: <uuid>".
+    #[test]
+    fn a_supervised_stop_records_the_harnesss_own_conversation_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(dir.path());
+        let transcript = rotting_transcript(dir.path());
+
+        let state_root = dir.path().join("state");
+        let zirv_session = "6c967beb-0b72-46e9-9d3e-504a03f741b3";
+        let env: std::collections::HashMap<String, String> = [
+            (
+                crate::commands::ctx::state::STATE_ENV.to_string(),
+                state_root.display().to_string(),
+            ),
+            (SESSION_ENV.to_string(), zirv_session.to_string()),
+            (adapters::AGENT_ENV.to_string(), "claude".to_string()),
+        ]
+        .into();
+        // The payload's own id is the conversation claude actually minted,
+        // which an unpinned launch leaves different from zirv's uuid.
+        let stdin = serde_json::json!({
+            "session_id": "49195b07-217f-4401-8681-c857fcea294e",
+            "transcript_path": transcript,
+            "cwd": dir.path(),
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_stop(&mut out, &stdin, &|k| env.get(k).cloned()).expect("runs");
+
+        let state = StateDir::from_root(state_root);
+        let short = super::super::sessions::short_id("49195b07-217f-4401-8681-c857fcea294e");
+        assert_eq!(
+            super::super::sessions::native_conversation(&state, &short, "claude", zirv_session)
+                .as_deref(),
+            Some("49195b07-217f-4401-8681-c857fcea294e"),
+            "the harness's own conversation id must be recorded against zirv's session"
+        );
     }
 
     /// The other half: `run_scores_a_real_transcript_and_advises`'s own clean

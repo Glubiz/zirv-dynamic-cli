@@ -4098,28 +4098,79 @@ fn settle_pending_rollover(
                     }
                 )
             });
-            super::rollover::fail(
-                state,
-                "dash",
-                &short,
-                generation,
-                "the successor exited before it answered",
-                now,
-            );
+            // Issue #462: preserve WHY the successor exited. Recovery below
+            // can fail in its own right -- in the incident the restored pane
+            // died immediately on a resume of an id its harness had never
+            // heard of -- and a reason string that only ever said "the
+            // successor exited before it answered" left the initial failure
+            // unexplained in the retained evidence.
+            let mut reason = "the successor exited before it answered".to_string();
+            if let PaneState::Ended(code) = pane_state {
+                reason.push_str(&format!(" (exit {code})"));
+            }
+            let tail = pane.last_line().trim().to_string();
+            if !tail.is_empty() {
+                reason.push_str(": ");
+                reason.extend(tail.chars().take(160));
+            }
+            super::rollover::fail(state, "dash", &short, generation, &reason, now);
             *pending = None;
             // Issue #440: resume the source's OWN conversation where the
             // adapter has a verified mechanism for it. A cold relaunch
             // carrying a structural packet cannot carry unsaved in-flight
             // state, and that state is exactly what the incident lost.
+            //
+            // Issue #462: the id resumed here is the one the HARNESS knows,
+            // which equals zirv's seat uuid only when the launch was pinned
+            // (`AgentAdapter::session_pin_args`). A `zirv chat -- --resume
+            // <id>` launch deliberately suppresses that pin, so the seat's
+            // uuid is a zirv-side handle no `--resume` can resolve: resuming
+            // it blind is what killed the restored pane and closed the
+            // orchestrator outright. Preference order is therefore the
+            // conversation a lifecycle hook actually OBSERVED for this seat
+            // (`sessions::native_conversation`), then the seat uuid -- and
+            // either one only when the adapter cannot prove that
+            // conversation is absent.
             let resume = source.as_ref().and_then(|seat| {
-                adapters::select(Some(&seat.agent), &[], cfg)
-                    .ok()
-                    .filter(|adapter| adapter.resume_args(&seat.session).is_some())
-                    .map(|_| seat.session.clone())
+                let adapter = adapters::select(Some(&seat.agent), &[], cfg).ok()?;
+                match super::sessions::native_conversation(
+                    state,
+                    &short,
+                    &seat.agent,
+                    &seat.session,
+                ) {
+                    // A lifecycle hook OBSERVED this conversation for this
+                    // exact seat and zirv session: the strongest evidence
+                    // there is, and it needs no probe.
+                    Some(observed) => adapter.resume_args(&observed).map(|_| observed),
+                    // Nothing observed (no turn boundary reached this seat
+                    // yet, or an unsupervised launch). The seat uuid is only
+                    // the conversation id when the launch was PINNED, so it
+                    // is used only where the adapter cannot prove that
+                    // conversation is absent -- `None` from
+                    // `conversation_exists` means "cannot tell", which keeps
+                    // the previous behaviour, while a proven-absent
+                    // conversation downgrades to a cold structural relaunch
+                    // instead of a resume the harness would reject.
+                    None => {
+                        adapter.resume_args(&seat.session)?;
+                        let exists = adapter.conversation_exists(&SessionRef {
+                            id: SessionId::parse(&seat.session),
+                            cwd: repo.to_path_buf(),
+                        });
+                        (exists != Some(false)).then(|| seat.session.clone())
+                    }
+                }
             });
             let restored = source
                 .filter(|seat| !seat.agent.eq_ignore_ascii_case(pane.agent()))
                 .is_some_and(|seat| {
+                    // Issue #462: the outgoing context is read from the
+                    // conversation actually being resumed, not from zirv's
+                    // seat uuid -- `handover_pane` resolves the transcript
+                    // from this value, and for an unpinned launch the seat
+                    // uuid names no transcript at all.
+                    let context_session = resume.clone().unwrap_or_else(|| seat.session.clone());
                     handover_pane(
                         pane,
                         &handover::HandoverRequest {
@@ -4139,7 +4190,7 @@ fn settle_pending_rollover(
                         repo,
                         state,
                         errors,
-                        Some((seat.agent.as_str(), seat.session.as_str())),
+                        Some((seat.agent.as_str(), context_session.as_str())),
                     )
                 });
             // A source that is hard-blocked waits out its own window rather
@@ -17021,6 +17072,14 @@ mod tests {
         )
         .expect("prepare rollover");
 
+        // Issue #462: a PINNED launch is the case where zirv's uuid and the
+        // harness's own conversation id coincide, which is what makes a
+        // resume of the seat's own session id correct here. Recorded the way
+        // a real turn boundary records it, so this test states that premise
+        // rather than assuming it -- the sibling test below is the case
+        // where the two ids differ.
+        sessions::record_native_conversation(&state, &short, "claude", session_id, session_id);
+
         let relaunched = tmp.path().join("relaunched.sh");
         std::fs::write(&relaunched, "#!/bin/sh\nsleep 30\n").expect("write relaunch script");
         let mut cfg = CtxConfig {
@@ -17078,6 +17137,138 @@ mod tests {
                     && entry.text.contains("resumed")
                     && entry.text.contains("parked until")),
             "the pane says the source was resumed and the seat parked: {errors:?}"
+        );
+
+        panes[0].finish_shutdown().expect("shutdown");
+    }
+
+    /// Issue #462: the incident. A seat whose zirv session uuid is NOT the
+    /// harness's own conversation id (any launch that suppressed
+    /// `session_pin_args` -- `zirv chat -- --resume <id>` -- or a harness
+    /// that mints its own id) used to be recovered with `--resume <zirv
+    /// uuid>`. Claude answered "No conversation found with session ID:
+    /// <uuid>", the restored pane exited 1, and the operator's orchestrator
+    /// was gone for good. Recovery must resume the conversation a lifecycle
+    /// hook actually OBSERVED for this seat, and the failure evidence must
+    /// still say why the successor itself died.
+    #[test]
+    fn a_dead_successor_resumes_the_harnesss_own_conversation_not_the_seat_uuid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        // The successor that never answered: a child that exits immediately.
+        let session_id = "6c967beb-0b72-46e9-9d3e-504a03f741b3";
+        let native_id = "49195b07-217f-4401-8681-c857fcea294e";
+        let short = sessions::short_id(session_id);
+        let spec = PaneSpec {
+            agent_name: "codex".to_string(),
+            argv: trivial_argv(),
+            role: prompt::PromptRole::Orchestrator,
+            verb: sessions::Verb::Chat,
+            session_id: session_id.to_string(),
+            title: "orch".to_string(),
+        };
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            pane::DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        let now = super::super::state::now_secs();
+        // The seat as `handover_pane` left it: still naming the source claude
+        // seat, with an open transaction naming the codex successor above.
+        super::seat::register(
+            &state,
+            &short,
+            session_id,
+            "claude",
+            None,
+            "anthropic",
+            prompt::PromptRole::Orchestrator.label(),
+            false,
+            now,
+        )
+        .expect("register seat");
+        let generation = super::seat::prepare(
+            &state,
+            &short,
+            "codex",
+            None,
+            super::seat::Cause::Manual,
+            now,
+        )
+        .expect("prepare rollover");
+        // What the harness itself reported at its own turn boundaries: a
+        // conversation id that is NOT zirv's session uuid.
+        sessions::record_native_conversation(&state, &short, "claude", session_id, native_id);
+
+        // The relaunch records the argv it was actually given. Written to a
+        // path relative to the pane's own cwd (the repo), so the script has
+        // no host path to quote.
+        let argv_log = repo.join("argv.txt");
+        let relaunched = tmp.path().join("relaunched.sh");
+        std::fs::write(
+            &relaunched,
+            "#!/bin/sh\nprintf '%s\n' \"$@\" > argv.txt\nsleep 30\n",
+        )
+        .expect("write relaunch script");
+        let mut cfg = CtxConfig {
+            agent_bin: Some(format!("sh {}", relaunched.display())),
+            ..CtxConfig::default()
+        };
+        cfg.pace.estimator = false;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !matches!(pane.state(), PaneState::Ended(_)) {
+            pane.drain();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            matches!(pane.state(), PaneState::Ended(_)),
+            "sanity: the successor child must have exited"
+        );
+
+        let mut panes = vec![pane];
+        let mut pending = Some((short.clone(), generation, Instant::now()));
+        let mut errors = ErrorLog::default();
+
+        settle_pending_rollover(&mut panes, &cfg, &repo, &state, &mut pending, &mut errors);
+
+        assert!(pending.is_none(), "the dead transaction must close");
+        assert_eq!(
+            panes[0].agent(),
+            "claude",
+            "the source harness must be running in this pane again"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !argv_log.is_file() {
+            panes[0].drain();
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let argv = std::fs::read_to_string(&argv_log).expect("the relaunch recorded its argv");
+        assert!(
+            argv.contains(native_id),
+            "the relaunch must resume the harness's OWN conversation: {argv}"
+        );
+        assert!(
+            !argv.contains(session_id),
+            "zirv's seat uuid is not a conversation any harness can resume: {argv}"
+        );
+
+        let logged =
+            std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE)).expect("log");
+        assert!(
+            logged.contains("the successor exited before it answered (exit"),
+            "the successor's own exit must survive its failed recovery: {logged}"
         );
 
         panes[0].finish_shutdown().expect("shutdown");

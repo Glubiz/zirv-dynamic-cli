@@ -1988,6 +1988,24 @@ pub trait AgentAdapter: std::fmt::Debug {
         None
     }
 
+    /// Issue #462: whether `session` names a conversation this harness could
+    /// actually be resumed into, when that is knowable from what the harness
+    /// itself has on disk. `None` -- the default -- means this adapter has no
+    /// verified way to tell, and a caller must fall back to its own
+    /// evidence rather than treat "unknown" as either answer.
+    ///
+    /// This exists because [`session_pin_args`](Self::session_pin_args) is
+    /// not always applied: a launch the operator pinned themselves (`zirv
+    /// chat -- --resume <id>`), or any harness with no pin flag, leaves
+    /// zirv's uuid a zirv-side handle only. A recovery path that resumes it
+    /// blind gets the harness's own "no conversation found" and the pane
+    /// dies -- which, for the orchestrator pane, closes the dashboard's own
+    /// seat.
+    fn conversation_exists(&self, session: &SessionRef) -> Option<bool> {
+        let _ = session;
+        None
+    }
+
     /// Argv tokens that make this agent adopt zirv's own `session` uuid as the
     /// id of the conversation it is about to start, so a later
     /// [`resume_args`](Self::resume_args) against that same uuid finds
