@@ -2400,17 +2400,25 @@ impl Pane {
         repo: &Path,
         size: (u16, u16),
     ) -> CtxResult<()> {
-        let (new_adapter, mut extra) = super::super::handover::resolve_swap_launch(cfg, req)?;
-        // Issue #440: whether `resolve_swap_launch` above actually appended
-        // this adapter's resume flags. A resumed conversation already holds
-        // everything a handoff packet could only summarise -- the unsaved
-        // in-flight state a cold relaunch provably cannot carry -- so it is
-        // launched in the verified restore shape (`roster::restore_argv`):
-        // resume args, no handoff prompt layered on top.
-        let resuming = req
-            .resume_session
-            .as_deref()
-            .is_some_and(|session| new_adapter.resume_args(session).is_some());
+        // Whether the packet has to ride along with the resume. A swap back
+        // onto the harness this pane is ALREADY running (issue #440's
+        // source recovery) does not: that conversation holds everything the
+        // packet could only summarise, and nothing happened outside it. A
+        // swap onto a DIFFERENT harness whose conversation is being resumed
+        // is a RETURN from a park -- that conversation missed the whole
+        // interim harness's turn, so the packet is exactly what it lacks.
+        let same_harness = req.target_agent.eq_ignore_ascii_case(self.agent());
+        let carries_handoff = !same_harness;
+        let (new_adapter, mut extra) =
+            super::super::handover::resolve_swap_launch(cfg, req, carries_handoff)?;
+        // Whether `resolve_swap_launch` above actually appended this
+        // adapter's resume flags -- the same shared answer, so the argv and
+        // the prompt decision below cannot disagree.
+        let resuming = super::super::handover::resumes_conversation(
+            new_adapter.as_ref(),
+            req,
+            carries_handoff,
+        );
         let new_argv: Vec<String> = {
             // Issue #220: the same off-argv delivery `wrap`'s own restart uses
             // -- a handover packet is multi-line too, so on a Windows `.cmd`
@@ -2420,8 +2428,7 @@ impl Pane {
                 // Delta review: claude applies its system-prompt flag per
                 // INVOCATION, so a resumed session keeps its whole
                 // conversation but would lose zirv's role layer for the rest
-                // of its life unless this relaunch carries it again. The role
-                // layer only -- no handoff text, no positional prompt.
+                // of its life unless this relaunch carries it again.
                 extra.extend(super::super::prompt::role_layer_args(
                     new_adapter.as_ref(),
                     role,
@@ -2429,7 +2436,25 @@ impl Pane {
                     &self.state_dir,
                     &self.session_id,
                 ));
-                new_adapter.interactive_cmd(None, &extra)
+                if carries_handoff {
+                    // A return to a parked conversation: resume flags AND
+                    // the interim harness's own packet, which is the only
+                    // record of what happened while this conversation was
+                    // parked.
+                    let prompt_text = super::super::prompt::interactive_handoff_prompt(
+                        new_adapter.as_ref(),
+                        &[],
+                        &mut extra,
+                        &wrap::restart_prompt(handoff_note, &cfg.screen.thresholds()),
+                        &self.state_dir,
+                        &self.session_id,
+                    );
+                    new_adapter.interactive_cmd(Some(&prompt_text), &extra)
+                } else {
+                    // Issue #440's source recovery: the role layer only --
+                    // no handoff text, no positional prompt.
+                    new_adapter.interactive_cmd(None, &extra)
+                }
             } else {
                 let prompt_text = super::super::prompt::interactive_handoff_prompt(
                     new_adapter.as_ref(),
@@ -4746,6 +4771,110 @@ pub(crate) mod tests {
             "1",
             "a manual swap must carry the seat's current (unchanged) generation, not leave the \
              successor unfenced"
+        );
+
+        pane.finish_shutdown().expect("shutdown");
+    }
+
+    /// The other half of that rule: a RETURN to a harness that was parked
+    /// while a DIFFERENT harness held the seat resumes that parked
+    /// conversation AND carries the interim harness's handoff packet. The
+    /// conversation is continuous (never a cold restart), but it missed the
+    /// whole interim turn, so the packet is exactly what it lacks.
+    #[test]
+    fn a_return_to_a_parked_harness_resumes_it_and_carries_the_interim_handoff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+
+        // The pane is running the INTERIM harness; the seat is returning to
+        // claude, whose own conversation id is not this pane's session.
+        let session_id = "55555555-2222-4333-8444-555555555555";
+        let parked_conversation = "49195b07-217f-4401-8681-c857fcea294e";
+        let mut spec = test_spec(session_id);
+        spec.argv = long_lived_argv();
+        spec.agent_name = "codex".to_string();
+        spec.role = PromptRole::Orchestrator;
+        let mut pane = Pane::spawn(
+            spec,
+            &state,
+            &repo,
+            &repo,
+            (80, 24),
+            &[],
+            true,
+            DEFAULT_IDLE_QUIET,
+        )
+        .expect("spawn");
+
+        // Relative to the successor's own cwd (the repo), so no host path
+        // has to survive quoting inside the script.
+        let argv_log = repo.join("return-argv.log");
+        let script = tmp.path().join("log-argv.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > return-argv.log\nsleep 3\n",
+        )
+        .expect("write script");
+
+        let cfg = crate::commands::ctx::config::CtxConfig {
+            agent_bin: Some(format!("sh {}", script.display())),
+            ..Default::default()
+        };
+        let req = crate::commands::ctx::handover::HandoverRequest {
+            target_agent: "claude".to_string(),
+            target_model: None,
+            force: true,
+            requested_at: 0,
+            interactive: true,
+            automatic: true,
+            generation: None,
+            structural_only: false,
+            resume_session: Some(parked_conversation.to_string()),
+        };
+
+        pane.handover(
+            &cfg,
+            &req,
+            &crate::commands::ctx::handoff::Handoff::default(),
+            PromptRole::Orchestrator,
+            &repo,
+            (80, 24),
+        )
+        .expect("the parked harness returns");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !argv_log.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let logged = std::fs::read_to_string(&argv_log).unwrap_or_default();
+        let args: Vec<&str> = logged.lines().collect();
+
+        let at = args
+            .iter()
+            .position(|arg| *arg == "--resume")
+            .unwrap_or_else(|| panic!("the parked conversation must be resumed: {args:?}"));
+        assert_eq!(
+            args.get(at + 1).copied(),
+            Some(parked_conversation),
+            "the resume flag names the PARKED conversation, not this pane's session: {args:?}"
+        );
+        assert!(
+            args.iter().any(
+                |arg| *arg == "--append-system-prompt-file" || *arg == "--append-system-prompt"
+            ),
+            "the role layer must survive the return: {args:?}"
+        );
+        // Either delivery form, the same idiom the sibling test above uses
+        // for the role layer: the by-file pointer where the adapter's own
+        // probe verified that flag, the inline packet otherwise.
+        assert!(
+            args.iter().any(|arg| {
+                arg.contains(crate::commands::ctx::prompt::HANDOFF_BY_FILE_PROMPT)
+                    || arg.contains("Continue from the handoff below")
+            }),
+            "the interim harness's handoff must reach the resumed conversation: {args:?}"
         );
 
         pane.finish_shutdown().expect("shutdown");

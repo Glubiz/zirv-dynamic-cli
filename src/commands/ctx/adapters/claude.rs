@@ -2619,6 +2619,15 @@ impl AgentAdapter for ClaudeAdapter {
         vec!["--session-id".to_string(), session.to_string()]
     }
 
+    /// `claude --resume <session-id> "<query>"` is claude's own documented
+    /// shape ("Resume session by ID" with a query, CLI reference), which is
+    /// what lets a return to a parked conversation carry the interim
+    /// harness's handoff packet in the same launch instead of choosing
+    /// between continuity and context.
+    fn resume_accepts_prompt(&self) -> bool {
+        true
+    }
+
     /// Issue #462: claude keeps one JSONL file per conversation, named by
     /// the conversation id, and [`transcript_path`](Self::transcript_path)
     /// resolves exactly that file (computing it from the cwd slug, then

@@ -2107,6 +2107,26 @@ are the operator's final override. `orchestrator_rollover_headroom_pct`,
 tuning an already-enabled rollover's timing is an operator decision, the same
 as `handoff.model`.
 
+**The displaced harness is parked, not closed.** A rollover has to quit the
+source child — one seat, one live pane — but quitting a harness does not
+destroy its conversation. The seat records the harness it was rolled off,
+together with that harness's OWN conversation id (observed at a turn
+boundary, which is the only place zirv's session uuid and the harness's
+conversation id are both visible), and keeps it until the seat comes home.
+When that harness reads healthy again — its window reset, its endpoint
+recovered — the reclaim path returns the seat to it and **resumes that same
+conversation** rather than starting the operator over, with the interim
+harness's own distilled handoff packet delivered as the resumed
+conversation's first message: continuous conversation, plus a record of
+everything that happened while it was parked. The first displacement wins, so
+a seat that hops twice still wants its original harness back; an operator's
+own `zirv ctx handover` owes no return. A return is only taken on a harness
+that can resume *and* accept a prompt in the same launch (claude's
+`--resume <id> "<query>"`); anything else keeps the previous behaviour — a
+cold launch carrying the packet — because resuming a conversation without
+telling it what happened in its absence would silently drop the interim's
+work.
+
 **Cross-harness capacity, at a glance.** `zirv ctx status` (and `zirv ctx
 status --json` for machine-readable output) reports a pool section built on
 the same pure allocator: each harness's scheduling state (`ready` /

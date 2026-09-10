@@ -338,9 +338,13 @@ fn take_ack(state: &StateDir, short: &str) -> Option<HandoverAck> {
 /// flag. Shared by every live-swap seam (`wrap::perform_handover_swap`,
 /// `dash::pane::Pane::handover`) so the two can never drift on what a swap's
 /// fresh launch actually carries.
+/// `carries_handoff`: whether the caller will deliver the handoff packet as
+/// this launch's initial prompt. It decides whether a resume is even
+/// possible -- see [`resumes_conversation`].
 pub fn resolve_swap_launch(
     cfg: &CtxConfig,
     req: &HandoverRequest,
+    carries_handoff: bool,
 ) -> CtxResult<(Box<dyn adapters::AgentAdapter>, Vec<String>)> {
     let new_adapter = adapters::select(Some(&req.target_agent), &[], cfg)?;
     let mut extra = adapters::policy_launch_args(
@@ -357,15 +361,38 @@ pub fn resolve_swap_launch(
         extra.extend(new_adapter.model_args(model));
     }
     // Issue #440: a source recovery resumes the conversation it already had.
-    // `resume_args` is `None` for an adapter with no verified mechanism, so
-    // this silently degrades to the cold launch above rather than guessing a
-    // flag -- the same rule the dashboard's own restore roster follows.
+    // `resumes_conversation` is the single answer both this function and
+    // `Pane::handover` read, so the argv and the prompt decision can never
+    // disagree about whether this launch is a resume.
     if let Some(session) = &req.resume_session
+        && resumes_conversation(new_adapter.as_ref(), req, carries_handoff)
         && let Some(args) = new_adapter.resume_args(session)
     {
         extra.extend(args);
     }
     Ok((new_adapter, extra))
+}
+
+/// Whether this swap continues `req.resume_session`'s existing conversation
+/// rather than starting a fresh one.
+///
+/// Two conditions, both required: the adapter has a verified resume
+/// mechanism (`resume_args`), and -- when this launch must also deliver a
+/// handoff packet (`carries_handoff`, true for a RETURN to a harness that
+/// was parked while an interim harness worked) -- it can carry a prompt
+/// alongside those resume flags (`resume_accepts_prompt`). A harness that
+/// cannot do both takes the cold launch: resuming a conversation without
+/// telling it what happened in its absence would silently drop the interim's
+/// work, which is the one thing a return exists to preserve.
+pub fn resumes_conversation(
+    adapter: &dyn adapters::AgentAdapter,
+    req: &HandoverRequest,
+    carries_handoff: bool,
+) -> bool {
+    req.resume_session
+        .as_deref()
+        .is_some_and(|session| adapter.resume_args(session).is_some())
+        && (!carries_handoff || adapter.resume_accepts_prompt())
 }
 
 /// The environment a swap's fresh child needs to carry its identity
@@ -1066,6 +1093,44 @@ mod tests {
     /// `--permission-mode dontAsk` under `Headless`, so that flag's value
     /// is the observable signal here.
     #[test]
+    fn a_resume_that_must_carry_a_handoff_is_refused_for_a_harness_that_cannot_do_both() {
+        // copilot has a verified resume mechanism but no verified way to
+        // resume AND prompt in one launch, so a RETURN (which must deliver
+        // the interim harness's packet) falls back to the cold launch rather
+        // than silently resuming a conversation nobody told what happened.
+        let cfg = CtxConfig::default();
+        let req = HandoverRequest {
+            target_agent: "copilot".to_string(),
+            target_model: None,
+            force: false,
+            requested_at: 0,
+            interactive: true,
+            automatic: true,
+            generation: None,
+            structural_only: false,
+            resume_session: Some("conv-1".to_string()),
+        };
+        let (adapter, extra) = resolve_swap_launch(&cfg, &req, true).expect("resolves");
+        assert!(
+            !resumes_conversation(adapter.as_ref(), &req, true),
+            "a handoff-carrying resume needs both halves"
+        );
+        assert!(
+            !extra.iter().any(|arg| arg == "conv-1"),
+            "no resume flags may reach a cold launch: {extra:?}"
+        );
+
+        // The same request WITHOUT a packet to deliver (issue #440's
+        // same-harness recovery) resumes exactly as before.
+        let (adapter, extra) = resolve_swap_launch(&cfg, &req, false).expect("resolves");
+        assert!(resumes_conversation(adapter.as_ref(), &req, false));
+        assert!(
+            extra.iter().any(|arg| arg == "conv-1"),
+            "a resume with nothing to say still resumes: {extra:?}"
+        );
+    }
+
+    #[test]
     fn resolve_swap_launch_fails_closed_to_headless_for_a_non_interactive_request() {
         let cfg = CtxConfig::default();
         let req = HandoverRequest {
@@ -1079,7 +1144,7 @@ mod tests {
             structural_only: false,
             resume_session: None,
         };
-        let (_, extra) = resolve_swap_launch(&cfg, &req).expect("resolves");
+        let (_, extra) = resolve_swap_launch(&cfg, &req, true).expect("resolves");
         assert!(
             extra.contains(&"--permission-mode".to_string())
                 && extra.contains(&"dontAsk".to_string()),
@@ -1107,7 +1172,7 @@ mod tests {
             structural_only: true,
             resume_session: None,
         };
-        let (_, extra) = resolve_swap_launch(&cfg, &cold).expect("resolves");
+        let (_, extra) = resolve_swap_launch(&cfg, &cold, true).expect("resolves");
         assert!(
             !extra.contains(&"--resume".to_string()),
             "an ordinary swap has no conversation of its own to resume: {extra:?}"
@@ -1117,7 +1182,7 @@ mod tests {
             resume_session: Some(session.to_string()),
             ..cold
         };
-        let (_, extra) = resolve_swap_launch(&cfg, &resumed).expect("resolves");
+        let (_, extra) = resolve_swap_launch(&cfg, &resumed, true).expect("resolves");
         let at = extra
             .iter()
             .position(|arg| arg == "--resume")

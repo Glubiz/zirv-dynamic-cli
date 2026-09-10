@@ -495,10 +495,18 @@ pub fn evaluate(
     // headroom than the seat it would take back. Same idle boundary and
     // cooldown as the proactive path: a reclaim is a convenience, never an
     // emergency.
-    let reclaim = cfg
-        .fallback
-        .order
-        .first()
+    // The harness a return is FOR: the one this seat was actually rolled off
+    // (`Seat::displaced`, parked with its own conversation rather than
+    // closed), falling back to the operator's primary for a seat that was
+    // never displaced -- a seat that started on codex and never left it
+    // still reclaims claude once claude reads healthy.
+    let reclaim_target = current
+        .displaced
+        .as_ref()
+        .map(|displaced| displaced.agent.clone())
+        .or_else(|| cfg.fallback.order.first().cloned());
+    let reclaim = reclaim_target
+        .as_ref()
         .filter(|primary| !primary.eq_ignore_ascii_case(&current.agent))
         .and_then(|primary| snapshot.harness(primary))
         .filter(|harness| harness.state == HarnessState::Ready)
@@ -584,6 +592,7 @@ pub fn evaluate(
         } => {
             let reactive = matches!(cause, seat::Cause::Reactive { .. });
             let reclaimed = matches!(cause, seat::Cause::Reclaim { .. });
+            let resume_session = return_resume(&current, &agent);
             match seat::prepare(
                 state,
                 seat_short,
@@ -636,7 +645,14 @@ pub fn evaluate(
                             // one: the structural packet is what actually
                             // survives an exhausted provider.
                             structural_only: reactive,
-                            resume_session: None,
+                            // A return resumes the parked harness's OWN
+                            // conversation instead of starting it over; the
+                            // interim harness's handoff packet rides along
+                            // (`Pane::handover`), since that conversation
+                            // missed everything that happened while it was
+                            // parked. `None` for any other target, which has
+                            // no conversation of its own here.
+                            resume_session,
                         },
                         generation,
                         cause,
@@ -943,6 +959,20 @@ pub fn record_route(
     );
 }
 
+/// The conversation a swap onto `target` should resume: the parked harness's
+/// own, and only when `target` IS the harness this seat was displaced from
+/// (`seat::Displaced`). `None` for every other swap -- a harness this seat
+/// has never run has no conversation here to resume -- and for a
+/// displacement whose conversation was never observed, which degrades to the
+/// cold launch carrying the handoff packet that every rollover used to do.
+fn return_resume(current: &seat::Seat, target: &str) -> Option<String> {
+    current
+        .displaced
+        .as_ref()
+        .filter(|displaced| displaced.agent.eq_ignore_ascii_case(target))
+        .and_then(|displaced| displaced.conversation.clone())
+}
+
 /// Commits a prepared rollover once the successor has proven itself ready --
 /// the supervisors' half of [`Evaluation::Rollover`].
 ///
@@ -1184,6 +1214,7 @@ pub fn on_resume(
             ..base
         },
     );
+    let resume_session = return_resume(&current, &candidate.name);
     Some(HandoverRequest {
         target_agent: candidate.name,
         target_model: candidate.model,
@@ -1193,7 +1224,10 @@ pub fn on_resume(
         automatic: true,
         generation: Some(generation),
         structural_only: true,
-        resume_session: None,
+        // Same rule as `evaluate`'s own request: a park that ends by moving
+        // the seat back onto the harness it was displaced from resumes that
+        // harness's own conversation.
+        resume_session,
     })
 }
 
@@ -1983,6 +2017,69 @@ mod tests {
         };
         assert_eq!(request.target_agent, "claude");
         assert!(request.automatic);
+    }
+
+    /// The point of parking rather than closing the source: when the seat
+    /// returns to the harness it was displaced from, it RESUMES that
+    /// harness's own conversation, and (because `structural_only` is false
+    /// on this path) the interim harness's distilled handoff rides along --
+    /// the operator picks up the same conversation, told what happened while
+    /// it was parked.
+    #[test]
+    fn a_return_resumes_the_parked_harnesss_own_conversation() {
+        let (_dir, state) = temp_state();
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let cfg = cfg();
+        register_codex_seat(&state);
+        // The seat got here by being rolled off claude, whose conversation a
+        // turn boundary observed before it was parked.
+        let mut parked = seat::load(&state, SHORT).expect("seat");
+        parked.displaced = Some(seat::Displaced {
+            agent: "claude".to_string(),
+            model: None,
+            session: "6c967beb-0b72-46e9-9d3e-504a03f741b3".to_string(),
+            conversation: Some("49195b07-217f-4401-8681-c857fcea294e".to_string()),
+            since: NOW,
+        });
+        seat::store(&state, &parked).expect("store the displacement");
+        store_usage(&state, "anthropic", 5.0, NOW);
+        store_usage(&state, "openai", 40.0, NOW);
+
+        let Evaluation::Rollover { request, .. } = evaluate_now(&state, &cfg, true, None) else {
+            panic!("a recovered claude must take its own seat back");
+        };
+        assert_eq!(request.target_agent, "claude");
+        assert_eq!(
+            request.resume_session.as_deref(),
+            Some("49195b07-217f-4401-8681-c857fcea294e"),
+            "the return resumes the parked conversation, not a fresh one"
+        );
+        assert!(
+            !request.structural_only,
+            "a return spends a distiller call: the parked conversation missed the interim \
+             harness's whole turn"
+        );
+    }
+
+    /// A swap onto a harness this seat was never displaced from has no
+    /// conversation here to resume: the request stays a cold launch carrying
+    /// the handoff packet, exactly as before.
+    #[test]
+    fn an_ordinary_rollover_onto_a_new_harness_resumes_nothing() {
+        let (_dir, state) = temp_state();
+        let home = tempfile::tempdir().expect("home tempdir");
+        let _home = crate::commands::ctx::testenv::EnvGuard::set(home.path(), None);
+        let cfg = cfg();
+        register_seat(&state);
+        store_usage(&state, "anthropic", 85.0, NOW);
+        store_usage(&state, "openai", 5.0, NOW);
+
+        let Evaluation::Rollover { request, .. } = evaluate_now(&state, &cfg, true, None) else {
+            panic!("a source at the threshold must roll over");
+        };
+        assert_eq!(request.target_agent, "codex");
+        assert_eq!(request.resume_session, None);
     }
 
     /// A seat already sitting on the primary never "reclaims" it: the
