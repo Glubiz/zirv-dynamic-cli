@@ -724,9 +724,9 @@ pub(crate) enum CompactionScope {
     /// otherwise.
     Diff,
     /// Issue #414: a search/listing tool (`rg`/`grep`/`find`/`fd`/`ls`/`dir`/
-    /// `tree`) with `[output] compact_search` opted in -- reached only when
-    /// that operator-only key is set, since these seven stay `Verbatim`
-    /// otherwise. Compacted past `compact_generic_min_bytes`, the same
+    /// `tree`) reached whenever `[output] compact_search` is on, which it is
+    /// by default -- these seven stay `Verbatim` only once an operator turns
+    /// it off. Compacted past `compact_generic_min_bytes`, the same
     /// threshold `Generic` uses, into a grouped/capped rendering built from
     /// each program's own known grammar (`output_search`), never a head/tail
     /// guess.
@@ -898,12 +898,13 @@ fn classify_segment(segment: &str, extra: &[String], compact_search: bool) -> Se
 /// output passes `[output] diff_max_bytes`. `blame`/`grep` stay full
 /// `Verbatim`, since their output has no such bounded shape.
 ///
-/// `compact_search` (issue #414, `[output] compact_search`, default `false`)
-/// is a third, narrower carve-out: when an operator opts in, `rg`/`grep`/
-/// `find`/`fd`/`ls`/`dir`/`tree` -- ordinarily `VERBATIM_PROGRAMS` members --
-/// become `CompactionScope::Shape` instead, UNLESS the operator's own
-/// `extra_verbatim` (`[output] verbatim`) also names them: that explicit,
-/// per-program "never compact this" always wins over the blanket opt-in.
+/// `compact_search` (issue #414, `[output] compact_search`, default `true`)
+/// is a third, narrower carve-out, on by default: unless an operator turns
+/// it off, `rg`/`grep`/`find`/`fd`/`ls`/`dir`/`tree` -- ordinarily
+/// `VERBATIM_PROGRAMS` members -- become `CompactionScope::Shape` instead,
+/// UNLESS the operator's own `extra_verbatim` (`[output] verbatim`) also
+/// names them: that explicit, per-program "never compact this" always wins
+/// over the blanket default.
 ///
 /// Verbatim wins outright over Shape/Diff/Known across EVERY candidate
 /// segment `classify_segment` visits, not just the first one
@@ -1061,8 +1062,9 @@ fn reserve_log(dir: &Path, started_at: u64) -> (String, PathBuf) {
 
 /// Issue #417: the first `[[output.filter]]` rule (declaration order) whose
 /// `match_command` matches `command_line`, or `None` when no rule matches
-/// (including when `rules` is empty, the default -- zero rules ship).
-/// `CtxConfig::load` already validated every rule's `match_command` compiles
+/// (including when `rules` is empty -- `filter_defaults = false` with no
+/// operator rules declared). `CtxConfig::load` already validated every
+/// rule's `match_command` compiles
 /// and is fully anchored, but this recompiles it here rather than caching a
 /// compiled form: rules only ever run once per `Generic`-scope command that
 /// has already cleared `compact_generic_min_bytes`, so the cost is
@@ -1187,7 +1189,7 @@ fn apply_output_filter_stages(
 /// process-level never-worse fallback everywhere else in this module.
 /// Returns `None` (meaning: use the unfiltered text) when no rule matches
 /// OR the wrapped call panicked.
-fn apply_operator_output_filter(
+pub(crate) fn apply_operator_output_filter(
     rules: &[super::config::OutputFilterRule],
     command_line: &str,
     raw: &str,

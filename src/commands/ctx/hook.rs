@@ -6840,10 +6840,13 @@ mod tests {
     /// `diff_max_bytes` -- still reaches the model untouched, exercising
     /// that generous threshold rather than an unconditional exemption. See
     /// `posttool_compacts_a_diff_only_past_diff_max_bytes` for what happens
-    /// once a diff clears it.
+    /// once a diff clears it. `rg` needs `compact_search` explicitly turned
+    /// off here: it defaults `true`, under which `rg` is `Shape`-compacted
+    /// instead of left verbatim -- see
+    /// `posttool_compacts_rg_results_only_when_compact_search_is_enabled`.
     #[test]
     fn posttool_never_compacts_a_reader_command() {
-        let rig = posttool_rig(&[]);
+        let rig = posttool_rig(&[("ZIRV_CTX_OUTPUT_COMPACT_SEARCH", "false")]);
         let big: String = (1..=2000)
             .map(|i| format!("line {i} of the file\n"))
             .collect();
@@ -8980,10 +8983,11 @@ mod tests {
 
     // -- Issue #414: opt-in shape-aware search/listing compaction ----------
 
-    /// `[output] compact_search` end to end: off (the default), a large `rg`
-    /// result reaches the model untouched, same as any other reader; on
-    /// (via `ZIRV_CTX_OUTPUT_COMPACT_SEARCH`, the operator's own override),
-    /// the identical result is replaced with a grouped, bounded summary.
+    /// `[output] compact_search` end to end: off (via
+    /// `ZIRV_CTX_OUTPUT_COMPACT_SEARCH=false`, since the operator turned it
+    /// off), a large `rg` result reaches the model untouched, same as any
+    /// other reader; on (the default, no override needed), the identical
+    /// result is replaced with a grouped, bounded summary.
     #[test]
     fn posttool_compacts_rg_results_only_when_compact_search_is_enabled() {
         let mut big = String::new();
@@ -8997,7 +9001,7 @@ mod tests {
         }
         assert!(big.len() > 16384, "{}", big.len());
 
-        let off_rig = posttool_rig(&[]);
+        let off_rig = posttool_rig(&[("ZIRV_CTX_OUTPUT_COMPACT_SEARCH", "false")]);
         let out = run_post(
             &off_rig,
             &posttool_stdin(
@@ -9017,7 +9021,7 @@ mod tests {
             "compact_search off must leave rg untouched: {out}"
         );
 
-        let on_rig = posttool_rig(&[("ZIRV_CTX_OUTPUT_COMPACT_SEARCH", "true")]);
+        let on_rig = posttool_rig(&[]);
         let out = run_post(
             &on_rig,
             &posttool_stdin(
@@ -9034,7 +9038,7 @@ mod tests {
         );
         assert!(
             !out.is_empty(),
-            "compact_search on must compact the same rg result"
+            "compact_search on (the default) must compact the same rg result"
         );
         let parsed: serde_json::Value = serde_json::from_str(out.trim()).expect("json");
         let summary = parsed["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
