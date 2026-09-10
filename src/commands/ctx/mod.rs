@@ -76,6 +76,7 @@ pub mod screen;
 pub mod search;
 pub mod search_index;
 pub mod seat;
+pub mod session_spend;
 pub mod sessions;
 pub mod signal;
 pub mod snapshot;
@@ -432,7 +433,10 @@ pub enum CtxVerb {
     Resume(resume::ResumeArgs),
     /// Agent hook entrypoints.
     Hook(hook::HookArgs),
-    /// Show supervised sessions, scores and handoffs.
+    /// Show supervised sessions, scores and handoffs. The `spend:` line's
+    /// "this session"/"this 5h window" figures include this session's own
+    /// seat transcript, its native subagent transcripts, and every `zirv
+    /// agent` delegation row -- never delegations alone (issue #457).
     Status(status::StatusArgs),
     /// Explain one session's composed attention projection: what it is,
     /// why, which authority decided, and every fallback that was suppressed

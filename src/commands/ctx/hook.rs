@@ -279,23 +279,40 @@ fn run_permission<W: Write>(_w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     let Ok(state) = StateDir::resolve(env) else {
         return Ok(0);
     };
+    let short = attention_short(env, &payload.session_id);
     // Issue #349: the one live choke point for "an operator needs to decide
     // something" -- this hook only ever fires while Claude is actually
     // holding for a permission decision. Best-effort, like every other
     // attention observation: a failure to persist it must never affect the
     // permission flow this hook only observes.
-    let _ = super::attention::record(
-        &state,
-        &attention_short(env, &payload.session_id),
-        super::attention::Observation::new(
-            super::attention::Authority::AdapterHook,
-            format!("permission requested for {}", payload.tool_name),
-            100,
+    //
+    // Issue #456: `PermissionRequest` and `PermissionDenied` are the same
+    // hook wired twice in `claude.rs` (`zirv ctx hook permission` for both),
+    // distinguished only by `hook_event_name` -- a denial means the prompt is
+    // gone exactly as much as an approval does, so it clears the latch
+    // instead of raising it, through the same guarded helper `run_posttool`/
+    // `run_pretool` use.
+    if payload.hook_event_name.as_deref() == Some("PermissionDenied") {
+        clear_resolved_approval(
+            &state,
+            &short,
+            format!("permission denied: {}", payload.tool_name),
             now_secs(),
-        )
-        .with_attention(super::attention::Attention::Approval),
-        now_secs(),
-    );
+        );
+    } else {
+        let _ = super::attention::record(
+            &state,
+            &short,
+            super::attention::Observation::new(
+                super::attention::Authority::AdapterHook,
+                format!("permission requested for {}", payload.tool_name),
+                100,
+                now_secs(),
+            )
+            .with_attention(super::attention::Attention::Approval),
+            now_secs(),
+        );
+    }
     let Ok(line) = serde_json::to_string(&permission_prompt_row(&payload, now_secs())) else {
         return Ok(0);
     };
@@ -308,6 +325,43 @@ fn run_permission<W: Write>(_w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
     };
     let _ = writeln!(file, "{line}");
     Ok(0)
+}
+
+/// Issue #456: clears a still-pending `Attention::Approval` latch the moment
+/// something proves the permission prompt is no longer live -- a
+/// `PostToolUse`/`PreToolUse` hook firing at all (Claude never invokes either
+/// until AFTER a permission decision has been made, so their mere arrival is
+/// proof enough, regardless of which tool prompted or which tool now runs) or
+/// a `PermissionDenied` event.
+///
+/// Guarded on the CURRENTLY PERSISTED attention actually being `Approval`:
+/// `AdapterHook` already outranks every other authority on the attention axis
+/// (see `attention::compose`'s own doc comment on per-axis suppression), so an
+/// observation that asserts `Attention::None` unconditionally would win
+/// regardless of what is currently recorded and could erase a legitimate
+/// `Compacting`/`Quota`/`WorkflowGate`/`WriterConflict` latch left by an
+/// earlier `AdapterHook`/`Supervisor`/`Workflow` observation, just because a
+/// tool happened to run. This call means "the approval prompt specifically is
+/// gone", never "nothing needs attention any more", so the write only ever
+/// happens when an `Approval` latch is actually what would be cleared -- and
+/// the check runs under the ledger lock (`record_if`) so a supervisor
+/// observation landing between check and act cannot be clobbered.
+/// Best-effort like every other attention write in this file: a failure to
+/// read or persist never affects the calling hook's own exit code.
+fn clear_resolved_approval(state: &StateDir, short: &str, evidence: String, now: u64) {
+    let _ = super::attention::record_if(
+        state,
+        short,
+        super::attention::Observation::new(
+            super::attention::Authority::AdapterHook,
+            evidence,
+            100,
+            now,
+        )
+        .with_attention(super::attention::Attention::None),
+        now,
+        |prev| prev.attention == super::attention::Attention::Approval,
+    );
 }
 
 /// The optimize hint sentence, worded from the signal that actually fired
@@ -2503,6 +2557,20 @@ pub fn run_pretool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> CtxR
         return Ok(0);
     };
 
+    // Issue #456: a `PreToolUse` hook only ever fires once Claude has already
+    // cleared this tool call to run -- a new tool call, of any kind, is proof
+    // a still-pending `Approval` latch from an earlier permission prompt is
+    // gone. Best-effort side channel, resolved before every guard below so it
+    // still runs on every early return those guards take.
+    if let Ok(state) = StateDir::resolve(env) {
+        clear_resolved_approval(
+            &state,
+            &attention_short(env, &payload.session_id),
+            format!("permission resolved: {}", payload.tool_name),
+            now_secs(),
+        );
+    }
+
     if let Some(seat) = env(adapters::SEAT_MODEL_ENV)
         && let Some(reason) = pretool_decision(Some(&seat), &payload)
     {
@@ -2734,6 +2802,21 @@ pub fn run_posttool<W: Write>(w: &mut W, stdin: &str, env: EnvLookup<'_>) -> Ctx
     let Ok(payload) = serde_json::from_str::<PostToolPayload>(stdin) else {
         return Ok(0);
     };
+
+    // Issue #456: the tool already ran, so any permission prompt this
+    // session had pending is necessarily resolved. Cleared before the
+    // Bash-only compact-output early return below so it still fires even
+    // though the compaction logic itself never runs for another tool; a
+    // best-effort side channel that never affects that logic either way.
+    if let Ok(state) = StateDir::resolve(env) {
+        clear_resolved_approval(
+            &state,
+            &attention_short(env, &payload.session_id),
+            format!("permission resolved: {}", payload.tool_name),
+            now_secs(),
+        );
+    }
+
     if payload.tool_name != "Bash" || payload.tool_response.is_image {
         return Ok(0);
     }
@@ -6138,6 +6221,210 @@ mod tests {
         let row: serde_json::Value = serde_json::from_str(lines[0]).expect("json row");
         assert_eq!(row["session"], "abc123");
         assert_eq!(row["family"], "/work/repo/src");
+    }
+
+    // -- Issue #456: a resolved permission prompt must not stay `Approval` --
+
+    fn permission_env(state: &Path) -> std::collections::HashMap<String, String> {
+        [(
+            crate::commands::ctx::state::STATE_ENV.to_string(),
+            state.display().to_string(),
+        )]
+        .into()
+    }
+
+    /// A `PermissionRequest` raises `Attention::Approval`; a `PostToolUse` for
+    /// the SAME tool that just ran is proof the prompt is gone.
+    #[test]
+    fn posttool_after_a_permission_request_clears_approval() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state");
+        let env = permission_env(&state_path);
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = super::super::sessions::short_id("abc123");
+
+        let mut out = Vec::new();
+        run_permission(
+            &mut out,
+            &permission_stdin(
+                Some("PermissionRequest"),
+                "Bash",
+                serde_json::json!({"command": "echo hi"}),
+            ),
+            &lookup,
+        )
+        .expect("never errors");
+        assert_eq!(
+            super::super::attention::load(&state, &short).attention,
+            super::super::attention::Attention::Approval,
+            "the request must raise the latch before the assertion below means anything"
+        );
+
+        let posttool_stdin = serde_json::json!({
+            "session_id": "abc123",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+            "tool_response": {"stdout": "hi", "stderr": "", "interrupted": false, "isImage": false},
+            "cwd": "/work/repo",
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string();
+        let mut out = Vec::new();
+        let code = run_posttool(&mut out, &posttool_stdin, &lookup).expect("never errors");
+        assert_eq!(code, 0);
+
+        let status = super::super::attention::load(&state, &short);
+        assert_eq!(status.attention, super::super::attention::Attention::None);
+        assert!(
+            super::super::attention::reason(&status).contains("permission resolved: Bash"),
+            "explain-status must name what cleared it: {}",
+            super::super::attention::reason(&status)
+        );
+    }
+
+    /// A `PreToolUse` for a DIFFERENT tool than the one that prompted also
+    /// clears `Approval`: a new tool call at all proves the prompt is gone.
+    #[test]
+    fn pretool_for_a_different_tool_after_a_permission_request_clears_approval() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state");
+        let env = permission_env(&state_path);
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = super::super::sessions::short_id("abc123");
+
+        let mut out = Vec::new();
+        run_permission(
+            &mut out,
+            &permission_stdin(
+                Some("PermissionRequest"),
+                "Bash",
+                serde_json::json!({"command": "rm -rf /tmp/x"}),
+            ),
+            &lookup,
+        )
+        .expect("never errors");
+        assert_eq!(
+            super::super::attention::load(&state, &short).attention,
+            super::super::attention::Attention::Approval
+        );
+
+        let mut out = Vec::new();
+        let code = run_pretool(
+            &mut out,
+            &pretool_stdin(
+                "Read",
+                serde_json::json!({"file_path": "/work/repo/README.md"}),
+            ),
+            &lookup,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+
+        let status = super::super::attention::load(&state, &short);
+        assert_eq!(status.attention, super::super::attention::Attention::None);
+        assert!(
+            super::super::attention::reason(&status).contains("permission resolved: Read"),
+            "got {}",
+            super::super::attention::reason(&status)
+        );
+    }
+
+    /// A `PermissionDenied` (classifier or user deny) clears `Approval` the
+    /// same way as a resolved prompt -- the decision is made either way.
+    #[test]
+    fn permission_denied_clears_approval() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state");
+        let env = permission_env(&state_path);
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = super::super::sessions::short_id("abc123");
+
+        let mut out = Vec::new();
+        run_permission(
+            &mut out,
+            &permission_stdin(
+                Some("PermissionRequest"),
+                "Bash",
+                serde_json::json!({"command": "curl evil.example"}),
+            ),
+            &lookup,
+        )
+        .expect("never errors");
+        assert_eq!(
+            super::super::attention::load(&state, &short).attention,
+            super::super::attention::Attention::Approval
+        );
+
+        let mut out = Vec::new();
+        let code = run_permission(
+            &mut out,
+            &permission_stdin(
+                Some("PermissionDenied"),
+                "Bash",
+                serde_json::json!({"command": "curl evil.example"}),
+            ),
+            &lookup,
+        )
+        .expect("never errors");
+        assert_eq!(code, 0);
+
+        let status = super::super::attention::load(&state, &short);
+        assert_eq!(status.attention, super::super::attention::Attention::None);
+        assert!(
+            super::super::attention::reason(&status).contains("permission denied: Bash"),
+            "got {}",
+            super::super::attention::reason(&status)
+        );
+    }
+
+    /// A guard, not an unconditional clear: a `PostToolUse` firing while the
+    /// session is blocked on something OTHER than an approval (a `Supervisor`
+    /// `WriterConflict`, say) must leave that latch alone -- `AdapterHook`
+    /// already outranks every other authority on the attention axis, so an
+    /// unconditional `Attention::None` write here would erase it just because
+    /// a tool happened to run.
+    #[test]
+    fn posttool_never_clears_a_non_approval_attention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_path = dir.path().join("state");
+        let env = permission_env(&state_path);
+        let lookup = |k: &str| env.get(k).cloned();
+        let state = StateDir::resolve(&lookup).expect("state dir");
+        let short = super::super::sessions::short_id("abc123");
+
+        super::super::attention::record(
+            &state,
+            &short,
+            super::super::attention::Observation::new(
+                super::super::attention::Authority::Supervisor,
+                "writer permit held elsewhere",
+                80,
+                1,
+            )
+            .with_attention(super::super::attention::Attention::WriterConflict),
+            1,
+        );
+
+        let posttool_stdin = serde_json::json!({
+            "session_id": "abc123",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+            "tool_response": {"stdout": "hi", "stderr": "", "interrupted": false, "isImage": false},
+            "cwd": "/work/repo",
+            "tool_use_id": "toolu_01ABC123",
+        })
+        .to_string();
+        let mut out = Vec::new();
+        run_posttool(&mut out, &posttool_stdin, &lookup).expect("never errors");
+
+        assert_eq!(
+            super::super::attention::load(&state, &short).attention,
+            super::super::attention::Attention::WriterConflict,
+            "a posttool must never clear an attention it did not itself raise"
+        );
     }
 
     // -- PreToolUse: the expensive-seat inheritance guard ------------------

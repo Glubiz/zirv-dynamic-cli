@@ -728,8 +728,12 @@ pub fn sidechain_transcript_usage(jsonl: &str) -> Option<TranscriptUsage> {
 /// bytes it will read. Bounds a directory that accumulates one file per
 /// dispatch for the life of a session; a phase that overruns either bound
 /// reports what it read rather than stalling the caller.
-const MAX_SUBAGENT_TRANSCRIPTS: usize = 256;
-const MAX_SUBAGENT_BYTES: u64 = 32 * 1024 * 1024;
+/// `pub(crate)`: `session_spend::session_transcript_usage` (issue #457)
+/// applies the identical newest-first cap to the same `subagents/`
+/// directory when folding a session's own total spend, and reuses these
+/// exact bounds rather than picking its own.
+pub(crate) const MAX_SUBAGENT_TRANSCRIPTS: usize = 256;
+pub(crate) const MAX_SUBAGENT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The modern home of subagent spend (2026-09-06). Current Claude Code writes
 /// NO `isSidechain` rows into the main transcript at all -- 0 of 15,510 rows
@@ -806,7 +810,11 @@ pub fn subagent_transcript_usage(transcript: &Path, main_range: &str) -> Option<
 /// `<transcript-dir>/<session-id>/subagents`, derived from the main
 /// transcript's own path rather than recomputed from a `SessionRef`, so the
 /// scan-fallback path `transcript_path` may have resolved is honoured.
-fn subagents_dir(transcript: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)`: `session_spend::session_transcript_usage` (issue #457)
+/// reuses this exact derivation rather than recomputing it, so the two can
+/// never disagree about where a session's native-subagent transcripts live.
+pub(crate) fn subagents_dir(transcript: &Path) -> Option<PathBuf> {
     let stem = transcript.file_stem()?;
     Some(transcript.parent()?.join(stem).join("subagents"))
 }

@@ -2019,23 +2019,6 @@ where
     produced
 }
 
-/// The delegation ledger's `(len, mtime_secs)`, or `(0, 0)` when there is no
-/// ledger yet. A1-4: one `stat` standing in for a full read-and-re-price of
-/// every row the ledger holds -- see [`FactsCache::spend_key`].
-fn delegation_ledger_fingerprint(state: &StateDir) -> (u64, u64) {
-    let path = state.logs().join(super::log::DELEGATION_FILE);
-    let Ok(meta) = std::fs::metadata(&path) else {
-        return (0, 0);
-    };
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    (meta.len(), mtime)
-}
-
 /// The disk-backed part of the header's facts: everything `FactsCache::
 /// refresh_if_due` re-reads on the throttle. Kept separate from
 /// `ui::HeaderFacts` itself because the harness/error line and the live
@@ -2132,11 +2115,20 @@ struct DiskFacts {
     attention: HashMap<String, super::attention::SessionStatus>,
 }
 
-/// Issue #264: [`DiskFacts::spend`]'s own shape.
+/// Issue #264: [`DiskFacts::spend`]'s own shape. Issue #457: `cost_micros`
+/// now folds in the seat's own transcript and its native subagent
+/// transcripts too, not only `delegations.jsonl` -- see
+/// `session_spend::fold_session_spend`, the one function this and
+/// `status::spend_status_line` both call.
 #[derive(Debug, Clone, Copy)]
 struct AggregateSpendFacts {
     failed: u64,
     cost_micros: u64,
+    /// Issue #457: how many deduplicated assistant messages/delegation rows
+    /// contributed nothing to `cost_micros` because their model priced as
+    /// unknown -- surfaced on the dashboard inspector (`^A i`) so "$0.00"
+    /// never looks indistinguishable from "nothing happened".
+    skipped_messages: u64,
 }
 
 /// Who the dashboard is, for the reads that are scoped to it: the repo it
@@ -2419,12 +2411,14 @@ struct FactsCache {
     disk: DiskFacts,
     registry: Vec<(sessions::Record, sessions::Liveness)>,
     last_refresh: Instant,
-    /// A1-4: the delegation ledger's `(len, mtime_secs)` as of the last time
-    /// `disk.spend` was actually folded. `None` until the first fold. The
-    /// ledger is append-only and grows on every row, so an unchanged
-    /// fingerprint means an unchanged file -- and re-reading and re-pricing
-    /// every row once a second, forever, buys nothing.
-    spend_key: Option<(u64, u64)>,
+    /// A1-4/#457: every file `disk.spend` was last folded from -- the
+    /// delegation ledger, the seat's own transcript, and its subagent
+    /// directory (`session_spend::SpendFingerprint`) -- as of the last fold.
+    /// `None` until the first fold. Every one of those files only ever
+    /// grows or is appended to for a live session, so an unchanged
+    /// fingerprint means unchanged content -- and re-reading and re-pricing
+    /// megabytes of transcript once a second, forever, buys nothing.
+    spend_key: Option<super::session_spend::SpendFingerprint>,
 }
 
 impl FactsCache {
@@ -2441,59 +2435,53 @@ impl FactsCache {
         }
     }
 
-    /// A1-4: folds the delegation ledger into `disk.spend`, but only when the
-    /// ledger's own fingerprint moved since the last fold. `read_rows` is
-    /// injected so the skip is testable without a ledger on disk.
+    /// A1-4/#457: folds `disk.spend` from THIS session's own delegation rows
+    /// AND its own transcript sources (seat + native subagents), but only
+    /// when the combined fingerprint moved since the last fold. `read` is
+    /// injected so the skip is testable without any of those on disk, and so
+    /// this stays the one place both inputs are actually read -- pricing
+    /// itself happens in `session_spend::fold_session_spend`, the identical
+    /// function `status::spend_status_line` calls, so the footer and `zirv
+    /// ctx status` can no longer disagree about what "this session" means.
     fn refresh_spend_with<F>(
         &mut self,
-        fingerprint: (u64, u64),
+        fingerprint: super::session_spend::SpendFingerprint,
         cfg: &CtxConfig,
         session_short: &str,
-        read_rows: F,
+        read: F,
     ) where
-        F: FnOnce() -> Vec<super::log::DelegationRow>,
+        F: FnOnce() -> (
+            Vec<super::log::DelegationRow>,
+            super::session_spend::TranscriptFold,
+        ),
     {
         if self.spend_key == Some(fingerprint) {
             return;
         }
         self.spend_key = Some(fingerprint);
+        let (delegation_rows, transcript) = read();
+        let table = super::price::resolve_table(cfg);
         // 2026-09-06: the footer renders this as "$<cost> this session", so
-        // it is filtered by the same predicate `status::spend_status_line`
-        // uses for its own "this session" figure -- `parent_session`, the
-        // session that DELEGATED the row. Unfiltered, the footer summed the
-        // whole machine-wide ledger and disagreed with `zirv ctx status` on
-        // the same dashboard.
-        let delegation_rows: Vec<_> = read_rows()
-            .into_iter()
-            .filter(|row| row.parent_session == session_short)
-            .collect();
-        self.disk.spend = if delegation_rows.is_empty() {
-            None
-        } else {
-            let table = super::price::resolve_table(cfg);
-            let failed = delegation_rows
-                .iter()
-                .filter(|row| row.outcome != "ok")
-                .count() as u64;
-            let mut cost_micros: u64 = 0;
-            for row in &delegation_rows {
-                if let Some(model) = row.model.as_deref() {
-                    let usage = super::event::TranscriptUsage {
-                        input_tokens: row.input_tokens,
-                        cache_creation_input_tokens: row.cache_creation_input_tokens,
-                        cache_read_input_tokens: row.cache_read_input_tokens,
-                        output_tokens: row.output_tokens,
-                    };
-                    if let Some(cost) = super::price::price(model, &usage, &table) {
-                        cost_micros = cost_micros.saturating_add(cost);
-                    }
-                }
-            }
-            Some(AggregateSpendFacts {
-                failed,
-                cost_micros,
-            })
-        };
+        // delegation rows are filtered by the same predicate `status::
+        // spend_status_line` uses for its own "this session" figure --
+        // `parent_session`, the session that DELEGATED the row. Unfiltered,
+        // the footer summed the whole machine-wide ledger and disagreed with
+        // `zirv ctx status` on the same dashboard.
+        let spend = super::session_spend::fold_session_spend(
+            &delegation_rows,
+            Some(session_short),
+            None,
+            &transcript,
+            &table,
+        );
+        // Issue #457 item 3: `--` only when NEITHER source exists at all --
+        // `spend.cost_micros` is already `None` in exactly that case (see
+        // `fold_session_spend`'s own doc comment), never re-hidden here.
+        self.disk.spend = spend.cost_micros.map(|cost_micros| AggregateSpendFacts {
+            failed: spend.delegation_failed,
+            cost_micros,
+            skipped_messages: spend.skipped_messages,
+        });
     }
 
     /// Pure: swaps in whatever the background [`FactsRefresher`] last
@@ -2634,18 +2622,25 @@ impl FactsCache {
         self.disk.pool_seat =
             seat::load(state, session_short).map(|s| format!("gen {}", s.generation));
 
-        // Issue #264: the aggregate row's own `failed`/`cost` cells. A plain
-        // file read, same as `usage` right above -- never a scan, a poll, or
-        // a network call. `None` when the ledger has no rows at all, so the
-        // aggregate row renders `--` rather than a phantom `0`/`$0.00`.
-        // A1-4: a `stat`, not a full read-and-re-price of every delegation
-        // row, on the overwhelmingly common tick where the append-only
-        // ledger has not moved since the last one.
+        // Issue #264/#457: the aggregate row's own `failed`/`cost` cells --
+        // delegations, the seat's own transcript, and its native subagent
+        // transcripts, folded through the one shared function `status::
+        // spend_status_line` also calls. `None` when NONE of those sources
+        // exist at all, so the aggregate row renders `--` rather than a
+        // phantom `0`/`$0.00`. A1-4: a handful of `stat` calls, not a full
+        // read-and-re-price of every source, on the overwhelmingly common
+        // tick where nothing has moved since the last one.
+        let transcript = super::session_spend::resolve_transcript(state, session_short);
         self.refresh_spend_with(
-            delegation_ledger_fingerprint(state),
+            super::session_spend::fingerprint(state, transcript.as_deref()),
             cfg,
             session_short,
-            || super::log::read_delegations(state, usize::MAX),
+            || {
+                let delegation_rows = super::log::read_delegations(state, usize::MAX);
+                let transcript_fold =
+                    super::session_spend::session_transcript_usage(transcript.as_deref(), None);
+                (delegation_rows, transcript_fold)
+            },
         );
 
         // Rebuilt rather than updated in place: a reaped pane or a released
@@ -8496,6 +8491,21 @@ fn build_dashboard_inspector(facts: &DashboardFacts<'_>) -> ui::InspectorView {
                 .map(|s| super::price::format_usd(s.cost_micros, false)),
         ),
     ];
+    // Issue #457: surfaced only when non-zero -- a session where every
+    // message priced cleanly shows no extra line at all, matching the
+    // "quiet unless there is something to flag" convention every other
+    // inspector section here already follows.
+    if let Some(spend) = facts.spend
+        && spend.skipped_messages > 0
+    {
+        spend_lines.push(inspect_line(
+            "unpriced",
+            Some(format!(
+                "{} message(s)/row(s) skipped (no known price)",
+                spend.skipped_messages
+            )),
+        ));
+    }
     for strip in facts.pool {
         spend_lines.push(inspect_line(
             &strip.name,
@@ -17987,29 +17997,40 @@ mod tests {
         let _ = pane.finish_shutdown();
     }
 
-    /// A1-4: the delegation ledger is append-only, so an unchanged
-    /// `(len, mtime)` means unchanged rows. Re-reading the whole file and
-    /// re-pricing every row once a second, forever, bought nothing.
+    /// A1-4/#457: every spend source is append-only (or entirely rewritten
+    /// wholesale, for a transcript), so an unchanged fingerprint means
+    /// unchanged content. Re-reading and re-pricing every source once a
+    /// second, forever, bought nothing.
     #[test]
     fn the_delegation_ledger_is_re_priced_only_when_it_actually_changed() {
+        use super::super::session_spend::SpendFingerprint;
+
         let cfg = CtxConfig::default();
         let mut cache = FactsCache::new(Instant::now());
         let mut reads = 0usize;
+        let unchanged = SpendFingerprint {
+            delegations: (128, 42),
+            ..Default::default()
+        };
+        let grown = SpendFingerprint {
+            delegations: (256, 43),
+            ..Default::default()
+        };
 
         for _ in 0..5 {
-            cache.refresh_spend_with((128, 42), &cfg, "orch0001", || {
+            cache.refresh_spend_with(unchanged, &cfg, "orch0001", || {
                 reads += 1;
-                Vec::new()
+                (Vec::new(), Default::default())
             });
         }
         assert_eq!(
             reads, 1,
-            "an unchanged ledger is folded once, not once per throttled tick"
+            "an unchanged fingerprint is folded once, not once per throttled tick"
         );
 
-        cache.refresh_spend_with((256, 43), &cfg, "orch0001", || {
+        cache.refresh_spend_with(grown, &cfg, "orch0001", || {
             reads += 1;
-            Vec::new()
+            (Vec::new(), Default::default())
         });
         assert_eq!(reads, 2, "a grown ledger is re-read and re-priced");
     }
@@ -18041,9 +18062,17 @@ mod tests {
             .expect("row")
         };
 
-        cache.refresh_spend_with((1, 1), &cfg, "orch0001", || {
-            vec![row("orch0001", "ok"), row("other999", "failed")]
-        });
+        cache.refresh_spend_with(
+            super::super::session_spend::SpendFingerprint::default(),
+            &cfg,
+            "orch0001",
+            || {
+                (
+                    vec![row("orch0001", "ok"), row("other999", "failed")],
+                    Default::default(),
+                )
+            },
+        );
 
         let spend = cache.disk.spend.expect("the owner's own row is not empty");
         assert_eq!(
@@ -23758,6 +23787,7 @@ mod tests {
             spend: Some(AggregateSpendFacts {
                 failed: 2,
                 cost_micros: 420_000,
+                skipped_messages: 0,
             }),
             usage: &usage,
             pool: &pool,
