@@ -4429,12 +4429,18 @@ impl CtxConfig {
         )?;
 
         // Read on its own first: the repo layer is the one layer that comes
-        // from a checkout rather than from the operator.
+        // from a checkout rather than from the operator. If `repo` IS the
+        // operator's own home directory (`zirv`/`zirv chat` run from `~`),
+        // there is no repository layer at all -- without this check,
+        // `~/.zirv/ctx.toml` would be read a second time as the repo layer
+        // and hard-error on `agent`, a key only the operator layer may set.
         let repo_path = repo
             .join(crate::utils::SCRIPT_DIR_NAME)
             .join(CTX_CONFIG_FILE);
         let mut repo_layer = toml::Table::new();
-        if let Some(bad) = read_layer(&repo_path, &mut repo_layer, false)? {
+        if !crate::utils::repo_is_home(repo)
+            && let Some(bad) = read_layer(&repo_path, &mut repo_layer, false)?
+        {
             unparsable_layers.push(bad);
         }
         // Before the lift, so a future `policy.*` entry in `REPO_FORBIDDEN`
@@ -6578,6 +6584,43 @@ mod tests {
         assert!(
             !is_repo_forbidden(typo_err.as_ref()),
             "a schema error is not a REPO_FORBIDDEN rejection: {typo_err}"
+        );
+    }
+
+    /// `repo == home_dir()` (`zirv`/`zirv chat` run from `~`) must not
+    /// re-read `~/.zirv/ctx.toml` as a repo layer and hard-error on `agent`.
+    #[test]
+    fn repo_equal_to_home_has_no_repository_layer_and_still_honors_agent() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "agent = \"claude\"\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(home.path(), &|k| empty.get(k).cloned())
+            .expect("repo == home_dir() must not hard-error as REPO_FORBIDDEN");
+        assert_eq!(cfg.agent.as_deref(), Some("claude"));
+    }
+
+    /// Regression guard: a real repository distinct from home is still
+    /// REPO_FORBIDDEN for `agent`, even when home sets the same key.
+    #[test]
+    fn a_real_repository_distinct_from_home_still_hard_errors_on_agent() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".zirv")).expect("mkdir");
+        std::fs::write(home.path().join(".zirv/ctx.toml"), "agent = \"claude\"\n").expect("write");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(repo.path().join(".zirv/ctx.toml"), "agent = \"claude\"\n").expect("write");
+
+        let empty = env_map(&[]);
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a real repository must still be REPO_FORBIDDEN for agent");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "expected REPO_FORBIDDEN: {err}"
         );
     }
 

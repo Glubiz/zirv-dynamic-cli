@@ -1439,7 +1439,10 @@ only from the token ceiling.
 ### Configuration
 
 Layered, lowest priority first: `~/.zirv/ctx.toml`, then `<repo>/.zirv/ctx.toml`,
-then `ZIRV_CTX_*` environment variables, then flags.
+then `ZIRV_CTX_*` environment variables, then flags. A `.zirv/` directory that
+is the operator's own (running `zirv`/`zirv chat` from the home directory
+itself) is never also read as the repository layer for `ctx.toml` or for the
+`system-prompt.md` prompt layer.
 
 ```toml
 # .zirv/ctx.toml
