@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::adapters::{self, AGENT_ENV, DefaultOrigin};
 use super::chain;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
-use super::event::{TranscriptUsage, input_hash};
+use super::event::input_hash;
 use super::group;
 use super::handoff::latest_for_repo;
 use super::hook_integrity;
@@ -17,6 +17,7 @@ use super::permit;
 use super::pool;
 use super::price;
 use super::search;
+use super::session_spend;
 use super::sessions::{self, Liveness};
 use super::state::{StateDir, now_secs, repo_slug};
 use super::task;
@@ -948,17 +949,30 @@ pub struct StatusArgs {
     pub full: bool,
 }
 
-/// Issue #264: the `spend:` line's own computation, factored out so a test
-/// can drive it directly against a fixture ledger without rendering the
-/// whole report. Sums `zirv ctx spend`'s identical per-row `price::price`
-/// call over two slices of the same `delegations.jsonl` ledger: every row
-/// this session's own short id delegated ("this session"), and every row
-/// completed in the trailing 5 hours regardless of who delegated it ("this
-/// 5h window") -- a time-boxed slice of the ledger itself, never the
-/// vendor's own rate-limit window (`pace::current_windows` tracks that
-/// separately, in tokens, not dollars). A row whose model has no price
-/// (`price::price` returning `None`) contributes nothing to either sum,
-/// mirroring `spend::SpendRow`'s own "never a phantom zero" rule.
+/// Issue #264/#457: the `spend:` line's own computation, factored out so a
+/// test can drive it directly without rendering the whole report. Both
+/// figures are folded through `session_spend::fold_session_spend` -- the
+/// identical function the dashboard footer calls
+/// (`dash::FactsCache::refresh_spend_with`) -- so the two surfaces can no
+/// longer disagree about what "this session" means:
+///
+/// - "this session": this session's own seat transcript, its native
+///   subagent transcripts, and every `zirv agent` delegation row it
+///   spawned -- unbounded in time.
+/// - "this 5h window": every delegation row completed in the trailing 5
+///   hours machine-wide, regardless of who delegated it (unchanged from
+///   before #457 -- a time-boxed slice of the LEDGER, never the vendor's own
+///   rate-limit window, which `pace::current_windows` tracks separately in
+///   tokens, not dollars), UNIONED with this session's own transcript
+///   sources filtered to the same trailing 5 hours. A machine-wide
+///   transcript scan is deliberately not attempted for the window figure --
+///   see `session_spend`'s own module doc comment for the cost reasoning.
+///
+/// A message/row whose model has no price (`price::price` returning `None`,
+/// `<synthetic>` included) contributes nothing to either sum -- mirroring
+/// `spend::SpendRow`'s own "never a phantom zero" rule -- but is counted in
+/// the trailing "N skipped" note so a `$0.00` this session never looks
+/// indistinguishable from "nothing happened".
 fn spend_status_line(
     state: &StateDir,
     cfg: &CtxConfig,
@@ -968,38 +982,52 @@ fn spend_status_line(
     let table = price::resolve_table(cfg);
     let now = now_secs();
     let stale = table.is_stale(now, cfg.price.stale_after_days);
-    let session_ident = mail::session_identity(env);
+    let session_short = mail::session_identity(env);
     let five_hours_ago = now.saturating_sub(5 * 3_600);
 
-    let mut session_micros: u64 = 0;
-    let mut window_micros: u64 = 0;
-    for row in log::read_delegations(state, usize::MAX) {
-        let Some(model) = row.model.as_deref() else {
-            continue;
-        };
-        let usage = TranscriptUsage {
-            input_tokens: row.input_tokens,
-            cache_creation_input_tokens: row.cache_creation_input_tokens,
-            cache_read_input_tokens: row.cache_read_input_tokens,
-            output_tokens: row.output_tokens,
-        };
-        let Some(cost) = price::price(model, &usage, &table) else {
-            continue;
-        };
-        if session_ident.as_deref() == Some(row.parent_session.as_str()) {
-            session_micros = session_micros.saturating_add(cost);
-        }
-        if row.ts >= five_hours_ago {
-            window_micros = window_micros.saturating_add(cost);
-        }
-    }
+    let transcript = session_short
+        .as_deref()
+        .and_then(|short| session_spend::resolve_transcript(state, short));
+    let delegation_rows = log::read_delegations(state, usize::MAX);
+
+    let session_transcript = session_spend::session_transcript_usage(transcript.as_deref(), None);
+    let session_total = session_spend::fold_session_spend(
+        &delegation_rows,
+        session_short.as_deref(),
+        None,
+        &session_transcript,
+        &table,
+    );
+
+    let window_transcript =
+        session_spend::session_transcript_usage(transcript.as_deref(), Some(five_hours_ago));
+    let window_total = session_spend::fold_session_spend(
+        &delegation_rows,
+        None,
+        Some(five_hours_ago),
+        &window_transcript,
+        &table,
+    );
+
+    // The two queries can skip different rows/messages (different session
+    // and time scopes); `max` rather than a sum, so this note never implies
+    // double-counted skips across the two figures it accompanies.
+    let skipped = session_total
+        .skipped_messages
+        .max(window_total.skipped_messages);
+    let skipped_suffix = if skipped > 0 {
+        format!(" \u{b7} {skipped} msg(s)/row(s) skipped (no known price)")
+    } else {
+        String::new()
+    };
 
     format!(
-        "{} {} this session \u{b7} {} this 5h window (prices as of {})",
+        "{} {} this session \u{b7} {} this 5h window (prices as of {}){}",
         label(colour, "spend:"),
-        price::format_usd(session_micros, stale),
-        price::format_usd(window_micros, stale),
+        price::format_usd(session_total.cost_micros.unwrap_or(0), stale),
+        price::format_usd(window_total.cost_micros.unwrap_or(0), stale),
         table.as_of,
+        skipped_suffix,
     )
 }
 

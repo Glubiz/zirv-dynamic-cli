@@ -335,9 +335,11 @@ pub fn compose(
     let mut skipped = Vec::new();
 
     // -- lifecycle axis ----------------------------------------------------
+    let mut lifecycle_winner: Option<&Observation> = None;
     let (lifecycle, authority, mut evidence, confidence) =
         match pick_winner(observations, |o| o.lifecycle.is_some()) {
             Some((winner, losers)) => {
+                lifecycle_winner = Some(winner);
                 for loser in losers {
                     skipped.push(Skipped {
                         authority: loser.authority,
@@ -375,10 +377,12 @@ pub fn compose(
                 });
             }
             // The attention winner's own evidence rides as a second clause
-            // only when it came from a DIFFERENT authority than the
-            // lifecycle winner above -- otherwise it is the same fact and
-            // `evidence` already carries it.
-            if winner.authority != authority {
+            // unless it IS the lifecycle winner above -- then it is the same
+            // fact and `evidence` already carries it. Comparing observations
+            // (not authorities) keeps an attention-only hook observation
+            // visible when the lifecycle axis is still owned by an earlier
+            // observation of the same authority.
+            if !lifecycle_winner.is_some_and(|l| std::ptr::eq(l, winner)) {
                 if evidence.is_empty() {
                     evidence = format!("{:?}: {}", winner.authority, winner.evidence);
                 } else {
@@ -840,6 +844,26 @@ pub fn record(
 ) -> SessionStatus {
     let _guard = lock_status(state, short);
     let prev = load(state, short);
+    let next = compose(Some(&prev), std::slice::from_ref(&observation), now);
+    persist(state, short, &next);
+    next
+}
+
+/// [`record`], but only when `applies(&prev)` holds for the status read
+/// UNDER the lock -- a conditional write whose check and act cannot be split
+/// by another process's observation. Returns the untouched status otherwise.
+pub fn record_if(
+    state: &super::state::StateDir,
+    short: &str,
+    observation: Observation,
+    now: u64,
+    applies: impl FnOnce(&SessionStatus) -> bool,
+) -> SessionStatus {
+    let _guard = lock_status(state, short);
+    let prev = load(state, short);
+    if !applies(&prev) {
+        return prev;
+    }
     let next = compose(Some(&prev), std::slice::from_ref(&observation), now);
     persist(state, short, &next);
     next
