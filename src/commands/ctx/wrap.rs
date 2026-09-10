@@ -1263,7 +1263,7 @@ fn automatic_rollover_request(
         return Some(req);
     }
     let idle = handover_may_act(supervision, Instant::now(), debounce, false);
-    let blocked = super::rollover::confirmed_block(state_dir, cfg, now, provider);
+    let blocked = super::rollover::confirmed_block(state_dir, cfg, now, provider, short);
     let evaluation = super::rollover::evaluate(
         state_dir,
         cfg,

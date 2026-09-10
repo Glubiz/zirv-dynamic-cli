@@ -95,6 +95,21 @@ pub fn home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
         .map_err(|_| "Could not determine home directory".into())
 }
 
+/// Whether `repo` IS the operator's own home directory (`zirv`/`zirv chat`
+/// run from `~`) -- in which case there is no separate repository layer to
+/// read. Compares after `canonicalize` where possible, falling back to
+/// plain equality when either side cannot be canonicalized yet.
+/// `home_dir()` failing is not evidence of a match, so this fails open.
+pub fn repo_is_home(repo: &Path) -> bool {
+    let Ok(home) = home_dir() else {
+        return false;
+    };
+    match (repo.canonicalize(), home.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => repo == home,
+    }
+}
+
 pub fn parse_script_content(
     content: &str,
     ext: &str,

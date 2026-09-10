@@ -1232,7 +1232,11 @@ pub fn compose(
         composed.sources.push(PromptSource::User);
     }
 
-    if cfg.repo_layer {
+    // If `repo` IS the operator's home directory (`zirv`/`zirv chat` run
+    // from `~`), `repo_path` below would resolve to the exact file
+    // `user_path` above just read, appending the operator's own trusted
+    // `system-prompt.md` a second time, mislabeled as untrusted repo content.
+    if cfg.repo_layer && !crate::utils::repo_is_home(repo) {
         let repo_path: PathBuf = repo.join(crate::utils::SCRIPT_DIR_NAME).join(PROMPT_FILE);
         if let Some(layer) = read_layer(&repo_path, Some(cfg.max_repo_bytes)) {
             // Labeled, capped, and last. Cloning a repository is enough to
@@ -3342,6 +3346,32 @@ mod tests {
 
         assert!(!composed.text.contains("worker-only user text"));
         assert!(!composed.sources.contains(&PromptSource::User));
+    }
+
+    /// `repo == home_dir()` (`zirv chat` run from `~`) must not read the
+    /// operator's own `system-prompt.md` a second time as a `Repo` layer.
+    #[test]
+    fn repo_equal_to_home_does_not_duplicate_the_system_prompt_as_a_repo_layer() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".zirv")).expect("mkdir home");
+        std::fs::write(home.join(".zirv/system-prompt.md"), "operator text\n").expect("write");
+        let _home_guard = crate::commands::ctx::testenv::HomeGuard::set(&home);
+
+        let composed = compose(
+            Some(&home),
+            &home,
+            false,
+            &PromptConfig::default(),
+            PromptRole::Orchestrator,
+            &[],
+            usize::MAX,
+            &super::super::screen::Thresholds::default(),
+        )
+        .expect("composed");
+
+        assert!(!composed.sources.contains(&PromptSource::Repo));
+        assert_eq!(composed.text.matches("operator text").count(), 1);
     }
 
     #[test]

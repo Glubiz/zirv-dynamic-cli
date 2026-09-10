@@ -80,6 +80,11 @@ pub struct HarnessCapacity {
     pub reserve_headroom_pct: f64,
     pub state: HarnessState,
     pub state_reason: String,
+    /// Issue #455: what the route-health breaker says about this harness
+    /// (`health_store::harness_admission`, resolved once by the snapshot).
+    /// `Allow` whenever the policy is off, so this module's behaviour is
+    /// unchanged by default.
+    pub health: super::health::Admission,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -136,6 +141,12 @@ pub enum Exclusion {
     NoEquivalentModel,
     Visited,
     Excluded,
+    /// Issue #455: the route-health breaker is open (or the route is
+    /// `Unavailable`) for this harness. Carries the breaker's own reason so
+    /// `PoolView.exclusions` and a park message name the failures, the
+    /// window and the estimated retry, rather than reporting a bare
+    /// `HardBlocked` that reads as a usage refusal.
+    Unhealthy(String),
     /// This candidate cleared every eligibility check but lost to `by`,
     /// whose own projected headroom (`projected_headroom_pct`) was greater
     /// (or tied and earlier in `cfg.fallback.order`). Issue #358 follow-up:
@@ -170,6 +181,7 @@ impl Exclusion {
             Self::NoEquivalentModel => "no equivalent model available".to_string(),
             Self::Visited => "already visited in this order".to_string(),
             Self::Excluded => "explicitly excluded".to_string(),
+            Self::Unhealthy(reason) => reason.clone(),
             Self::Outranked {
                 by,
                 projected_headroom_pct,
@@ -221,6 +233,14 @@ pub fn classify(
             .unwrap_or_else(|| "not ready".to_string());
         return (HarnessState::Disabled, reason);
     }
+    // Issue #455: read before the usage ladder below. A route that cannot be
+    // connected to is unusable at any headroom, so a denied breaker is a
+    // hard block regardless of what the usage windows say -- and the reason
+    // travels with it, which is what `zirv ctx status` and a park message
+    // then show instead of a bare "hard blocked".
+    if let Some(reason) = harness.health.denied() {
+        return (HarnessState::HardBlocked, reason.to_string());
+    }
     if provider.hard_refused {
         return (
             HarnessState::HardBlocked,
@@ -251,6 +271,15 @@ pub fn classify(
         return (
             HarnessState::Unknown,
             "no usable binding usage reading".to_string(),
+        );
+    }
+    // A half-open breaker is `Ready`, not blocked: exactly one trial is the
+    // whole point. The suffix is the only place a human sees that this
+    // launch is a probe rather than an ordinary placement.
+    if harness.health.is_trial() {
+        return (
+            HarnessState::Ready,
+            "ready (route health trial: one attempt admitted after a cooldown)".to_string(),
         );
     }
     (HarnessState::Ready, "ready".to_string())
@@ -383,6 +412,12 @@ fn requested_unfit_reason(
     cfg: &CtxConfig,
     unit: &WorkUnit,
 ) -> Exclusion {
+    // Issue #455: named before the state ladder, so a health denial reports
+    // its own reason rather than the generic `HardBlocked` label `classify`
+    // folded it into.
+    if let Some(reason) = harness.health.denied() {
+        return Exclusion::Unhealthy(reason.to_string());
+    }
     match harness.state {
         HarnessState::Disabled => Exclusion::Disabled,
         HarnessState::HardBlocked => Exclusion::HardBlocked,
@@ -532,6 +567,13 @@ pub fn place(
         }
         if unit.needs_tool_call_counting && !harness.counts_tool_calls {
             exclusions.push((name.clone(), Exclusion::NoToolCallCounting));
+            continue;
+        }
+        // Issue #455: before the state match below, which would otherwise
+        // report a health denial as a bare `HardBlocked` and lose the
+        // breaker's reason.
+        if let Some(reason) = harness.health.denied() {
+            exclusions.push((name.clone(), Exclusion::Unhealthy(reason.to_string())));
             continue;
         }
         match harness.state {
@@ -830,6 +872,7 @@ mod tests {
             reserve_headroom_pct: 10.0,
             state: HarnessState::Unknown,
             state_reason: String::new(),
+            health: super::super::health::Admission::Allow,
         }
     }
 

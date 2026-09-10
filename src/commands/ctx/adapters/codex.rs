@@ -2025,8 +2025,22 @@ impl AgentAdapter for CodexAdapter {
                         .and_then(|error| error.get("message"))
                         .and_then(Value::as_str)
                     {
+                        // Issue #455: codex's `task_complete.error` payload
+                        // carries no structured kind or status of its own,
+                        // so this stays the text-only classification -- and
+                        // the gate stays this payload shape alone, never
+                        // arbitrary agent output.
                         events.push(NormalizedEvent::ProviderError {
-                            class: super::classify_provider_error(message),
+                            class: super::classify_provider_error(
+                                message,
+                                super::ProviderErrorHints::default(),
+                            ),
+                            at: at_ms.map(|ms| ms / 1000),
+                            // Codex rollout rows carry no id of their own
+                            // (`event_msg` rows hold only `timestamp`,
+                            // `type` and `payload`), so the identity is a
+                            // fingerprint of this row's time and message.
+                            id: super::provider_error_id(at_ms, message),
                         });
                     }
                 }
@@ -2511,8 +2525,15 @@ mod tests {
                     input_tokens: 2200,
                     at_ms: t2_complete,
                 },
+                // Issue #455: a codex rollout row carries its own
+                // timestamp but no id of its own, so the identity is a
+                // fingerprint of that time plus the message. Built through
+                // the same helper the parser uses, so this pins the
+                // CONTRACT rather than a hash constant.
                 NormalizedEvent::ProviderError {
                     class: crate::commands::ctx::event::ProviderErrorClass::Other,
+                    at: t2_complete.map(|ms| ms / 1000),
+                    id: super::super::provider_error_id(t2_complete, "tool call failed",),
                 },
             ],
             "got {events:?}"
@@ -2531,7 +2552,8 @@ mod tests {
                 .filter(|event| matches!(
                     event,
                     NormalizedEvent::ProviderError {
-                        class: ProviderErrorClass::Overflow
+                        class: ProviderErrorClass::Overflow,
+                        ..
                     }
                 ))
                 .count(),
@@ -2543,7 +2565,8 @@ mod tests {
                 .filter(|event| matches!(
                     event,
                     NormalizedEvent::ProviderError {
-                        class: ProviderErrorClass::RateLimit
+                        class: ProviderErrorClass::RateLimit,
+                        ..
                     }
                 ))
                 .count(),

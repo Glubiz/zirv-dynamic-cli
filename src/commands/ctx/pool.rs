@@ -100,6 +100,33 @@ pub struct PoolView {
     pub harnesses: Vec<HarnessRow>,
     pub providers: Vec<ProviderRow>,
     pub exclusions: Vec<(String, String)>,
+    /// Issue #455: every route whose health is NOT `Healthy`. Empty (and
+    /// omitted from `--json`) in the ordinary case, which is what an
+    /// operator should see almost always -- a row here means zirv has
+    /// stopped trusting a route.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub health: Vec<RouteHealthRow>,
+}
+
+/// One unhealthy route in a [`PoolView`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RouteHealthRow {
+    /// `claude` or `claude/opus` -- `health::RouteKey::label`.
+    pub route: String,
+    pub harness: String,
+    pub model: Option<String>,
+    /// `health::Phase::as_str`: `suspect` / `open` / `half-open` /
+    /// `unavailable`.
+    pub phase: String,
+    /// How many Transport/Server observations the record currently holds.
+    pub failures: usize,
+    /// When an open breaker admits its next trial. `None` for every other
+    /// phase. An estimate, not a promise: nothing is known about when the
+    /// endpoint actually recovers.
+    pub retry_after: Option<u64>,
+    /// The admission verdict this phase produces right now -- the same
+    /// reason text `PoolView::exclusions` carries.
+    pub reason: Option<String>,
 }
 
 /// Which bucket a binding window's own reading falls into for a human
@@ -310,7 +337,59 @@ pub fn build(
         harnesses,
         providers,
         exclusions,
+        health: health_rows(state, cfg, now),
     }
+}
+
+/// Issue #455: the non-healthy routes, straight off `health_store::all`
+/// (which already skips aged-out healthy records). Empty whenever the policy
+/// is off, so `status` says nothing about a feature the operator disabled.
+fn health_rows(state: &StateDir, cfg: &CtxConfig, now: u64) -> Vec<RouteHealthRow> {
+    let policy = cfg.fallback.effective_health();
+    if !policy.enabled {
+        return Vec::new();
+    }
+    super::health_store::all(state, now)
+        .into_iter()
+        .filter(|record| !record.health.phase.is_healthy())
+        .map(|record| RouteHealthRow {
+            route: record.key.label(),
+            harness: record.key.harness.clone(),
+            model: record.model.clone(),
+            // Finding 8: the EFFECTIVE phase, not the stored one. An `Open`
+            // or `Unavailable` record past its cooldown is already admitting
+            // trials, and rendering the stored phase reported it as still
+            // shut with a retry time in the past. The promotion is persisted
+            // by the next poll (`health_store::observe_poll`); until one
+            // happens, this is what is actually true.
+            phase: match super::health::admission(&record.health, now, &policy) {
+                super::health::Admission::Trial if !record.health.phase.is_healthy() => {
+                    "half-open".to_string()
+                }
+                _ => record.health.phase.as_str().to_string(),
+            },
+            failures: record
+                .health
+                .observations
+                .iter()
+                .filter(|obs| {
+                    matches!(
+                        obs.class,
+                        super::event::ProviderErrorClass::Transport
+                            | super::event::ProviderErrorClass::Server
+                    )
+                })
+                .count(),
+            // `None` once the cooldown has elapsed: there is nothing left
+            // to wait for, which is exactly what made the stale value
+            // misleading.
+            retry_after: super::health::trial_at(&record.health.phase, &policy)
+                .filter(|at| *at > now),
+            reason: super::health::admission(&record.health, now, &policy)
+                .denied()
+                .map(str::to_string),
+        })
+        .collect()
 }
 
 fn label(colour: bool, title: &str) -> String {
@@ -425,10 +504,47 @@ fn render_full(view: &PoolView, colour: bool) -> String {
             provider.provider, provider.reserved_tokens, provider.reservations
         ));
     }
+    for row in &view.health {
+        lines.push(format!(
+            "  {}",
+            style::paint(&format_health_row(row), health_tone(&row.phase), colour)
+        ));
+    }
     for (name, reason) in &view.exclusions {
         lines.push(format!("  excluded {name}: {reason}"));
     }
     lines.join("\n")
+}
+
+fn health_tone(phase: &str) -> Tone {
+    match phase {
+        "open" | "unavailable" => Tone::Err,
+        "suspect" | "half-open" => Tone::Warn,
+        _ => Tone::Plain,
+    }
+}
+
+/// One health line, e.g. `health: claude/opus open (3 transport/server
+/// errors; retry ~unix 1700003600, an estimate)`. The retry time is always
+/// labelled an estimate: it is when the breaker admits its next TRIAL, not
+/// when the endpoint is known to be back.
+fn format_health_row(row: &RouteHealthRow) -> String {
+    let retry = row
+        .retry_after
+        .map(|at| format!("; next health check ~unix {at} (estimate)"))
+        .unwrap_or_default();
+    // The model is informational -- it is NOT part of the route identity
+    // (see `health`'s own header) -- but it is what an operator wants to
+    // know when a breaker trips, so it is named as "last model".
+    let model = row
+        .model
+        .as_deref()
+        .map(|model| format!(", last model {model}"))
+        .unwrap_or_default();
+    format!(
+        "health: {} {} ({} transport/server error(s){model}{retry})",
+        row.route, row.phase, row.failures
+    )
 }
 
 /// The one-line brief form, e.g. `pool: claude ready 62% | codex draining
@@ -450,6 +566,16 @@ fn render_brief(view: &PoolView, colour: bool) -> String {
         .collect();
     if let Some(seat) = &view.seat {
         parts.push(format!("seat {} gen {}", seat.agent, seat.generation));
+    }
+    // Issue #455: one word per unhealthy route, so `--brief` cannot hide the
+    // fact that zirv has stopped trusting one. Absent entirely in the
+    // ordinary case, which keeps the brief line's usual shape.
+    for row in &view.health {
+        parts.push(style::paint(
+            &format!("health {} {}", row.route, row.phase),
+            health_tone(&row.phase),
+            colour,
+        ));
     }
     if parts.is_empty() {
         parts.push("(no harnesses configured)".to_string());
@@ -533,6 +659,7 @@ mod tests {
                 binding_window: Some("five_hour".to_string()),
             }],
             exclusions: vec![("gemini".to_string(), "disabled".to_string())],
+            health: Vec::new(),
         }
     }
 
@@ -631,6 +758,7 @@ mod tests {
             harnesses: Vec::new(),
             providers: Vec::new(),
             exclusions: Vec::new(),
+            health: Vec::new(),
         };
         let text = render_text(&view, true, false);
         assert_eq!(text, "pool: seat claude gen 1");
@@ -829,5 +957,102 @@ mod tests {
         let seat_view = view.seat.expect("seat present");
         assert_eq!(seat_view.agent, "claude");
         assert_eq!(seat_view.generation, 1);
+    }
+    /// Issue #455: an unhealthy route shows up in the full table, in the
+    /// brief line, and in `--json` -- and the JSON field is omitted
+    /// entirely while every route is healthy.
+    #[test]
+    fn an_unhealthy_route_is_rendered_and_serialized() {
+        let mut view = sample_view();
+        view.health = vec![RouteHealthRow {
+            route: "claude".to_string(),
+            harness: "claude".to_string(),
+            model: Some("opus".to_string()),
+            phase: "open".to_string(),
+            failures: 3,
+            retry_after: Some(1_700_000_300),
+            reason: Some("route health open: 3 transport error(s) in 10m".to_string()),
+        }];
+        view.exclusions = vec![(
+            "claude".to_string(),
+            "route health open: 3 transport error(s) in 10m".to_string(),
+        )];
+
+        let full = render_text(&view, false, false);
+        assert!(
+            full.contains(
+                "health: claude open (3 transport/server error(s), last model opus; next \
+                 health check ~unix 1700000300 (estimate))"
+            ),
+            "got {full}"
+        );
+        assert!(
+            full.contains("excluded claude: route health open"),
+            "got {full}"
+        );
+        let brief = render_text(&view, true, false);
+        assert!(brief.contains("health claude open"), "got {brief}");
+
+        let json = serde_json::to_string(&view).expect("serialize");
+        assert!(json.contains("\"health\""), "got {json}");
+        assert!(json.contains("\"retry_after\":1700000300"), "got {json}");
+
+        let healthy = sample_view();
+        let json = serde_json::to_string(&healthy).expect("serialize");
+        assert!(
+            !json.contains("\"health\""),
+            "an all-healthy pool says nothing about health: {json}"
+        );
+    }
+    /// Finding 8: an `Open` record whose cooldown has already elapsed is
+    /// admitting trials. Rendering the STORED phase reported it as still
+    /// shut, with a retry time in the past.
+    #[test]
+    fn a_stored_open_record_past_its_cooldown_renders_as_half_open() {
+        use crate::commands::ctx::health::{HealthPolicy, Phase, RouteHealth, RouteKey};
+        use crate::commands::ctx::health_store::{RouteHealthRecord, dir};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.fallback.health = HealthPolicy::default();
+
+        let record = RouteHealthRecord {
+            key: RouteKey::new("claude"),
+            model: Some("opus".to_string()),
+            health: RouteHealth {
+                phase: Phase::Open {
+                    opened_at: 1_000,
+                    until: 1_300,
+                    reason: "3 transport error(s) in 10m".to_string(),
+                },
+                ..RouteHealth::default()
+            },
+            updated_at: 1_000,
+        };
+        crate::commands::ctx::state::create_private_dir_all(&dir(&state)).expect("mkdir");
+        std::fs::write(
+            dir(&state).join("claude.json"),
+            serde_json::to_string(&record).expect("serialize"),
+        )
+        .expect("write");
+
+        let inside = health_rows(&state, &cfg, 1_200);
+        assert_eq!(inside[0].phase, "open");
+        assert_eq!(inside[0].retry_after, Some(1_300));
+
+        let elapsed = health_rows(&state, &cfg, 1_400);
+        assert_eq!(
+            elapsed[0].phase, "half-open",
+            "past the cooldown it is admitting trials, not shut"
+        );
+        assert_eq!(
+            elapsed[0].retry_after, None,
+            "there is nothing left to wait for"
+        );
+        assert_eq!(
+            elapsed[0].reason, None,
+            "and nothing is being denied any more"
+        );
     }
 }

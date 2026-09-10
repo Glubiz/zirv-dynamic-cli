@@ -87,6 +87,37 @@ impl ModelTracker {
 /// `rot::token_gates` scale for an adapter whose `context_window_tokens` is
 /// otherwise `None` (codex). The operator's own `score.model_context_tokens`
 /// still outranks both -- `token_gates` consults it first.
+/// Issue #455: every `ProviderError` class in `events`, in order -- route
+/// health's observation feed.
+fn provider_errors_of(events: &[NormalizedEvent]) -> Vec<super::health::Observed> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            NormalizedEvent::ProviderError { class, at, id } => {
+                Some(super::health::Observed::new(*class, *at, id.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `events` shows the route answering: an assistant message with
+/// real text, positioned after the last provider error in the same batch. A
+/// batch with no errors at all and one non-empty assistant message is the
+/// ordinary healthy turn, which is what recovers a merely-suspect route.
+fn turn_completed_after_last_error(events: &[NormalizedEvent]) -> bool {
+    let last_error = events
+        .iter()
+        .rposition(|event| matches!(event, NormalizedEvent::ProviderError { .. }));
+    let start = last_error.map(|i| i + 1).unwrap_or(0);
+    events[start.min(events.len())..].iter().any(|event| {
+        matches!(
+            event,
+            NormalizedEvent::AssistantFinal { text, .. } if !text.trim().is_empty()
+        )
+    })
+}
+
 fn caps_with_window(
     adapter: &dyn AgentAdapter,
     model: Option<&str>,
@@ -446,6 +477,25 @@ pub struct IncrementalScorer {
     context_window: Option<u64>,
     model_tracker: ModelTracker,
     provider_limit_hit: bool,
+    /// Issue #455: this poll's provider errors, in transcript order, drained
+    /// by [`IncrementalScorer::take_provider_errors`]. Describes only the
+    /// most recent poll and is deliberately NOT persisted in the checkpoint,
+    /// exactly like `provider_limit_hit` and `last_speed`: the checkpoint's
+    /// own offset is what guarantees each error row is observed once, so a
+    /// value carried across polls would double-count it.
+    provider_errors: Vec<super::health::Observed>,
+    /// Whether this poll saw an assistant turn complete AFTER the last
+    /// provider error it parsed -- the "the route answered" signal route
+    /// health recovers on. `false` for a poll with no events at all.
+    turn_succeeded: bool,
+    /// Whether this poll read APPENDED bytes rather than re-reading the
+    /// transcript from its start (review round 1, finding 2). A poll
+    /// starting at offset 0 -- a fresh scorer, a missing or version-bumped
+    /// checkpoint, a restarted transcript -- may be re-parsing rows that are
+    /// months old, so route health must not stamp an undated row from such
+    /// a poll with the current clock. Not persisted in the checkpoint: it
+    /// describes one poll.
+    poll_was_incremental: bool,
     /// Issue #293: this pass's speed sample, derived from exactly the events
     /// this ONE poll parsed (never the whole session's history -- see
     /// `derive_speed_metrics`'s own doc comment on why that must stay
@@ -466,6 +516,9 @@ impl IncrementalScorer {
             context_window: None,
             model_tracker: ModelTracker::default(),
             provider_limit_hit: false,
+            provider_errors: Vec::new(),
+            turn_succeeded: false,
+            poll_was_incremental: false,
             last_speed: None,
         }
     }
@@ -488,6 +541,9 @@ impl IncrementalScorer {
             context_window,
             model_tracker,
             provider_limit_hit: false,
+            provider_errors: Vec::new(),
+            turn_succeeded: false,
+            poll_was_incremental: false,
             last_speed: None,
         }
     }
@@ -500,12 +556,35 @@ impl IncrementalScorer {
         self.state.as_ref()
     }
 
-    fn model(&self) -> Option<&str> {
+    pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
     }
 
     pub fn provider_limit_hit(&self) -> bool {
         self.provider_limit_hit
+    }
+
+    /// Issue #455: this poll's provider errors, drained. Draining rather
+    /// than peeking is deliberate: an observation must reach route health
+    /// exactly once, and the caller taking them is what guarantees a second
+    /// look at the same scorer cannot re-record them.
+    pub fn take_provider_errors(&mut self) -> Vec<super::health::Observed> {
+        std::mem::take(&mut self.provider_errors)
+    }
+
+    /// Whether this poll saw an assistant turn complete after the last
+    /// provider error it parsed -- route health's recovery signal. Reset by
+    /// the same drain, so it is read alongside `take_provider_errors`.
+    pub fn take_turn_succeeded(&mut self) -> bool {
+        std::mem::take(&mut self.turn_succeeded)
+    }
+
+    /// Whether the most recent poll read appended bytes rather than
+    /// re-reading the transcript from its start -- see the field's own doc
+    /// comment. Read alongside the two drains above; not itself drained,
+    /// since it describes the read rather than carrying data out of it.
+    pub fn poll_was_incremental(&self) -> bool {
+        self.poll_was_incremental
     }
 
     /// Issue #293: the speed sample this poll derived from its own newly
@@ -589,9 +668,14 @@ impl IncrementalScorer {
         if !adapter.capabilities().events {
             return Ok((None, None));
         }
+        // Finding 2: captured BEFORE the read, so route health can tell a
+        // genuinely incremental poll from one that re-parsed the transcript
+        // from its start.
+        let start_offset = self.watcher.position().0;
         let Some(appended) = self.watcher.read_appended()? else {
             return Ok((None, None));
         };
+        self.poll_was_incremental = start_offset > 0 && !appended.restarted;
         // Issue #243: screens exactly the bytes this cycle newly
         // read off the transcript (the committed lines plus the
         // still-in-progress partial one), never the whole file.
@@ -631,6 +715,13 @@ impl IncrementalScorer {
         let context_window = self.context_window;
         let events = adapter.parse_events(&appended.lines);
         self.provider_limit_hit = super::pace::provider_events_hit_limit(&events);
+        // Issue #455: drawn from the COMMITTED lines only, never from
+        // `appended.partial` below. The partial line is deliberately read
+        // again, complete, by the next poll -- counting it here would record
+        // the same error row twice, and a circuit breaker that double-counts
+        // opens after two real failures rather than the configured three.
+        self.provider_errors = provider_errors_of(&events);
+        self.turn_succeeded = turn_completed_after_last_error(&events);
         self.model_tracker.feed_all(&events);
         let Some(state) = self.state.as_mut() else {
             // An unbounded window has no bounded state to fold into.
@@ -868,6 +959,7 @@ pub fn score_transcript_cached(
         adapter.as_ref(),
         &cfg.score,
         &screen_thresholds,
+        &cfg.fallback.effective_health(),
     )
 }
 
@@ -904,12 +996,23 @@ fn screen_tail(path: &Path, cap: usize, thresholds: &screen::Thresholds) -> Scre
 /// dir the caller already has. Split out so the dashboard's [`cached_score`]
 /// reaches the same incremental fold without re-resolving the state dir from
 /// the environment.
+///
+/// Issue #455: this is also the one seam route health observes from, and
+/// deliberately the ONLY one. It is where every supervisor's scoring
+/// actually reaches `IncrementalScorer::poll` -- the Claude Stop hook (so
+/// every `wrap`-supervised session), the dashboard's per-pane
+/// [`cached_score`] (so every pane, on any harness), and `zirv ctx score`
+/// -- and the checkpoint it advances is what guarantees each transcript byte
+/// range is drained once. Observing from a second, uncheckpointed scorer
+/// (`exec`/`run_loop` keep their own) would count the same error rows twice
+/// for a child that also fires a Stop hook.
 fn score_with_checkpoint(
     state_dir: &StateDir,
     transcript: &Path,
     adapter: &dyn AgentAdapter,
     cfg: &ScoreConfig,
     screen_thresholds: &screen::Thresholds,
+    health: &super::health::HealthPolicy,
 ) -> CtxResult<(Score, ScreenReport, Option<SpeedMetrics>)> {
     let path = checkpoint_path(state_dir, transcript);
     let fingerprint = fingerprint(adapter, cfg);
@@ -943,8 +1046,53 @@ fn score_with_checkpoint(
         ));
     };
     let speed = scorer.last_speed_sample();
+    observe_route_health(state_dir, adapter, &mut scorer, health, "-", "score");
     save_checkpoint(&path, transcript, fingerprint, &scorer);
     Ok((score, screening, speed))
+}
+
+/// Issue #455: folds this poll's drained provider errors (and its
+/// turn-completed signal) into the route's health record, and appends one
+/// decision-log line per phase change.
+///
+/// `pub` because the two headless supervisors (`exec::supervise_run`,
+/// `run_loop`) own their OWN uncheckpointed scorers and must observe too
+/// (review round 1, finding 4) -- a headless codex worker dying on
+/// connection refusals otherwise left the harness reading `Healthy`.
+/// Double-counting the rows a Stop hook also reads is prevented by row
+/// identity (`health::RouteHealth::seen_ids`), not by having one caller.
+///
+/// The route is the adapter's own name plus whatever model the scorer has
+/// resolved for this transcript, which is the same `model_hint` the score
+/// itself was computed with. Best-effort in every direction: `observe_poll`
+/// swallows its own I/O failures, and the drain happens whether or not a
+/// policy is enabled so a later poll cannot inherit stale observations.
+pub fn observe_route_health(
+    state_dir: &StateDir,
+    adapter: &dyn AgentAdapter,
+    scorer: &mut IncrementalScorer,
+    health: &super::health::HealthPolicy,
+    session: &str,
+    verb: &str,
+) {
+    let errors = scorer.take_provider_errors();
+    let turn_succeeded = scorer.take_turn_succeeded();
+    let incremental = scorer.poll_was_incremental();
+    if !health.enabled || (errors.is_empty() && !turn_succeeded) {
+        return;
+    }
+    super::health_store::observe_poll(
+        state_dir,
+        adapter.name(),
+        scorer.model(),
+        &errors,
+        turn_succeeded,
+        incremental,
+        super::state::now_secs(),
+        health,
+        session,
+        verb,
+    );
 }
 
 /// What a transcript looked like when its score was last computed. `mtime`
@@ -1145,6 +1293,7 @@ fn cached_score_with(
             adapter.as_ref(),
             &cfg.score,
             &cfg.screen.thresholds(),
+            &cfg.fallback.effective_health(),
         )
         .ok()
         .map(|(score, _, _)| {
@@ -1613,6 +1762,7 @@ mod tests {
             &adapter,
             &ScoreConfig::default(),
             &screen::Thresholds::default(),
+            &crate::commands::ctx::health::HealthPolicy::default(),
         )
         .expect_err("no verified event parsing");
         assert!(err.to_string().contains("eventless"), "got {err}");
@@ -2909,5 +3059,88 @@ mod tests {
     fn tool_error_rate_is_none_with_no_tool_results_at_all() {
         let events = vec![NormalizedEvent::TurnStart { at_ms: Some(0) }];
         assert_eq!(derive_speed_metrics(&events).tool_error_rate, None);
+    }
+    /// Issue #455 (review round 1, finding 4): the exact function both
+    /// headless supervisors (`exec::supervise_run`, `run_loop`) call after
+    /// every poll. A worker dying on connection refusals must leave its
+    /// harness's breaker OPEN, not `Healthy`.
+    #[test]
+    fn observe_route_health_opens_a_harness_breaker_from_a_polled_transcript() {
+        use crate::commands::ctx::health::{HealthPolicy, Phase, RouteKey};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(dir.path().join("state"));
+        let transcript = dir.path().join("session.jsonl");
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        // A decade-wide window, so the fixture's own fixed row timestamps
+        // are inside it whatever the wall clock says when this test runs --
+        // `observe_route_health` reads the real clock, and the point here is
+        // the wiring, not the window arithmetic (which `health.rs` tests
+        // directly, with an explicit `now`).
+        let policy = HealthPolicy {
+            window_secs: 10 * 365 * 86_400,
+            ..HealthPolicy::default()
+        };
+
+        // Three consecutive retries of one failing turn, exactly the shape
+        // the observed incident produced -- distinct `uuid`s and distinct
+        // timestamps, so they are three observations and not one.
+        let mut rows = String::new();
+        for (i, second) in [10, 20, 30].iter().enumerate() {
+            rows.push_str(&format!(
+                concat!(
+                    r#"{{"type":"assistant","uuid":"row-{i}","#,
+                    r#""timestamp":"2026-09-10T08:00:{second:02}.000Z","#,
+                    r#""isApiErrorMessage":true,"error":"server_error","#,
+                    r#""message":{{"role":"assistant","content":[{{"type":"text","#,
+                    r#""text":"API Error: Connection refused (ConnectionRefused)"}}]}}}}"#,
+                    "\n"
+                ),
+                i = i,
+                second = second
+            ));
+        }
+        std::fs::write(&transcript, &rows).expect("write transcript");
+
+        let mut scorer = IncrementalScorer::new(transcript.clone());
+        let _ = scorer.poll(
+            &adapter,
+            &ScoreConfig::default(),
+            &screen::Thresholds::default(),
+        );
+        observe_route_health(&state, &adapter, &mut scorer, &policy, "sess", "exec");
+
+        let stored = crate::commands::ctx::health_store::load(
+            &state,
+            &RouteKey::new(adapter.name()),
+            crate::commands::ctx::state::now_secs(),
+        );
+        assert!(
+            matches!(stored.phase, Phase::Open { .. }),
+            "three transport failures must open the breaker: {stored:?}"
+        );
+
+        // The drain is a drain: a second call with no new poll records
+        // nothing further, and the ids already seen make a re-read of the
+        // same rows a no-op too.
+        let before = stored.observations.len();
+        observe_route_health(&state, &adapter, &mut scorer, &policy, "sess", "exec");
+        let mut replay = IncrementalScorer::new(transcript);
+        let _ = replay.poll(
+            &adapter,
+            &ScoreConfig::default(),
+            &screen::Thresholds::default(),
+        );
+        observe_route_health(&state, &adapter, &mut replay, &policy, "sess", "exec");
+        let after = crate::commands::ctx::health_store::load(
+            &state,
+            &RouteKey::new(adapter.name()),
+            crate::commands::ctx::state::now_secs(),
+        );
+        assert_eq!(
+            after.observations.len(),
+            before,
+            "the same rows read by a second supervisor must count once: {after:?}"
+        );
     }
 }

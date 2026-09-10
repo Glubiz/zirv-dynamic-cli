@@ -148,6 +148,57 @@ having a separate one, not a bug in the alias routing itself.
   terminal (announced in one line) when none is. Pass `-` as the prompt to
   read it from stdin instead.
 
+#### Delegation receipt (`--json`)
+
+`--json` prints one machine-readable receipt to stdout instead of the human
+lines, so a scripted orchestrator does not have to scrape prose:
+
+```bash
+zirv agent codex "fix the failing test" --json
+```
+
+```json
+{
+  "schema_version": 1,
+  "harness": "codex",
+  "model": "gpt-5.6-terra",
+  "mode": "inline",
+  "state": "reported_validated",
+  "exit_code": 0,
+  "session": "abcd1234",
+  "workdir": "/repo",
+  "result_path": "/state/logs/delegation-results/<session>.json",
+  "report_truncated": false,
+  "mail_delivered": true,
+  "note": "full report stored at result_path"
+}
+```
+
+Every optional field is omitted rather than written as `null` or `[]` when
+it has nothing to say: `model` (unresolved), `exit_code` (no result yet),
+`session`, `task`, `workdir`, `result_path` (nothing persisted), `reason`
+(no launch failure), and `errors`/`capability_warnings` (empty). Exit codes
+are unchanged by `--json`; it only changes what reaches stdout, and stderr
+notices still print normally.
+
+- **`mode`** — `dashboard_pane` (a live dashboard admitted or fulfilled the
+  request) or `inline` (this process supervised the worker itself).
+- **`state`** — `launched` (a pane was admitted/claimed; nothing has run
+  yet — check `zirv ctx inbox` later for the worker's own report),
+  `launch_failed` (refused, or the worker process never started at all —
+  see `reason`), `exited_no_report` (the process exited but no final
+  assistant text could be extracted — treat the task as unverified),
+  `reported` (final text extracted, no `--result-schema`/`--result-kind`
+  contract declared), `reported_validated` (a declared contract was
+  satisfied), `reported_contract_failed` (a declared contract failed even
+  after the one bounded retry — see `errors`).
+- **`result_path`** — where the worker's full report was persisted, when
+  one was (see [Sending mail between sessions](#sending-mail-between-sessions)
+  below for the file's own shape).
+
+Only `zirv ctx agent`/`zirv agent` (a one-shot delegation) has `--json` today
+— `zirv ctx exec`/`zirv ctx loop` do not.
+
 #### Nested sessions are refused
 
 `zirv chat` (and `zirv ctx wrap`) refuse to start when they can tell they are
@@ -312,6 +363,28 @@ never the message body itself, the same "advisory, not authority" rule
 `--to-session`: unlike the config knobs elsewhere in this document, session
 addressing is a per-invocation argument, not something an operator or a repo
 would want to pin as a default.
+
+A body over `[mail] max_message_bytes`/`max_delivered_bytes` is still stored,
+truncated, rather than failing the send — but the cut text is no longer just
+lost. The full original body is written to a sidecar file under the
+mailbox's own `full/` subdirectory (capped at 1 MiB of its own, with a
+trailing `[truncated]` marker if even that is exceeded), and the stored
+message's own `[truncated]` marker becomes `[truncated; full body: <path>]`,
+naming that sidecar. `full/` is a dedicated directory nothing else ever
+moves a message into or out of — unlike the message itself, a sidecar is
+never relocated into `read/` on consume or into a dead-letter directory once
+its TTL expires, so a marker's path always stays valid for as long as the
+sidecar exists. It is pruned to the same `[mail] keep` as the mailbox
+itself, in its own pass, so it does not accumulate forever either.
+
+A delegated worker's own final report is persisted before any report-back
+mail is sent, at
+`<state>/logs/delegation-results/<session>.json` (capped at 1 MiB, with a
+`report_truncated` flag when cut) — whether or not the delegation declared a
+`--result-schema`/`--result-kind` contract. The report-back mail for a
+contract-declared delegation names that file as a trailing `full report:
+<path>` line, and `zirv ctx agent --json`'s own receipt carries it as
+`result_path` (see [Delegation receipt](#delegation-receipt---json) above).
 
 ### Session registry and nudging
 
@@ -1366,7 +1439,10 @@ only from the token ceiling.
 ### Configuration
 
 Layered, lowest priority first: `~/.zirv/ctx.toml`, then `<repo>/.zirv/ctx.toml`,
-then `ZIRV_CTX_*` environment variables, then flags.
+then `ZIRV_CTX_*` environment variables, then flags. A `.zirv/` directory that
+is the operator's own (running `zirv`/`zirv chat` from the home directory
+itself) is never also read as the repository layer for `ctx.toml` or for the
+`system-prompt.md` prompt layer.
 
 ```toml
 # .zirv/ctx.toml
@@ -1607,6 +1683,9 @@ checkout:
 | `fallback.orchestrator_rollover_headroom_pct` | `ZIRV_CTX_FALLBACK_ORCHESTRATOR_ROLLOVER_HEADROOM_PCT` |
 | `fallback.rollover_cooldown_secs` | `ZIRV_CTX_FALLBACK_ROLLOVER_COOLDOWN_SECS` |
 | `fallback.reactive_force_after_secs` | `ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS` |
+| `fallback.health.open_after_failures` | `ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES` |
+| `fallback.health.window_secs` | `ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS` |
+| `fallback.health.cooldown_secs` | `ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
@@ -1653,6 +1732,12 @@ like `fallback.enabled`, but tuning *when* an already-enabled rollover fires
 or how soon another one may follow picks the same kind of vendor-spend
 decision `handoff.model`/`optimize.model` already gate, so only the operator
 may set either.
+`fallback.health.open_after_failures`/`fallback.health.window_secs`/`fallback.health.cooldown_secs`
+(issue #455) close it once more for health-aware routing: how many failures
+make zirv stop trusting a vendor route, over what window, and how long it
+stays distrusted decides where the operator's tokens get spent, so only they
+may tune it. `fallback.health.enabled` itself stays repo-narrowable like
+`fallback.enabled` — a checkout may switch the breaker off, never on.
 Everything else, including `chrome.banner`/`chrome.bar`,
 `supervise.max_nudges`, and every threshold, is still repo-configurable.
 
@@ -2032,6 +2117,98 @@ token reservations are tracked in a small durable ledger
 (`<state>/reservations/<provider>.json`) so two admitted-but-unsettled
 delegations against the same billed account are never double-counted (capacity
 snapshot formula, the fenced rollover transaction, anti-flap rules).
+
+#### Health-aware routing
+
+Usage headroom answers *may this account spend more*. It says nothing about
+whether the endpoint can be reached: a session that dies on `API Error:
+Connection refused` has full headroom and zero capacity. So alongside the
+headroom rules above, zirv keeps a small circuit breaker per **harness**,
+fed by the structured provider-error rows a transcript already carries. The
+harness is the whole identity: the failing hop in a transport or server
+failure is the connection or the endpoint, not the model, so an open breaker
+on one model would have to steer work away from the others anyway. The last
+model seen is recorded alongside it, as information for `status` only.
+
+Five phases, per route:
+
+1. **healthy** — routed to normally.
+2. **suspect** — some transport/server failures inside `window_secs`, still routed to.
+3. **open** — `open_after_failures` reached: excluded from routing for `cooldown_secs`.
+4. **half-open** — the cooldown elapsed; exactly one trial is admitted.
+5. **unavailable** — an authentication, permission or model-not-found error; denied at once rather than after `open_after_failures`, then re-probed on the same `cooldown_secs` so a credential you have since fixed heals on its own.
+
+Only *transport* (connection refused/reset, DNS, proxy, socket hang-up,
+timeouts) and *server* (overloaded, internal server error, service
+unavailable, bad or timed-out gateway) failures count towards opening a
+breaker. `unavailable` needs an explicit provider token
+(`authentication_error`, `invalid_api_key`, `permission_error`) or a
+structured 401/403/404 — never ordinary English, so a sandbox saying
+"permission denied" about a file cannot deny a vendor route. A rate limit is capacity, which the headroom rules
+above already own; a context overflow belongs to the session, which rot owns;
+anything unattributed changes nothing. Classification is gated on the
+structured rows only (Claude's `isApiErrorMessage`, codex's
+`task_complete.error`), so an agent merely *writing* about an outage can never
+trip a breaker.
+
+An open route is excluded from `zirv agent`'s automatic reroute, from the
+orchestrator seat's successor choice, and from the pool view's candidate
+ranking — carrying its own reason, not a bare `hard-blocked`. An open breaker
+on the **seat's own** route is itself a rollover trigger, and takes the
+reactive path, so the handoff is the host-computed structural packet: zirv
+never asks a route that just refused connections to distil a handoff. If every
+route is denied, the seat parks exactly as it does when every account is
+exhausted, and the park reason names the health failures. State lives in
+`<state>/health/<harness>.json` — delete that file to reset a route by hand;
+there is no verb for it, and every phase heals on its own anyway. Each phase
+change is one `health-open` / `health-half-open` / `health-recovered` /
+`health-unavailable` line in the decision log, never one line per failure.
+
+`open_after_failures` must be 1..=20 (the size of the per-route observation
+ring), and both `window_secs` and `cooldown_secs` must be above zero; a value
+outside that is refused at config load rather than leaving a breaker that can
+never trip.
+
+Observations are stamped with the transcript **row's** own timestamp, not the
+clock, and de-duplicated by the row's own id — so re-reading a transcript
+from the start (a new supervisor, a rebuilt scoring checkpoint) can neither
+fold old failures into the current window nor count the same failure twice.
+That holds for every class, `unavailable` included: an authentication error
+older than `window_secs` is history and changes nothing, and healing a route
+clears its phase without forgetting which rows it has already counted. A row
+whose transcript states no timestamp at all is only ever counted when the
+poll that read it was reading genuinely new bytes. Both the interactive
+supervisor and the headless `exec`/`loop` supervisors feed the same records,
+each under the route's own lock, and a supervisor that finds the lock held
+skips the fold rather than waiting on another process.
+
+`zirv ctx status` shows a line per route that is not healthy (and nothing at
+all when every route is fine), plus the exclusion reason in the pool section:
+
+```
+pool
+  health: claude open (3 transport/server error(s), last model opus; next health check ~unix 1700000300 (estimate))
+  excluded claude: claude: route health open: 3 transport error(s) in 10m; next health check in ~5m (estimate)
+```
+
+The retry time is always an *estimate*: it is when the breaker admits its next
+trial, not when the endpoint is known to be back. `zirv ctx status --json`
+carries the same rows under the pool view's `health` field, omitted entirely
+while every route is healthy.
+
+Configure it under `[fallback.health]`:
+
+```toml
+[fallback.health]
+enabled = true             # issue #455: master switch (also off whenever fallback.enabled is off)
+open_after_failures = 3    # transport/server failures inside the window that open a route
+window_secs = 600          # the sliding window failures are counted over
+cooldown_secs = 300        # how long an open route stays excluded before one trial
+```
+
+`--force` and an explicit pin bypass health exactly as they bypass headroom:
+health only ever adds exclusions, it never overrules a route you asked for
+outright.
 
 **`zirv ctx handover`** performs the swap directly, on demand, mid-session —
 the same mechanism the dashboard's `Ctrl+A o` picker and automatic fallback

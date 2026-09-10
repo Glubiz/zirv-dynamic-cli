@@ -643,6 +643,16 @@ pub struct RolloverInputs<'a> {
     /// Whether the source session is definitely blocked by the provider.
     /// Reactive rollover skips cooldown and may force after the pending grace.
     pub source_hard_blocked: bool,
+    /// Issue #455 (review round 1, finding 5): whether the reason the source
+    /// is hard-blocked is that its route cannot be REACHED (an open
+    /// route-health breaker), as opposed to an account that is out of
+    /// capacity. Only this relaxes the hysteresis floor below -- a usage
+    /// block whose own reading still shows plenty of headroom (the stale
+    /// `limit_reached` class, issue #337) must keep parking rather than
+    /// rolling onto a harness with less headroom than the seat it left.
+    /// Set only by `rollover::evaluate`'s health check; `false` everywhere
+    /// else, including every usage-reactive path.
+    pub source_unreachable: bool,
     pub auto_enabled: bool,
     /// The supervisor's verified turn boundary. Proactive rollover always
     /// waits; reactive rollover waits up to `reactive_force_after_secs`.
@@ -806,8 +816,23 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
         // seat parked instead of rolling over. An assumed candidate clears
         // `min_candidate_headroom_pct` alone; the reactive-only gate above
         // is what keeps it out of the proactive path entirely.
+        // Issue #455: the `source_floor` term is dropped when the source is
+        // UNREACHABLE. That term exists so a rollover only ever moves the
+        // seat somewhere genuinely better than where it already is, which
+        // presumes the source's own headroom is usable. A route whose
+        // endpoint refuses connections reads 95% headroom and has zero
+        // capacity, so holding its successor to `95 + 10` refused every
+        // candidate that exists and the seat could never move.
+        //
+        // Finding 5: keyed on `source_unreachable`, NOT on `reactive`.
+        // Reactive also covers a usage block whose own reading still shows
+        // headroom (issue #337's stale `limit_reached`), and that case must
+        // keep its previous behaviour -- park rather than roll onto a worse
+        // harness.
         let floor = if c.assumed && !c.stale {
             min_headroom
+        } else if inputs.source_unreachable {
+            threshold + min_headroom
         } else {
             (threshold + min_headroom).max(source_floor + min_headroom)
         };
@@ -1213,6 +1238,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
+            source_unreachable: false,
             auto_enabled: false,
             idle: true,
             reclaim: false,
@@ -1232,6 +1258,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
+            source_unreachable: false,
             auto_enabled: true,
             idle: true,
             reclaim: false,
@@ -1255,6 +1282,7 @@ mod tests {
             source_headroom_pct: None,
             source_observed_at: 500,
             source_hard_blocked: false,
+            source_unreachable: false,
             auto_enabled: true,
             idle: true,
             reclaim: false,
@@ -1275,6 +1303,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
+            source_unreachable: false,
             auto_enabled: true,
             idle: false,
             reclaim: false,
@@ -1299,6 +1328,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
+            source_unreachable: false,
             auto_enabled: true,
             idle: true,
             reclaim: false,
@@ -1327,6 +1357,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
+            source_unreachable: false,
             auto_enabled: true,
             idle: true,
             reclaim: false,
@@ -1351,6 +1382,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
+            source_unreachable: false,
             auto_enabled: true,
             idle: false,
             reclaim: false,
@@ -1379,6 +1411,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
+            source_unreachable: false,
             auto_enabled: true,
             // Finding #14 (issue #358 review): `true`, not `false` -- this
             // test is about the visited-epoch exclusion, not the idle
@@ -1415,6 +1448,7 @@ mod tests {
             source_headroom_pct: Some(15.0),
             source_observed_at: 500,
             source_hard_blocked: false,
+            source_unreachable: false,
             auto_enabled: true,
             idle: true,
             reclaim: false,
@@ -1438,6 +1472,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
+            source_unreachable: false,
             auto_enabled: true,
             idle: true,
             reclaim: false,
@@ -1450,6 +1485,7 @@ mod tests {
 
         let reactive = RolloverInputs {
             source_hard_blocked: true,
+            source_unreachable: false,
             ..proactive
         };
         assert!(matches!(
@@ -1471,6 +1507,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: false,
+            source_unreachable: false,
             auto_enabled: true,
             idle: true,
             reclaim: false,
@@ -1508,6 +1545,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
+            source_unreachable: false,
             auto_enabled: true,
             // Finding #14 (issue #358 review): `true`, not `false` -- this
             // test is about the visited-epoch flap invariant, not the idle
@@ -1534,6 +1572,7 @@ mod tests {
             source_headroom_pct: Some(1.0),
             source_observed_at: 500,
             source_hard_blocked: true,
+            source_unreachable: false,
             auto_enabled: true,
             idle: true,
             reclaim: false,
@@ -1726,6 +1765,7 @@ mod tests {
             source_headroom_pct: None,
             source_observed_at: 500,
             source_hard_blocked: true,
+            source_unreachable: false,
             auto_enabled: true,
             idle: true,
             reclaim: false,
@@ -1755,6 +1795,7 @@ mod tests {
                 source_headroom_pct: Some(13.0),
                 source_observed_at: 500,
                 source_hard_blocked: reactive,
+                source_unreachable: false,
                 auto_enabled: true,
                 idle: true,
                 reclaim: false,
@@ -1778,6 +1819,7 @@ mod tests {
             source_headroom_pct: Some(13.0),
             source_observed_at: 500,
             source_hard_blocked: true,
+            source_unreachable: false,
             auto_enabled: true,
             idle: false,
             reclaim: false,
@@ -1806,6 +1848,51 @@ mod tests {
         assert_eq!(
             decide(&inputs, &cfg),
             RolloverDecision::Wait("idle boundary".to_string())
+        );
+    }
+    /// Issue #455 (review round 1, finding 5): the hysteresis floor's
+    /// `source_floor` term is relaxed ONLY when the source route is
+    /// unreachable. Both cases here are reactive with a source that still
+    /// reads plenty of headroom -- the difference is why.
+    #[test]
+    fn only_an_unreachable_source_relaxes_the_hysteresis_floor() {
+        let cfg = cfg();
+        let seat = base_seat();
+        // 40% projected: comfortably above `threshold + min_headroom` (30)
+        // but far below `source_floor + min_headroom` (95 + 10).
+        let candidates = [candidate("codex", 40.0)];
+
+        let unreachable = RolloverInputs {
+            seat: &seat,
+            now: 2_000,
+            pending_since: None,
+            source_headroom_pct: Some(95.0),
+            source_observed_at: 500,
+            source_hard_blocked: true,
+            source_unreachable: true,
+            auto_enabled: true,
+            idle: true,
+            reclaim: false,
+            candidates: &candidates,
+        };
+        assert!(
+            matches!(
+                decide(&unreachable, &cfg),
+                RolloverDecision::Proceed { ref agent, .. } if agent == "codex"
+            ),
+            "a route that cannot be reached has zero capacity at any headroom: {:?}",
+            decide(&unreachable, &cfg)
+        );
+
+        let usage_blocked = RolloverInputs {
+            source_unreachable: false,
+            ..unreachable
+        };
+        assert!(
+            matches!(decide(&usage_blocked, &cfg), RolloverDecision::Refuse(_)),
+            "a usage block whose own reading still shows 95% headroom must keep parking \
+             rather than roll onto a worse harness (issue #337's class): {:?}",
+            decide(&usage_blocked, &cfg)
         );
     }
 }

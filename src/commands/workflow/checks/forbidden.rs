@@ -61,6 +61,11 @@ pub const NARROW_ONLY_ALLOWLIST: &[&str] = &[
     "supervise.orchestrator_writes", // repo may only tighten allow -> advise -> deny.
     "fallback.adaptive_delegation", // repo may only disable, per its own doc comment.
     "fallback.auto_orchestrator_rollover", // same AND-fold as adaptive_delegation.
+    // Issue #455: the same AND-fold again -- a repo may switch the
+    // route-health breaker off, never on for an operator who disabled it.
+    // Its three timing knobs (`open_after_failures`, `window_secs`,
+    // `cooldown_secs`) are `REPO_FORBIDDEN` outright.
+    "fallback.health.enabled",
     // `chat.model` is deliberately not `REPO_FORBIDDEN` (see [[Untrusted
     // Configuration]] / README.md's own trust-boundary intro): the one model
     // key a repo may set at all, because a wrong model choice costs money,
