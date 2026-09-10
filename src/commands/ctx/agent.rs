@@ -4921,6 +4921,7 @@ mod tests {
             selected_headroom_assumed: false,
             binding_window: None,
             reserved_tokens: 0,
+            health_reason: None,
         }
     }
 
@@ -5849,11 +5850,46 @@ mod tests {
             selected_headroom_assumed: false,
             binding_window: None,
             reserved_tokens: 0,
+            health_reason: None,
         };
         let message = automatic_route_message(&route, pace::Seat::Cli);
         assert!(
             message.contains("(pass --force to keep codex)"),
             "got {message}"
+        );
+    }
+
+    /// Issue #455 (review round 1, finding 10): a health reroute's human
+    /// line has to say WHY. "route unhealthy" beside a 95% source headroom
+    /// reads like a contradiction unless the breaker's own reason is there.
+    #[test]
+    fn an_unhealthy_route_message_names_the_breakers_own_reason() {
+        let route = fallback::Route {
+            requested: "claude".to_string(),
+            selected: "codex".to_string(),
+            model: "gpt-5.6-terra".to_string(),
+            reason: fallback::RouteReason::Unhealthy,
+            requested_headroom_pct: Some(95.0),
+            requested_age_secs: Some(4),
+            requested_observed_at: Some(1_700_000_000),
+            selected_headroom_pct: 40.0,
+            selected_headroom_assumed: false,
+            binding_window: None,
+            reserved_tokens: 0,
+            health_reason: Some(
+                "claude: route health open: 3 transport error(s) in 10m; next health check in \
+                 ~5m (estimate)"
+                    .to_string(),
+            ),
+        };
+        let message = automatic_route_message(&route, pace::Seat::Cli);
+        assert!(
+            message.contains("route unhealthy: claude: route health open: 3 transport error(s)"),
+            "got {message}"
+        );
+        assert!(
+            message.contains("source headroom 95.0%"),
+            "the headroom is still reported, so the two together explain the verdict: {message}"
         );
     }
 

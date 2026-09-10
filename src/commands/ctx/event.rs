@@ -171,10 +171,30 @@ impl TranscriptUsage {
 /// messages. The marker signal groups by turn and takes the last non-empty
 /// text; the token gate takes the most recent event's `input_tokens`
 /// regardless of text, so mid-turn token growth is visible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Issue #455: `Transport`, `Server` and `Auth` split the reachability
+/// failures out of what used to be the catch-all `Other`. They are what
+/// `health.rs` reasons about -- a route that cannot be connected to has full
+/// usage headroom and zero capacity, which no headroom reading can express.
+/// `Overflow` still belongs to rot (the session's own context), `RateLimit`
+/// to `pace` (the account's own capacity), and `Other` remains genuinely
+/// unattributed and changes no routing decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ProviderErrorClass {
     Overflow,
     RateLimit,
+    /// The request never reached the provider: connection refused/reset, a
+    /// DNS or proxy failure, a socket hang-up, a request or first-token
+    /// timeout.
+    Transport,
+    /// It reached the provider and the provider failed: a 5xx, an overload,
+    /// a bad or timed-out gateway.
+    Server,
+    /// The provider rejected the caller rather than failing: a bad or
+    /// missing credential, a forbidden model, a 404-shaped configuration
+    /// error. No cooldown fixes this class.
+    Auth,
     Other,
 }
 
@@ -364,8 +384,23 @@ pub enum NormalizedEvent {
         new_bytes: u64,
         core_bytes: u64,
     },
+    /// Issue #455: `at` is the transcript ROW's own timestamp in epoch
+    /// seconds and `id` its own row identity (claude's `uuid`; a
+    /// timestamp-plus-content fingerprint for codex, whose rollout rows
+    /// carry no id of their own). Both `None` for a row that states
+    /// neither.
+    ///
+    /// Review round 1, finding 2: route health stamped observations with
+    /// wall-clock `now`, so a poll that re-read a transcript from offset 0
+    /// (a missing or version-bumped checkpoint) folded months-old error
+    /// rows into the current window and opened the breaker on a healthy
+    /// harness. `id` additionally makes an observation idempotent across
+    /// two supervisors reading the same rows. `rot.rs` reads neither field
+    /// and its verdicts are unchanged by them.
     ProviderError {
         class: ProviderErrorClass,
+        at: Option<u64>,
+        id: Option<String>,
     },
     ModelId {
         id: String,

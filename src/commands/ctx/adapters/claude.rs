@@ -373,10 +373,37 @@ pub fn parse_events(jsonl: &str) -> Vec<NormalizedEvent> {
             .and_then(Value::as_str)
             .and_then(parse_iso8601_utc_ms);
 
+        // Issue #455: the two structured fields these rows carry alongside
+        // the text (`error: "server_error"`, `apiErrorStatus: 429`) are read
+        // here and handed to the classifier as hints. The gate stays
+        // `isApiErrorMessage` alone: an ordinary assistant row whose prose
+        // happens to mention "API Error: 503" must never produce a
+        // `ProviderError`, or route health would be poisoned by a session
+        // merely talking about an outage.
         if row.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
             let message = row.get("message").cloned().unwrap_or(Value::Null);
+            let hints = super::ProviderErrorHints {
+                kind: row.get("error").and_then(Value::as_str),
+                status: row.get("apiErrorStatus").and_then(Value::as_u64),
+            };
+            let text = text_of(&message);
+            // Issue #455 (review round 1, finding 2): the row's OWN time,
+            // not the clock -- `at_ms` above is already parsed from this
+            // row's `timestamp`. `uuid` is claude's own row identity
+            // (verified on every row of `claude-real-session.jsonl`);
+            // `provider_error_id` falls back to a time-plus-content
+            // fingerprint so consecutive retries of one failing turn stay
+            // DISTINCT observations while the same row seen twice does not.
+            let at = at_ms.map(|ms| ms / 1000);
+            let id = row
+                .get("uuid")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| super::provider_error_id(at_ms, &text));
             events.push(NormalizedEvent::ProviderError {
-                class: super::classify_provider_error(&text_of(&message)),
+                class: super::classify_provider_error(&text, hints),
+                at,
+                id,
             });
             continue;
         }
@@ -3174,20 +3201,195 @@ mod tests {
                 "too many requests: request_too_large",
                 ProviderErrorClass::RateLimit,
             ),
+            // Issue #455: reachability wording no longer lands in the
+            // catch-all -- `service unavailable:` is the provider failing,
+            // a reset connection never reached it at all.
             (
                 "Service unavailable: request_too_large",
-                ProviderErrorClass::Other,
+                ProviderErrorClass::Server,
             ),
-            ("API Error: connection reset", ProviderErrorClass::Other),
+            ("API Error: connection reset", ProviderErrorClass::Transport),
         ];
 
         for (message, expected) in cases {
             assert_eq!(
-                super::super::classify_provider_error(message),
+                super::super::classify_provider_error(
+                    message,
+                    super::super::ProviderErrorHints::default()
+                ),
                 expected,
                 "{message}"
             );
         }
+    }
+
+    /// Issue #455: the reachability classes, including the exact wording the
+    /// observed incident produced, and the structured-hint fallback for a
+    /// row whose text says nothing specific.
+    #[test]
+    fn reachability_errors_are_classified_from_text_then_from_structured_hints() {
+        use crate::commands::ctx::adapters::ProviderErrorHints;
+        use crate::commands::ctx::event::ProviderErrorClass;
+
+        let text_cases = [
+            (
+                "API Error: Connection refused - a firewall or proxy may be blocking it \
+                 (ConnectionRefused)",
+                ProviderErrorClass::Transport,
+            ),
+            (
+                "API Error: 503 Service Unavailable",
+                ProviderErrorClass::Server,
+            ),
+            ("overloaded_error", ProviderErrorClass::Server),
+            (
+                "API Error: 401 authentication_error",
+                ProviderErrorClass::Auth,
+            ),
+        ];
+        for (message, expected) in text_cases {
+            assert_eq!(
+                super::super::classify_provider_error(message, ProviderErrorHints::default()),
+                expected,
+                "{message}"
+            );
+        }
+
+        assert_eq!(
+            super::super::classify_provider_error(
+                "the request failed",
+                ProviderErrorHints {
+                    kind: Some("server_error"),
+                    status: None,
+                }
+            ),
+            ProviderErrorClass::Server,
+            "a neutral message with error: server_error is a server failure"
+        );
+        assert_eq!(
+            super::super::classify_provider_error(
+                "the request failed",
+                ProviderErrorHints {
+                    kind: Some("server_error"),
+                    status: Some(429),
+                }
+            ),
+            ProviderErrorClass::RateLimit,
+            "the status wins over the generic kind"
+        );
+        assert_eq!(
+            super::super::classify_provider_error(
+                "the request failed",
+                ProviderErrorHints::default()
+            ),
+            ProviderErrorClass::Other,
+            "no text match and no hints stays unattributed"
+        );
+    }
+
+    /// Review round 1, finding 3: `Auth` is the one class no cooldown used
+    /// to clear, and it was reachable from ordinary English. A sandbox
+    /// refusing a file write and a transient proxy 404 are not credential
+    /// problems, and codex's `task_complete.error.message` is task text.
+    #[test]
+    fn ordinary_english_and_bare_status_numbers_never_classify_as_auth() {
+        use crate::commands::ctx::adapters::ProviderErrorHints;
+        use crate::commands::ctx::event::ProviderErrorClass;
+
+        for message in [
+            "permission denied writing /x",
+            "404 Not Found",
+            "EACCES: permission denied, open '/etc/hosts'",
+            "the tool returned 401 lines of output",
+        ] {
+            assert_eq!(
+                super::super::classify_provider_error(message, ProviderErrorHints::default()),
+                ProviderErrorClass::Other,
+                "{message}"
+            );
+        }
+
+        // The status still reaches `Auth` -- through the structured field,
+        // which is the only place a number is evidence.
+        assert_eq!(
+            super::super::classify_provider_error(
+                "the request failed",
+                ProviderErrorHints {
+                    kind: None,
+                    status: Some(401),
+                }
+            ),
+            ProviderErrorClass::Auth
+        );
+        // A bare 5xx in prose is likewise not evidence on its own; the
+        // words are.
+        assert_eq!(
+            super::super::classify_provider_error(
+                "upstream said 500",
+                ProviderErrorHints::default()
+            ),
+            ProviderErrorClass::Other
+        );
+        assert_eq!(
+            super::super::classify_provider_error(
+                "internal server error",
+                ProviderErrorHints::default()
+            ),
+            ProviderErrorClass::Server
+        );
+    }
+
+    /// Finding 2: the row's own timestamp and identity travel with the
+    /// event, so the window is judged on transcript time and the same row
+    /// seen twice is recognisable.
+    #[test]
+    fn a_provider_error_carries_its_rows_own_time_and_identity() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","uuid":"row-1","timestamp":"2026-09-10T08:00:00.000Z","#,
+            r#""isApiErrorMessage":true,"error":"server_error","apiErrorStatus":503,"#,
+            r#""message":{"role":"assistant","content":[{"type":"text","#,
+            r#""text":"API Error: 503 Service Unavailable"}]}}"#,
+        );
+        let events = parse_events(jsonl);
+        let NormalizedEvent::ProviderError { class, at, id } = &events[0] else {
+            panic!("expected a provider error, got {events:?}");
+        };
+        assert_eq!(
+            *class,
+            crate::commands::ctx::event::ProviderErrorClass::Server
+        );
+        assert_eq!(*at, Some(1_789_027_200));
+        assert_eq!(
+            id.as_deref(),
+            Some("row-1"),
+            "claude rows carry their own uuid"
+        );
+    }
+
+    /// Issue #455: plain assistant prose must never reach route health. The
+    /// only rows that produce a `ProviderError` are the structured ones
+    /// (`isApiErrorMessage: true`), so a session discussing an outage in
+    /// its own answer cannot open a circuit breaker.
+    #[test]
+    fn only_structured_api_error_rows_produce_a_provider_error() {
+        use crate::commands::ctx::event::ProviderErrorClass;
+
+        let jsonl = concat!(
+            r#"{"type":"assistant","isApiErrorMessage":true,"error":"server_error","#,
+            r#""message":{"role":"assistant","content":[{"type":"text","#,
+            r#""text":"API Error: Connection refused (ConnectionRefused)"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","#,
+            r#""text":"That looked like API Error: 503 Service Unavailable, so I retried."}]}}"#,
+        );
+        let errors: Vec<ProviderErrorClass> = parse_events(jsonl)
+            .into_iter()
+            .filter_map(|event| match event {
+                NormalizedEvent::ProviderError { class, .. } => Some(class),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, vec![ProviderErrorClass::Transport]);
     }
 
     #[test]
@@ -3204,7 +3406,8 @@ mod tests {
                 .filter(|event| matches!(
                     event,
                     NormalizedEvent::ProviderError {
-                        class: ProviderErrorClass::Overflow
+                        class: ProviderErrorClass::Overflow,
+                        ..
                     }
                 ))
                 .count(),
@@ -3216,7 +3419,8 @@ mod tests {
                 .filter(|event| matches!(
                     event,
                     NormalizedEvent::ProviderError {
-                        class: ProviderErrorClass::RateLimit
+                        class: ProviderErrorClass::RateLimit,
+                        ..
                     }
                 ))
                 .count(),

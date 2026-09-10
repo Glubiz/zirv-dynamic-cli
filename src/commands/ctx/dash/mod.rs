@@ -4006,7 +4006,7 @@ fn rollover_sweep(
     let req = match super::rollover::on_resume(state, cfg, "dash", &short, now, true) {
         Some(req) => req,
         None => {
-            let blocked = super::rollover::confirmed_block(state, cfg, now, &provider);
+            let blocked = super::rollover::confirmed_block(state, cfg, now, &provider, &short);
             match super::rollover::evaluate(state, cfg, "dash", &short, now, idle, blocked, true) {
                 super::rollover::Evaluation::Rollover { request, .. } => request,
                 _ => return,

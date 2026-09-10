@@ -28,7 +28,8 @@ pub fn provider_events_hit_limit(events: &[NormalizedEvent]) -> bool {
         matches!(
             event,
             NormalizedEvent::ProviderError {
-                class: ProviderErrorClass::RateLimit
+                class: ProviderErrorClass::RateLimit,
+                ..
             }
         )
     })
@@ -3049,15 +3050,21 @@ mod tests {
         let events = [
             NormalizedEvent::ProviderError {
                 class: ProviderErrorClass::Other,
+                at: None,
+                id: None,
             },
             NormalizedEvent::ProviderError {
                 class: ProviderErrorClass::RateLimit,
+                at: None,
+                id: None,
             },
         ];
         assert!(provider_events_hit_limit(&events));
         assert!(!provider_events_hit_limit(&[
             NormalizedEvent::ProviderError {
                 class: ProviderErrorClass::Overflow,
+                at: None,
+                id: None,
             }
         ]));
     }

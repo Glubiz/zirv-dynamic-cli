@@ -284,20 +284,47 @@ pub fn successor_readiness(
 }
 
 /// The reactive half of the trigger: a vendor block this supervisor can
-/// actually corroborate against the provider's structured usage reading.
-/// `None` -- never a rollover -- for an unconfirmed reading, which is
+/// actually corroborate against the provider's structured usage reading, OR
+/// (issue #455) an open route-health breaker on the seat's own route.
+/// `None` -- never a rollover -- for an unconfirmed usage reading, which is
 /// exactly `pace::confirm_limit_hit`'s own contract (a loose text match, a
 /// stale collector and a missing reading all fail to confirm).
+///
+/// `seat_short` names the seat whose route health is checked; the seat
+/// ledger (`seat::load`) is the authority on which harness the seat is
+/// actually sitting on, so this never has to re-derive it from a provider
+/// string. A missing seat record simply skips the health half.
+///
+/// A route IS a harness (`health_store::harness_admission`), so the seat's
+/// model never enters this lookup -- see `health`'s own header for why the
+/// model was deliberately dropped from the route identity.
+///
+/// Returning `Some` here is what makes the rest of the reactive path do the
+/// right thing for a broken route without a second mechanism: `evaluate`
+/// sets `source_hard_blocked`, which sets `structural_only` on the
+/// `HandoverRequest` -- so the handoff is the host-computed structural
+/// packet and NO distiller call is made on the route that just failed.
 pub fn confirmed_block(
     state: &StateDir,
     cfg: &CtxConfig,
     now: u64,
     provider: &str,
+    seat_short: &str,
 ) -> Option<String> {
-    match pace::confirm_limit_hit(state, &cfg.pace, now, provider) {
-        pace::LimitConfirmation::Confirmed { detail } => Some(detail),
-        pace::LimitConfirmation::Unconfirmed { .. } => None,
+    if let pace::LimitConfirmation::Confirmed { detail } =
+        pace::confirm_limit_hit(state, &cfg.pace, now, provider)
+    {
+        return Some(detail);
     }
+    let seat = seat::load(state, seat_short)?;
+    super::health_store::harness_admission(
+        state,
+        &seat.agent,
+        now,
+        &cfg.fallback.effective_health(),
+    )
+    .denied()
+    .map(str::to_string)
 }
 
 /// Pending reactive causes retry each minute so the force grace can expire;
@@ -391,6 +418,14 @@ pub fn evaluate(
     let source_observed_at = fresh.map(|window| window.observed_at).unwrap_or(now);
     let source_hard_blocked =
         confirmed_block.is_some() || (fresh.is_some() && source.is_some_and(|p| p.hard_refused));
+    // Issue #455 (finding 5): read straight off the snapshot this function
+    // already built -- `HarnessCapacity::health` is the same verdict
+    // `confirmed_block` consulted, so no second read and no way for the two
+    // to disagree. It is deliberately NARROWER than `source_hard_blocked`:
+    // only an unreachable route relaxes `seat::decide`'s hysteresis floor.
+    let source_unreachable = snapshot
+        .harness(&current.agent)
+        .is_some_and(|harness| harness.health.denied().is_some());
 
     let mut candidates: Vec<seat::CandidateHeadroom> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
@@ -513,6 +548,7 @@ pub fn evaluate(
         source_headroom_pct,
         source_observed_at,
         source_hard_blocked,
+        source_unreachable,
         auto_enabled: cfg.auto_orchestrator_rollover(),
         idle,
         reclaim,
@@ -2164,5 +2200,59 @@ mod tests {
         let cfg = cfg();
         assert_eq!(evaluate_interval(&cfg, true), Duration::from_secs(60));
         assert_eq!(evaluate_interval(&cfg, false), Duration::from_secs(900));
+    }
+    /// Issue #455: an open route-health breaker on the seat's own route is a
+    /// confirmed block in its own right -- and because that drives the
+    /// reactive path, the resulting handover is `structural_only`, so NO
+    /// distiller call is made on the very route that just failed.
+    #[test]
+    fn confirmed_block_reports_an_open_route_health_breaker_and_skips_distillation() {
+        let (_dir, state) = temp_state();
+        let cfg = cfg();
+        register_seat(&state);
+        store_usage(&state, "anthropic", 5.0, NOW);
+        store_usage(&state, "openai", 5.0, NOW);
+
+        assert_eq!(
+            confirmed_block(&state, &cfg, NOW, "anthropic", SHORT),
+            None,
+            "a healthy route with no confirmed usage limit is not a block"
+        );
+
+        // A model-bearing route, while the seat ledger records no model at
+        // all: the harness-level aggregation is what makes those two
+        // spellings the same judgement.
+        // The record is keyed on the HARNESS, and the model it carries is
+        // informational -- so a seat ledger recording no model at all is
+        // still the same route the observation landed on (finding 1).
+        let key = super::super::health::RouteKey::new("claude");
+        for at in [NOW - 20, NOW - 10, NOW] {
+            super::super::health_store::observe_and_persist(
+                &state,
+                &key,
+                &super::super::health::Observed::new(
+                    super::super::event::ProviderErrorClass::Transport,
+                    Some(at),
+                    Some(format!("row-{at}")),
+                ),
+                Some("claude-opus-5"),
+                at,
+                &cfg.fallback.effective_health(),
+            );
+        }
+
+        let detail = confirmed_block(&state, &cfg, NOW, "anthropic", SHORT)
+            .expect("an open breaker on the seat's route is a confirmed block");
+        assert!(detail.contains("route health open"), "{detail}");
+
+        let Evaluation::Rollover { request, .. } = evaluate_now(&state, &cfg, true, Some(detail))
+        else {
+            panic!("an unreachable route rolls the seat over once idle");
+        };
+        assert_eq!(request.target_agent, "codex");
+        assert!(
+            request.structural_only,
+            "a route that cannot be reached cannot answer a distiller call either"
+        );
     }
 }

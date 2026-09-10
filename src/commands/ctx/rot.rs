@@ -300,7 +300,8 @@ pub fn signals(events: &[NormalizedEvent], caps: Capabilities, cfg: &ScoreConfig
             matches!(
                 event,
                 NormalizedEvent::ProviderError {
-                    class: ProviderErrorClass::Overflow
+                    class: ProviderErrorClass::Overflow,
+                    ..
                 }
             )
         })
@@ -460,6 +461,7 @@ impl RotState {
             }
             NormalizedEvent::ProviderError {
                 class: ProviderErrorClass::Overflow,
+                ..
             } => {
                 if let Some(segment) = self.segments.back_mut() {
                     segment.provider_overflows += 1;
@@ -1797,6 +1799,8 @@ mod tests {
         let cfg = ScoreConfig::default();
         let overflow = NormalizedEvent::ProviderError {
             class: ProviderErrorClass::Overflow,
+            at: None,
+            id: None,
         };
 
         let once = score_events(std::slice::from_ref(&overflow), full_caps(), &cfg);
@@ -1817,9 +1821,13 @@ mod tests {
         let events = [
             NormalizedEvent::ProviderError {
                 class: ProviderErrorClass::RateLimit,
+                at: None,
+                id: None,
             },
             NormalizedEvent::ProviderError {
                 class: ProviderErrorClass::Other,
+                at: None,
+                id: None,
             },
             NormalizedEvent::ModelId {
                 id: "claude-sonnet-5".to_string(),
@@ -1836,9 +1844,13 @@ mod tests {
         events.extend([
             NormalizedEvent::ProviderError {
                 class: ProviderErrorClass::Overflow,
+                at: None,
+                id: None,
             },
             NormalizedEvent::ProviderError {
                 class: ProviderErrorClass::Overflow,
+                at: None,
+                id: None,
             },
         ]);
         let before = score_events(&events, full_caps(), &cfg);

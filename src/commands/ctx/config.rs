@@ -2063,6 +2063,15 @@ pub struct FallbackConfig {
     /// `reserve_headroom_pct` per harness name -- see `narrow_fallback_
     /// harness` and `HarnessLimits`' own doc comment.
     pub harness: std::collections::BTreeMap<String, HarnessLimits>,
+    /// Issue #455: health-aware routing (`[fallback.health]`). Usage
+    /// headroom cannot express "this endpoint refuses connections", so a
+    /// per-route circuit breaker is folded in alongside it. `enabled`
+    /// narrows like `fallback.enabled` (a repo may switch it off, never on);
+    /// the three timing knobs are `REPO_FORBIDDEN`, matching
+    /// `rollover_cooldown_secs`/`reactive_force_after_secs` right above --
+    /// tuning when zirv stops trusting a vendor route is the same class of
+    /// spend decision.
+    pub health: super::health::HealthPolicy,
 }
 
 impl Default for FallbackConfig {
@@ -2081,6 +2090,7 @@ impl Default for FallbackConfig {
             rollover_cooldown_secs: 600,
             reactive_force_after_secs: 120,
             harness: std::collections::BTreeMap::new(),
+            health: super::health::HealthPolicy::default(),
         }
     }
 }
@@ -2127,6 +2137,18 @@ impl FallbackConfig {
         self.harness_limits(name)
             .reserve_headroom_pct
             .unwrap_or(self.min_candidate_headroom_pct)
+    }
+
+    /// Issue #455: the route-health policy every consumer should read, with
+    /// the master fallback switch already folded in. Turning cross-harness
+    /// fallback off leaves nowhere for a denied route's work to go, so the
+    /// breaker must go quiet with it rather than deny work zirv can no
+    /// longer reroute.
+    pub fn effective_health(&self) -> super::health::HealthPolicy {
+        super::health::HealthPolicy {
+            enabled: self.enabled && self.health.enabled,
+            ..self.health.clone()
+        }
     }
 }
 
@@ -2538,6 +2560,26 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
     (
         "ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS",
         &["fallback", "reactive_force_after_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_HEALTH",
+        &["fallback", "health", "enabled"],
+        EnvKind::Bool,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES",
+        &["fallback", "health", "open_after_failures"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS",
+        &["fallback", "health", "window_secs"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS",
+        &["fallback", "health", "cooldown_secs"],
         EnvKind::Int,
     ),
     ("ZIRV_CTX_OPTIMIZE", &["optimize", "enabled"], EnvKind::Bool),
@@ -3996,6 +4038,24 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["fallback", "reactive_force_after_secs"],
         "ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS",
     ),
+    // Issue #455: same reasoning one more time for the route-health breaker.
+    // `fallback.health.enabled` stays narrowing-only (a repo may safely
+    // switch health-aware routing off, exactly as it may `fallback.enabled`),
+    // but how many failures trip a route, over what window, and how long it
+    // stays tripped decide when the operator's vendor spend moves -- only
+    // they may set that.
+    (
+        &["fallback", "health", "open_after_failures"],
+        "ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES",
+    ),
+    (
+        &["fallback", "health", "window_secs"],
+        "ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS",
+    ),
+    (
+        &["fallback", "health", "cooldown_secs"],
+        "ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS",
+    ),
     // Issue #326 B1: without this a repo checkout could simply raise its own
     // parent-outcome budget, making the cap decorative -- same reasoning as
     // every other byte cap in this table (`mail.max_delivered_bytes`,
@@ -4319,6 +4379,14 @@ impl CtxConfig {
         // The repo may only narrow automatic vendor steering; see the
         // re-insertion below for each field's strict direction.
         let home_fallback_enabled = bool_at(take_nested(&mut merged, "fallback", "enabled"));
+        // Issue #455: `fallback.health.enabled` gets the identical AND fold
+        // as `fallback.enabled` right above -- a repo may switch the
+        // route-health breaker off, never on for an operator who disabled
+        // it. Its three timing knobs need no lift: they are `REPO_FORBIDDEN`
+        // outright, so `reject_untrusted_keys` has already refused the whole
+        // load if a repo layer named one.
+        let home_fallback_health_enabled =
+            bool_at(take_nested3(&mut merged, "fallback", "health", "enabled"));
         let home_fallback_order = string_array_at(take_nested(&mut merged, "fallback", "order"));
         let home_fallback_predictive = float_at(take_nested(
             &mut merged,
@@ -4457,6 +4525,12 @@ impl CtxConfig {
         let repo_output_diff_max_bytes =
             integer_at(take_nested(&mut repo_layer, "output", "diff_max_bytes"));
         let repo_fallback_enabled = bool_at(take_nested(&mut repo_layer, "fallback", "enabled"));
+        let repo_fallback_health_enabled = bool_at(take_nested3(
+            &mut repo_layer,
+            "fallback",
+            "health",
+            "enabled",
+        ));
         let repo_fallback_order =
             string_array_at(take_nested(&mut repo_layer, "fallback", "order"));
         let repo_fallback_predictive = float_at(take_nested(
@@ -4809,6 +4883,15 @@ impl CtxConfig {
             &["fallback", "enabled"],
             toml::Value::Boolean(home_enabled && repo_fallback_enabled.unwrap_or(true)),
         );
+        let home_health_enabled =
+            home_fallback_health_enabled.unwrap_or(default_fallback.health.enabled);
+        insert_path(
+            &mut merged,
+            &["fallback", "health", "enabled"],
+            toml::Value::Boolean(
+                home_health_enabled && repo_fallback_health_enabled.unwrap_or(true),
+            ),
+        );
         let home_order = home_fallback_order.unwrap_or_else(|| default_fallback.order.clone());
         insert_path(
             &mut merged,
@@ -5008,6 +5091,35 @@ impl CtxConfig {
                 "fallback.orchestrator_rollover_headroom_pct must be between 0 and 100, got {value}"
             )
             .into());
+        }
+        // Issue #455 (review round 1, finding 9): the breaker's own knobs.
+        // `open_after_failures` above the observation ring can never be
+        // reached, so the breaker would silently never open; a zero window
+        // discards every observation the instant it is recorded, and a zero
+        // cooldown makes every poll a trial.
+        if !(1..=super::health::MAX_OBSERVATIONS as u32)
+            .contains(&cfg.fallback.health.open_after_failures)
+        {
+            return Err(format!(
+                "fallback.health.open_after_failures must be between 1 and {}, got {}",
+                super::health::MAX_OBSERVATIONS,
+                cfg.fallback.health.open_after_failures
+            )
+            .into());
+        }
+        for (key, value) in [
+            (
+                "fallback.health.window_secs",
+                cfg.fallback.health.window_secs,
+            ),
+            (
+                "fallback.health.cooldown_secs",
+                cfg.fallback.health.cooldown_secs,
+            ),
+        ] {
+            if value == 0 {
+                return Err(format!("{key} must be greater than 0, got {value}").into());
+            }
         }
         for (name, limits) in &cfg.fallback.harness {
             if !super::adapters::ADAPTERS
@@ -8433,6 +8545,115 @@ mod tests {
         assert_eq!(TaskConfig::default().max_parent_outcome_bytes, 4096);
     }
 
+    /// Issue #455: `[fallback.health]` parses with its documented defaults,
+    /// and each key reads from its own environment variable.
+    #[test]
+    fn fallback_health_parses_with_defaults_and_env_overrides() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let empty = env_map(&[]);
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned()).expect("load");
+        assert!(cfg.fallback.health.enabled);
+        assert_eq!(cfg.fallback.health.open_after_failures, 3);
+        assert_eq!(cfg.fallback.health.window_secs, 600);
+        assert_eq!(cfg.fallback.health.cooldown_secs, 300);
+        assert!(
+            cfg.fallback.effective_health().enabled,
+            "health follows fallback.enabled, which defaults on"
+        );
+
+        let env = env_map(&[
+            ("ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES", "5"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS", "900"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS", "60"),
+            ("ZIRV_CTX_FALLBACK", "false"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.fallback.health.open_after_failures, 5);
+        assert_eq!(cfg.fallback.health.window_secs, 900);
+        assert_eq!(cfg.fallback.health.cooldown_secs, 60);
+        assert!(
+            !cfg.fallback.effective_health().enabled,
+            "with fallback off there is nowhere for a denied route's work to go"
+        );
+    }
+
+    /// Issue #455 (review round 1, finding 9): a knob outside its usable
+    /// range is a silently dead breaker, so each one is refused with the
+    /// same shape the neighbouring headroom keys use.
+    #[test]
+    fn fallback_health_knobs_are_range_checked() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        for (var, value, needle) in [
+            (
+                "ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES",
+                "0",
+                "fallback.health.open_after_failures must be between 1 and 20, got 0",
+            ),
+            (
+                "ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES",
+                "21",
+                "fallback.health.open_after_failures must be between 1 and 20, got 21",
+            ),
+            (
+                "ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS",
+                "0",
+                "fallback.health.window_secs must be greater than 0, got 0",
+            ),
+            (
+                "ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS",
+                "0",
+                "fallback.health.cooldown_secs must be greater than 0, got 0",
+            ),
+        ] {
+            let env = env_map(&[(var, value)]);
+            let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+                .expect_err("an unusable breaker knob must be refused");
+            assert!(err.to_string().contains(needle), "{var}={value}: {err}");
+        }
+
+        // The boundary values themselves are fine.
+        let env = env_map(&[
+            ("ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES", "20"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS", "1"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS", "1"),
+        ]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.fallback.health.open_after_failures, 20);
+    }
+
+    /// Issue #455: the breaker's timing knobs are operator-only, exactly
+    /// like `fallback.rollover_cooldown_secs`. `fallback.health.enabled`
+    /// itself stays narrowing-only, mirroring `fallback.enabled`.
+    #[test]
+    fn fallback_health_timing_is_repo_forbidden_but_its_switch_may_narrow() {
+        let empty = env_map(&[]);
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::commands::ctx::testenv::HomeGuard::set(home.path());
+
+        let repo = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback.health]\ncooldown_secs = 5\n",
+        )
+        .expect("write");
+        let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect_err("a repository must not tune the health breaker's cooldown");
+        assert!(
+            is_repo_forbidden(err.as_ref()),
+            "fallback.health.cooldown_secs must be rejected as REPO_FORBIDDEN: {err}"
+        );
+
+        std::fs::write(
+            repo.path().join(".zirv/ctx.toml"),
+            "[fallback.health]\nenabled = false\n",
+        )
+        .expect("write");
+        let cfg = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+            .expect("switching the breaker off is a narrowing");
+        assert!(!cfg.fallback.health.enabled);
+    }
+
     #[test]
     fn task_max_parent_outcome_bytes_reads_from_its_own_env_var() {
         let repo = tempfile::tempdir().expect("tempdir");
@@ -10236,6 +10457,10 @@ mod tests {
     /// is not a complete key list on its own.
     const ALL_CONFIG_KEYS: &[(&str, &str)] = &[
         ("fallback", "reactive_force_after_secs"),
+        ("fallback.health", "enabled"),
+        ("fallback.health", "open_after_failures"),
+        ("fallback.health", "window_secs"),
+        ("fallback.health", "cooldown_secs"),
         ("", "agent"),
         ("", "agent_bin"),
         ("chat", "model"),

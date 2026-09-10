@@ -302,3 +302,11 @@ model = "fable"
 
 # [fallback]
 # reactive_force_after_secs = 120     # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_REACTIVE_FORCE_AFTER_SECS): wait for idle after a confirmed block before forcing a structural seat handover.
+
+# [fallback.health]
+# Issue #455: health-aware routing. `enabled` may be narrowed here (a repo may switch the
+# route-health breaker off, never on); the three timing knobs are operator-only.
+# enabled = true                      # whether the per-route circuit breaker runs at all. Default: true.
+# open_after_failures = 3             # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES): transport/server failures inside the window that exclude a route. Default: 3.
+# window_secs = 600                   # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS): the sliding window those failures are counted over. Default: 600.
+# cooldown_secs = 300                 # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS): how long an excluded route stays excluded before one trial. Default: 300.

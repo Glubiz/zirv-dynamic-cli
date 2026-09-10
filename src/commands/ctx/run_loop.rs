@@ -616,6 +616,21 @@ pub(crate) fn run_with_clock<W: Write>(
                         &mut screening_announced,
                     );
                 }
+                // Issue #455 (review round 1, finding 4): this loop owns
+                // its own uncheckpointed scorer, so it feeds route health
+                // itself -- before the limit short-circuit below can
+                // return, so a transcript carrying both a rate limit and a
+                // transport failure still records the transport one.
+                // Double counting against a checkpointed reader of the same
+                // rows is prevented by row identity, not by exclusivity.
+                super::score::observe_route_health(
+                    &state,
+                    adapter.as_ref(),
+                    &mut scorer,
+                    &cfg.fallback.effective_health(),
+                    session.as_str(),
+                    "loop",
+                );
                 if scorer.provider_limit_hit() {
                     limit_hit = true;
                     return Tick::Stop("limit");
@@ -653,6 +668,14 @@ pub(crate) fn run_with_clock<W: Write>(
 
             if !limit_hit {
                 let _ = scorer.poll(adapter.as_ref(), &cfg.score, &cfg.screen.thresholds());
+                super::score::observe_route_health(
+                    &state,
+                    adapter.as_ref(),
+                    &mut scorer,
+                    &cfg.fallback.effective_health(),
+                    session.as_str(),
+                    "loop",
+                );
                 limit_hit = scorer.provider_limit_hit();
             }
 

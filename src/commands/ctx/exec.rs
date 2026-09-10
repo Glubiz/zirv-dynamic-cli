@@ -1584,6 +1584,7 @@ fn run_with_clock_inner<W: Write>(
             &cfg.score,
             &cfg.pace,
             &cfg.screen.thresholds(),
+            &cfg.fallback.effective_health(),
             &state,
             server.as_ref(),
             session.as_str(),
@@ -3141,6 +3142,13 @@ fn supervise_run(
     // `pace_cfg` right above -- so a repo-narrowed threshold reaches the
     // live supervision poll below, not just the Stop hook's own fallback.
     screen_thresholds: &super::screen::Thresholds,
+    // Issue #455 (review round 1, finding 4): the route-health policy, in
+    // the same narrow-purpose-parameter shape as `score_cfg`/`pace_cfg`/
+    // `screen_thresholds` above. This supervisor owns its own
+    // uncheckpointed scorer, so it must feed route health itself; a
+    // headless codex worker dying on connection refusals otherwise left
+    // its harness reading `Healthy` forever.
+    health_policy: &super::health::HealthPolicy,
     state: &StateDir,
     server: Option<&signal::SignalServer>,
     session: &str,
@@ -3582,6 +3590,12 @@ fn supervise_run(
                 screening_announced,
             );
         }
+        // Finding 4: drained every poll, before the limit short-circuit
+        // below can return -- a poll whose transcript carried BOTH a rate
+        // limit and a transport failure must still record the transport
+        // one. Swallows its own I/O failures; nothing here can reach the
+        // supervised child.
+        score::observe_route_health(state, adapter, scorer, health_policy, session, "exec");
         if scorer.provider_limit_hit() {
             *limit_hit = true;
             return Tick::Stop("limit");
@@ -3614,6 +3628,7 @@ fn supervise_run(
     // whether this was an ordinary exit.
     if !*limit_hit {
         let _ = scorer.poll(adapter, score_cfg, screen_thresholds);
+        score::observe_route_health(state, adapter, scorer, health_policy, session, "exec");
         *limit_hit = scorer.provider_limit_hit();
     }
 
