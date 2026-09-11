@@ -106,6 +106,9 @@ pub enum ModelResolutionError {
         endpoint: EndpointId,
         endpoint_vendor: String,
     },
+    EmptyModel {
+        vendor_prefix: Option<String>,
+    },
 }
 
 impl std::fmt::Display for ModelResolutionError {
@@ -130,11 +133,37 @@ impl std::fmt::Display for ModelResolutionError {
                 f,
                 "route `{route}` model names vendor `{named_vendor}` but endpoint `{endpoint}` is vendor `{endpoint_vendor}`"
             ),
+            Self::EmptyModel { vendor_prefix } => match vendor_prefix {
+                Some(vendor) => {
+                    write!(f, "must name a model after the `{vendor}/` prefix")
+                }
+                None => f.write_str("model is empty"),
+            },
         }
     }
 }
 
 impl std::error::Error for ModelResolutionError {}
+
+pub(crate) fn nonempty_model_name<'a>(
+    vendor_slug: &str,
+    requested: &'a str,
+) -> Result<&'a str, Option<&'a str>> {
+    if let Some((named_vendor, model_name)) = requested.split_once('/')
+        && named_vendor.eq_ignore_ascii_case(vendor_slug)
+    {
+        return if model_name.trim().is_empty() {
+            Err(Some(named_vendor))
+        } else {
+            Ok(model_name)
+        };
+    }
+    if requested.trim().is_empty() {
+        Err(None)
+    } else {
+        Ok(requested)
+    }
+}
 
 pub(crate) fn resolve_model(
     route: &RouteId,
@@ -142,19 +171,21 @@ pub(crate) fn resolve_model(
     vendor_slug: &str,
     requested: &str,
 ) -> Result<(ModelId, Option<String>), ModelResolutionError> {
-    let model_name = if let Some((named_vendor, model_name)) = requested.split_once('/') {
-        if !named_vendor.eq_ignore_ascii_case(vendor_slug) {
-            return Err(ModelResolutionError::VendorMismatch {
-                route: route.clone(),
-                named_vendor: named_vendor.to_string(),
-                endpoint: endpoint.clone(),
-                endpoint_vendor: vendor_slug.to_string(),
-            });
+    if let Some((named_vendor, _)) = requested.split_once('/')
+        && !named_vendor.eq_ignore_ascii_case(vendor_slug)
+    {
+        return Err(ModelResolutionError::VendorMismatch {
+            route: route.clone(),
+            named_vendor: named_vendor.to_string(),
+            endpoint: endpoint.clone(),
+            endpoint_vendor: vendor_slug.to_string(),
+        });
+    }
+    let model_name = nonempty_model_name(vendor_slug, requested).map_err(|vendor_prefix| {
+        ModelResolutionError::EmptyModel {
+            vendor_prefix: vendor_prefix.map(str::to_string),
         }
-        model_name
-    } else {
-        requested
-    };
+    })?;
     let needle = model_name.to_ascii_lowercase();
     let Some(vendor) = crate::commands::ctx::catalogue::vendor(vendor_slug) else {
         return Ok((
@@ -514,6 +545,7 @@ pub fn has_verified_capability(capabilities: &ModelCapabilities) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::testenv::{HomeGuard, repo};
     use super::super::config::NativeConfig;
     use super::super::credential::FakeStore;
     use super::super::probe::FakeProbe;
@@ -599,9 +631,19 @@ mod tests {
 
     #[test]
     fn subscription_route_stops_at_configured_without_harming_api_route() {
-        let cfg = config(
-            "schema=1\n[account.plan]\nprovider='anthropic'\nbilling='subscription'\n[account.api]\nprovider='anthropic'\n[route.plan]\naccount='plan'\nmodel='haiku'\n[route.api]\naccount='api'\nmodel='sonnet'\n",
-        );
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        let path = NativeConfig::operator_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "schema=1\n[account.plan]\nprovider='anthropic'\nbilling='subscription'\n[account.api]\nprovider='anthropic'\ncredential='env:API_KEY'\n[route.plan]\naccount='plan'\nmodel='haiku'\n[route.api]\naccount='api'\nmodel='sonnet'\n",
+        )
+        .unwrap();
+        let cfg = NativeConfig::load(home.path(), repo.path())
+            .unwrap()
+            .unwrap();
         let inventory = Inventory::build(
             &cfg,
             &|_| Some("key".into()),
@@ -626,6 +668,13 @@ mod tests {
             .unwrap();
         assert_eq!(api.state, RouteState::Credentialed);
         assert!(api.problems.is_empty());
+
+        std::fs::write(&path, "schema=1\n[account.api]\nprovider='anthropic'\n").unwrap();
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("`account.api.credential`"),
+            "got {error}"
+        );
     }
 
     #[test]

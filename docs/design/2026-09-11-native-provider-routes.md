@@ -66,15 +66,19 @@ account, endpoint, credential, role binding, route, or allowed route. A role
 left bound outside the intersection is an error rather than a fallback.
 
 All references and provider/endpoint agreement are validated while loading,
-before credentials or network access. Every route must declare a model that is
-non-empty after trimming, including routes for rungless compatible vendors.
-Schema versions newer than 1 fail with an upgrade instruction.
+before credentials or network access. Every route must declare a model whose
+name remains non-empty after trimming and removing an optional matching
+`vendor/` prefix, including routes for rungless compatible vendors. Schema
+versions newer than 1 fail with an upgrade instruction.
 
 ### 2.3 Credential references and protected stores
 
 Accounts refer to credentials as `env:NAME`, `store:<item>`, or `file:<path>`.
-Every account except `openai-compatible` must declare a credential reference;
-compatible endpoints may deliberately operate without authentication.
+Every API-billed account except `openai-compatible` must declare a credential
+reference; compatible endpoints may deliberately operate without
+authentication. Subscription-billed accounts may omit one because native
+routes never resolve or spend their harness entitlement; declaring a reference
+does not advance such a route beyond `Configured`.
 Environment values are read through an injectable lookup. Files expand `~`,
 must be regular files, and on Unix must not be group/world readable. Values
 are trimmed, wrapped in `Secret`, and can be exposed only by the explicit

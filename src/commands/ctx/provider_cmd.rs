@@ -138,12 +138,12 @@ fn run_with(
             let reference = account_cfg.credential.as_ref().ok_or_else(|| {
                 format!("account `{account}` has no credential ref; set it to store:<item>")
             })?;
-            refuse_harness_login(reference)?;
             let item = reference.store_item().ok_or_else(|| {
                 format!(
                     "account `{account}` credential is `{reference}`; credential set requires store:<item>"
                 )
             })?;
+            refuse_harness_login(reference)?;
             let secret = read_secret_fn()?;
             if secret.trim().is_empty() {
                 return Err("credential is empty".into());

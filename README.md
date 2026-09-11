@@ -1840,13 +1840,16 @@ allowed_routes = ["work-sonnet"]
 Providers with a default URL have an implicit endpoint named after the
 provider. `openai-compatible` instead requires both `base_url` and `vendor`.
 Account pools default to the account id; two accounts may deliberately share
-one `pool` when they share quota. Every account except `openai-compatible`
-must declare a credential reference. Credential references are `env:NAME`,
-`store:<item>`, or `file:<path>` (`~` expands; Unix files must be mode 0600 or
-stricter). Claude Code/Codex harness login tokens are refused: Claude.ai and
-ChatGPT subscriptions are entitlements for the harness backend, not native API
-credentials, and `credential set` refuses those store refs before reading a
-secret. Every route must declare a non-empty model. Model ids and aliases
+one `pool` when they share quota. Every API-billed account except
+`openai-compatible` must declare a credential reference. Subscription-billed
+accounts may omit one; even when one is declared, their native routes stop at
+`configured` with the harness-entitlement problem. Credential references are
+`env:NAME`, `store:<item>`, or `file:<path>` (`~` expands; Unix files must be
+mode 0600 or stricter). Claude Code/Codex harness login tokens are refused:
+Claude.ai and ChatGPT subscriptions are entitlements for the harness backend,
+not native API credentials, and `credential set` refuses those store refs
+before reading a secret. Every route must declare a model that remains
+non-empty after an optional matching `vendor/` prefix. Model ids and aliases
 resolve by exact case-insensitive match. A matching `vendor/` prefix is
 accepted, but `@date` and `:suffix` decorations are never stripped or silently
 substituted.

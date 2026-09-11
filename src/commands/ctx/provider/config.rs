@@ -281,7 +281,10 @@ impl NativeConfig {
                 )
                 .into());
             };
-            if spec.id != "openai-compatible" && account.credential.is_none() {
+            if account.billing == BillingClass::Api
+                && spec.id != "openai-compatible"
+                && account.credential.is_none()
+            {
                 return Err(format!(
                     "{}: `account.{id}.credential` is required for provider `{}`",
                     path.display(),
@@ -293,9 +296,6 @@ impl NativeConfig {
 
         let endpoints = self.effective_endpoints();
         for (id, route) in &self.routes {
-            if route.model.trim().is_empty() {
-                return Err(format!("{}: `route.{id}.model` is required", path.display()).into());
-            }
             let account = self.accounts.get(&route.account).ok_or_else(|| {
                 format!(
                     "{}: `route.{id}.account` references undeclared account `{}`",
@@ -337,6 +337,15 @@ impl NativeConfig {
                     account.provider
                 )
                 .into());
+            }
+            if let Err(vendor_prefix) =
+                super::inventory::nonempty_model_name(&endpoint.vendor, &route.model)
+            {
+                let problem = vendor_prefix.map_or_else(
+                    || "is required".to_string(),
+                    |_| format!("must name a model after the `{}/` prefix", endpoint.vendor),
+                );
+                return Err(format!("{}: `route.{id}.model` {problem}", path.display()).into());
             }
             super::inventory::resolve_model(id, &endpoint_id, &endpoint.vendor, &route.model)
                 .map_err(|error| format!("{}: `route.{id}.model`: {error}", path.display()))?;
@@ -545,6 +554,30 @@ mod tests {
         assert!(
             error.to_string().contains("`route.local.model`"),
             "got {error}"
+        );
+    }
+
+    #[test]
+    fn vendor_prefix_must_be_followed_by_a_nonempty_model() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        write(
+            &NativeConfig::operator_path(home.path()),
+            "schema=1\n[endpoint.local]\nprovider='openai-compatible'\nbase_url='http://127.0.0.1:11434'\nvendor='ollama'\n[account.local]\nprovider='openai-compatible'\n[route.local]\naccount='local'\nendpoint='local'\nmodel='ollama/'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("`route.local.model` must name a model after the `ollama/` prefix"),
+            "got {error}"
+        );
+
+        let route = RouteId::new("local").unwrap();
+        let endpoint = EndpointId::new("local").unwrap();
+        assert!(
+            super::super::inventory::resolve_model(&route, &endpoint, "ollama", "ollama/").is_err()
         );
     }
 }
