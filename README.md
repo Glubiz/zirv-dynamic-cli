@@ -1686,6 +1686,9 @@ checkout:
 | `fallback.health.open_after_failures` | `ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES` |
 | `fallback.health.window_secs` | `ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS` |
 | `fallback.health.cooldown_secs` | `ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS` |
+| `fallback.health.degrade_error_rate_pct` | `ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT` |
+| `fallback.health.degrade_min_samples` | `ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES` |
+| `fallback.health.degrade_ttft_ms` | `ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS` |
 
 The `mail.*`/`chrome.events` entries close the same hole `prompt.max_repo_bytes`
 does: mail is folded into a launched worker's prompt as its own layer, so a
@@ -1736,7 +1739,10 @@ may set either.
 (issue #455) close it once more for health-aware routing: how many failures
 make zirv stop trusting a vendor route, over what window, and how long it
 stays distrusted decides where the operator's tokens get spent, so only they
-may tune it. `fallback.health.enabled` itself stays repo-narrowable like
+may tune it. `fallback.health.degrade_error_rate_pct`/`fallback.health.degrade_min_samples`/`fallback.health.degrade_ttft_ms`
+are the same decision one step earlier -- how bad a route has to get before
+zirv starts ranking it behind the operator's other account -- and are
+operator-only for the same reason. `fallback.health.enabled` itself stays repo-narrowable like
 `fallback.enabled` — a checkout may switch the breaker off, never on.
 Everything else, including `chrome.banner`/`chrome.bar`,
 `supervise.max_nudges`, and every threshold, is still repo-configurable.
@@ -2150,13 +2156,14 @@ failure is the connection or the endpoint, not the model, so an open breaker
 on one model would have to steer work away from the others anyway. The last
 model seen is recorded alongside it, as information for `status` only.
 
-Five phases, per route:
+Six phases, per route:
 
 1. **healthy** — routed to normally.
 2. **suspect** — some transport/server failures inside `window_secs`, still routed to.
-3. **open** — `open_after_failures` reached: excluded from routing for `cooldown_secs`.
-4. **half-open** — the cooldown elapsed; exactly one trial is admitted.
-5. **unavailable** — an authentication, permission or model-not-found error; denied at once rather than after `open_after_failures`, then re-probed on the same `cooldown_secs` so a credential you have since fixed heals on its own.
+3. **degraded** — reachable, but measurably worse than it should be; still routed to, just ranked behind every healthy alternative.
+4. **open** — `open_after_failures` reached: excluded from routing for `cooldown_secs`.
+5. **half-open** — the cooldown elapsed; exactly one trial is admitted.
+6. **unavailable** — an authentication, permission or model-not-found error; denied at once rather than after `open_after_failures`, then re-probed on the same `cooldown_secs` so a credential you have since fixed heals on its own.
 
 Only *transport* (connection refused/reset, DNS, proxy, socket hang-up,
 timeouts) and *server* (overloaded, internal server error, service
@@ -2171,14 +2178,86 @@ structured rows only (Claude's `isApiErrorMessage`, codex's
 `task_complete.error`), so an agent merely *writing* about an outage can never
 trip a breaker.
 
+**Degraded** is the soft half of the same idea, and the only phase that
+reduces a route rather than excluding it. Two signals can reach it, both read
+over `window_secs`:
+
+- a rolling transport/server error rate at or above `degrade_error_rate_pct`,
+  once the window holds at least `degrade_min_samples` dated turn outcomes
+  (failures plus completed error-free turns);
+- a first-token latency whose median is at or above `degrade_ttft_ms`, over
+  the same minimum sample count. **Opt-in**: `degrade_ttft_ms` is unset by
+  default.
+
+Leaving degraded takes more than crossing back over the line: the error rate
+must fall below **half** `degrade_error_rate_pct`, or the latency median below
+**three quarters** of `degrade_ttft_ms`, or the evidence must age out of the
+window entirely. Without that hysteresis a route sitting on the threshold
+would flap in and out on every poll. A single completed turn never clears a
+degradation on its own — a rate is not a turn.
+
+The latency signal is off by default because of what a transcript can actually
+measure. Neither harness records a first-token time, so it is derived from row
+timestamps: the gap between the user row that opened the turn and the first
+assistant row after it. That interval includes the model's own thinking, so a
+reasoning model reads "slow" on a perfectly healthy endpoint. Inter-token
+latency is not measurable from either transcript at all. So latency only ever
+*reduces* a route: it never opens a circuit, never marks a route unavailable,
+and never migrates a session.
+
+A degraded route is reduced, never excluded. It loses every comparison to a
+healthy candidate regardless of headroom, and `zirv agent` steers a delegation
+off it — but only when a healthy alternative exists. If every route is
+degraded, the work stays where it was asked for: trading one degraded route
+for another is churn, not a reroute. A degraded seat route is not a rollover
+trigger either.
+
+**Shared endpoints.** When `[endpoint.claude]` and `[endpoint.codex]` are both
+pointed at one gateway, the two routes have one dependency, and failing over
+between them just buys a second failure. So a breaker that opened on a
+**transport or server** failure also denies any other harness whose configured
+`base_url` resolves to the same `host[:port]`, naming the route that actually
+failed. Only a configured endpoint override defines a shared dependency —
+native default accounts are always independent, because zirv knows nothing
+about the estate behind them. Authentication failures never propagate (a
+rejected credential belongs to one account, not to the host), and neither do
+rate limits, `unavailable`, or degradation. The dependency is only ever the
+host and port: no credentials, no paths, no full URLs reach a log or a status
+row. An alias denial excludes *placements* only — the seat sitting on the
+aliased route keeps working and never rolls over for its sibling's failure.
+
+**One trial at a time.** A half-open route admits exactly one recovery probe,
+so two dispatches landing in the same cooldown cannot both "test" a broken
+endpoint. Whoever gets there first claims the trial, recorded as one
+`health-trial` line; anyone else is told who is holding it, and when it frees
+itself, and re-runs placement once with that route excluded. A dispatch that
+still has nowhere healthy to go is refused rather than launched onto the route
+that was already being probed. The claim expires by itself after
+`cooldown_secs`, so a probe that never reports back cannot hold a route shut.
+A claim attempt that finds the route's own health record momentarily locked by
+another process is refused the same way rather than waiting on it — the lock
+holder may be halfway through claiming the very same trial.
+A trial that succeeds recovers the route and clears the claim; one that fails
+reopens the breaker and clears it too.
+
 An open route is excluded from `zirv agent`'s automatic reroute, from the
 orchestrator seat's successor choice, and from the pool view's candidate
 ranking — carrying its own reason, not a bare `hard-blocked`. An open breaker
 on the **seat's own** route is itself a rollover trigger, and takes the
 reactive path, so the handoff is the host-computed structural packet: zirv
-never asks a route that just refused connections to distil a handoff. If every
-route is denied, the seat parks exactly as it does when every account is
-exhausted, and the park reason names the health failures. State lives in
+never asks a route that just refused connections to distil a handoff. That
+structural packet also reconciles a partial stream (issue #455): a tool call
+whose result never arrived by the end of the scanned transcript is listed as
+`UNRESOLVED` rather than silently dropped -- with any file it claimed to
+modify marked `(unconfirmed)` -- and a reply cut short by the failure is
+withheld from `Done` and reported as `PARTIAL` instead of standing in as a
+finished answer, so the successor checks the real outcome before repeating or
+assuming away the side effect. Codex's own rollout carries no per-turn
+"stream ended mid-generation" marker, so its cut-tail detection only covers a
+`task_complete` that itself reports an error, not a raw stream cut with no
+completion event at all. If every route is denied, the seat parks exactly as
+it does when every account is exhausted, and the park reason names the
+health failures. State lives in
 `<state>/health/<harness>.json` — delete that file to reset a route by hand;
 there is no verb for it, and every phase heals on its own anyway. Each phase
 change is one `health-open` / `health-half-open` / `health-recovered` /
@@ -2187,7 +2266,9 @@ change is one `health-open` / `health-half-open` / `health-recovered` /
 `open_after_failures` must be 1..=20 (the size of the per-route observation
 ring), and both `window_secs` and `cooldown_secs` must be above zero; a value
 outside that is refused at config load rather than leaving a breaker that can
-never trip.
+never trip. The same applies to the degrade knobs:
+`degrade_error_rate_pct` must be 1..=100, `degrade_min_samples` at least 2,
+and `degrade_ttft_ms`, when set at all, at least 1000.
 
 Observations are stamped with the transcript **row's** own timestamp, not the
 clock, and de-duplicated by the row's own id — so re-reading a transcript
@@ -2208,8 +2289,12 @@ all when every route is fine), plus the exclusion reason in the pool section:
 ```
 pool
   health: claude open (3 transport/server error(s), last model opus; next health check ~unix 1700000300 (estimate))
+  health: codex degraded (2 transport/server error(s); codex: error rate 25% over 8 turns)
   excluded claude: claude: route health open: 3 transport error(s) in 10m; next health check in ~5m (estimate)
 ```
+
+A half-open route names whoever holds its trial the same way
+(`half-open (0 transport/server error(s); trial in flight: 7f3a2b1c (12s))`).
 
 The retry time is always an *estimate*: it is when the breaker admits its next
 trial, not when the endpoint is known to be back. `zirv ctx status --json`
@@ -2220,10 +2305,13 @@ Configure it under `[fallback.health]`:
 
 ```toml
 [fallback.health]
-enabled = true             # issue #455: master switch (also off whenever fallback.enabled is off)
-open_after_failures = 3    # transport/server failures inside the window that open a route
-window_secs = 600          # the sliding window failures are counted over
-cooldown_secs = 300        # how long an open route stays excluded before one trial
+enabled = true               # issue #455: master switch (also off whenever fallback.enabled is off)
+open_after_failures = 3      # transport/server failures inside the window that open a route
+window_secs = 600            # the sliding window failures are counted over
+cooldown_secs = 300          # how long an open route stays excluded before one trial
+degrade_error_rate_pct = 25  # rolling error rate that ranks a reachable route last
+degrade_min_samples = 8      # dated turn outcomes the window needs before either degrade signal fires
+# degrade_ttft_ms = 20000    # opt-in first-token p50 that degrades a route; unset by default
 ```
 
 `--force` and an explicit pin bypass health exactly as they bypass headroom:

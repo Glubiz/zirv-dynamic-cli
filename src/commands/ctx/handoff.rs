@@ -661,6 +661,27 @@ fn normalize_rendered_line(text: &str) -> String {
     }
 }
 
+/// Issue #455 (review round 2): how much of `StructuralContext::partial_text`
+/// the `PARTIAL` line quotes inline -- shorter than
+/// `VERIFICATION_LINE_CHAR_CAP`/the adapter's own `TOOL_CALL_SUMMARY_CAP`
+/// (both already redacted/capped upstream) purely so the quote reads as a
+/// short excerpt rather than the whole cut-off reply.
+const PARTIAL_TEXT_QUOTE_CAP: usize = 80;
+
+/// Cuts `text` (already redacted by the adapter) to
+/// [`PARTIAL_TEXT_QUOTE_CAP`] characters for the `PARTIAL` line's inline
+/// quote -- a no-op when it already fits.
+fn quote_partial_text(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= PARTIAL_TEXT_QUOTE_CAP {
+        return text.to_string();
+    }
+    let truncated: String = chars[..PARTIAL_TEXT_QUOTE_CAP.saturating_sub(3)]
+        .iter()
+        .collect();
+    format!("{truncated}...")
+}
+
 /// Renders a `StructuralContext::last_verification` outcome as the single
 /// line the `Verification` section holds: `"none recorded"` when the
 /// transcript never ran anything recognizable as a build/test/lint command,
@@ -715,6 +736,11 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| "Unknown task (no user prompt found in the transcript)".to_string());
 
+    // Issue #455 review round 2: `assistant_texts` never carries the text
+    // open at the moment of a cut -- the adapter already holds that out,
+    // in `ctx.partial_text` instead -- so `done` needs no popping here. An
+    // earlier, already-closed reply stays in `done` even when a LATER,
+    // unrelated turn is the one that gets cut.
     let done: Vec<String> = ctx
         .assistant_texts
         .iter()
@@ -722,10 +748,53 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         .filter(|t| !t.is_empty())
         .collect();
 
-    let remaining: Vec<String> = ctx
-        .tool_errors
+    // Issue #455: unresolved tool calls and a cut tail come first -- both
+    // describe an in-flight side effect or reply whose true state a
+    // successor must check before acting, which outranks an ordinary
+    // "these errors were never retried" note.
+    let mut remaining: Vec<String> = ctx
+        .unresolved_tool_calls
         .iter()
-        .map(|e| format!("Unresolved error: {}", e.lines().next().unwrap_or(e).trim()))
+        .map(|call| format!(
+            "UNRESOLVED: {} call {} ({}) was issued but no result was recorded -- check its actual outcome before repeating it; do not assume it ran or did not run.",
+            call.name, call.id, call.summary
+        ))
+        .collect();
+    if let Some(reason) = &ctx.tail_cut {
+        let mut line = format!(
+            "PARTIAL: the last reply was cut by {reason}; treat it as incomplete, not as an answer."
+        );
+        // Issue #455 review round 2: only present when the cut turn itself
+        // had open text (never an earlier, unrelated reply) -- already
+        // redacted by the adapter; capped again here, shorter, purely for
+        // an inline quote's own readability.
+        if let Some(partial) = &ctx.partial_text {
+            line.push_str(&format!(
+                " Cut text began: \"{}\"",
+                quote_partial_text(partial)
+            ));
+        }
+        remaining.push(line);
+    }
+    remaining.extend(
+        ctx.tool_errors
+            .iter()
+            .map(|e| format!("Unresolved error: {}", e.lines().next().unwrap_or(e).trim())),
+    );
+
+    // Issue #455: a file a still-unresolved call claimed to modify is
+    // marked, never silently presented as a plain, completed edit -- whether
+    // the write actually landed is exactly what is unknown.
+    let files_modified: Vec<String> = ctx
+        .files_modified
+        .iter()
+        .map(|path| {
+            if ctx.unconfirmed_files_modified.iter().any(|u| u == path) {
+                format!("{path} (unconfirmed)")
+            } else {
+                path.clone()
+            }
+        })
         .collect();
 
     Handoff {
@@ -738,7 +807,7 @@ pub fn structural(ctx: &StructuralContext) -> Handoff {
         verification: render_verification(ctx.last_verification.as_ref()),
         next_step: "Re-read the files listed below, then continue the task above from where the previous session stopped.".to_string(),
         files_read: ctx.files_read.clone(),
-        files_modified: ctx.files_modified.clone(),
+        files_modified,
         gotchas: vec!["This handoff was extracted mechanically, so it may be incomplete.".to_string()],
     }
 }
@@ -2481,6 +2550,125 @@ mod tests {
         );
         assert!(!handoff.next_step.is_empty(), "always leave a next step");
         assert!(handoff.is_usable());
+    }
+
+    /// Issue #455: an unresolved tool call renders as its own `UNRESOLVED`
+    /// line in `remaining`, naming the call and warning the successor not
+    /// to assume its outcome either way.
+    #[test]
+    fn structural_renders_an_unresolved_tool_call_as_a_warning_in_remaining() {
+        use super::super::event::UnresolvedToolCall;
+
+        let ctx = StructuralContext {
+            unresolved_tool_calls: vec![UnresolvedToolCall {
+                name: "Bash".to_string(),
+                id: "toolu_1".to_string(),
+                summary: "git push origin feat/x".to_string(),
+            }],
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        let line = handoff
+            .remaining
+            .iter()
+            .find(|r| r.starts_with("UNRESOLVED:"))
+            .expect("an UNRESOLVED line");
+        assert!(line.contains("Bash"));
+        assert!(line.contains("toolu_1"));
+        assert!(line.contains("git push origin feat/x"));
+        assert!(line.contains("do not assume it ran or did not run"));
+    }
+
+    /// Issue #455 (review round 2): a cut tail adds a `PARTIAL` note to
+    /// `remaining`, quoting the text that was actually open at the moment of
+    /// the cut (`partial_text`) -- rather than blindly popping `done`'s last
+    /// entry, which the adapter never even puts there in the first place.
+    #[test]
+    fn structural_adds_a_partial_note_quoting_the_text_open_at_the_cut() {
+        let ctx = StructuralContext {
+            tail_cut: Some("API error (server_error) after tool call Bash".to_string()),
+            partial_text: Some("I'll push the branch now.".to_string()),
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        let line = handoff
+            .remaining
+            .iter()
+            .find(|r| r.starts_with("PARTIAL:"))
+            .expect("a PARTIAL line");
+        assert!(line.contains("API error (server_error) after tool call Bash"));
+        assert!(line.contains("treat it as incomplete"));
+        assert!(line.contains("I'll push the branch now."));
+    }
+
+    /// Issue #455 (review round 2), the exact regression this round fixes:
+    /// an EARLIER, already-completed reply must survive in `done` even when
+    /// a LATER, unrelated turn (one with no text of its own) is the one
+    /// that gets cut -- `done` must never lose an entry it never should
+    /// have lost just because SOME cut happened somewhere in the session.
+    #[test]
+    fn structural_keeps_an_earlier_completed_reply_when_a_later_untexted_turn_is_cut() {
+        let ctx = StructuralContext {
+            assistant_texts: vec!["Pushed the branch.".to_string()],
+            tail_cut: Some("API error (server_error) after tool call Bash".to_string()),
+            partial_text: None,
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        assert_eq!(
+            handoff.done,
+            vec!["Pushed the branch.".to_string()],
+            "an unrelated, already-completed reply must stay in done: {:?}",
+            handoff.done
+        );
+        let line = handoff
+            .remaining
+            .iter()
+            .find(|r| r.starts_with("PARTIAL:"))
+            .expect("a PARTIAL line");
+        assert!(
+            !line.contains("Cut text began"),
+            "no partial text was recorded, so none may be quoted: {line}"
+        );
+    }
+
+    /// Issue #455: a file an unresolved call claimed to modify is marked
+    /// `(unconfirmed)` rather than rendered as a plain, completed edit; an
+    /// untouched file in the same list is rendered exactly as before.
+    #[test]
+    fn structural_marks_a_file_from_an_unresolved_call_as_unconfirmed() {
+        let ctx = StructuralContext {
+            files_modified: vec!["src/lib.rs".to_string(), "src/main.rs".to_string()],
+            unconfirmed_files_modified: vec!["src/lib.rs".to_string()],
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        assert!(
+            handoff
+                .files_modified
+                .contains(&"src/lib.rs (unconfirmed)".to_string())
+        );
+        assert!(handoff.files_modified.contains(&"src/main.rs".to_string()));
+    }
+
+    /// Issue #455: with no unresolved calls and no cut tail, rendering is
+    /// exactly what it was before this feature existed.
+    #[test]
+    fn structural_renders_nothing_extra_when_there_is_no_reconciliation_signal() {
+        let ctx = StructuralContext {
+            assistant_texts: vec!["[zirv] all done".to_string()],
+            tool_errors: vec!["boom".to_string()],
+            ..StructuralContext::default()
+        };
+        let handoff = structural(&ctx);
+        assert_eq!(handoff.done, vec!["[zirv] all done"]);
+        assert!(
+            !handoff
+                .remaining
+                .iter()
+                .any(|r| r.starts_with("UNRESOLVED:") || r.starts_with("PARTIAL:"))
+        );
+        assert_eq!(handoff.remaining, vec!["Unresolved error: boom"]);
     }
 
     #[test]

@@ -2582,6 +2582,21 @@ const ENV_MAP: &[(&str, &[&str], EnvKind)] = &[
         &["fallback", "health", "cooldown_secs"],
         EnvKind::Int,
     ),
+    (
+        "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT",
+        &["fallback", "health", "degrade_error_rate_pct"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES",
+        &["fallback", "health", "degrade_min_samples"],
+        EnvKind::Int,
+    ),
+    (
+        "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS",
+        &["fallback", "health", "degrade_ttft_ms"],
+        EnvKind::Int,
+    ),
     ("ZIRV_CTX_OPTIMIZE", &["optimize", "enabled"], EnvKind::Bool),
     (
         "ZIRV_CTX_OPTIMIZE_SESSIONS",
@@ -4056,6 +4071,21 @@ const REPO_FORBIDDEN: &[(&[&str], &str)] = &[
         &["fallback", "health", "cooldown_secs"],
         "ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS",
     ),
+    // The degrade knobs are the same class of decision one step earlier: how
+    // bad a route has to get before zirv starts ranking it behind the
+    // operator's other vendor account.
+    (
+        &["fallback", "health", "degrade_error_rate_pct"],
+        "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT",
+    ),
+    (
+        &["fallback", "health", "degrade_min_samples"],
+        "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES",
+    ),
+    (
+        &["fallback", "health", "degrade_ttft_ms"],
+        "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS",
+    ),
     // Issue #326 B1: without this a repo checkout could simply raise its own
     // parent-outcome budget, making the cap decorative -- same reasoning as
     // every other byte cap in this table (`mail.max_delivered_bytes`,
@@ -5126,6 +5156,43 @@ impl CtxConfig {
             if value == 0 {
                 return Err(format!("{key} must be greater than 0, got {value}").into());
             }
+        }
+        // Slice A: the degrade knobs. A 0% rate degrades every route that
+        // ever sees one failure and a rate above 100 can never be reached;
+        // a single sample is not a rate at all; and a sub-second first-token
+        // threshold would mark every thinking model degraded.
+        if !(1..=100).contains(&cfg.fallback.health.degrade_error_rate_pct) {
+            return Err(format!(
+                "fallback.health.degrade_error_rate_pct must be between 1 and 100, got {}",
+                cfg.fallback.health.degrade_error_rate_pct
+            )
+            .into());
+        }
+        // Finding 12: bounded above by the ring the samples land in, or the
+        // signal can never fire at all -- a minimum the evidence store
+        // cannot physically reach is a silently dead knob, exactly what the
+        // `open_after_failures` bound above exists to prevent. The latency
+        // ring is the smaller of the two, so enabling the latency signal
+        // tightens the ceiling.
+        let sample_ceiling = if cfg.fallback.health.degrade_ttft_ms.is_some() {
+            super::health::MAX_OBSERVATIONS as u32
+        } else {
+            super::health::MAX_SAMPLES as u32
+        };
+        if !(2..=sample_ceiling).contains(&cfg.fallback.health.degrade_min_samples) {
+            return Err(format!(
+                "fallback.health.degrade_min_samples must be between 2 and {sample_ceiling}, got {}",
+                cfg.fallback.health.degrade_min_samples
+            )
+            .into());
+        }
+        if let Some(ttft_ms) = cfg.fallback.health.degrade_ttft_ms
+            && ttft_ms < 1_000
+        {
+            return Err(format!(
+                "fallback.health.degrade_ttft_ms must be at least 1000, got {ttft_ms}"
+            )
+            .into());
         }
         for (name, limits) in &cfg.fallback.harness {
             if !super::adapters::ADAPTERS
@@ -8599,6 +8666,12 @@ mod tests {
         assert_eq!(cfg.fallback.health.open_after_failures, 3);
         assert_eq!(cfg.fallback.health.window_secs, 600);
         assert_eq!(cfg.fallback.health.cooldown_secs, 300);
+        assert_eq!(cfg.fallback.health.degrade_error_rate_pct, 25);
+        assert_eq!(cfg.fallback.health.degrade_min_samples, 8);
+        assert_eq!(
+            cfg.fallback.health.degrade_ttft_ms, None,
+            "the latency signal is opt-in"
+        );
         assert!(
             cfg.fallback.effective_health().enabled,
             "health follows fallback.enabled, which defaults on"
@@ -8608,12 +8681,18 @@ mod tests {
             ("ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES", "5"),
             ("ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS", "900"),
             ("ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS", "60"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT", "40"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES", "12"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS", "20000"),
             ("ZIRV_CTX_FALLBACK", "false"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.fallback.health.open_after_failures, 5);
         assert_eq!(cfg.fallback.health.window_secs, 900);
         assert_eq!(cfg.fallback.health.cooldown_secs, 60);
+        assert_eq!(cfg.fallback.health.degrade_error_rate_pct, 40);
+        assert_eq!(cfg.fallback.health.degrade_min_samples, 12);
+        assert_eq!(cfg.fallback.health.degrade_ttft_ms, Some(20_000));
         assert!(
             !cfg.fallback.effective_health().enabled,
             "with fallback off there is nowhere for a denied route's work to go"
@@ -8647,6 +8726,26 @@ mod tests {
                 "0",
                 "fallback.health.cooldown_secs must be greater than 0, got 0",
             ),
+            (
+                "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT",
+                "0",
+                "fallback.health.degrade_error_rate_pct must be between 1 and 100, got 0",
+            ),
+            (
+                "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES",
+                "1",
+                "fallback.health.degrade_min_samples must be between 2 and 40, got 1",
+            ),
+            (
+                "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES",
+                "41",
+                "fallback.health.degrade_min_samples must be between 2 and 40, got 41",
+            ),
+            (
+                "ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS",
+                "999",
+                "fallback.health.degrade_ttft_ms must be at least 1000, got 999",
+            ),
         ] {
             let env = env_map(&[(var, value)]);
             let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
@@ -8659,9 +8758,38 @@ mod tests {
             ("ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES", "20"),
             ("ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS", "1"),
             ("ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS", "1"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT", "100"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES", "2"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS", "1000"),
         ]);
         let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
         assert_eq!(cfg.fallback.health.open_after_failures, 20);
+        assert_eq!(cfg.fallback.health.degrade_error_rate_pct, 100);
+    }
+
+    /// Finding 12: with the latency signal on, the samples land in the
+    /// smaller latency ring, so the usable ceiling drops with it -- a
+    /// minimum the ring cannot reach is a knob that can never fire.
+    #[test]
+    fn degrade_min_samples_is_bounded_by_the_ring_its_samples_land_in() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let env = env_map(&[
+            ("ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES", "21"),
+            ("ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS", "20000"),
+        ]);
+        let err = CtxConfig::load(repo.path(), &|k| env.get(k).cloned())
+            .expect_err("21 latency samples can never accumulate in a 20-deep ring");
+        assert!(
+            err.to_string()
+                .contains("fallback.health.degrade_min_samples must be between 2 and 20, got 21"),
+            "{err}"
+        );
+
+        // The same value is fine while the latency signal is off: the error
+        // rate's own rings are twice as deep.
+        let env = env_map(&[("ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES", "21")]);
+        let cfg = CtxConfig::load(repo.path(), &|k| env.get(k).cloned()).expect("load");
+        assert_eq!(cfg.fallback.health.degrade_min_samples, 21);
     }
 
     /// Issue #455: the breaker's timing knobs are operator-only, exactly
@@ -8686,6 +8814,26 @@ mod tests {
             is_repo_forbidden(err.as_ref()),
             "fallback.health.cooldown_secs must be rejected as REPO_FORBIDDEN: {err}"
         );
+
+        // Slice A: the three degrade knobs are the same decision one step
+        // earlier, and are refused the same way.
+        for line in [
+            "degrade_error_rate_pct = 90",
+            "degrade_min_samples = 40",
+            "degrade_ttft_ms = 60000",
+        ] {
+            std::fs::write(
+                repo.path().join(".zirv/ctx.toml"),
+                format!("[fallback.health]\n{line}\n"),
+            )
+            .expect("write");
+            let err = CtxConfig::load(repo.path(), &|k| empty.get(k).cloned())
+                .expect_err("a repository must not tune the degrade thresholds");
+            assert!(
+                is_repo_forbidden(err.as_ref()),
+                "{line} must be rejected as REPO_FORBIDDEN: {err}"
+            );
+        }
 
         std::fs::write(
             repo.path().join(".zirv/ctx.toml"),
@@ -10504,6 +10652,9 @@ mod tests {
         ("fallback.health", "open_after_failures"),
         ("fallback.health", "window_secs"),
         ("fallback.health", "cooldown_secs"),
+        ("fallback.health", "degrade_error_rate_pct"),
+        ("fallback.health", "degrade_min_samples"),
+        ("fallback.health", "degrade_ttft_ms"),
         ("", "agent"),
         ("", "agent_bin"),
         ("chat", "model"),

@@ -282,6 +282,12 @@ pub fn classify(
             "ready (route health trial: one attempt admitted after a cooldown)".to_string(),
         );
     }
+    // Slice A: a degraded route is `Ready` -- it answers, just worse than it
+    // should. The reason rides on the state so `zirv ctx status` explains why
+    // this harness keeps losing ties it used to win.
+    if let Some(reason) = harness.health.degraded() {
+        return (HarnessState::Ready, format!("ready (degraded: {reason})"));
+    }
     (HarnessState::Ready, "ready".to_string())
 }
 
@@ -466,6 +472,11 @@ pub fn place(
     models: &dyn Fn(&str) -> Option<String>,
 ) -> Placement {
     let mut exclusions: Vec<(String, Exclusion)> = Vec::new();
+    // Slice A: the requested harness's own fit, held back rather than
+    // returned when it is DEGRADED. Rule (a) may keep a degraded route only
+    // once the order walk below has proved there is no healthy one to take
+    // the work instead -- a degraded route is reduced, never excluded.
+    let mut degraded_requested: Option<(String, String, Candidate)> = None;
     // Rule (a) is subject to `exclude` like every other candidate: a caller
     // that named the requested harness there (a `VISITED_ENV` entry, an
     // orchestrator seat's own harness, or a trigger that has already decided
@@ -484,20 +495,29 @@ pub fn place(
                 let (headroom_pct, binding_window) = binding_headroom(provider);
                 let projected =
                     projected_headroom(provider, cfg, unit.expected_tokens).unwrap_or(headroom_pct);
-                return Placement {
-                    unit: unit.id.clone(),
-                    selected: Some(Candidate {
-                        name: requested.name.clone(),
-                        model: models(&requested.name),
-                        headroom_pct,
-                        projected_headroom_pct: projected,
-                        assumed: false,
-                        stale: ranking_window(provider).is_some_and(|w| w.stale),
-                        binding_window,
-                    }),
-                    keep_requested: true,
-                    exclusions,
+                let candidate = Candidate {
+                    name: requested.name.clone(),
+                    model: models(&requested.name),
+                    headroom_pct,
+                    projected_headroom_pct: projected,
+                    assumed: false,
+                    stale: ranking_window(provider).is_some_and(|w| w.stale),
+                    binding_window,
                 };
+                match requested.health.degraded() {
+                    None => {
+                        return Placement {
+                            unit: unit.id.clone(),
+                            selected: Some(candidate),
+                            keep_requested: true,
+                            exclusions,
+                        };
+                    }
+                    Some(reason) => {
+                        degraded_requested =
+                            Some((requested.name.clone(), reason.to_string(), candidate));
+                    }
+                }
             } else {
                 exclusions.push((
                     requested.name.clone(),
@@ -523,7 +543,7 @@ pub fn place(
     // position order -- kept whole (not just the running best) so every
     // eligible loser can be recorded as `Exclusion::Outranked` once the
     // winner is known, not only the disqualified ones.
-    let mut eligible: Vec<(usize, Candidate)> = Vec::new();
+    let mut eligible: Vec<(usize, bool, Candidate)> = Vec::new();
 
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
         if name.eq_ignore_ascii_case(&unit.requested) {
@@ -684,6 +704,7 @@ pub fn place(
 
         eligible.push((
             order_index,
+            harness.health.degraded().is_some(),
             Candidate {
                 name: name.clone(),
                 model: Some(model),
@@ -699,22 +720,27 @@ pub fn place(
     // The same "greatest projected headroom, ties by order position" rule
     // as before, just applied over the whole `eligible` set at once instead
     // of tracked incrementally, so the loser(s) can still be identified.
-    let winner_index =
-        eligible
-            .iter()
-            .enumerate()
-            .min_by(|(_, (a_order, a)), (_, (b_order, b))| {
-                b.projected_headroom_pct
-                    .partial_cmp(&a.projected_headroom_pct)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a_order.cmp(b_order))
-            });
+    // Slice A: a healthy eligible candidate beats a degraded one outright;
+    // among equals the rule is unchanged (greatest projected headroom, ties
+    // by `cfg.fallback.order` position).
+    let winner_index = eligible.iter().enumerate().min_by(
+        |(_, (a_order, a_degraded, a)), (_, (b_order, b_degraded, b))| {
+            a_degraded
+                .cmp(b_degraded)
+                .then_with(|| {
+                    b.projected_headroom_pct
+                        .partial_cmp(&a.projected_headroom_pct)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a_order.cmp(b_order))
+        },
+    );
 
-    let selected = winner_index.map(|(i, _)| eligible[i].1.clone());
+    let selected = winner_index.map(|(i, _)| eligible[i].2.clone());
     if let Some((winner_i, _)) = winner_index {
-        let winner_name = eligible[winner_i].1.name.clone();
-        let winner_projected = eligible[winner_i].1.projected_headroom_pct;
-        for (i, (_, candidate)) in eligible.iter().enumerate() {
+        let winner_name = eligible[winner_i].2.name.clone();
+        let winner_projected = eligible[winner_i].2.projected_headroom_pct;
+        for (i, (_, _, candidate)) in eligible.iter().enumerate() {
             if i == winner_i {
                 continue;
             }
@@ -726,6 +752,38 @@ pub fn place(
                 },
             ));
         }
+    }
+
+    // Rule (a), resolved: the degraded requested harness keeps the work
+    // unless the walk above found a HEALTHY candidate. A degraded winner is
+    // no improvement on a degraded incumbent, and moving the work anyway
+    // would just trade one degraded route for another.
+    if let Some((name, reason, candidate)) = degraded_requested {
+        let healthy_alternative = winner_index.is_some_and(|(i, _)| !eligible[i].1);
+        if healthy_alternative {
+            exclusions.push((name, Exclusion::Unhealthy(reason)));
+            return Placement {
+                unit: unit.id.clone(),
+                selected,
+                keep_requested: false,
+                exclusions,
+            };
+        }
+        if let Some(loser) = &selected {
+            exclusions.push((
+                loser.name.clone(),
+                Exclusion::Outranked {
+                    by: name,
+                    projected_headroom_pct: candidate.projected_headroom_pct,
+                },
+            ));
+        }
+        return Placement {
+            unit: unit.id.clone(),
+            selected: Some(candidate),
+            keep_requested: true,
+            exclusions,
+        };
     }
 
     Placement {
@@ -922,6 +980,128 @@ mod tests {
 
     fn always_model(_: &str) -> Option<String> {
         Some("model".to_string())
+    }
+
+    fn degraded(reason: &str) -> super::super::health::Admission {
+        super::super::health::Admission::Degraded {
+            reason: reason.to_string(),
+        }
+    }
+
+    /// Slice A: a degraded route is reduced, not excluded -- rule (a) hands
+    /// the work to a healthy alternative instead of keeping the requested
+    /// harness, and says why.
+    #[test]
+    fn a_degraded_requested_harness_loses_to_a_healthy_alternative() {
+        let cfg = base_cfg();
+        let mut claude = harness("claude", "anthropic", 0, None);
+        claude.health = degraded("claude: error rate 30% over 10 turns");
+        let snapshot = classify_all(
+            &cfg,
+            vec![
+                provider("anthropic", vec![window("five_hour", 90.0)], Some(0)),
+                provider("openai", vec![window("five_hour", 40.0)], Some(0)),
+            ],
+            vec![claude, harness("codex", "openai", 0, None)],
+        );
+
+        assert_eq!(
+            snapshot.harness("claude").map(|h| h.state),
+            Some(HarnessState::Ready),
+            "a degraded route still answers"
+        );
+        let placement = place(&snapshot, &cfg, &unit("u", "claude", 0), &[], &always_model);
+        assert!(!placement.keep_requested);
+        assert_eq!(
+            placement.selected.map(|c| c.name),
+            Some("codex".to_string()),
+            "even though claude has more than twice the headroom"
+        );
+        assert!(
+            placement
+                .exclusions
+                .iter()
+                .any(|(name, exclusion)| name == "claude"
+                    && matches!(exclusion, Exclusion::Unhealthy(reason)
+                    if reason.contains("error rate 30%"))),
+            "{:?}",
+            placement.exclusions
+        );
+    }
+
+    #[test]
+    fn a_degraded_harness_is_still_chosen_when_it_is_the_only_candidate() {
+        let cfg = base_cfg();
+        let mut claude = harness("claude", "anthropic", 0, None);
+        claude.health = degraded("claude: error rate 30% over 10 turns");
+        let mut codex = harness("codex", "openai", 0, None);
+        codex.health = degraded("codex: error rate 40% over 10 turns");
+        let snapshot = classify_all(
+            &cfg,
+            vec![
+                provider("anthropic", vec![window("five_hour", 90.0)], Some(0)),
+                provider("openai", vec![window("five_hour", 40.0)], Some(0)),
+            ],
+            vec![claude, codex],
+        );
+
+        let placement = place(&snapshot, &cfg, &unit("u", "claude", 0), &[], &always_model);
+        assert!(
+            placement.keep_requested,
+            "trading one degraded route for another is churn, not a reroute"
+        );
+        assert_eq!(
+            placement.selected.map(|c| c.name),
+            Some("claude".to_string())
+        );
+    }
+
+    /// Rule (b): among alternatives, healthy beats degraded outright -- the
+    /// projected-headroom comparison only decides ties within one band.
+    #[test]
+    fn a_healthy_alternative_outranks_a_degraded_one_with_more_headroom() {
+        let mut cfg = base_cfg();
+        cfg.fallback.order = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "gemini".to_string(),
+        ];
+        let mut codex = harness("codex", "openai", 0, None);
+        codex.health = degraded("codex: error rate 30% over 10 turns");
+        let snapshot = classify_all(
+            &cfg,
+            vec![
+                provider("anthropic", vec![window("five_hour", 5.0)], Some(0)),
+                provider("openai", vec![window("five_hour", 95.0)], Some(0)),
+                provider("google", vec![window("five_hour", 40.0)], Some(0)),
+            ],
+            vec![
+                harness("claude", "anthropic", 0, None),
+                codex,
+                harness("gemini", "google", 0, None),
+            ],
+        );
+
+        let placement = place(&snapshot, &cfg, &unit("u", "claude", 0), &[], &always_model);
+        assert_eq!(
+            placement.selected.map(|c| c.name),
+            Some("gemini".to_string()),
+            "40% healthy beats 95% degraded"
+        );
+    }
+
+    #[test]
+    fn classify_names_the_degradation_on_an_otherwise_ready_harness() {
+        let cfg = base_cfg();
+        let mut claude = harness("claude", "anthropic", 0, None);
+        claude.health = degraded("claude: first-token p50 30.0s over 8 turns");
+        let provider = provider("anthropic", vec![window("five_hour", 90.0)], Some(0));
+        let (state, reason) = classify(&claude, &provider, &cfg);
+        assert_eq!(state, HarnessState::Ready);
+        assert_eq!(
+            reason,
+            "ready (degraded: claude: first-token p50 30.0s over 8 turns)"
+        );
     }
 
     /// Audit finding G2: codex's only usage source is its own rollout files,

@@ -118,6 +118,91 @@ fn turn_completed_after_last_error(events: &[NormalizedEvent]) -> bool {
     })
 }
 
+/// The turn route health is still watching: its start, whether it has
+/// produced first text or a final answer yet, and whether anything in it
+/// failed.
+///
+/// Finding 7: this lives on [`IncrementalScorer`] and survives across polls.
+/// Rebuilding it per poll closed every batch's open tail as a finished turn,
+/// so one long turn straddling three polls counted as three successes, and a
+/// turn whose `TurnStart` and first text landed in different polls yielded no
+/// TTFT sample at all.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct OpenTurn {
+    started_at_ms: Option<u64>,
+    last_final_at_ms: Option<u64>,
+    first_text_at_ms: Option<u64>,
+    failed: bool,
+    answered: bool,
+}
+
+/// Issue #455 slice A: folds `events` into `open`, emitting one success (and
+/// at most one TTFT sample) per turn that is provably OVER.
+///
+/// Terminal evidence is the next `TurnStart` or a `Compaction` -- never the
+/// end of a poll's batch, which says nothing about whether the turn finished
+/// (finding 7). Waiting for it also means a `ProviderError` arriving later in
+/// the same turn, possibly in a later poll, still retracts the success before
+/// it is ever emitted. The cost is that a session's LAST turn contributes
+/// nothing until the next one starts, which a rolling rate over `window_secs`
+/// does not notice.
+///
+/// A turn containing any `ProviderError` is not a success: it is already the
+/// breaker's evidence, and counting it on both sides would halve every rate.
+/// Times convert to epoch SECONDS, the unit every route-health ring prunes on
+/// (`health::Observation::at` comes from the transcript row's own `timestamp`,
+/// which is already seconds).
+fn fold_turn_health(
+    open: &mut OpenTurn,
+    events: &[NormalizedEvent],
+    successes: &mut Vec<u64>,
+    latencies: &mut Vec<super::health::LatencySample>,
+) {
+    fn close(
+        open: &mut OpenTurn,
+        successes: &mut Vec<u64>,
+        latencies: &mut Vec<super::health::LatencySample>,
+    ) {
+        let turn = std::mem::take(open);
+        if turn.failed || !turn.answered {
+            return;
+        }
+        if let Some(at_ms) = turn.last_final_at_ms {
+            successes.push(at_ms / 1000);
+        }
+        if let (Some(start), Some(text_at)) = (turn.started_at_ms, turn.first_text_at_ms) {
+            latencies.push(super::health::LatencySample {
+                at: text_at / 1000,
+                ttft_ms: text_at.saturating_sub(start),
+            });
+        }
+    }
+
+    for event in events {
+        match event {
+            NormalizedEvent::TurnStart { at_ms } => {
+                close(open, successes, latencies);
+                open.started_at_ms = *at_ms;
+            }
+            NormalizedEvent::AssistantFirstText { at_ms } => {
+                if open.first_text_at_ms.is_none() {
+                    open.first_text_at_ms = *at_ms;
+                }
+            }
+            NormalizedEvent::AssistantFinal { text, at_ms, .. } => {
+                if !text.trim().is_empty() {
+                    open.answered = true;
+                    open.last_final_at_ms = at_ms.or(open.last_final_at_ms);
+                }
+            }
+            NormalizedEvent::ProviderError { .. } => open.failed = true,
+            NormalizedEvent::Compaction => close(open, successes, latencies),
+            _ => {}
+        }
+    }
+}
+
 fn caps_with_window(
     adapter: &dyn AgentAdapter,
     model: Option<&str>,
@@ -488,6 +573,18 @@ pub struct IncrementalScorer {
     /// provider error it parsed -- the "the route answered" signal route
     /// health recovers on. `false` for a poll with no events at all.
     turn_succeeded: bool,
+    /// Issue #455 slice A: this poll's dated turn outcomes, drained
+    /// alongside `provider_errors` and for the same reason -- the rolling
+    /// error rate's denominator and the optional first-token latency
+    /// samples. Describes one poll only; never persisted in the checkpoint.
+    turn_successes: Vec<u64>,
+    turn_latencies: Vec<super::health::LatencySample>,
+    /// The turn the samples above are still waiting on (finding 7). Carried
+    /// across polls, unlike the two drained vectors, and deliberately NOT in
+    /// the checkpoint: a fresh process re-parses the transcript and rebuilds
+    /// it, and `health::record_samples` de-duplicates by row time so the
+    /// replay cannot double count.
+    open_turn: OpenTurn,
     /// Whether this poll read APPENDED bytes rather than re-reading the
     /// transcript from its start (review round 1, finding 2). A poll
     /// starting at offset 0 -- a fresh scorer, a missing or version-bumped
@@ -518,31 +615,32 @@ impl IncrementalScorer {
             provider_limit_hit: false,
             provider_errors: Vec::new(),
             turn_succeeded: false,
+            turn_successes: Vec::new(),
+            turn_latencies: Vec::new(),
+            open_turn: OpenTurn::default(),
             poll_was_incremental: false,
             last_speed: None,
         }
     }
 
     /// Resumes from a checkpoint a previous process wrote.
-    fn resuming(
-        transcript: PathBuf,
-        offset: u64,
-        consumed: u64,
-        state: RotState,
-        model: Option<String>,
-        context_window: Option<u64>,
-        model_tracker: ModelTracker,
-    ) -> Self {
+    /// Takes the whole [`Checkpoint`] rather than its fields one by one:
+    /// every value here comes from that file, and the list had grown past
+    /// the point where positional arguments were readable at the call site.
+    fn resuming(transcript: PathBuf, checkpoint: Checkpoint) -> Self {
         Self {
-            watcher: Watcher::resuming(transcript.clone(), offset, consumed),
+            watcher: Watcher::resuming(transcript.clone(), checkpoint.offset, checkpoint.consumed),
             transcript,
-            state: Some(state),
-            model,
-            context_window,
-            model_tracker,
+            state: Some(checkpoint.state),
+            model: checkpoint.model,
+            context_window: checkpoint.context_window,
+            model_tracker: checkpoint.model_tracker,
             provider_limit_hit: false,
             provider_errors: Vec::new(),
             turn_succeeded: false,
+            turn_successes: Vec::new(),
+            turn_latencies: Vec::new(),
+            open_turn: checkpoint.open_turn,
             poll_was_incremental: false,
             last_speed: None,
         }
@@ -577,6 +675,18 @@ impl IncrementalScorer {
     /// the same drain, so it is read alongside `take_provider_errors`.
     pub fn take_turn_succeeded(&mut self) -> bool {
         std::mem::take(&mut self.turn_succeeded)
+    }
+
+    /// Issue #455 slice A: this poll's completed, error-free turns, by row
+    /// time in epoch seconds. Drained for the same reason the two above are
+    /// -- a sample must reach route health exactly once.
+    pub fn take_turn_successes(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.turn_successes)
+    }
+
+    /// This poll's first-token latency samples, drained.
+    pub fn take_turn_latencies(&mut self) -> Vec<super::health::LatencySample> {
+        std::mem::take(&mut self.turn_latencies)
     }
 
     /// Whether the most recent poll read appended bytes rather than
@@ -699,6 +809,9 @@ impl IncrementalScorer {
             self.model = None;
             self.context_window = None;
             self.model_tracker = ModelTracker::default();
+            // A rewritten transcript's open turn belongs to a conversation
+            // this scorer is no longer following.
+            self.open_turn = OpenTurn::default();
         }
         // Issue #155 D1: resolved off the committed lines every poll, newest
         // wins, kept across polls (see the `model` field's own doc comment).
@@ -722,6 +835,19 @@ impl IncrementalScorer {
         // opens after two real failures rather than the configured three.
         self.provider_errors = provider_errors_of(&events);
         self.turn_succeeded = turn_completed_after_last_error(&events);
+        // Committed lines only, for the same double-count reason the errors
+        // right above are: the still-open partial line is read again, whole,
+        // by the next poll. Cleared rather than overwritten because the
+        // fold appends, and these two describe one poll (finding 7's
+        // `open_turn` is the part that deliberately does not).
+        self.turn_successes.clear();
+        self.turn_latencies.clear();
+        fold_turn_health(
+            &mut self.open_turn,
+            &events,
+            &mut self.turn_successes,
+            &mut self.turn_latencies,
+        );
         self.model_tracker.feed_all(&events);
         let Some(state) = self.state.as_mut() else {
             // An unbounded window has no bounded state to fold into.
@@ -838,6 +964,15 @@ struct Checkpoint {
     context_window: Option<u64>,
     #[serde(default)]
     model_tracker: ModelTracker,
+    /// R1: the turn route health is still waiting on, carried across the
+    /// Stop hook's fresh-process-per-turn restarts for exactly the reason
+    /// `model` above is. The checkpoint is written between turns -- after a
+    /// `TurnStart` and its completed reply, before the next `TurnStart` --
+    /// so a scorer that resumed with an empty open turn saw only the next
+    /// `TurnStart` and silently dropped the finished turn's success and TTFT
+    /// samples. `#[serde(default)]` for the same same-version reason.
+    #[serde(default)]
+    open_turn: OpenTurn,
 }
 
 /// Everything outside the transcript that decides what the same bytes score
@@ -902,6 +1037,7 @@ fn save_checkpoint(path: &Path, transcript: &Path, fingerprint: u64, scorer: &In
         model: scorer.model().map(str::to_string),
         context_window: scorer.context_window,
         model_tracker: scorer.model_tracker.clone(),
+        open_turn: scorer.open_turn.clone(),
     }) else {
         return;
     };
@@ -1017,15 +1153,7 @@ fn score_with_checkpoint(
     let path = checkpoint_path(state_dir, transcript);
     let fingerprint = fingerprint(adapter, cfg);
     let mut scorer = match load_checkpoint(&path, transcript, fingerprint, cfg) {
-        Some(checkpoint) => IncrementalScorer::resuming(
-            transcript.to_path_buf(),
-            checkpoint.offset,
-            checkpoint.consumed,
-            checkpoint.state,
-            checkpoint.model,
-            checkpoint.context_window,
-            checkpoint.model_tracker,
-        ),
+        Some(checkpoint) => IncrementalScorer::resuming(transcript.to_path_buf(), checkpoint),
         None => IncrementalScorer::new(transcript.to_path_buf()),
     };
 
@@ -1077,8 +1205,12 @@ pub fn observe_route_health(
 ) {
     let errors = scorer.take_provider_errors();
     let turn_succeeded = scorer.take_turn_succeeded();
+    let successes = scorer.take_turn_successes();
+    let latencies = scorer.take_turn_latencies();
     let incremental = scorer.poll_was_incremental();
-    if !health.enabled || (errors.is_empty() && !turn_succeeded) {
+    if !health.enabled
+        || (errors.is_empty() && !turn_succeeded && successes.is_empty() && latencies.is_empty())
+    {
         return;
     }
     super::health_store::observe_poll(
@@ -1086,6 +1218,8 @@ pub fn observe_route_health(
         adapter.name(),
         scorer.model(),
         &errors,
+        &successes,
+        &latencies,
         turn_succeeded,
         incremental,
         super::state::now_secs(),
@@ -2031,6 +2165,98 @@ mod tests {
         );
     }
 
+    /// R1: the Stop hook's checkpoint is written BETWEEN turns -- after a
+    /// `TurnStart` and its completed reply, before the next one. A scorer
+    /// that resumed from that offset with an empty open turn saw only the
+    /// next `TurnStart` and silently dropped the finished turn's success and
+    /// TTFT samples, so a supervised session's rolling rate lost a sample per
+    /// turn.
+    ///
+    /// Drives the checkpoint save/load directly rather than
+    /// `score_transcript_cached`: the persisted rings are window-pruned
+    /// against the real clock, so a fixture with fixed timestamps could only
+    /// ever be asserted here, where no clock is involved.
+    #[test]
+    fn a_checkpoint_resume_still_emits_the_turn_it_was_written_between() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transcript = dir.path().join("session.jsonl");
+        let checkpoint_file = dir.path().join("checkpoint.json");
+        let cfg = ScoreConfig::default();
+        let thresholds = screen::Thresholds::default();
+        let adapter = super::adapters::claude::ClaudeAdapter::new(None);
+        let fp = fingerprint(&adapter, &cfg);
+
+        let turn_one = concat!(
+            r#"{"type":"user","message":{"content":"go"},"timestamp":"2026-08-20T10:00:00.000Z"}"#,
+            "
+",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"thinking"}],"usage":{"input_tokens":10}},"timestamp":"2026-08-20T10:00:00.200Z"}"#,
+            "
+",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"[zirv] done"}],"usage":{"input_tokens":12}},"timestamp":"2026-08-20T10:00:00.500Z"}"#,
+            "
+",
+        );
+        std::fs::write(&transcript, turn_one).expect("write transcript");
+
+        let mut first = IncrementalScorer::new(transcript.clone());
+        first.poll(&adapter, &cfg, &thresholds).expect("first poll");
+        assert!(
+            first.take_turn_successes().is_empty(),
+            "a turn nothing follows is not yet a finished turn"
+        );
+        save_checkpoint(&checkpoint_file, &transcript, fp, &first);
+
+        // The next turn opens. A brand-new scorer resumes purely from the
+        // checkpoint file -- no in-memory state survives.
+        let turn_two_start = concat!(
+            r#"{"type":"user","message":{"content":"again"},"timestamp":"2026-08-20T10:00:09.000Z"}"#,
+            "
+",
+        );
+        std::fs::write(&transcript, format!("{turn_one}{turn_two_start}")).expect("append");
+        let restored =
+            load_checkpoint(&checkpoint_file, &transcript, fp, &cfg).expect("checkpoint loads");
+        let mut resumed = IncrementalScorer::resuming(transcript.clone(), restored);
+        resumed
+            .poll(&adapter, &cfg, &thresholds)
+            .expect("resumed poll");
+        assert_eq!(
+            resumed.take_turn_successes(),
+            vec![1_787_220_000],
+            "the turn the checkpoint was written between must still count"
+        );
+        assert_eq!(
+            resumed
+                .take_turn_latencies()
+                .iter()
+                .map(|sample| sample.ttft_ms)
+                .collect::<Vec<_>>(),
+            vec![200],
+            "and its TTFT spans the resume boundary"
+        );
+
+        // Turn two completes, but nothing follows it -- so it contributes
+        // nothing yet, and turn one is not folded a second time.
+        let turn_two_end = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"[zirv] done"}],"usage":{"input_tokens":14}},"timestamp":"2026-08-20T10:00:09.500Z"}"#,
+            "
+",
+        );
+        std::fs::write(
+            &transcript,
+            format!("{turn_one}{turn_two_start}{turn_two_end}"),
+        )
+        .expect("append");
+        resumed
+            .poll(&adapter, &cfg, &thresholds)
+            .expect("third poll");
+        assert!(
+            resumed.take_turn_successes().is_empty(),
+            "no double count, and turn two is still open"
+        );
+    }
+
     /// Grows `transcript` towards `body` in `chunks` appends cut at line
     /// boundaries, scoring through the cached path after every one, and
     /// returns the last score. The final write is `body` byte for byte, so a
@@ -2201,6 +2427,7 @@ mod tests {
             model: None,
             context_window: None,
             model_tracker: ModelTracker::default(),
+            open_turn: OpenTurn::default(),
         };
         let mut json = serde_json::to_value(checkpoint).expect("serialize checkpoint");
         let state = json["state"].as_object_mut().expect("state object");
@@ -2848,6 +3075,88 @@ mod tests {
     }
 
     // -- Issue #293: speed axis (turn latency / TTFT / tool-error rate) --
+
+    /// Issue #455 slice A: the same real fixture, read for route health
+    /// instead of for reporting. Two turns complete cleanly (final texts at
+    /// 10:00:00.500 and 10:00:05.150, first texts 200ms and 150ms in), and a
+    /// third turn carrying an API-error row contributes nothing at all --
+    /// it is already the breaker's evidence.
+    #[test]
+    fn turn_health_samples_counts_clean_turns_and_skips_failed_ones() {
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"content":"go"},"timestamp":"2026-08-20T10:00:00.000Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}],"usage":{"input_tokens":10}},"timestamp":"2026-08-20T10:00:00.200Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"[zirv] done"}],"usage":{"input_tokens":15}},"timestamp":"2026-08-20T10:00:00.500Z"}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"go again"},"timestamp":"2026-08-20T10:00:05.000Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"still here"}],"usage":{"input_tokens":16}},"timestamp":"2026-08-20T10:00:05.050Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"[zirv] done"}],"usage":{"input_tokens":18}},"timestamp":"2026-08-20T10:00:05.150Z"}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":"and again"},"timestamp":"2026-08-20T10:00:09.000Z"}"#,
+            "\n",
+            r#"{"type":"assistant","isApiErrorMessage":true,"uuid":"e1","requestId":"req-1","error":"server_error","apiErrorStatus":500,"message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 500"}]},"timestamp":"2026-08-20T10:00:09.100Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"[zirv] done"}],"usage":{"input_tokens":20}},"timestamp":"2026-08-20T10:00:09.500Z"}"#,
+            "\n",
+        );
+        let events = super::adapters::claude::parse_events(jsonl);
+        let mut open = OpenTurn::default();
+        let mut successes = Vec::new();
+        let mut latencies = Vec::new();
+        fold_turn_health(&mut open, &events, &mut successes, &mut latencies);
+
+        // Epoch seconds, the unit every route-health ring prunes on. The
+        // third turn errored, and is also still open (nothing follows it),
+        // so it contributes nothing on either count.
+        assert_eq!(successes, vec![1_787_220_000, 1_787_220_005]);
+        assert_eq!(
+            latencies
+                .iter()
+                .map(|sample| sample.ttft_ms)
+                .collect::<Vec<_>>(),
+            vec![200, 50],
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, NormalizedEvent::ProviderError { .. })),
+            "the fixture really does carry the API-error row this test skips"
+        );
+
+        // Finding 7: the same events split across two polls must yield the
+        // identical samples -- no premature success for the batch's open
+        // tail, and a TTFT sample whose two ends landed in different polls.
+        let boundary = events
+            .iter()
+            .position(|e| matches!(e, NormalizedEvent::AssistantFirstText { .. }))
+            .expect("a first-text event to cut on")
+            + 1;
+        let mut split_open = OpenTurn::default();
+        let mut split_successes = Vec::new();
+        let mut split_latencies = Vec::new();
+        fold_turn_health(
+            &mut split_open,
+            &events[..boundary],
+            &mut split_successes,
+            &mut split_latencies,
+        );
+        assert!(
+            split_successes.is_empty() && split_latencies.is_empty(),
+            "a turn that has only started is not a completed turn: {split_successes:?}"
+        );
+        fold_turn_health(
+            &mut split_open,
+            &events[boundary..],
+            &mut split_successes,
+            &mut split_latencies,
+        );
+        assert_eq!(split_successes, successes, "no turn counted twice");
+        assert_eq!(split_latencies, latencies, "TTFT survives a poll boundary");
+    }
 
     /// The acceptance criterion, literally: a fixture transcript with known
     /// timestamps, parsed by the real claude adapter and fed through

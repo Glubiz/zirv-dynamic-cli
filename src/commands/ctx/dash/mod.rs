@@ -6377,27 +6377,43 @@ fn fulfill_spawn_request(
         adapters::last_model_flag(&model_args).map(str::to_string)
     });
     let now = super::state::now_secs();
-    let route = super::fallback::route_new_delegation(
+    let route_request = super::fallback::RouteRequest {
+        requested: &req.agent,
+        source_model: source_model.as_deref(),
+        source_model_explicit: req.model.is_some(),
+        delegation: true,
+        bounds: super::fallback::TaskBounds {
+            tokens: None,
+            tool_calls: None,
+        },
+        now,
+        // The dashboard's own Spawn overlay authority path, not an
+        // `agent::run_with` orchestrator-seat delegation -- issue
+        // #328's same-harness exclusion is scoped to that call site.
+        exclude: &[],
+        requester: None,
+    };
+    let route = super::fallback::route_new_delegation(state, cfg, route_request, req.force);
+    // Issue #455 slice C (finding 2): this authority path launches panes
+    // without ever passing through `agent::run_with`, so it needs the same
+    // claim-at-commit as every other launch -- a half-open route admits one
+    // recovery probe, and two panes probing the same broken endpoint is what
+    // the rule exists to prevent. Same helper, so the two cannot drift.
+    let route = match super::fallback::claim_route_trial(
         state,
         cfg,
-        super::fallback::RouteRequest {
-            requested: &req.agent,
-            source_model: source_model.as_deref(),
-            source_model_explicit: req.model.is_some(),
-            delegation: true,
-            bounds: super::fallback::TaskBounds {
-                tokens: None,
-                tool_calls: None,
-            },
-            now,
-            // The dashboard's own Spawn overlay authority path, not an
-            // `agent::run_with` orchestrator-seat delegation -- issue
-            // #328's same-harness exclusion is scoped to that call site.
-            exclude: None,
-            requester: None,
-        },
+        route_request,
+        route,
+        &req.requested_by,
         req.force,
-    );
+    ) {
+        super::fallback::TrialClaim::Cleared(route) => route,
+        super::fallback::TrialClaim::Refused(reason) => {
+            return Err(SpawnRefusal::policy(format!(
+                "{reason}. Nothing else can take this work right now; retry once the trial                  above frees itself."
+            )));
+        }
+    };
     let mut effective_req = req.clone();
     // Issue #228: from here on, `effective_req.cwd` (and so `req.cwd` once
     // rebound below) IS the actual accepted spawn location -- `spawn_cwd`

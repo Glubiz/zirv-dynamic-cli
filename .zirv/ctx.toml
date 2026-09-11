@@ -310,3 +310,6 @@ model = "fable"
 # open_after_failures = 3             # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_HEALTH_OPEN_AFTER_FAILURES): transport/server failures inside the window that exclude a route. Default: 3.
 # window_secs = 600                   # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_HEALTH_WINDOW_SECS): the sliding window those failures are counted over. Default: 600.
 # cooldown_secs = 300                 # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_HEALTH_COOLDOWN_SECS): how long an excluded route stays excluded before one trial. Default: 300.
+# degrade_error_rate_pct = 25          # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_ERROR_RATE_PCT): rolling transport/server error rate that ranks a reachable route last. Default: 25.
+# degrade_min_samples = 8              # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_MIN_SAMPLES): dated turn outcomes the window needs before either degrade signal fires. Default: 8.
+# degrade_ttft_ms = 20000              # REPO-FORBIDDEN (ZIRV_CTX_FALLBACK_HEALTH_DEGRADE_TTFT_MS): opt-in first-token p50 that marks a route degraded. Unset by default.

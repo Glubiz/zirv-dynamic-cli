@@ -115,8 +115,8 @@ pub struct RouteHealthRow {
     pub route: String,
     pub harness: String,
     pub model: Option<String>,
-    /// `health::Phase::as_str`: `suspect` / `open` / `half-open` /
-    /// `unavailable`.
+    /// `health::Phase::as_str`: `suspect` / `degraded` / `open` /
+    /// `half-open` / `unavailable`.
     pub phase: String,
     /// How many Transport/Server observations the record currently holds.
     pub failures: usize,
@@ -125,8 +125,15 @@ pub struct RouteHealthRow {
     /// endpoint actually recovers.
     pub retry_after: Option<u64>,
     /// The admission verdict this phase produces right now -- the same
-    /// reason text `PoolView::exclusions` carries.
+    /// reason text `PoolView::exclusions` carries. Also carries a degraded
+    /// route's own reason, which is the only thing that explains why a
+    /// harness reading `Ready` keeps losing ties.
     pub reason: Option<String>,
+    /// Issue #455 slice C: who holds this half-open route's single recovery
+    /// trial, and how long they have held it. `None` for every other phase
+    /// and for a half-open route nobody has claimed yet.
+    pub trial: Option<String>,
+    pub trial_age_secs: Option<u64>,
 }
 
 /// Which bucket a binding window's own reading falls into for a human
@@ -352,6 +359,15 @@ fn health_rows(state: &StateDir, cfg: &CtxConfig, now: u64) -> Vec<RouteHealthRo
     super::health_store::all(state, now)
         .into_iter()
         .filter(|record| !record.health.phase.is_healthy())
+        // Slice A: a stored `Degraded` record whose evidence has aged out
+        // admits normally again (see `health::admission`), so it has nothing
+        // left to report -- the same finding-8 reasoning the phase mapping
+        // just below applies to an elapsed `Open`.
+        .filter(|record| {
+            !matches!(record.health.phase, super::health::Phase::Degraded { .. })
+                || super::health::admission(&record.health, now, &policy)
+                    != super::health::Admission::Allow
+        })
         .map(|record| RouteHealthRow {
             route: record.key.label(),
             harness: record.key.harness.clone(),
@@ -385,11 +401,35 @@ fn health_rows(state: &StateDir, cfg: &CtxConfig, now: u64) -> Vec<RouteHealthRo
             // misleading.
             retry_after: super::health::trial_at(&record.health.phase, &policy)
                 .filter(|at| *at > now),
-            reason: super::health::admission(&record.health, now, &policy)
-                .denied()
-                .map(str::to_string),
+            reason: match super::health::admission(&record.health, now, &policy) {
+                super::health::Admission::Deny { reason } => Some(reason),
+                super::health::Admission::Degraded { reason } => Some(reason),
+                _ => None,
+            },
+            trial: trial_of(&record.health.phase, now, &policy).map(|trial| trial.claim.clone()),
+            trial_age_secs: trial_of(&record.health.phase, now, &policy)
+                .map(|trial| now.saturating_sub(trial.at)),
         })
         .collect()
+}
+
+/// The in-flight recovery trial on a half-open route, if some caller is
+/// still holding one.
+///
+/// Finding 13: checked against `now`, exactly as `health::admission` checks
+/// it. An expired claim admits the next trial, so reporting it as "in
+/// flight" named a holder that no longer holds anything.
+fn trial_of<'a>(
+    phase: &'a super::health::Phase,
+    now: u64,
+    policy: &super::health::HealthPolicy,
+) -> Option<&'a super::health::Trial> {
+    match phase {
+        super::health::Phase::HalfOpen { trial, .. } => trial
+            .as_ref()
+            .filter(|held| now < held.at.saturating_add(policy.cooldown_secs)),
+        _ => None,
+    }
 }
 
 fn label(colour: bool, title: &str) -> String {
@@ -519,7 +559,7 @@ fn render_full(view: &PoolView, colour: bool) -> String {
 fn health_tone(phase: &str) -> Tone {
     match phase {
         "open" | "unavailable" => Tone::Err,
-        "suspect" | "half-open" => Tone::Warn,
+        "suspect" | "half-open" | "degraded" => Tone::Warn,
         _ => Tone::Plain,
     }
 }
@@ -533,6 +573,20 @@ fn format_health_row(row: &RouteHealthRow) -> String {
         .retry_after
         .map(|at| format!("; next health check ~unix {at} (estimate)"))
         .unwrap_or_default();
+    // A degraded route's failure count says nothing on its own -- the whole
+    // point of the phase is the RATE -- so its own reason is named here.
+    let degraded = (row.phase == "degraded")
+        .then_some(row.reason.as_deref())
+        .flatten()
+        .map(|reason| format!("; {reason}"))
+        .unwrap_or_default();
+    let trial = match (&row.trial, row.trial_age_secs) {
+        (Some(claim), Some(age)) => format!(
+            "; trial in flight: {claim} ({})",
+            crate::style::format_age(age)
+        ),
+        _ => String::new(),
+    };
     // The model is informational -- it is NOT part of the route identity
     // (see `health`'s own header) -- but it is what an operator wants to
     // know when a breaker trips, so it is named as "last model".
@@ -542,7 +596,7 @@ fn format_health_row(row: &RouteHealthRow) -> String {
         .map(|model| format!(", last model {model}"))
         .unwrap_or_default();
     format!(
-        "health: {} {} ({} transport/server error(s){model}{retry})",
+        "health: {} {} ({} transport/server error(s){model}{degraded}{trial}{retry})",
         row.route, row.phase, row.failures
     )
 }
@@ -972,6 +1026,8 @@ mod tests {
             failures: 3,
             retry_after: Some(1_700_000_300),
             reason: Some("route health open: 3 transport error(s) in 10m".to_string()),
+            trial: None,
+            trial_age_secs: None,
         }];
         view.exclusions = vec![(
             "claude".to_string(),
@@ -1025,6 +1081,7 @@ mod tests {
                     opened_at: 1_000,
                     until: 1_300,
                     reason: "3 transport error(s) in 10m".to_string(),
+                    class: crate::commands::ctx::event::ProviderErrorClass::Transport,
                 },
                 ..RouteHealth::default()
             },
@@ -1054,5 +1111,102 @@ mod tests {
             elapsed[0].reason, None,
             "and nothing is being denied any more"
         );
+    }
+
+    /// Slices A and C: a degraded route names its RATE (its failure count
+    /// says nothing on its own) and a half-open route names who is holding
+    /// its single recovery trial.
+    #[test]
+    fn a_degraded_route_and_an_in_flight_trial_are_rendered_and_serialized() {
+        use crate::commands::ctx::health::{HealthPolicy, Phase, RouteHealth, RouteKey, Trial};
+        use crate::commands::ctx::health_store::{RouteHealthRecord, dir};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.fallback.health = HealthPolicy::default();
+
+        let write = |name: &str, health: RouteHealth| {
+            let record = RouteHealthRecord {
+                key: RouteKey::new(name),
+                model: None,
+                health,
+                updated_at: 1_000,
+            };
+            crate::commands::ctx::state::create_private_dir_all(&dir(&state)).expect("mkdir");
+            std::fs::write(
+                dir(&state).join(format!("{name}.json")),
+                serde_json::to_string(&record).expect("serialize"),
+            )
+            .expect("write");
+        };
+        write(
+            "claude",
+            RouteHealth {
+                phase: Phase::Degraded {
+                    since: 900,
+                    reason: "error rate 30% over 10 turns".to_string(),
+                },
+                failures: vec![900],
+                successes: vec![901],
+                ..RouteHealth::default()
+            },
+        );
+        write(
+            "codex",
+            RouteHealth {
+                phase: Phase::HalfOpen {
+                    since: 900,
+                    trial: Some(Trial {
+                        claim: "sess-a".to_string(),
+                        at: 1_000,
+                    }),
+                },
+                ..RouteHealth::default()
+            },
+        );
+
+        let rows = health_rows(&state, &cfg, 1_030);
+        assert_eq!(rows[0].phase, "degraded");
+        assert_eq!(
+            health_rows(&state, &cfg, 1_030 + HealthPolicy::default().window_secs)
+                .iter()
+                .filter(|row| row.phase == "degraded")
+                .count(),
+            0,
+            "a degraded record whose evidence aged out has nothing left to report"
+        );
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some("error rate 30% over 10 turns")
+        );
+        assert_eq!(rows[1].phase, "half-open");
+        assert_eq!(rows[1].trial.as_deref(), Some("sess-a"));
+        assert_eq!(rows[1].trial_age_secs, Some(30));
+
+        // Finding 13: once the claim has expired the route admits the next
+        // trial, so there is no holder left to name.
+        let expired = health_rows(&state, &cfg, 1_000 + HealthPolicy::default().cooldown_secs);
+        let codex = expired
+            .iter()
+            .find(|row| row.harness == "codex")
+            .expect("codex row");
+        assert_eq!(codex.trial, None, "{codex:?}");
+        assert_eq!(codex.trial_age_secs, None, "{codex:?}");
+
+        let mut view = sample_view();
+        view.health = rows;
+        let full = render_text(&view, false, false);
+        assert!(
+            full.contains(
+                "health: claude degraded (0 transport/server error(s); error rate 30% over \
+                 10 turns)"
+            ),
+            "got {full}"
+        );
+        assert!(full.contains("trial in flight: sess-a (30s)"), "got {full}");
+        let json = serde_json::to_string(&view).expect("serialize");
+        assert!(json.contains("\"phase\":\"degraded\""), "got {json}");
+        assert!(json.contains("\"trial\":\"sess-a\""), "got {json}");
     }
 }

@@ -1,0 +1,4 @@
+{"timestamp":"2026-09-04T07:00:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"timestamp":"2026-09-04T07:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.6-sol"}}
+{"timestamp":"2026-09-04T07:00:05.000Z","type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_partial_1","status":"completed","call_id":"call_partial_1","name":"exec","sandbox_permissions":"require_escalated","command":["bash","-lc","git push origin feat/x"]}}
+{"timestamp":"2026-09-04T07:00:10.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null,"error":{"message":"server_error: the model provider returned a 500","codex_error_info":"other"}}}

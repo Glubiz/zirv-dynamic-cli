@@ -25,6 +25,11 @@ pub enum RouteReason {
     /// capacity reason at all -- the account has headroom, the endpoint is
     /// what cannot be reached.
     Unhealthy,
+    /// Slice A: the requested route still answers, but its rolling
+    /// transport/server error rate (or, when the operator opted in, its
+    /// first-token latency) says a healthy alternative will serve this work
+    /// better. Only ever chosen when there IS such an alternative.
+    Degraded,
 }
 
 impl RouteReason {
@@ -33,6 +38,7 @@ impl RouteReason {
             Self::Exhausted => "usage exhausted",
             Self::Predictive => "low headroom",
             Self::Unhealthy => "route unhealthy",
+            Self::Degraded => "route degraded",
         }
     }
 }
@@ -99,7 +105,9 @@ impl Route {
         // Finding 10: the breaker's reason replaces the bare label, since
         // "route unhealthy" alone says nothing an operator can act on.
         let verdict = match (&self.health_reason, self.reason) {
-            (Some(reason), RouteReason::Unhealthy) => format!("{}: {reason}", self.reason.label()),
+            (Some(reason), RouteReason::Unhealthy | RouteReason::Degraded) => {
+                format!("{}: {reason}", self.reason.label())
+            }
             _ => self.reason.label().to_string(),
         };
         format!(
@@ -195,10 +203,12 @@ pub struct RouteRequest<'a> {
     /// seat's own harness, so a low-headroom `zirv agent <other-harness>`
     /// cannot be silently rerouted back onto the very same seat
     /// `same_harness_refusal` (agent.rs) already refuses through the front
-    /// door. `None` for every caller with no such concept -- a running
-    /// worker's own vendor-blocked reroute (`route_blocked_session`) is not
-    /// an orchestrator-seat delegation and excludes nothing extra.
-    pub exclude: Option<&'a str>,
+    /// door, and (slice C) a harness whose half-open recovery trial this
+    /// caller just lost the race for. Empty for every caller with no such
+    /// concept -- a running worker's own vendor-blocked reroute
+    /// (`route_blocked_session`) is not an orchestrator-seat delegation and
+    /// excludes nothing extra.
+    pub exclude: &'a [&'a str],
     /// The requesting session's own identity (`mail::session_identity`'s
     /// shape), excluded from its harness's live `active` count by
     /// [`capacity_snapshot`] so a session never counts its own registry row
@@ -335,6 +345,10 @@ pub fn capacity_snapshot(
     // this is one small file read per harness on the single I/O choke point
     // every routing decision already flows through.
     let health_policy = cfg.fallback.effective_health();
+    // Slice B: one map for the whole snapshot, so a harness sharing its
+    // configured endpoint host with an open one is denied here too -- the
+    // per-route read this replaced could not see a sibling's failure.
+    let health = super::health_store::admissions(state, cfg, &names, now, &health_policy);
     let mut harnesses = Vec::with_capacity(names.len());
     for name in &names {
         let provider = adapters::provider_for_agent_name(Some(name)).to_string();
@@ -371,7 +385,7 @@ pub fn capacity_snapshot(
             reserve_headroom_pct: cfg.fallback.reserve_headroom_pct(name),
             state: allocator::HarnessState::Unknown,
             state_reason: String::new(),
-            health: super::health_store::harness_admission(state, name, now, &health_policy),
+            health: super::health_store::admission_for(&health, name),
         };
         let (state, reason) = allocator::classify(&harness, provider_capacity, cfg);
         harness.state = state;
@@ -627,7 +641,16 @@ fn best_alternate(
     request: RouteRequest<'_>,
     excluded: &[String],
 ) -> Option<(String, String, CandidateHeadroom)> {
-    let mut best: Option<(usize, String, String, CandidateHeadroom)> = None;
+    // Slice B: resolved once for the whole walk, so this path sees the same
+    // shared-endpoint denials `capacity_snapshot` does.
+    let health = super::health_store::admissions(
+        state,
+        cfg,
+        &health_names(cfg, request.requested),
+        request.now,
+        &cfg.fallback.effective_health(),
+    );
+    let mut best: Option<(usize, bool, String, String, CandidateHeadroom)> = None;
     for (order_index, name) in cfg.fallback.order.iter().enumerate() {
         // Case-insensitively, like `request.exclude` right below and like
         // `allocator::place`'s own order walk: `excluded` is parsed from
@@ -637,7 +660,8 @@ fn best_alternate(
             || excluded.iter().any(|seen| seen.eq_ignore_ascii_case(name))
             || request
                 .exclude
-                .is_some_and(|excl| excl.eq_ignore_ascii_case(name))
+                .iter()
+                .any(|excl| excl.eq_ignore_ascii_case(name))
             || !cfg.agents.is_enabled(name)
         {
             continue;
@@ -648,17 +672,13 @@ fn best_alternate(
         // Issue #455: the legacy (non-adaptive) path has no `CapacitySnapshot`
         // of its own, so route health is consulted here directly -- the same
         // exclusion `allocator::place` applies for the adaptive path.
-        if super::health_store::harness_admission(
-            state,
-            name,
-            request.now,
-            &cfg.fallback.effective_health(),
-        )
-        .denied()
-        .is_some()
-        {
+        let verdict = super::health_store::admission_for(&health, name);
+        if verdict.denied().is_some() {
             continue;
         }
+        // Slice A: a degraded alternate is still an alternate, it just loses
+        // every comparison to a healthy one.
+        let degraded = verdict.degraded().is_some();
         // Selection is the canonical readiness + agent_bin compatibility gate.
         // A broken/absent alternate is skipped, never allowed to turn fallback
         // itself into a failed launch.
@@ -704,16 +724,18 @@ fn best_alternate(
         };
         let replace = match &best {
             None => true,
-            Some((best_index, _, _, best_headroom)) => {
-                headroom.pct > best_headroom.pct
-                    || (headroom.pct == best_headroom.pct && order_index < *best_index)
+            Some((best_index, best_degraded, _, _, best_headroom)) => {
+                (!degraded && *best_degraded)
+                    || (degraded == *best_degraded
+                        && (headroom.pct > best_headroom.pct
+                            || (headroom.pct == best_headroom.pct && order_index < *best_index)))
             }
         };
         if replace {
-            best = Some((order_index, name.clone(), model, headroom));
+            best = Some((order_index, degraded, name.clone(), model, headroom));
         }
     }
-    best.map(|(_, name, model, headroom)| (name, model, headroom))
+    best.map(|(_, _, name, model, headroom)| (name, model, headroom))
 }
 
 /// Routes a *new* delegation when the requested harness is already refused by
@@ -754,7 +776,34 @@ pub fn route_new_delegation(
     let gate = pace::spawn_gate(&collector, estimator.as_ref(), request.now, &cfg.pace);
     let source_reading =
         pace::spawn_headroom(&collector, estimator.as_ref(), request.now, &cfg.pace);
-    if source_reading.is_some_and(|reading| reading.overage_covered) {
+    // Finding 5: resolved over every harness `cfg.fallback.order` names, not
+    // the requested one alone -- a shared-endpoint denial is only visible
+    // when the SIBLING's record is in the map too, and the single-name map
+    // this replaced could never see one.
+    let health_policy = cfg.fallback.effective_health();
+    let requested_health = super::health_store::admission_for(
+        &super::health_store::admissions(
+            state,
+            cfg,
+            &health_names(cfg, request.requested),
+            request.now,
+            &health_policy,
+        ),
+        request.requested,
+    );
+    let health_denial = requested_health.denied().map(str::to_string);
+    let health_triggered = health_denial.is_some();
+    // Slice A: the only SOFT trigger. A degraded route still answers, so
+    // this reroutes only when a healthy alternative actually exists --
+    // `allocator::place`'s rule (a) arbitrates that, which is why the
+    // requested harness is deliberately NOT excluded below when degradation
+    // is the only thing that fired.
+    let degraded_reason = requested_health.degraded().map(str::to_string);
+    let degrade_triggered = degraded_reason.is_some();
+    // Finding 4: a covered overage means usage has nothing to say, not that
+    // the endpoint is reachable. An open breaker with a healthy alternative
+    // used to return here and never reroute at all.
+    if source_reading.is_some_and(|reading| reading.overage_covered) && !health_triggered {
         return None;
     }
     let source_headroom = source_reading.map(|reading| reading.headroom_pct);
@@ -764,31 +813,25 @@ pub fn route_new_delegation(
             .required_headroom_pct(cfg, reading.window)
             .is_some_and(|required| reading.headroom_pct < required)
     });
-    let headroom_reason = match gate {
-        SpawnGate::Refuse { .. } => Some(RouteReason::Exhausted),
-        _ if task_will_not_fit
-            || source_headroom.is_some_and(|pct| pct <= cfg.fallback.predictive_headroom_pct) =>
-        {
-            Some(RouteReason::Predictive)
+    // Finding 4: a COVERED overage is not usage pressure, so it must not
+    // produce a usage reason either -- before health was evaluated first,
+    // such a reading returned early and never reached this match at all, and
+    // letting it label the route "low headroom" would report the covered
+    // overage as the cause of a reroute route health actually triggered.
+    let headroom_reason = if source_reading.is_some_and(|reading| reading.overage_covered) {
+        None
+    } else {
+        match gate {
+            SpawnGate::Refuse { .. } => Some(RouteReason::Exhausted),
+            _ if task_will_not_fit
+                || source_headroom
+                    .is_some_and(|pct| pct <= cfg.fallback.predictive_headroom_pct) =>
+            {
+                Some(RouteReason::Predictive)
+            }
+            _ => None,
         }
-        _ => None,
     };
-    // Issue #455: a third, independent trigger. The adaptive path below
-    // reaches the same conclusion through `allocator::classify` (a denied
-    // breaker classifies the harness `HardBlocked`, which `concurrency_
-    // triggered` already treats as a trigger); the legacy path has no
-    // snapshot, so it asks directly. Either way a healthy-headroom harness
-    // that cannot be connected to now reroutes instead of returning `None`.
-    let health_denial = super::health_store::harness_admission(
-        state,
-        request.requested,
-        request.now,
-        &cfg.fallback.effective_health(),
-    )
-    .denied()
-    .map(str::to_string);
-    let health_triggered = health_denial.is_some();
-
     if cfg.fallback.adaptive_delegation {
         let snapshot = capacity_snapshot(
             state,
@@ -803,11 +846,12 @@ pub fn route_new_delegation(
                 allocator::HarnessState::Draining | allocator::HarnessState::HardBlocked
             )
         });
-        if headroom_reason.is_none() && !concurrency_triggered && !health_triggered {
+        let hard_triggered = headroom_reason.is_some() || concurrency_triggered || health_triggered;
+        if !hard_triggered && !degrade_triggered {
             return None;
         }
         let unit = work_unit_for(request);
-        let mut exclude = request.exclude.into_iter().collect::<Vec<_>>();
+        let mut exclude = request.exclude.to_vec();
         // A trigger has already fired, so rule (a) of `allocator::place` --
         // "keep the requested harness whenever it is merely `Ready`" -- must
         // not silently overrule it. `Ready` covers every headroom above the
@@ -815,12 +859,21 @@ pub fn route_new_delegation(
         // `predictive_headroom_pct` band was dead in adaptive mode: a
         // delegation only ever steered at the reserve floor or the hard
         // spawn ceiling, never at the 20% threshold the legacy path honours.
-        exclude.push(request.requested);
+        //
+        // Slice A: NOT for a purely degraded route. Excluding it would force
+        // the work onto an alternative even when every alternative is just as
+        // degraded -- rule (a) already keeps a degraded incumbent in exactly
+        // that case, and returns an alternative when a healthy one exists.
+        if hard_triggered {
+            exclude.push(request.requested);
+        }
         let models = |name: &str| translated_model_for(request, name, cfg);
         let placement = super::allocator::place(&snapshot, cfg, &unit, &exclude, &models);
         let candidate = placement.selected.filter(|_| !placement.keep_requested)?;
         let reason = headroom_reason.unwrap_or(if health_triggered {
             RouteReason::Unhealthy
+        } else if !hard_triggered {
+            RouteReason::Degraded
         } else {
             RouteReason::Predictive
         });
@@ -831,16 +884,27 @@ pub fn route_new_delegation(
             source_reading,
             &snapshot,
             candidate,
-            health_denial,
+            health_denial.or(degraded_reason),
         ));
     }
 
     let reason = match headroom_reason {
         Some(reason) => reason,
         None if health_triggered => RouteReason::Unhealthy,
+        None if degrade_triggered => RouteReason::Degraded,
         None => return None,
     };
     let (selected, model, headroom) = best_alternate(state, cfg, request, &[])?;
+    // Slice A: the legacy path has no rule (a) to arbitrate with, so the same
+    // "only move to something better" guarantee is enforced here -- trading a
+    // degraded route for an equally degraded one is churn, not a reroute.
+    if reason == RouteReason::Degraded
+        && super::health_store::harness_admission(state, &selected, request.now, &health_policy)
+            .degraded()
+            .is_some()
+    {
+        return None;
+    }
     Some(Route {
         requested: request.requested.to_string(),
         selected,
@@ -853,8 +917,101 @@ pub fn route_new_delegation(
         selected_headroom_assumed: headroom.assumed,
         binding_window: None,
         reserved_tokens: 0,
-        health_reason: health_denial,
+        health_reason: health_denial.or(degraded_reason),
     })
+}
+
+/// What [`claim_route_trial`] decided about a placement that is about to
+/// become a launch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrialClaim {
+    /// Launch this. `Some` when the claim moved the work to an alternative,
+    /// `None` when the originally requested harness still holds it.
+    Cleared(Option<Route>),
+    /// Do NOT launch: the chosen route's single recovery trial belongs to
+    /// someone else and there is nowhere healthy to put this work instead.
+    /// Carries the breaker's own reason, including when the trial frees
+    /// itself.
+    Refused(String),
+}
+
+/// Issue #455 slice C, findings 1 and 2: claims the chosen route's single
+/// half-open recovery trial at the moment a placement becomes a launch.
+///
+/// A half-open route admits exactly ONE probe. Whoever claims it launches;
+/// anyone else re-plans once with that route excluded, claims the
+/// alternative too, and -- if that is also taken, or there is no alternative
+/// at all -- is refused rather than launched onto the route already being
+/// probed. Launching anyway was the defect: two sessions would "test" the
+/// same broken endpoint, which is precisely what the single-trial rule
+/// exists to stop.
+///
+/// Exactly two claim attempts, never a loop. Shared by `agent::run_with`,
+/// the dashboard's own spawn authority and (through its own candidate list)
+/// `rollover::evaluate`, so the three cannot drift.
+///
+/// `force` is the operator's explicit override and bypasses all of this, the
+/// same way it bypasses headroom.
+pub fn claim_route_trial(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    request: RouteRequest<'_>,
+    selected: Option<Route>,
+    claimant: &str,
+    force: bool,
+) -> TrialClaim {
+    let policy = cfg.fallback.effective_health();
+    if force || !policy.enabled {
+        return TrialClaim::Cleared(selected);
+    }
+    let target = selected
+        .as_ref()
+        .map(|route| route.selected.clone())
+        .unwrap_or_else(|| request.requested.to_string());
+    let Some(first) =
+        super::health_store::claim_trial(state, &target, claimant, request.now, &policy)
+            .denied()
+            .map(str::to_string)
+    else {
+        return TrialClaim::Cleared(selected);
+    };
+
+    let mut exclude: Vec<&str> = request.exclude.to_vec();
+    exclude.push(target.as_str());
+    let mut retry = request;
+    retry.exclude = &exclude;
+    let Some(alternate) = route_new_delegation(state, cfg, retry, false) else {
+        return TrialClaim::Refused(first);
+    };
+    if alternate.selected.eq_ignore_ascii_case(&target) {
+        return TrialClaim::Refused(first);
+    }
+    if let Some(second) =
+        super::health_store::claim_trial(state, &alternate.selected, claimant, request.now, &policy)
+            .denied()
+    {
+        return TrialClaim::Refused(format!("{first}; {second}"));
+    }
+    TrialClaim::Cleared(Some(alternate))
+}
+
+/// Every harness route health has to be asked about for one routing
+/// decision: the operator's whole fallback order, plus the requested harness
+/// when it is not in it.
+///
+/// Finding 5: a shared-endpoint denial is a statement about a PAIR, so the
+/// sibling's record has to be in the map or the alias can never be found.
+/// Asking about the requested harness alone silently disabled the whole
+/// alias rule on this path.
+fn health_names(cfg: &CtxConfig, requested: &str) -> Vec<String> {
+    let mut names = cfg.fallback.order.clone();
+    if !names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(requested))
+    {
+        names.push(requested.to_string());
+    }
+    names
 }
 
 /// Builds the `allocator::WorkUnit` a `RouteRequest` maps to -- shared by
@@ -970,7 +1127,8 @@ pub fn earliest_reset_choice(
             || excluded.iter().any(|seen| seen.eq_ignore_ascii_case(name))
             || request
                 .exclude
-                .is_some_and(|excl| excl.eq_ignore_ascii_case(name))
+                .iter()
+                .any(|excl| excl.eq_ignore_ascii_case(name))
             || !cfg.agents.is_enabled(name)
             || !candidate_allowed_by_capacity(cfg, name, request.bounds)
         {
@@ -1061,9 +1219,7 @@ pub fn route_blocked_session(
         );
         let unit = work_unit_for(request);
         let mut exclude: Vec<&str> = excluded.iter().map(String::as_str).collect();
-        if let Some(excl) = request.exclude {
-            exclude.push(excl);
-        }
+        exclude.extend(request.exclude.iter().copied());
         let models = |name: &str| translated_model_for(request, name, cfg);
         let placement = super::allocator::place(&snapshot, cfg, &unit, &exclude, &models);
         let candidate = placement.selected.filter(|_| !placement.keep_requested)?;
@@ -1212,7 +1368,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             &[],
@@ -1250,7 +1406,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             false,
@@ -1296,7 +1452,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             false,
@@ -1347,7 +1503,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             false,
@@ -1383,7 +1539,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             &[],
@@ -1431,7 +1587,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: Some("codex"),
+                exclude: &["codex"],
                 requester: None,
             },
             false,
@@ -1469,7 +1625,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: Some("Codex"),
+                exclude: &["Codex"],
                 requester: None,
             },
             false,
@@ -1507,7 +1663,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: Some("codex"),
+                exclude: &["codex"],
                 requester: None,
             },
             &[],
@@ -1547,7 +1703,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             false,
@@ -1643,7 +1799,7 @@ mod tests {
                 tool_calls: None,
             },
             now,
-            exclude: None,
+            exclude: &[],
             requester: None,
         };
         let implicit = route_new_delegation(&state, &cfg, request(false), false)
@@ -1691,7 +1847,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             false,
@@ -1741,7 +1897,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             false,
@@ -1776,7 +1932,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             &[],
@@ -1834,7 +1990,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             false,
@@ -1969,7 +2125,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             false,
@@ -2066,7 +2222,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: Some(&session),
             },
             false,
@@ -2135,7 +2291,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: Some(&short),
             },
             false,
@@ -2286,7 +2442,7 @@ mod tests {
                 tool_calls: None,
             },
             now,
-            exclude: None,
+            exclude: &[],
             requester: None,
         };
         let visited = vec!["Codex".to_string()];
@@ -2324,7 +2480,7 @@ mod tests {
                     tool_calls: None,
                 },
                 now,
-                exclude: None,
+                exclude: &[],
                 requester: None,
             },
             &["Codex".to_string()],
@@ -2335,6 +2491,362 @@ mod tests {
             "codex was already visited, whatever its spelling"
         );
     }
+    /// Slice A: a degraded route still answers, so it only ever steers when
+    /// there is a HEALTHY alternative to steer to. Both harnesses sit at 10%
+    /// used here, so nothing about usage would ever move this delegation.
+    fn degrade(state: &StateDir, cfg: &CtxConfig, harness: &str, now: u64) {
+        let key = super::super::health::RouteKey::new(harness);
+        let policy = cfg.fallback.effective_health();
+        for at in [now - 40, now - 30] {
+            super::super::health_store::observe_and_persist(
+                state,
+                &key,
+                &super::super::health::Observed::new(
+                    super::super::event::ProviderErrorClass::Transport,
+                    Some(at),
+                    Some(format!("{harness}-{at}")),
+                ),
+                None,
+                at,
+                &policy,
+            );
+        }
+        let successes: Vec<u64> = (0..6).map(|i| now - 25 + i).collect();
+        super::super::health_store::record_samples_and_persist(
+            state,
+            &key,
+            &successes,
+            &[],
+            None,
+            now,
+            &policy,
+        );
+    }
+
+    fn gateway_endpoints(cfg: &mut CtxConfig) {
+        let target = |path: &str| super::super::config::EndpointTarget {
+            vendor: "zai".to_string(),
+            base_url: format!("https://gateway.example.com/{path}"),
+            credential_env: "TOKEN".to_string(),
+            model: Some("glm-4.6".to_string()),
+            wire_api: None,
+        };
+        cfg.endpoint.claude = Some(target("anthropic"));
+        cfg.endpoint.codex = Some(target("openai"));
+    }
+
+    fn open_breaker(state: &StateDir, cfg: &CtxConfig, harness: &str, now: u64) {
+        let key = super::super::health::RouteKey::new(harness);
+        for at in [now - 20, now - 10, now] {
+            super::super::health_store::observe_and_persist(
+                state,
+                &key,
+                &super::super::health::Observed::new(
+                    super::super::event::ProviderErrorClass::Transport,
+                    Some(at),
+                    Some(format!("{harness}-{at}")),
+                ),
+                None,
+                at,
+                &cfg.fallback.effective_health(),
+            );
+        }
+    }
+
+    /// Finding 4: a covered overage says usage has nothing to complain
+    /// about, not that the endpoint can be reached. The early return it
+    /// triggered used to skip route health entirely, so an open breaker with
+    /// a healthy alternative never rerouted at all.
+    #[test]
+    fn a_covered_overage_no_longer_hides_an_open_route_from_the_router() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        // A covered overage on the source, plenty of room on the target.
+        crate::commands::ctx::window::store_for(
+            &state,
+            "anthropic",
+            &crate::commands::ctx::window::UsageWindows {
+                five_hour: Some(crate::commands::ctx::window::Window {
+                    used_percentage: 100.0,
+                    resets_at: now + 3_600,
+                    observed_at: now,
+                    overage_covered: true,
+                    limit_reached: false,
+                }),
+                seven_day: None,
+            },
+        )
+        .expect("store covered overage");
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let request = RouteRequest {
+            requested: "claude",
+            source_model: Some("sonnet"),
+            source_model_explicit: false,
+            delegation: true,
+            bounds: TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            },
+            now,
+            exclude: &[],
+            requester: None,
+        };
+        assert!(
+            route_new_delegation(&state, &cfg, request, false).is_none(),
+            "a covered overage on a HEALTHY route is still not a reroute"
+        );
+
+        open_breaker(&state, &cfg, "claude", now);
+        let route = route_new_delegation(&state, &cfg, request, false)
+            .expect("an unreachable route reroutes even under a covered overage");
+        assert_eq!(route.selected, "codex");
+        assert_eq!(route.reason, RouteReason::Unhealthy);
+    }
+
+    /// Puts `harness` in `HalfOpen` with `claimant` already holding its one
+    /// recovery trial -- the state a second launcher has to lose against.
+    fn trial_held_by(state: &StateDir, harness: &str, claimant: &str, at: u64) {
+        let record = super::super::health_store::RouteHealthRecord {
+            key: super::super::health::RouteKey::new(harness),
+            model: None,
+            health: super::super::health::RouteHealth {
+                phase: super::super::health::Phase::HalfOpen {
+                    since: at,
+                    trial: Some(super::super::health::Trial {
+                        claim: claimant.to_string(),
+                        at,
+                    }),
+                },
+                ..Default::default()
+            },
+            updated_at: at,
+        };
+        let dir = super::super::health_store::dir(state);
+        super::super::state::create_private_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join(format!("{harness}.json")),
+            serde_json::to_string(&record).expect("serialize"),
+        )
+        .expect("write");
+    }
+
+    /// Findings 1 and 2: a half-open route admits ONE probe. A launcher that
+    /// loses the race re-plans once and claims the alternative; with nowhere
+    /// healthy left it is REFUSED, never launched onto the route someone
+    /// else is already probing.
+    #[test]
+    fn claim_route_trial_reroutes_a_lost_race_and_refuses_when_nothing_is_left() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let request = RouteRequest {
+            requested: "claude",
+            source_model: Some("sonnet"),
+            source_model_explicit: false,
+            delegation: true,
+            bounds: TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            },
+            now,
+            exclude: &[],
+            requester: None,
+        };
+
+        // Nothing wrong: the placement stands untouched.
+        assert_eq!(
+            claim_route_trial(&state, &cfg, request, None, "sess-b", false),
+            TrialClaim::Cleared(None)
+        );
+
+        // claude's trial belongs to sess-a, codex is healthy.
+        trial_held_by(&state, "claude", "sess-a", now);
+        let TrialClaim::Cleared(Some(route)) =
+            claim_route_trial(&state, &cfg, request, None, "sess-b", false)
+        else {
+            panic!("a healthy alternative takes the work");
+        };
+        assert_eq!(route.selected, "codex");
+
+        // ... and the winner's own claim was taken, so a third launcher
+        // arriving at the same moment has nowhere left to go.
+        trial_held_by(&state, "codex", "sess-a", now);
+        let TrialClaim::Refused(reason) =
+            claim_route_trial(&state, &cfg, request, None, "sess-c", false)
+        else {
+            panic!("with both routes being probed the dispatch must be refused");
+        };
+        assert!(
+            reason.contains("recovery trial already in flight (sess-a)")
+                && reason.contains("next attempt in ~"),
+            "the refusal names the holder and when the slot frees itself: {reason}"
+        );
+
+        // The operator's explicit override still spends where asked.
+        assert_eq!(
+            claim_route_trial(&state, &cfg, request, None, "sess-c", true),
+            TrialClaim::Cleared(None),
+            "--force bypasses health exactly as it bypasses headroom"
+        );
+    }
+
+    /// Finding 5: the legacy router asked route health about the requested
+    /// harness ALONE, and a shared-endpoint denial is a statement about a
+    /// PAIR -- so the whole alias rule was silently dead on that path. This
+    /// pins the inputs the router now uses: the same map, over the same
+    /// names, denies the sibling of the route that actually failed.
+    ///
+    /// Not written as a full reroute assertion on purpose: `handover`'s
+    /// ladder maps models for claude and codex only, so those two are the
+    /// only harnesses that can be a routing target today -- which makes an
+    /// alias denial on one imply an open breaker on the other, and the other
+    /// was already skipped for its own denial. There is no third harness to
+    /// reroute onto, so the fix is not observable at the router's boundary.
+    #[test]
+    fn the_legacy_router_asks_route_health_about_the_whole_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = test_cfg_with_ready_adapters();
+        cfg.fallback.adaptive_delegation = false;
+        gateway_endpoints(&mut cfg);
+        let now = 1_700_000_000;
+        // claude, not codex, is the route that actually failed.
+        open_breaker(&state, &cfg, "claude", now);
+
+        let asked = |requested: &str| {
+            super::super::health_store::admission_for(
+                &super::super::health_store::admissions(
+                    &state,
+                    &cfg,
+                    &health_names(&cfg, requested),
+                    now,
+                    &cfg.fallback.effective_health(),
+                ),
+                requested,
+            )
+        };
+        let reason = asked("codex").denied().unwrap_or_default().to_string();
+        assert!(
+            reason.contains("shares endpoint gateway.example.com with claude"),
+            "{reason}"
+        );
+        // The single-name map this replaced could not see the sibling at all.
+        assert_eq!(
+            super::super::health_store::admission_for(
+                &super::super::health_store::admissions(
+                    &state,
+                    &cfg,
+                    &["codex".to_string()],
+                    now,
+                    &cfg.fallback.effective_health(),
+                ),
+                "codex",
+            ),
+            super::super::health::Admission::Allow,
+            "which is exactly the bug: asked alone, codex looks fine"
+        );
+    }
+
+    #[test]
+    fn health_names_always_covers_the_requested_harness_and_the_order() {
+        let mut cfg = CtxConfig::default();
+        cfg.fallback.order = vec!["claude".to_string(), "codex".to_string()];
+        assert_eq!(health_names(&cfg, "Codex"), cfg.fallback.order);
+        assert_eq!(
+            health_names(&cfg, "gemini"),
+            vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "gemini".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_degraded_route_steers_a_delegation_onto_a_healthy_harness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+
+        let request = RouteRequest {
+            requested: "claude",
+            source_model: Some("sonnet"),
+            source_model_explicit: false,
+            delegation: true,
+            bounds: TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            },
+            now,
+            exclude: &[],
+            requester: None,
+        };
+        assert!(route_new_delegation(&state, &cfg, request, false).is_none());
+
+        degrade(&state, &cfg, "claude", now);
+        let route = route_new_delegation(&state, &cfg, request, false)
+            .expect("a degraded claude steers onto a healthy codex");
+        assert_eq!(route.selected, "codex");
+        assert_eq!(route.reason, RouteReason::Degraded);
+        let detail = route.detail(pace::Seat::Cli);
+        assert!(
+            detail.contains("route degraded: claude: error rate 25% over 8 turns"),
+            "{detail}"
+        );
+
+        assert!(
+            route_new_delegation(&state, &cfg, request, true).is_none(),
+            "--force keeps the harness the operator asked for"
+        );
+    }
+
+    #[test]
+    fn a_degraded_route_keeps_the_work_when_every_alternative_is_degraded_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = test_cfg_with_ready_adapters();
+        let now = 1_700_000_000;
+        store_usage(&state, "anthropic", 10.0, now + 3_600, now);
+        store_usage(&state, "openai", 10.0, now + 3_600, now);
+        degrade(&state, &cfg, "claude", now);
+        degrade(&state, &cfg, "codex", now);
+
+        let request = RouteRequest {
+            requested: "claude",
+            source_model: Some("sonnet"),
+            source_model_explicit: false,
+            delegation: true,
+            bounds: TaskBounds {
+                tokens: None,
+                tool_calls: None,
+            },
+            now,
+            exclude: &[],
+            requester: None,
+        };
+        assert!(
+            route_new_delegation(&state, &cfg, request, false).is_none(),
+            "trading one degraded route for another is churn, not a reroute"
+        );
+
+        let mut legacy = cfg.clone();
+        legacy.fallback.adaptive_delegation = false;
+        assert!(
+            route_new_delegation(&state, &legacy, request, false).is_none(),
+            "the legacy path enforces the same guarantee without rule (a)"
+        );
+    }
+
     /// Issue #455: an open route-health breaker on the requested harness is
     /// its own reroute trigger, independent of headroom -- both harnesses
     /// here are at 10% used, so nothing about usage would ever steer.
@@ -2360,7 +2872,7 @@ mod tests {
                 tool_calls: None,
             },
             now,
-            exclude: None,
+            exclude: &[],
             requester: None,
         };
         assert!(

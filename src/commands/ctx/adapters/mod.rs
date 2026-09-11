@@ -174,6 +174,32 @@ pub(crate) fn provider_error_id(at_ms: Option<u64>, message: &str) -> Option<Str
     ))
 }
 
+/// Cap on an [`summary`](super::event::UnresolvedToolCall::summary) line and
+/// on the error detail folded into `StructuralContext::tail_cut`'s reason
+/// text (issue #455): long enough to show a real command, path or error
+/// message, short enough that a pathological one (a huge inline patch, a
+/// giant error body) cannot make the handoff arbitrarily large.
+pub(crate) const TOOL_CALL_SUMMARY_CAP: usize = 120;
+
+/// Reduces `raw` to a single, bounded, secret-scrubbed line (issue #455):
+/// redacted through [`super::pace::redact_for_log`] (which also collapses it
+/// to one line), then cut to [`TOOL_CALL_SUMMARY_CAP`] characters. Used for
+/// an unresolved tool call's own summary and for the error text folded into
+/// a `tail_cut` reason -- both are transcript-derived text that may be
+/// arbitrarily large or carry a secret-shaped token, and neither has ever
+/// been screened before reaching a successor session's prompt.
+pub(crate) fn redacted_tool_summary(raw: &str) -> String {
+    let redacted = super::pace::redact_for_log(raw);
+    let chars: Vec<char> = redacted.chars().collect();
+    if chars.len() <= TOOL_CALL_SUMMARY_CAP {
+        return redacted;
+    }
+    let truncated: String = chars[..TOOL_CALL_SUMMARY_CAP.saturating_sub(3)]
+        .iter()
+        .collect();
+    format!("{truncated}...")
+}
+
 fn classify_from_hints(hints: ProviderErrorHints<'_>) -> ProviderErrorClass {
     if let Some(status) = hints.status {
         match status {

@@ -2231,7 +2231,7 @@ fn run_with_clock_inner<W: Write>(
                 // A running worker's own vendor-blocked reroute is not an
                 // orchestrator-seat delegation (issue #328's exclusion is
                 // scoped to `agent::run_with` specifically).
-                exclude: None,
+                exclude: &[],
                 // This very session is the one being rerouted, so its own
                 // registry row is not competing capacity.
                 requester: Some(session.as_str()),

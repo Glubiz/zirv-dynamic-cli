@@ -29,7 +29,11 @@ use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 
-use super::health::{self, Admission, HealthPolicy, Observed, RouteHealth, RouteKey, Transition};
+use super::config::CtxConfig;
+use super::health::{
+    self, Admission, HealthPolicy, LatencySample, Observed, Phase, RouteHealth, RouteKey,
+    Transition,
+};
 use super::state::StateDir;
 
 /// Records untouched for this long with a `Healthy` phase carry no
@@ -204,6 +208,228 @@ pub fn record_success_and_persist(
     transition
 }
 
+/// Folds one poll's dated turn outcomes into `key`'s record. Unlike
+/// [`record_success_and_persist`], this DOES create a record for a route that
+/// has none: the rolling error rate needs its denominator from the first
+/// healthy turn onwards, or a route's first three failures would read as a
+/// 100% error rate.
+pub fn record_samples_and_persist(
+    state: &StateDir,
+    key: &RouteKey,
+    successes: &[u64],
+    latencies: &[LatencySample],
+    model: Option<&str>,
+    now: u64,
+    policy: &HealthPolicy,
+) -> Option<Transition> {
+    // Finding 9: a poll with no samples of its own still has to reach a
+    // degrade verdict once a record exists -- its numerator is whatever the
+    // errors folded a moment ago left behind. Only a route with no record at
+    // all and nothing to add is skipped.
+    if successes.is_empty() && latencies.is_empty() && !record_path(state, key).exists() {
+        return None;
+    }
+    let _lock = lock_route(state, key).ok()?;
+    let current = load(state, key, now);
+    let (next, transition) = health::record_samples(&current, successes, latencies, now, policy);
+    if next != current {
+        store(state, key, &next, model, now);
+    }
+    transition
+}
+
+/// Claims `harness`'s single half-open recovery trial for `claimant`.
+///
+/// Returns what the CALLER may do: `Trial` when it won the claim (and the
+/// claim is now persisted), a `Deny` naming the current holder when another
+/// caller got there first, and the ordinary [`harness_admission`] verdict for
+/// every other phase -- so a caller can hand the result straight to the same
+/// `denied()` check it already applies.
+///
+/// Never blocks. A contended lock is a DENIAL, not a pass-through
+/// (finding 3): the holder is in the middle of its own read-modify-write, so
+/// an unlocked read can still see an unclaimed `HalfOpen` that is about to
+/// be claimed -- returning `Trial` on that reading handed out a second
+/// trial with no claim persisted anywhere, which is the exact race this
+/// whole mechanism exists to prevent. The caller re-plans or refuses
+/// instead.
+pub fn claim_trial(
+    state: &StateDir,
+    harness: &str,
+    claimant: &str,
+    now: u64,
+    policy: &HealthPolicy,
+) -> Admission {
+    if !policy.enabled {
+        return Admission::Allow;
+    }
+    let key = RouteKey::new(harness);
+    let Ok(_lock) = lock_route(state, &key) else {
+        return named(
+            harness,
+            Admission::Deny {
+                reason: "half-open, health record busy; trial not claimed".to_string(),
+            },
+        );
+    };
+    let current = load(state, &key, now);
+    let (next, verdict, transition) = health::claim(&current, claimant, now, policy);
+    if next != current {
+        store(state, &key, &next, None, now);
+    }
+    if let Some(transition) = &transition {
+        log_transition(state, &key, transition, now, claimant, "route-health");
+    }
+    named(harness, verdict)
+}
+
+/// The configured endpoint host two harnesses would SHARE, `None` when this
+/// harness runs on its own native account. A native default account is not a
+/// shared dependency: zirv knows nothing about which vendor estate is behind
+/// it, and inventing one would let an Anthropic outage deny a codex route.
+pub fn dependency_of(cfg: &CtxConfig, harness: &str) -> Option<String> {
+    let target = match harness.to_lowercase().as_str() {
+        "claude" => cfg.endpoint.claude.as_ref(),
+        "codex" => cfg.endpoint.codex.as_ref(),
+        _ => None,
+    }?;
+    health::dependency_from_base_url(&target.base_url)
+}
+
+/// Every named harness's admission at once, with shared-endpoint denials
+/// folded in.
+///
+/// A route open on a TRANSPORT or SERVER failure says its endpoint host is
+/// down, and an operator who pointed both harnesses at one gateway has two
+/// routes behind that one host. Sending the work to the sibling then just
+/// buys a second failure, so the sibling is denied too, naming the route that
+/// actually failed. `Auth` never propagates (a rejected credential is one
+/// account's, not the host's), and neither does `RateLimit`, `Unavailable` or
+/// a merely degraded route.
+///
+/// Keyed by the LOWER-CASED harness name; [`admission_for`] is the matching
+/// lookup.
+pub fn admissions(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    names: &[String],
+    now: u64,
+    policy: &HealthPolicy,
+) -> std::collections::BTreeMap<String, Admission> {
+    let mut verdicts: std::collections::BTreeMap<String, Admission> =
+        std::collections::BTreeMap::new();
+    if !policy.enabled {
+        return names
+            .iter()
+            .map(|name| (name.to_lowercase(), Admission::Allow))
+            .collect();
+    }
+    // One record read per harness, reused for both the verdict and the
+    // shared-endpoint check below.
+    let loaded: Vec<(String, RouteHealth)> = names
+        .iter()
+        .map(|name| (name.clone(), load(state, &RouteKey::new(name), now)))
+        .collect();
+    for (name, record) in &loaded {
+        verdicts.insert(
+            name.to_lowercase(),
+            named(name, health::admission(record, now, policy)),
+        );
+    }
+    let failing: Vec<(&str, String, String)> = loaded
+        .iter()
+        .filter_map(|(name, record)| {
+            let Phase::Open { reason, class, .. } = &record.phase else {
+                return None;
+            };
+            if !matches!(
+                class,
+                super::event::ProviderErrorClass::Transport
+                    | super::event::ProviderErrorClass::Server
+            ) {
+                return None;
+            }
+            health::admission(record, now, policy).denied()?;
+            let dependency = dependency_of(cfg, name)?;
+            Some((name.as_str(), dependency, reason.clone()))
+        })
+        .collect();
+    for (name, _) in &loaded {
+        let key = name.to_lowercase();
+        if verdicts.get(&key).is_some_and(|a| a.denied().is_some()) {
+            continue;
+        }
+        let Some(dependency) = dependency_of(cfg, name) else {
+            continue;
+        };
+        let Some((failed, _, reason)) = failing
+            .iter()
+            .find(|(failed, dep, _)| !failed.eq_ignore_ascii_case(name) && *dep == dependency)
+        else {
+            continue;
+        };
+        verdicts.insert(
+            key,
+            Admission::Deny {
+                reason: format!("{name}: shares endpoint {dependency} with {failed} ({reason})"),
+            },
+        );
+    }
+    verdicts
+}
+
+/// One harness's verdict out of an [`admissions`] map, matched the same
+/// case-insensitive way every other harness lookup in this codebase is.
+pub fn admission_for(
+    verdicts: &std::collections::BTreeMap<String, Admission>,
+    harness: &str,
+) -> Admission {
+    verdicts
+        .get(&harness.to_lowercase())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Whether `harness`'s OWN route is shut -- an open breaker inside its
+/// cooldown, or an unavailable one. Deliberately narrower than
+/// [`harness_admission`]: a shared-endpoint denial belongs to another route
+/// and an in-flight half-open trial belongs to another caller, and neither is
+/// evidence that THIS seat's session cannot continue where it is. Only this
+/// answer may trigger a rollover or relax the successor's hysteresis floor.
+pub fn harness_block(
+    state: &StateDir,
+    harness: &str,
+    now: u64,
+    policy: &HealthPolicy,
+) -> Option<String> {
+    if !policy.enabled {
+        return None;
+    }
+    let key = RouteKey::new(harness);
+    let record = load(state, &key, now);
+    if !matches!(record.phase, Phase::Open { .. } | Phase::Unavailable { .. }) {
+        return None;
+    }
+    named(harness, health::admission(&record, now, policy))
+        .denied()
+        .map(str::to_string)
+}
+
+/// Prefixes a verdict's reason with the harness it is about: these reasons
+/// travel into standalone human lines (`rollover`'s park message, `zirv ctx
+/// status`'s exclusions) where nothing else names the route.
+fn named(harness: &str, verdict: Admission) -> Admission {
+    match verdict {
+        Admission::Deny { reason } => Admission::Deny {
+            reason: format!("{harness}: {reason}"),
+        },
+        Admission::Degraded { reason } => Admission::Degraded {
+            reason: format!("{harness}: {reason}"),
+        },
+        other => other,
+    }
+}
+
 /// Whether `harness` may be given work right now -- one small file read,
 /// then the pure verdict. A route is one harness, so this is the whole
 /// question (see `health`'s own header).
@@ -217,14 +443,10 @@ pub fn harness_admission(
         return Admission::Allow;
     }
     let key = RouteKey::new(harness);
-    match health::admission(&load(state, &key, now), now, policy) {
-        // Named, because this reason travels into standalone human lines
-        // (`rollover`'s park message, `zirv ctx status`'s exclusions).
-        Admission::Deny { reason } => Admission::Deny {
-            reason: format!("{harness}: {reason}"),
-        },
-        other => other,
-    }
+    named(
+        harness,
+        health::admission(&load(state, &key, now), now, policy),
+    )
 }
 
 /// Every stored route with something to say -- an aged-out `Healthy` record
@@ -261,6 +483,12 @@ pub fn all(state: &StateDir, now: u64) -> Vec<RouteHealthRecord> {
 /// observed only then (finding 2), because otherwise there is nothing to
 /// distinguish a fresh failure from a months-old one being re-parsed.
 ///
+/// `successes` and `latencies` are this poll's dated turn outcomes, the
+/// rolling error rate's denominator and the optional first-token latency
+/// signal. They need no `incremental` gate of their own: both carry the
+/// row's OWN time, so a re-parse from offset 0 hands over samples that prune
+/// straight back out of the window.
+///
 /// Exactly one decision-log line is appended per phase change -- never one
 /// per observation.
 #[allow(clippy::too_many_arguments)]
@@ -269,6 +497,8 @@ pub fn observe_poll(
     harness: &str,
     model: Option<&str>,
     errors: &[Observed],
+    successes: &[u64],
+    latencies: &[LatencySample],
     turn_succeeded: bool,
     incremental: bool,
     now: u64,
@@ -296,6 +526,15 @@ pub fn observe_poll(
     }
     if turn_succeeded
         && let Some(transition) = record_success_and_persist(state, &key, model, now, policy)
+    {
+        log_transition(state, &key, &transition, now, session, verb);
+    }
+    // Last, and unconditionally: this is the single per-poll evaluation of
+    // the degrade rule (finding 9), judged against every piece of evidence
+    // the three steps above folded -- this poll's failures, its successes and
+    // whatever `record_success` just healed.
+    if let Some(transition) =
+        record_samples_and_persist(state, &key, successes, latencies, model, now, policy)
     {
         log_transition(state, &key, &transition, now, session, verb);
     }
@@ -343,6 +582,335 @@ mod tests {
             Some(at),
             Some(format!("row-{at}")),
         )
+    }
+
+    fn endpoint_cfg(claude: Option<&str>, codex: Option<&str>) -> CtxConfig {
+        let target = |base_url: &str| super::super::config::EndpointTarget {
+            vendor: "zai".to_string(),
+            base_url: base_url.to_string(),
+            credential_env: "TOKEN".to_string(),
+            model: Some("glm".to_string()),
+            wire_api: None,
+        };
+        let mut cfg = CtxConfig::default();
+        cfg.endpoint.claude = claude.map(target);
+        cfg.endpoint.codex = codex.map(target);
+        cfg
+    }
+
+    fn open_on(state: &StateDir, harness: &str, class: ProviderErrorClass, now: u64) {
+        let key = RouteKey::new(harness);
+        let policy = HealthPolicy::default();
+        for at in [now - 20, now - 10, now] {
+            observe_and_persist(
+                state,
+                &key,
+                &Observed::new(class, Some(at), Some(format!("{harness}-{at}"))),
+                None,
+                at,
+                &policy,
+            );
+        }
+    }
+
+    /// Slice B: an open TRANSPORT breaker on one harness denies the sibling
+    /// pointed at the same configured endpoint host -- sending the work there
+    /// only buys a second failure.
+    #[test]
+    fn an_open_transport_route_denies_the_harness_sharing_its_endpoint_host() {
+        let (_guard, state) = state();
+        let now = 2_000;
+        let policy = HealthPolicy::default();
+        let cfg = endpoint_cfg(
+            Some("https://gateway.example.com/anthropic"),
+            Some("https://user:secret@gateway.example.com/openai"),
+        );
+        open_on(&state, "claude", ProviderErrorClass::Transport, now);
+
+        let names = vec!["claude".to_string(), "codex".to_string()];
+        let verdicts = admissions(&state, &cfg, &names, now, &policy);
+        let codex = admission_for(&verdicts, "codex");
+        let reason = codex.denied().expect("the alias is denied too");
+        assert!(
+            reason.starts_with("codex: shares endpoint gateway.example.com with claude ("),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("secret"),
+            "a dependency string never carries a credential: {reason}"
+        );
+    }
+
+    #[test]
+    fn independent_endpoints_and_native_accounts_never_share_a_denial() {
+        let (_guard, state) = state();
+        let now = 2_000;
+        let policy = HealthPolicy::default();
+        open_on(&state, "claude", ProviderErrorClass::Transport, now);
+        let names = vec!["claude".to_string(), "codex".to_string()];
+
+        let native = admissions(&state, &CtxConfig::default(), &names, now, &policy);
+        assert_eq!(admission_for(&native, "codex"), Admission::Allow);
+
+        let split = endpoint_cfg(
+            Some("https://one.example.com/v1"),
+            Some("https://two.example.com/v1"),
+        );
+        let verdicts = admissions(&state, &split, &names, now, &policy);
+        assert_eq!(admission_for(&verdicts, "codex"), Admission::Allow);
+    }
+
+    #[test]
+    fn an_auth_failure_never_propagates_to_a_shared_endpoint() {
+        let (_guard, state) = state();
+        let now = 2_000;
+        let policy = HealthPolicy::default();
+        let cfg = endpoint_cfg(
+            Some("https://gateway.example.com/anthropic"),
+            Some("https://gateway.example.com/openai"),
+        );
+        open_on(&state, "claude", ProviderErrorClass::Auth, now);
+
+        let names = vec!["claude".to_string(), "codex".to_string()];
+        let verdicts = admissions(&state, &cfg, &names, now, &policy);
+        assert!(
+            admission_for(&verdicts, "claude").denied().is_some(),
+            "the rejected credential still denies its own route"
+        );
+        assert_eq!(
+            admission_for(&verdicts, "codex"),
+            Admission::Allow,
+            "a rejected credential belongs to one account, not to the host"
+        );
+    }
+
+    /// Slice B, finding 4: an alias denial is never a rollover trigger, and
+    /// neither is a trial someone else holds -- `harness_block` is the seat's
+    /// own route and nothing else. `rollover::evaluate` derives both
+    /// `confirmed_block`'s health half and `source_unreachable` from exactly
+    /// this call.
+    #[test]
+    fn harness_block_sees_only_the_routes_own_phase() {
+        let (_guard, state) = state();
+        let now = 2_000;
+        let policy = HealthPolicy::default();
+        let cfg = endpoint_cfg(
+            Some("https://gateway.example.com/anthropic"),
+            Some("https://gateway.example.com/openai"),
+        );
+        open_on(&state, "claude", ProviderErrorClass::Transport, now);
+
+        assert!(harness_block(&state, "claude", now, &policy).is_some());
+        assert_eq!(
+            harness_block(&state, "codex", now, &policy),
+            None,
+            "the seat on the alias is still working; only its placements are denied"
+        );
+        let names = vec!["claude".to_string(), "codex".to_string()];
+        assert!(
+            admission_for(&admissions(&state, &cfg, &names, now, &policy), "codex")
+                .denied()
+                .is_some(),
+            "which is exactly what makes the two answers different"
+        );
+    }
+
+    #[test]
+    fn harness_block_ignores_a_degraded_route_and_an_in_flight_trial() {
+        let (_guard, state) = state();
+        let policy = HealthPolicy::default();
+        let key = RouteKey::new("claude");
+
+        let degraded = RouteHealth {
+            phase: Phase::Degraded {
+                since: 1_000,
+                reason: "error rate 30% over 10 turns".to_string(),
+            },
+            // Evidence inside the window: a degraded record with none left
+            // admits normally again (`health::admission`).
+            failures: vec![1_000],
+            successes: vec![1_001],
+            ..RouteHealth::default()
+        };
+        store(&state, &key, &degraded, None, 1_000);
+        assert_eq!(harness_block(&state, "claude", 1_010, &policy), None);
+        assert!(
+            harness_admission(&state, "claude", 1_010, &policy)
+                .degraded()
+                .is_some()
+        );
+
+        let half_open = RouteHealth {
+            phase: Phase::HalfOpen {
+                since: 1_000,
+                trial: Some(super::super::health::Trial {
+                    claim: "sess-a".to_string(),
+                    at: 1_000,
+                }),
+            },
+            ..RouteHealth::default()
+        };
+        store(&state, &key, &half_open, None, 1_000);
+        assert_eq!(harness_block(&state, "claude", 1_010, &policy), None);
+        assert!(
+            harness_admission(&state, "claude", 1_010, &policy)
+                .denied()
+                .is_some()
+        );
+    }
+
+    /// Slice C: the first claimant gets the trial, the second is told who has
+    /// it, and the slot frees itself once the cooldown elapses.
+    #[test]
+    fn claim_trial_admits_one_caller_and_denies_the_next_until_it_expires() {
+        let (_guard, state) = state();
+        let policy = HealthPolicy::default();
+        let key = RouteKey::new("claude");
+        store(
+            &state,
+            &key,
+            &RouteHealth {
+                phase: Phase::HalfOpen {
+                    since: 1_000,
+                    trial: None,
+                },
+                ..RouteHealth::default()
+            },
+            None,
+            1_000,
+        );
+
+        assert_eq!(
+            claim_trial(&state, "claude", "sess-a", 1_010, &policy),
+            Admission::Trial
+        );
+        assert_eq!(
+            claim_trial(&state, "claude", "sess-b", 1_020, &policy).denied(),
+            Some(
+                "claude: half-open: recovery trial already in flight (sess-a); next attempt in \
+                 ~4m (estimate)"
+            )
+        );
+        let expired = 1_010 + policy.cooldown_secs;
+        assert_eq!(
+            claim_trial(&state, "claude", "sess-b", expired, &policy),
+            Admission::Trial
+        );
+
+        let log = std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE))
+            .expect("decision log");
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("\"health-trial\""))
+                .count(),
+            2,
+            "one line per successful claim, never one per lost race: {log}"
+        );
+    }
+
+    #[test]
+    fn claim_trial_is_a_no_op_for_a_healthy_route() {
+        let (_guard, state) = state();
+        let policy = HealthPolicy::default();
+        assert_eq!(
+            claim_trial(&state, "claude", "sess-a", 1_000, &policy),
+            Admission::Allow
+        );
+        assert!(!record_path(&state, &RouteKey::new("claude")).exists());
+    }
+
+    /// A record written before slices A-C existed still loads: no `class`, no
+    /// `trial`, none of the three sample rings.
+    #[test]
+    fn a_legacy_record_without_the_new_fields_still_loads() {
+        let (_guard, state) = state();
+        let key = RouteKey::new("claude");
+        super::super::state::create_private_dir_all(&dir(&state)).expect("mkdir");
+        std::fs::write(
+            record_path(&state, &key),
+            r#"{
+              "key": {"harness": "claude"},
+              "model": "opus",
+              "health": {
+                "phase": {"phase": "open", "opened_at": 1000, "until": 1300,
+                          "reason": "3 transport error(s) in 10m"},
+                "observations": [],
+                "seen_ids": []
+              },
+              "updated_at": 1000
+            }"#,
+        )
+        .expect("write");
+
+        let stored = load(&state, &key, 1_100);
+        assert!(
+            matches!(
+                stored.phase,
+                Phase::Open {
+                    class: ProviderErrorClass::Other,
+                    ..
+                }
+            ),
+            "an unattributed legacy open never propagates to an alias: {stored:?}"
+        );
+        assert!(stored.successes.is_empty());
+        assert!(stored.failures.is_empty());
+        assert!(stored.latency.is_empty());
+
+        let half_open = std::fs::read_to_string(record_path(&state, &key))
+            .expect("read")
+            .replace(
+                r#""phase": "open", "opened_at": 1000, "until": 1300"#,
+                r#""phase": "half-open", "since": 1000"#,
+            );
+        std::fs::write(record_path(&state, &key), half_open).expect("write");
+        assert!(
+            matches!(
+                load(&state, &key, 1_100).phase,
+                Phase::HalfOpen { trial: None, .. }
+            ),
+            "a legacy half-open record has no trial in flight"
+        );
+    }
+
+    /// Slice A end to end: one poll's turn outcomes reach the record and
+    /// degrade a route whose rolling error rate crossed the threshold.
+    #[test]
+    fn observe_poll_folds_turn_samples_and_degrades_a_flaky_route() {
+        let (_guard, state) = state();
+        let policy = HealthPolicy::default();
+        let now = 2_000;
+        let successes: Vec<u64> = (0..6).map(|i| 1_800 + i * 10).collect();
+
+        observe_poll(
+            &state,
+            "claude",
+            Some("opus"),
+            &[transport(1_900), transport(1_910)],
+            &successes,
+            &[],
+            false,
+            true,
+            now,
+            &policy,
+            "sess",
+            "wrap",
+        );
+
+        let stored = load(&state, &RouteKey::new("claude"), now);
+        assert!(matches!(stored.phase, Phase::Degraded { .. }), "{stored:?}");
+        assert_eq!(stored.successes.len(), 6);
+        assert_eq!(stored.failures.len(), 2);
+
+        let log = std::fs::read_to_string(state.logs().join(super::super::log::LOG_FILE))
+            .expect("decision log");
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("\"health-degraded\""))
+                .count(),
+            1,
+            "{log}"
+        );
     }
 
     #[test]
@@ -509,6 +1077,8 @@ mod tests {
             "claude",
             Some("opus"),
             &[transport(1_998), transport(1_999), transport(2_000)],
+            &[],
+            &[],
             false,
             true,
             2_000,
@@ -542,7 +1112,18 @@ mod tests {
         ];
 
         observe_poll(
-            &state, "claude", None, &undated, false, false, 5_000, &policy, "sess", "exec",
+            &state,
+            "claude",
+            None,
+            &undated,
+            &[],
+            &[],
+            false,
+            false,
+            5_000,
+            &policy,
+            "sess",
+            "exec",
         );
         assert_eq!(
             load(&state, &RouteKey::new("claude"), 5_000),
@@ -551,7 +1132,18 @@ mod tests {
         );
 
         observe_poll(
-            &state, "claude", None, &undated, false, true, 5_000, &policy, "sess", "exec",
+            &state,
+            "claude",
+            None,
+            &undated,
+            &[],
+            &[],
+            false,
+            true,
+            5_000,
+            &policy,
+            "sess",
+            "exec",
         );
         assert!(
             matches!(
@@ -585,6 +1177,8 @@ mod tests {
             &state,
             "claude",
             None,
+            &[],
+            &[],
             &[],
             true,
             true,

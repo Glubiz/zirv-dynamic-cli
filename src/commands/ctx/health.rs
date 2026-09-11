@@ -32,6 +32,33 @@ use super::event::ProviderErrorClass;
 /// a history: an endpoint flapping for a week must not grow this record.
 pub const MAX_OBSERVATIONS: usize = 20;
 
+/// How many dated turn outcomes one route keeps for the rolling error rate
+/// the `Degraded` phase is judged on. Larger than [`MAX_OBSERVATIONS`]
+/// because this ring is a DENOMINATOR: a route answering normally produces
+/// far more successes than failures, and a denominator capped at the failure
+/// ring's size would read every busy window as a 50% error rate.
+pub const MAX_SAMPLES: usize = 40;
+
+/// One turn's time-to-first-text. `at` is the transcript row's own time in
+/// epoch SECONDS -- the same unit [`Observation::at`] uses, so one window
+/// rule prunes every ring -- while `ttft_ms` is the measured latency in
+/// milliseconds, which is the unit the policy knob is expressed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LatencySample {
+    pub at: u64,
+    pub ttft_ms: u64,
+}
+
+/// The single recovery attempt a half-open breaker has handed out: who
+/// claimed it and when. It expires on its own after `cooldown_secs`, so a
+/// claimant that crashes before reporting anything back cannot hold the
+/// route shut -- the next caller simply claims the expired slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trial {
+    pub claim: String,
+    pub at: u64,
+}
+
 /// Which route an observation belongs to: one harness, lower-cased. See this
 /// module's own header for why the model is deliberately NOT part of the
 /// identity.
@@ -126,13 +153,36 @@ pub enum Phase {
         failures: u32,
         first_at: u64,
     },
+    /// Reachable, but measurably worse than it should be: a rolling
+    /// transport/server error rate at or above `degrade_error_rate_pct`, or
+    /// (only when the operator opted in) a first-token latency at or above
+    /// `degrade_ttft_ms`. Deliberately NOT a block -- work still routes
+    /// here, it is simply ranked behind every healthy alternative, and a
+    /// degraded route that is the only candidate still wins.
+    Degraded {
+        since: u64,
+        reason: String,
+    },
     Open {
         opened_at: u64,
         until: u64,
         reason: String,
+        /// Which class tripped this breaker. Only `Transport`/`Server`
+        /// describe a failing HOP rather than a failing account, so only
+        /// those propagate to another harness sharing the same configured
+        /// endpoint host (`health_store::admissions`). `#[serde(default)]`
+        /// leaves a record written before this field existed reading
+        /// `Other`, which propagates nothing.
+        #[serde(default)]
+        class: ProviderErrorClass,
     },
     HalfOpen {
         since: u64,
+        /// The one in-flight recovery attempt, when some caller has claimed
+        /// it. `#[serde(default)]` for the same legacy-file reason as
+        /// `Open::class` above.
+        #[serde(default)]
+        trial: Option<Trial>,
     },
     Unavailable {
         since: u64,
@@ -145,6 +195,7 @@ impl Phase {
         match self {
             Self::Healthy => "healthy",
             Self::Suspect { .. } => "suspect",
+            Self::Degraded { .. } => "degraded",
             Self::Open { .. } => "open",
             Self::HalfOpen { .. } => "half-open",
             Self::Unavailable { .. } => "unavailable",
@@ -172,6 +223,44 @@ pub struct RouteHealth {
     pub phase: Phase,
     pub observations: Vec<Observation>,
     pub seen_ids: Vec<String>,
+    /// The rolling rate's DENOMINATOR: the row time of every completed,
+    /// error-free assistant turn seen for this route, bounded by
+    /// [`MAX_SAMPLES`] and the policy window.
+    pub successes: Vec<u64>,
+    /// The rolling rate's NUMERATOR: the row time of every Transport/Server
+    /// observation folded in.
+    ///
+    /// Deliberately separate from `observations`, which [`record_success`]
+    /// CLEARS whenever a turn completes on a merely-suspect route. That is
+    /// right for the breaker (its question is "is this route broken right
+    /// now") and fatal for a rate: a flaky-but-working route completes a
+    /// turn after nearly every failure, so a numerator read off
+    /// `observations` would reset on every poll and no rate could ever
+    /// accumulate. This ring ages out of the window, it is never cleared.
+    pub failures: Vec<u64>,
+    /// Time-to-first-text samples, only ever read when the operator set
+    /// `degrade_ttft_ms`.
+    pub latency: Vec<LatencySample>,
+    /// R2: row ids for classes that can never open the circuit
+    /// (rate limits, overflows, `Other`), kept in their own small ring.
+    ///
+    /// They used to share `seen_ids` with the counting classes, where a
+    /// burst of rate limits -- the single most common thing a busy account
+    /// produces -- evicted the ids of Transport/Server failures the
+    /// `failures` ring was still holding. A replay from offset 0 then no
+    /// longer recognised those rows, counted them a second time, and
+    /// reopened a route on history it had already healed from.
+    pub seen_other_ids: Vec<String>,
+    /// R3: the `at` of the newest success this record has EVICTED by cap,
+    /// `None` while the ring has never overflowed.
+    ///
+    /// It is the boundary below which the success ring no longer describes
+    /// anything: failures older than it have no surviving successes to be
+    /// weighed against, so counting them reported a rate the window never
+    /// ran. A length test cannot stand in for this -- an exactly-full ring
+    /// that has evicted nothing still covers its whole span, and treating it
+    /// as overflowed discarded real failures and hid a real degradation.
+    pub success_floor: Option<u64>,
 }
 
 /// Operator policy for the breaker (`[fallback.health]`).
@@ -188,6 +277,21 @@ pub struct HealthPolicy {
     pub window_secs: u64,
     /// How long an open breaker stays open before one trial is admitted.
     pub cooldown_secs: u64,
+    /// The rolling transport/server error rate, in percent, at which a
+    /// reachable route is marked `Degraded` and ranked behind its healthy
+    /// alternatives.
+    pub degrade_error_rate_pct: u8,
+    /// How many dated turn outcomes (failures plus successes, or latency
+    /// samples) the window must hold before either degrade signal is
+    /// allowed to fire. Guards against one bad turn out of two reading as a
+    /// 50% error rate.
+    pub degrade_min_samples: u32,
+    /// Opt-in only: the first-token latency, in milliseconds, whose median
+    /// marks a route `Degraded`. `None` (the default) switches the latency
+    /// signal off entirely -- see the README on why this is not on by
+    /// default. Latency NEVER opens a breaker and never marks a route
+    /// unavailable.
+    pub degrade_ttft_ms: Option<u64>,
 }
 
 impl Default for HealthPolicy {
@@ -197,6 +301,9 @@ impl Default for HealthPolicy {
             open_after_failures: 3,
             window_secs: 600,
             cooldown_secs: 300,
+            degrade_error_rate_pct: 25,
+            degrade_min_samples: 8,
+            degrade_ttft_ms: None,
         }
     }
 }
@@ -209,6 +316,9 @@ pub enum Transition {
     HalfOpened(String),
     Recovered(String),
     MarkedUnavailable(String),
+    Degraded(String),
+    Restored(String),
+    TrialClaimed(String),
 }
 
 impl Transition {
@@ -219,6 +329,9 @@ impl Transition {
             Self::HalfOpened(_) => "health-half-open",
             Self::Recovered(_) => "health-recovered",
             Self::MarkedUnavailable(_) => "health-unavailable",
+            Self::Degraded(_) => "health-degraded",
+            Self::Restored(_) => "health-restored",
+            Self::TrialClaimed(_) => "health-trial",
         }
     }
 
@@ -227,7 +340,10 @@ impl Transition {
             Self::Opened(reason)
             | Self::HalfOpened(reason)
             | Self::Recovered(reason)
-            | Self::MarkedUnavailable(reason) => reason,
+            | Self::MarkedUnavailable(reason)
+            | Self::Degraded(reason)
+            | Self::Restored(reason)
+            | Self::TrialClaimed(reason) => reason,
         }
     }
 }
@@ -244,6 +360,11 @@ pub enum Admission {
     #[default]
     Allow,
     Trial,
+    /// Admissible, but ranked behind every healthy candidate. `denied()` is
+    /// `None` here on purpose: a degraded route reduces, it never excludes.
+    Degraded {
+        reason: String,
+    },
     Deny {
         reason: String,
     },
@@ -253,6 +374,15 @@ impl Admission {
     pub fn denied(&self) -> Option<&str> {
         match self {
             Self::Deny { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// The degradation reason, when this route is reachable but should lose
+    /// every tie to a healthy one.
+    pub fn degraded(&self) -> Option<&str> {
+        match self {
+            Self::Degraded { reason } => Some(reason),
             _ => None,
         }
     }
@@ -301,6 +431,227 @@ fn prune(mut observations: Vec<Observation>, now: u64, policy: &HealthPolicy) ->
     observations
 }
 
+/// The same window rule for the bare row-time rings (`successes`,
+/// `failures`), capped at [`MAX_SAMPLES`] newest.
+fn prune_times(mut times: Vec<u64>, now: u64, policy: &HealthPolicy) -> Vec<u64> {
+    let floor = now.saturating_sub(policy.window_secs);
+    times.retain(|at| *at >= floor);
+    if times.len() > MAX_SAMPLES {
+        let drop = times.len() - MAX_SAMPLES;
+        times.drain(..drop);
+    }
+    times
+}
+
+/// The same window rule again for the latency ring, capped at
+/// [`MAX_OBSERVATIONS`]: a median needs far fewer samples than a rate does.
+fn prune_latency(
+    mut samples: Vec<LatencySample>,
+    now: u64,
+    policy: &HealthPolicy,
+) -> Vec<LatencySample> {
+    let floor = now.saturating_sub(policy.window_secs);
+    samples.retain(|sample| sample.at >= floor);
+    if samples.len() > MAX_OBSERVATIONS {
+        let drop = samples.len() - MAX_OBSERVATIONS;
+        samples.drain(..drop);
+    }
+    samples
+}
+
+/// Every ring pruned to the current window at once, so no caller can fold
+/// evidence into one ring and judge it against another's stale contents.
+fn pruned(health: &RouteHealth, now: u64, policy: &HealthPolicy) -> RouteHealth {
+    let (kept_successes, success_floor) =
+        prune_successes(health.successes.clone(), health.success_floor, now, policy);
+    RouteHealth {
+        phase: health.phase.clone(),
+        observations: prune(health.observations.clone(), now, policy),
+        seen_ids: health.seen_ids.clone(),
+        successes: kept_successes,
+        failures: prune_times(health.failures.clone(), now, policy),
+        latency: prune_latency(health.latency.clone(), now, policy),
+        seen_other_ids: health.seen_other_ids.clone(),
+        success_floor,
+    }
+}
+
+fn median(values: &[u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied()
+}
+
+/// The rolling rate's numerator and denominator, over the span BOTH rings
+/// still cover.
+///
+/// Finding 10: the rings are capped independently, so a busy window can
+/// retain 20 failures while the success ring has already dropped everything
+/// older than its newest [`MAX_SAMPLES`]. Counting those failures against
+/// that truncated denominator reported 20/60 for a window that really ran
+/// 20/120 -- a degradation invented by the cap rather than by the route.
+/// Once the success ring has overflowed, its oldest retained entry is the
+/// floor for both sides.
+fn rate_samples(health: &RouteHealth) -> (u64, u64) {
+    let floor = health.success_floor.unwrap_or(0);
+    let failures = health.failures.iter().filter(|at| **at > floor).count() as u64;
+    (failures, failures + health.successes.len() as u64)
+}
+
+/// Window-prunes and caps the success ring, advancing `floor` to the `at` of
+/// the NEWEST entry a CAP eviction removed (R3).
+///
+/// Only a cap eviction moves the floor. Ageing out of the window does not:
+/// the failure ring ages out under the identical rule, so both sides lose
+/// the same span and the rate stays honest without a floor at all.
+///
+/// The newest evicted rather than the oldest: everything between the two is
+/// exactly the region whose successes are now gone, and keeping the failures
+/// that fall in it is the inflated numerator finding 10 set out to remove.
+fn prune_successes(
+    successes: Vec<u64>,
+    floor: Option<u64>,
+    now: u64,
+    policy: &HealthPolicy,
+) -> (Vec<u64>, Option<u64>) {
+    let mut kept = successes;
+    let window_floor = now.saturating_sub(policy.window_secs);
+    kept.retain(|at| *at >= window_floor);
+    if kept.len() <= MAX_SAMPLES {
+        return (kept, floor);
+    }
+    let drop = kept.len() - MAX_SAMPLES;
+    let evicted = kept[..drop].iter().copied().max();
+    kept.drain(..drop);
+    let advanced = match (floor, evicted) {
+        (Some(previous), Some(evicted)) => Some(previous.max(evicted)),
+        (previous, evicted) => previous.or(evicted),
+    };
+    (kept, advanced)
+}
+
+/// The rolling error-rate verdict over the already-pruned rings: `Some` with
+/// the human reason when the rate is at or above the policy threshold.
+fn error_rate_reason(health: &RouteHealth, policy: &HealthPolicy) -> Option<String> {
+    let (failures, samples) = rate_samples(health);
+    if samples < u64::from(policy.degrade_min_samples.max(2)) {
+        return None;
+    }
+    if failures * 100 < samples * u64::from(policy.degrade_error_rate_pct) {
+        return None;
+    }
+    Some(format!(
+        "error rate {}% over {samples} turns",
+        failures * 100 / samples
+    ))
+}
+
+/// The latency verdict, `None` whenever the operator left `degrade_ttft_ms`
+/// unset -- which is the default.
+fn latency_reason(health: &RouteHealth, policy: &HealthPolicy) -> Option<String> {
+    let threshold = policy.degrade_ttft_ms?;
+    if health.latency.len() < policy.degrade_min_samples.max(2) as usize {
+        return None;
+    }
+    let samples: Vec<u64> = health.latency.iter().map(|s| s.ttft_ms).collect();
+    let p50 = median(&samples)?;
+    if p50 < threshold {
+        return None;
+    }
+    Some(format!(
+        "first-token p50 {:.1}s over {} turns",
+        p50 as f64 / 1000.0,
+        samples.len()
+    ))
+}
+
+/// Whether both degrade signals have cleared their HYSTERESIS bands -- half
+/// the error-rate threshold, three quarters of the latency one -- or have no
+/// evidence left in the window at all. Deliberately stricter than "the
+/// degrade condition no longer holds": a route sitting exactly at the
+/// threshold would otherwise flap in and out of `Degraded` on every poll.
+fn restored(health: &RouteHealth, policy: &HealthPolicy) -> bool {
+    let (failures, samples) = rate_samples(health);
+    let min_samples = u64::from(policy.degrade_min_samples.max(2));
+    let error_clear = failures == 0
+        || (samples >= min_samples
+            && failures * 200 < samples * u64::from(policy.degrade_error_rate_pct));
+    let latency_clear = match policy.degrade_ttft_ms {
+        None => true,
+        Some(threshold) => {
+            if health.latency.is_empty() {
+                true
+            } else if health.latency.len() < min_samples as usize {
+                false
+            } else {
+                median(&health.latency.iter().map(|s| s.ttft_ms).collect::<Vec<_>>())
+                    .is_some_and(|p50| p50 * 4 < threshold * 3)
+            }
+        }
+    };
+    error_clear && latency_clear
+}
+
+/// Lays the `Degraded` overlay over a freshly recomputed `baseline` phase
+/// (always `Healthy` or `Suspect`), given what the phase was BEFORE this
+/// fold. Never touches `Open`/`HalfOpen`/`Unavailable`: a breaker that is
+/// already shut has nothing to say about a rate.
+fn settle_degradation(
+    prior: &Phase,
+    baseline: Phase,
+    health: &RouteHealth,
+    now: u64,
+    policy: &HealthPolicy,
+) -> (Phase, Option<Transition>) {
+    if !policy.enabled {
+        return (baseline, None);
+    }
+    if let Phase::Degraded { reason, .. } = prior {
+        if restored(health, policy) {
+            let reason = format!("{reason} cleared; route restored");
+            return (baseline, Some(Transition::Restored(reason)));
+        }
+        return (prior.clone(), None);
+    }
+    match error_rate_reason(health, policy).or_else(|| latency_reason(health, policy)) {
+        Some(reason) => (
+            Phase::Degraded {
+                since: now,
+                reason: reason.clone(),
+            },
+            Some(Transition::Degraded(reason)),
+        ),
+        None => (baseline, None),
+    }
+}
+
+/// The `host[:port]` a base URL points at, lower-cased, with scheme, any
+/// userinfo, path, query and fragment stripped -- the identity two harnesses
+/// SHARE when an operator retargets both at one gateway. `None` for a URL
+/// with no host at all, which is what a malformed value degrades to: an
+/// unparseable endpoint must never make two routes look related.
+///
+/// Never carries a credential: userinfo is dropped before the host is read,
+/// so this string is safe to put in a log line or a status row.
+pub fn dependency_from_base_url(raw: &str) -> Option<String> {
+    let after_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.to_lowercase())
+}
+
 /// When an `Open` or `Unavailable` breaker starts admitting its next trial:
 /// `cooldown_secs` after it tripped. `None` for every other phase.
 pub fn trial_at(phase: &Phase, policy: &HealthPolicy) -> Option<u64> {
@@ -337,7 +688,10 @@ pub fn promote(
     let reason = "cooldown elapsed; admitting one trial".to_string();
     (
         RouteHealth {
-            phase: Phase::HalfOpen { since: now },
+            phase: Phase::HalfOpen {
+                since: now,
+                trial: None,
+            },
             ..health.clone()
         },
         Some(Transition::HalfOpened(reason)),
@@ -373,31 +727,49 @@ pub fn observe(
     policy: &HealthPolicy,
 ) -> (RouteHealth, Option<Transition>) {
     if let Some(id) = &observed.id
-        && health.seen_ids.iter().any(|seen| seen == id)
+        && (health.seen_ids.iter().any(|seen| seen == id)
+            || health.seen_other_ids.iter().any(|seen| seen == id))
     {
         return (health.clone(), None);
     }
     let class = observed.class;
     let at = observed.at.unwrap_or(now);
     let (promoted, _) = promote(health, now, policy);
-    let mut next = RouteHealth {
-        phase: promoted.phase.clone(),
-        observations: prune(promoted.observations.clone(), now, policy),
-        seen_ids: promoted.seen_ids.clone(),
-    };
+    let mut next = pruned(&promoted, now, policy);
     next.observations.push(Observation { class, at });
     next.observations = prune(next.observations, now, policy);
+    if counts_toward_opening(class) {
+        next.failures.push(at);
+        next.failures = prune_times(next.failures, now, policy);
+    }
     if let Some(id) = &observed.id {
-        next.seen_ids.push(id.clone());
-        if next.seen_ids.len() > MAX_OBSERVATIONS {
-            let drop = next.seen_ids.len() - MAX_OBSERVATIONS;
-            next.seen_ids.drain(..drop);
+        // R2: a counting class's id shares the `failures` ring's own cap and
+        // its own FIFO order, so an id is only ever evicted alongside (or
+        // after) the failure it belongs to. Everything else goes in its own
+        // ring, where no burst of rate limits can push a still-retained
+        // failure's id out -- finding 8's single shared cap fixed the size
+        // but left the eviction competition in place.
+        let (ring, cap) = if counts_toward_opening(class) {
+            (&mut next.seen_ids, MAX_SAMPLES)
+        } else {
+            (&mut next.seen_other_ids, MAX_OBSERVATIONS)
+        };
+        ring.push(id.clone());
+        if ring.len() > cap {
+            let drop = ring.len() - cap;
+            ring.drain(..drop);
         }
     }
 
     if !policy.enabled {
         return (next, None);
     }
+    // The phase this fold started from, kept because the `Healthy`/`Suspect`
+    // recomputation below overwrites it -- `settle_degradation` needs to know
+    // whether the route was ALREADY degraded, or a route sitting at the
+    // threshold would re-enter `Degraded` (and log a fresh transition) on
+    // every single observation.
+    let prior_phase = next.phase.clone();
 
     if class == ProviderErrorClass::Auth {
         // Review round 2, finding 1: Auth is the one class that does NOT go
@@ -453,7 +825,7 @@ pub fn observe(
         // re-parse of an old transcript produces. That is HEALTHY, not
         // `Suspect { failures: 0 }`: a phase that is not healthy shows up in
         // `zirv ctx status` and keeps the record alive past its expiry.
-        next.phase = if failures == 0 {
+        let baseline = if failures == 0 {
             Phase::Healthy
         } else {
             Phase::Suspect {
@@ -467,6 +839,19 @@ pub fn observe(
                     .unwrap_or(at),
             }
         };
+        // Finding 9: the degrade rule is evaluated ONCE per poll, by
+        // [`record_samples`], after every piece of that poll's evidence is
+        // folded. Deriving it here too meant a poll carrying one failure and
+        // one success evaluated the failure against a denominator the
+        // success had not yet reached (2/8 rather than the poll's true 2/9),
+        // degraded on it, and then hysteresis held the route there. So this
+        // only ever CARRIES an existing degradation forward -- it never
+        // derives a new one.
+        next.phase = if matches!(prior_phase, Phase::Degraded { .. }) {
+            prior_phase
+        } else {
+            baseline
+        };
         return (next, None);
     }
 
@@ -475,8 +860,155 @@ pub fn observe(
         opened_at: now,
         until: now.saturating_add(policy.cooldown_secs),
         reason: reason.clone(),
+        class,
     };
     (next, Some(Transition::Opened(reason)))
+}
+
+/// Folds one poll's dated turn OUTCOMES into `health` and then evaluates the
+/// degrade/restore rule -- the ONE place that rule is applied, and the last
+/// step of every poll (finding 9), so it always judges a complete poll's
+/// evidence rather than a half-folded prefix of it.
+///
+/// Called even for a poll with no samples at all: a poll carrying only
+/// failures still has to reach a verdict, and its numerator is exactly the
+/// one [`observe`] just folded.
+///
+/// Separate from [`observe`] because these samples change only the rolling
+/// rate, never the breaker: no number of slow or successful turns can open a
+/// circuit, and a latency sample can do nothing at all unless the operator
+/// set `degrade_ttft_ms`.
+///
+/// Both rings are de-duplicated by the sample's own time rather than by a row
+/// id: a turn's closing row carries a millisecond timestamp, so two distinct
+/// turns landing on the same epoch SECOND is the only collision possible, and
+/// dropping one sample of a pair that close together costs a rate nothing.
+/// The id ring is reserved for `observations`, whose double-count would move
+/// a phase.
+pub fn record_samples(
+    health: &RouteHealth,
+    successes: &[u64],
+    latencies: &[LatencySample],
+    now: u64,
+    policy: &HealthPolicy,
+) -> (RouteHealth, Option<Transition>) {
+    let (promoted, _) = promote(health, now, policy);
+    let prior_phase = promoted.phase.clone();
+    let mut next = pruned(&promoted, now, policy);
+    let floor = now.saturating_sub(policy.window_secs);
+    for at in successes {
+        if *at >= floor && !next.successes.contains(at) {
+            next.successes.push(*at);
+        }
+    }
+    for sample in latencies {
+        if sample.at >= floor && !next.latency.iter().any(|kept| kept.at == sample.at) {
+            next.latency.push(*sample);
+        }
+    }
+    let (kept, floor) = prune_successes(
+        std::mem::take(&mut next.successes),
+        next.success_floor,
+        now,
+        policy,
+    );
+    next.successes = kept;
+    next.success_floor = floor;
+    next.latency = prune_latency(next.latency, now, policy);
+
+    // Only a route the breaker is not already reasoning about has a rate
+    // worth reading: `Open`/`HalfOpen`/`Unavailable` are shut or probing,
+    // and a rate cannot say anything more about them.
+    if !matches!(
+        prior_phase,
+        Phase::Healthy | Phase::Suspect { .. } | Phase::Degraded { .. }
+    ) {
+        return (next, None);
+    }
+    let baseline = match &prior_phase {
+        Phase::Degraded { .. } => {
+            let failures = next
+                .observations
+                .iter()
+                .filter(|obs| counts_toward_opening(obs.class))
+                .count() as u32;
+            if failures == 0 {
+                Phase::Healthy
+            } else {
+                Phase::Suspect {
+                    failures,
+                    first_at: next
+                        .observations
+                        .iter()
+                        .filter(|obs| counts_toward_opening(obs.class))
+                        .map(|obs| obs.at)
+                        .min()
+                        .unwrap_or(now),
+                }
+            }
+        }
+        other => other.clone(),
+    };
+    let (phase, transition) = settle_degradation(&prior_phase, baseline, &next, now, policy);
+    next.phase = phase;
+    (next, transition)
+}
+
+/// Records one caller's claim on a half-open route's single recovery trial.
+///
+/// Pure, like everything else here: the returned record is what the store
+/// must persist, and the returned [`Admission`] is what the CALLER may do --
+/// `Trial` when it won the claim, a `Deny` naming the current holder when it
+/// lost, and whatever [`admission`] says for any other phase.
+pub fn claim(
+    health: &RouteHealth,
+    claimant: &str,
+    now: u64,
+    policy: &HealthPolicy,
+) -> (RouteHealth, Admission, Option<Transition>) {
+    let (promoted, _) = promote(health, now, policy);
+    if !policy.enabled {
+        return (promoted, Admission::Allow, None);
+    }
+    let Phase::HalfOpen { since, trial } = &promoted.phase else {
+        let verdict = admission(&promoted, now, policy);
+        return (promoted, verdict, None);
+    };
+    if let Some(held) = trial
+        && now < held.at.saturating_add(policy.cooldown_secs)
+    {
+        let verdict = trial_in_flight_denial(&held.claim, held.at, now, policy);
+        return (promoted, verdict, None);
+    }
+    let reason = format!("recovery trial claimed by {claimant}");
+    let claimed = RouteHealth {
+        phase: Phase::HalfOpen {
+            since: *since,
+            trial: Some(Trial {
+                claim: claimant.to_string(),
+                at: now,
+            }),
+        },
+        ..promoted
+    };
+    (
+        claimed,
+        Admission::Trial,
+        Some(Transition::TrialClaimed(reason)),
+    )
+}
+
+fn trial_in_flight_denial(
+    claim: &str,
+    claimed_at: u64,
+    now: u64,
+    policy: &HealthPolicy,
+) -> Admission {
+    let expiry = claimed_at.saturating_add(policy.cooldown_secs);
+    Admission::deny(format!(
+        "half-open: recovery trial already in flight ({claim}); next attempt in ~{} (estimate)",
+        crate::style::format_age(expiry.saturating_sub(now))
+    ))
 }
 
 /// Folds one successfully completed turn into `health`. A trial that
@@ -499,6 +1031,15 @@ pub fn record_success(
                 phase: Phase::Healthy,
                 observations: Vec::new(),
                 seen_ids: promoted.seen_ids.clone(),
+                // The rolling-rate rings age out of the window, they are
+                // never wiped: see `RouteHealth::failures`' own comment on
+                // why a numerator cleared by every completed turn can never
+                // accumulate a rate.
+                successes: promoted.successes.clone(),
+                failures: promoted.failures.clone(),
+                latency: promoted.latency.clone(),
+                seen_other_ids: promoted.seen_other_ids.clone(),
+                success_floor: promoted.success_floor,
             },
             Some(Transition::Recovered(reason)),
         )
@@ -506,6 +1047,10 @@ pub fn record_success(
     match &promoted.phase {
         Phase::Healthy => (promoted, None),
         Phase::Open { .. } => (promoted, None),
+        // One completed turn says nothing about a RATE, so it never lifts a
+        // degradation on its own -- `record_samples` restores the route once
+        // the window's own evidence clears the hysteresis band.
+        Phase::Degraded { .. } => (promoted, None),
         Phase::HalfOpen { .. } => healed("a trial turn completed; route reopened".to_string()),
         Phase::Suspect { failures, .. } => healed(format!(
             "a turn completed after {failures} failure(s); route is healthy again"
@@ -526,7 +1071,33 @@ pub fn admission(health: &RouteHealth, now: u64, policy: &HealthPolicy) -> Admis
     }
     match &health.phase {
         Phase::Healthy | Phase::Suspect { .. } => Admission::Allow,
-        Phase::HalfOpen { .. } => Admission::Trial,
+        // The EFFECTIVE verdict, not the stored one -- the same rule
+        // `Open` follows past its cooldown. A degraded route's evidence
+        // ages out of the window whether or not anything is still polling
+        // it, and a record left behind by a finished session must not rank
+        // a route last forever. The next poll persists the restoration; until
+        // one happens, this is what is actually true.
+        Phase::Degraded { reason, .. } => {
+            let floor = now.saturating_sub(policy.window_secs);
+            let fresh = health.failures.iter().any(|at| *at >= floor)
+                || health.latency.iter().any(|sample| sample.at >= floor);
+            if !fresh {
+                return Admission::Allow;
+            }
+            Admission::Degraded {
+                reason: reason.clone(),
+            }
+        }
+        // A trial that is still inside its own cooldown belongs to whoever
+        // claimed it: admitting a second one defeats the whole point of a
+        // half-open probe. An EXPIRED trial is simply ignored, so a claimant
+        // that never came back cannot hold the route shut.
+        Phase::HalfOpen { trial, .. } => match trial {
+            Some(held) if now < held.at.saturating_add(policy.cooldown_secs) => {
+                trial_in_flight_denial(&held.claim, held.at, now, policy)
+            }
+            _ => Admission::Trial,
+        },
         Phase::Open { until, reason, .. } => {
             if now >= *until {
                 return Admission::Trial;
@@ -571,6 +1142,607 @@ mod tests {
             last = transition;
         }
         (health, last)
+    }
+
+    /// Slice A: the rolling rate degrades a route that is still reachable.
+    /// Two failures and six successes is 25% over eight turns -- exactly the
+    /// default threshold, and the default minimum sample count.
+    fn degraded_route(policy: &HealthPolicy) -> RouteHealth {
+        let mut health = RouteHealth::default();
+        for at in [1_000, 1_010] {
+            let (next, _) = observe(&health, &err(ProviderErrorClass::Transport, at), at, policy);
+            health = next;
+        }
+        let successes: Vec<u64> = (0..6).map(|i| 1_020 + i * 10).collect();
+        let (next, transition) = record_samples(&health, &successes, &[], 1_100, policy);
+        assert!(
+            matches!(transition, Some(Transition::Degraded(_))),
+            "{transition:?}"
+        );
+        next
+    }
+
+    #[test]
+    fn a_rolling_error_rate_degrades_a_reachable_route() {
+        let policy = policy();
+        let health = degraded_route(&policy);
+        assert!(matches!(health.phase, Phase::Degraded { .. }), "{health:?}");
+        let verdict = admission(&health, 1_100, &policy);
+        assert_eq!(verdict.degraded(), Some("error rate 25% over 8 turns"));
+        assert_eq!(
+            verdict.denied(),
+            None,
+            "a degraded route is reduced, never excluded"
+        );
+    }
+
+    #[test]
+    fn a_degraded_record_whose_evidence_aged_out_admits_normally_again() {
+        let policy = policy();
+        let health = degraded_route(&policy);
+        assert!(admission(&health, 1_100, &policy).degraded().is_some());
+        assert_eq!(
+            admission(&health, 1_100 + policy.window_secs, &policy),
+            Admission::Allow,
+            "a record left behind by a finished session must not rank a route \
+             last forever"
+        );
+    }
+
+    #[test]
+    fn a_rate_below_the_threshold_leaves_the_route_healthy() {
+        let policy = policy();
+        let mut health = RouteHealth::default();
+        let (next, _) = observe(
+            &health,
+            &err(ProviderErrorClass::Transport, 1_000),
+            1_000,
+            &policy,
+        );
+        health = next;
+        let successes: Vec<u64> = (0..9).map(|i| 1_010 + i * 10).collect();
+        let (next, transition) = record_samples(&health, &successes, &[], 1_100, &policy);
+        assert_eq!(transition, None, "10% over ten turns is not degradation");
+        assert!(matches!(next.phase, Phase::Suspect { .. }), "{next:?}");
+    }
+
+    #[test]
+    fn too_few_samples_never_degrade_a_route() {
+        let policy = policy();
+        let mut health = RouteHealth::default();
+        for at in [1_000, 1_010] {
+            let (next, _) = observe(
+                &health,
+                &err(ProviderErrorClass::Transport, at),
+                at,
+                &policy,
+            );
+            health = next;
+        }
+        // 2 failures, 2 successes: a 50% rate, but only four samples.
+        let (next, transition) = record_samples(&health, &[1_020, 1_030], &[], 1_100, &policy);
+        assert_eq!(transition, None);
+        assert!(!matches!(next.phase, Phase::Degraded { .. }), "{next:?}");
+    }
+
+    /// Hysteresis: dropping just under the threshold is not enough, half of
+    /// it is -- otherwise a route sitting at 25% flaps on every poll.
+    /// Finding 10: the two rings are capped independently, so a long busy
+    /// window retains every failure while the success ring has already
+    /// dropped the oldest successes. Counting those failures against the
+    /// truncated denominator invented a degradation the route never had.
+    #[test]
+    fn failures_older_than_the_retained_successes_do_not_inflate_the_rate() {
+        let policy = policy();
+        let mut health = RouteHealth::default();
+        // 20 failures first, then 100 clean turns -- a 17% window, well
+        // under the 25% threshold, but only the newest 40 successes survive
+        // the ring.
+        for i in 0..20u64 {
+            let at = 10_000 + i;
+            let (next, _) = observe(
+                &health,
+                &err(ProviderErrorClass::Transport, at),
+                at,
+                &policy,
+            );
+            health = next;
+        }
+        let successes: Vec<u64> = (0..100).map(|i| 10_100 + i).collect();
+        let (next, transition) = record_samples(&health, &successes, &[], 10_200, &policy);
+
+        assert_eq!(next.successes.len(), MAX_SAMPLES, "the ring overflowed");
+        assert_eq!(
+            transition, None,
+            "every retained failure predates the oldest retained success, so the covered \
+             span carries no failures at all: {next:?}"
+        );
+        assert!(!matches!(next.phase, Phase::Degraded { .. }), "{next:?}");
+    }
+
+    /// Finding 9: one degrade evaluation per poll, after ALL of that poll's
+    /// evidence is folded. Evaluating the failure first saw 2/8 (degraded)
+    /// where the poll's own true rate was 2/9 (healthy), and hysteresis then
+    /// held the route there.
+    #[test]
+    fn a_polls_failure_is_judged_against_that_same_polls_successes() {
+        let policy = policy();
+        // Six clean turns and one failure already in the window: 1/7.
+        let mut health = RouteHealth::default();
+        let (next, _) = observe(
+            &health,
+            &err(ProviderErrorClass::Transport, 1_000),
+            1_000,
+            &policy,
+        );
+        health = next;
+        let (next, _) = record_samples(
+            &health,
+            &(0..6).map(|i| 1_010 + i * 10).collect::<Vec<_>>(),
+            &[],
+            1_100,
+            &policy,
+        );
+        health = next;
+        assert!(
+            !matches!(health.phase, Phase::Degraded { .. }),
+            "{health:?}"
+        );
+
+        // One more poll carrying BOTH a failure and a success: 2/9, still
+        // healthy. `observe` alone must reach no verdict.
+        let (after_error, transition) = observe(
+            &health,
+            &err(ProviderErrorClass::Transport, 1_110),
+            1_110,
+            &policy,
+        );
+        assert_eq!(transition, None, "observe never degrades on its own");
+        let (settled, transition) = record_samples(&after_error, &[1_120], &[], 1_120, &policy);
+        assert_eq!(
+            transition, None,
+            "2 failures over 9 turns is 22%, under the 25% threshold: {settled:?}"
+        );
+        assert!(
+            !matches!(settled.phase, Phase::Degraded { .. }),
+            "{settled:?}"
+        );
+    }
+
+    /// R2: a burst of rate limits must not evict the row ids of failures the
+    /// numerator is still holding. Three healed failures followed by 41 rate
+    /// limits used to push all three ids out of the shared ring, so a replay
+    /// from offset 0 counted them again and reopened a route that had
+    /// already healed.
+    #[test]
+    fn a_burst_of_rate_limits_cannot_make_a_replay_reopen_a_healed_route() {
+        let policy = policy();
+        let failures: Vec<Observed> = (0..3)
+            .map(|i| err(ProviderErrorClass::Transport, 1_000 + i))
+            .collect();
+        // The state a healed route is left in: the phase and the observation
+        // ring are cleared, the failure times and their row ids are not.
+        let mut health = RouteHealth {
+            phase: Phase::Healthy,
+            failures: failures.iter().filter_map(|f| f.at).collect(),
+            seen_ids: failures
+                .iter()
+                .filter_map(|f| f.id.clone())
+                .collect::<Vec<_>>(),
+            ..RouteHealth::default()
+        };
+
+        for i in 0..41u64 {
+            let (next, _) = observe(
+                &health,
+                &err(ProviderErrorClass::RateLimit, 1_200 + i),
+                1_300,
+                &policy,
+            );
+            health = next;
+        }
+
+        // The replay a fresh scorer performs from offset 0.
+        for observed in &failures {
+            let (next, transition) = observe(&health, observed, 1_400, &policy);
+            assert_eq!(transition, None, "an already-counted row must be a no-op");
+            health = next;
+        }
+        assert!(
+            health.phase.is_healthy(),
+            "a healed route must not reopen on rows it already folded: {health:?}"
+        );
+        assert_eq!(health.failures.len(), 3, "and none was counted twice");
+    }
+
+    /// R3: an exactly-full success ring has evicted nothing, so it still
+    /// covers its whole span and every failure in it counts. A length test
+    /// could not tell that apart from an overflowed ring, and discarded both
+    /// failures below -- hiding a real degradation.
+    #[test]
+    fn an_exactly_full_success_ring_still_counts_its_failures() {
+        let policy = HealthPolicy {
+            degrade_error_rate_pct: 4,
+            ..policy()
+        };
+        let mut health = RouteHealth::default();
+        for i in 0..2u64 {
+            let at = 1_000 + i;
+            let (next, _) = observe(
+                &health,
+                &err(ProviderErrorClass::Transport, at),
+                at,
+                &policy,
+            );
+            health = next;
+        }
+        let successes: Vec<u64> = (0..MAX_SAMPLES as u64).map(|i| 1_010 + i).collect();
+        let (settled, transition) = record_samples(&health, &successes, &[], 1_100, &policy);
+
+        assert_eq!(settled.successes.len(), MAX_SAMPLES, "full, not overflowed");
+        assert_eq!(
+            settled.success_floor, None,
+            "nothing was evicted, so there is no uncovered span"
+        );
+        assert!(
+            matches!(transition, Some(Transition::Degraded(_))),
+            "2 failures over 42 turns is 4%, at the threshold: {settled:?}"
+        );
+    }
+
+    #[test]
+    fn an_overflowed_success_ring_records_the_span_it_no_longer_covers() {
+        let policy = policy();
+        let mut health = RouteHealth::default();
+        for i in 0..20u64 {
+            let at = 10_000 + i;
+            let (next, _) = observe(
+                &health,
+                &err(ProviderErrorClass::Transport, at),
+                at,
+                &policy,
+            );
+            health = next;
+        }
+        let successes: Vec<u64> = (0..100).map(|i| 10_100 + i).collect();
+        let (settled, transition) = record_samples(&health, &successes, &[], 10_200, &policy);
+
+        assert_eq!(settled.successes.len(), MAX_SAMPLES);
+        assert!(
+            settled.success_floor.is_some_and(|at| at > 10_019),
+            "the floor sits past every failure: {:?}",
+            settled.success_floor
+        );
+        assert_eq!(
+            transition, None,
+            "no retained failure falls inside the covered span: {settled:?}"
+        );
+    }
+
+    #[test]
+    fn a_degraded_route_restores_only_below_half_the_threshold() {
+        let policy = policy();
+        let health = degraded_route(&policy);
+
+        // 2 failures, 8 successes = 20%: under the 25% threshold, over the
+        // 12.5% hysteresis band.
+        let (still, transition) = record_samples(&health, &[1_080, 1_090], &[], 1_150, &policy);
+        assert_eq!(transition, None, "{still:?}");
+        assert!(matches!(still.phase, Phase::Degraded { .. }), "{still:?}");
+
+        // 2 failures, 18 successes = 10%, which clears the band.
+        let more: Vec<u64> = (0..10).map(|i| 1_100 + i * 10).collect();
+        let (restored, transition) = record_samples(&still, &more, &[], 1_250, &policy);
+        assert!(
+            matches!(transition, Some(Transition::Restored(_))),
+            "{transition:?}"
+        );
+        assert_eq!(admission(&restored, 1_250, &policy), Admission::Allow);
+    }
+
+    #[test]
+    fn a_degraded_route_restores_once_its_failures_age_out_of_the_window() {
+        let policy = policy();
+        let health = degraded_route(&policy);
+        // 600s window: everything above is long gone by now.
+        let (restored, transition) = record_samples(&health, &[2_000], &[], 2_000, &policy);
+        assert!(
+            matches!(transition, Some(Transition::Restored(_))),
+            "{transition:?}"
+        );
+        assert!(restored.phase.is_healthy(), "{restored:?}");
+    }
+
+    #[test]
+    fn a_degraded_route_still_opens_once_the_failures_reach_the_threshold() {
+        let policy = policy();
+        let health = degraded_route(&policy);
+        let (opened, transition) = observe(
+            &health,
+            &err(ProviderErrorClass::Transport, 1_110),
+            1_110,
+            &policy,
+        );
+        assert!(matches!(opened.phase, Phase::Open { .. }), "{opened:?}");
+        assert!(matches!(transition, Some(Transition::Opened(_))));
+        assert!(admission(&opened, 1_110, &policy).denied().is_some());
+    }
+
+    #[test]
+    fn a_completed_turn_alone_never_lifts_a_degradation() {
+        let policy = policy();
+        let health = degraded_route(&policy);
+        let (next, transition) = record_success(&health, 1_110, &policy);
+        assert_eq!(transition, None);
+        assert!(matches!(next.phase, Phase::Degraded { .. }), "{next:?}");
+    }
+
+    #[test]
+    fn latency_degrades_a_route_only_when_the_operator_set_a_threshold() {
+        let samples: Vec<LatencySample> = (0..8)
+            .map(|i| LatencySample {
+                at: 1_000 + i * 10,
+                ttft_ms: 30_000,
+            })
+            .collect();
+
+        let off = policy();
+        let (quiet, transition) =
+            record_samples(&RouteHealth::default(), &[], &samples, 1_100, &off);
+        assert_eq!(transition, None, "the latency signal is off by default");
+        assert!(quiet.phase.is_healthy(), "{quiet:?}");
+
+        let on = HealthPolicy {
+            degrade_ttft_ms: Some(20_000),
+            ..policy()
+        };
+        let (slow, transition) = record_samples(&RouteHealth::default(), &[], &samples, 1_100, &on);
+        assert!(
+            matches!(transition, Some(Transition::Degraded(_))),
+            "{transition:?}"
+        );
+        assert_eq!(
+            admission(&slow, 1_100, &on).degraded(),
+            Some("first-token p50 30.0s over 8 turns"),
+        );
+        assert_eq!(
+            admission(&slow, 1_100, &on).denied(),
+            None,
+            "latency never opens a circuit"
+        );
+    }
+
+    #[test]
+    fn a_latency_degraded_route_restores_under_three_quarters_of_the_threshold() {
+        let policy = HealthPolicy {
+            degrade_ttft_ms: Some(20_000),
+            ..policy()
+        };
+        let slow: Vec<LatencySample> = (0..8)
+            .map(|i| LatencySample {
+                at: 1_000 + i * 10,
+                ttft_ms: 30_000,
+            })
+            .collect();
+        let (degraded, _) = record_samples(&RouteHealth::default(), &[], &slow, 1_100, &policy);
+        assert!(matches!(degraded.phase, Phase::Degraded { .. }));
+
+        let borderline: Vec<LatencySample> = (0..20)
+            .map(|i| LatencySample {
+                at: 1_200 + i * 10,
+                ttft_ms: 16_000,
+            })
+            .collect();
+        let (still, transition) = record_samples(&degraded, &[], &borderline, 1_400, &policy);
+        assert_eq!(transition, None, "16s is still above 3/4 of 20s");
+        assert!(matches!(still.phase, Phase::Degraded { .. }), "{still:?}");
+
+        let fast: Vec<LatencySample> = (0..20)
+            .map(|i| LatencySample {
+                at: 1_500 + i * 10,
+                ttft_ms: 2_000,
+            })
+            .collect();
+        let (restored, transition) = record_samples(&still, &[], &fast, 1_700, &policy);
+        assert!(
+            matches!(transition, Some(Transition::Restored(_))),
+            "{transition:?}"
+        );
+        assert!(restored.phase.is_healthy(), "{restored:?}");
+    }
+
+    #[test]
+    fn turn_samples_are_deduplicated_by_their_own_row_time() {
+        let policy = policy();
+        let (once, _) = record_samples(
+            &RouteHealth::default(),
+            &[1_000, 1_010],
+            &[],
+            1_020,
+            &policy,
+        );
+        let (twice, _) = record_samples(&once, &[1_000, 1_010], &[], 1_020, &policy);
+        assert_eq!(
+            twice.successes,
+            vec![1_000, 1_010],
+            "a re-parsed transcript must not inflate the denominator"
+        );
+    }
+
+    #[test]
+    fn the_sample_rings_are_bounded_and_window_pruned() {
+        let policy = policy();
+        let successes: Vec<u64> = (0..(MAX_SAMPLES as u64 * 3)).map(|i| 1_000 + i).collect();
+        let latency: Vec<LatencySample> = (0..(MAX_OBSERVATIONS as u64 * 3))
+            .map(|i| LatencySample {
+                at: 1_000 + i,
+                ttft_ms: 100,
+            })
+            .collect();
+        let (full, _) = record_samples(
+            &RouteHealth::default(),
+            &successes,
+            &latency,
+            1_200,
+            &policy,
+        );
+        assert_eq!(full.successes.len(), MAX_SAMPLES);
+        assert_eq!(full.latency.len(), MAX_OBSERVATIONS);
+
+        let (aged, _) = record_samples(&full, &[], &[], 9_000, &policy);
+        assert!(aged.successes.is_empty(), "{aged:?}");
+        assert!(aged.latency.is_empty(), "{aged:?}");
+    }
+
+    /// Slice C: a half-open route hands out exactly one trial.
+    #[test]
+    fn a_half_open_route_admits_one_trial_and_denies_the_second() {
+        let policy = policy();
+        let health = RouteHealth {
+            phase: Phase::HalfOpen {
+                since: 2_000,
+                trial: None,
+            },
+            ..RouteHealth::default()
+        };
+        let (claimed, verdict, transition) = claim(&health, "sess-a", 2_010, &policy);
+        assert_eq!(verdict, Admission::Trial);
+        assert!(matches!(transition, Some(Transition::TrialClaimed(_))));
+
+        let (_, second, transition) = claim(&claimed, "sess-b", 2_020, &policy);
+        assert_eq!(
+            second.denied(),
+            Some(
+                "half-open: recovery trial already in flight (sess-a); next attempt in ~4m \
+                 (estimate)"
+            )
+        );
+        assert_eq!(transition, None, "a lost race is not a phase change");
+        assert_eq!(
+            admission(&claimed, 2_020, &policy).denied(),
+            Some(
+                "half-open: recovery trial already in flight (sess-a); next attempt in ~4m \
+                 (estimate)"
+            )
+        );
+    }
+
+    #[test]
+    fn an_expired_trial_is_claimable_again() {
+        let policy = policy();
+        let health = RouteHealth {
+            phase: Phase::HalfOpen {
+                since: 2_000,
+                trial: Some(Trial {
+                    claim: "sess-a".to_string(),
+                    at: 2_000,
+                }),
+            },
+            ..RouteHealth::default()
+        };
+        let expired = 2_000 + policy.cooldown_secs;
+        assert_eq!(admission(&health, expired, &policy), Admission::Trial);
+        let (_, verdict, transition) = claim(&health, "sess-b", expired, &policy);
+        assert_eq!(verdict, Admission::Trial);
+        assert!(matches!(transition, Some(Transition::TrialClaimed(_))));
+    }
+
+    #[test]
+    fn a_trial_that_succeeds_recovers_the_route_and_clears_the_claim() {
+        let policy = policy();
+        let health = RouteHealth {
+            phase: Phase::HalfOpen {
+                since: 2_000,
+                trial: Some(Trial {
+                    claim: "sess-a".to_string(),
+                    at: 2_000,
+                }),
+            },
+            ..RouteHealth::default()
+        };
+        let (next, transition) = record_success(&health, 2_010, &policy);
+        assert!(next.phase.is_healthy(), "{next:?}");
+        assert!(matches!(transition, Some(Transition::Recovered(_))));
+    }
+
+    #[test]
+    fn a_trial_that_fails_reopens_the_route_and_clears_the_claim() {
+        let policy = policy();
+        let health = RouteHealth {
+            phase: Phase::HalfOpen {
+                since: 2_000,
+                trial: Some(Trial {
+                    claim: "sess-a".to_string(),
+                    at: 2_000,
+                }),
+            },
+            observations: vec![
+                Observation {
+                    class: ProviderErrorClass::Transport,
+                    at: 1_990,
+                },
+                Observation {
+                    class: ProviderErrorClass::Transport,
+                    at: 1_995,
+                },
+            ],
+            ..RouteHealth::default()
+        };
+        let (next, transition) = observe(
+            &health,
+            &err(ProviderErrorClass::Transport, 2_010),
+            2_010,
+            &policy,
+        );
+        assert!(matches!(next.phase, Phase::Open { .. }), "{next:?}");
+        assert!(matches!(transition, Some(Transition::Opened(_))));
+    }
+
+    #[test]
+    fn an_open_breaker_records_the_class_that_tripped_it() {
+        let policy = policy();
+        let (health, _) = observe_many(
+            &[
+                err(ProviderErrorClass::Server, 1_000),
+                err(ProviderErrorClass::Server, 1_010),
+                err(ProviderErrorClass::Server, 1_020),
+            ],
+            1_020,
+            &policy,
+        );
+        assert!(
+            matches!(
+                health.phase,
+                Phase::Open {
+                    class: ProviderErrorClass::Server,
+                    ..
+                }
+            ),
+            "{health:?}"
+        );
+    }
+
+    #[test]
+    fn a_base_url_reduces_to_its_host_and_port_with_no_credentials() {
+        assert_eq!(
+            dependency_from_base_url("https://Gateway.Example.COM/v1/messages?beta=1"),
+            Some("gateway.example.com".to_string())
+        );
+        assert_eq!(
+            dependency_from_base_url("https://user:secret@gateway.example.com:8443/v1"),
+            Some("gateway.example.com:8443".to_string()),
+            "userinfo is dropped before the host is read"
+        );
+        assert_eq!(
+            dependency_from_base_url("localhost:11434"),
+            Some("localhost:11434".to_string()),
+            "a scheme-less value still names a host, and two harnesses \
+             configured with it really do share one"
+        );
+        // Malformed: nothing that could be a host survives the strip.
+        assert_eq!(dependency_from_base_url("https://"), None);
+        assert_eq!(dependency_from_base_url("https:///v1/messages"), None);
+        assert_eq!(dependency_from_base_url(""), None);
     }
 
     #[test]
@@ -671,12 +1843,16 @@ mod tests {
     #[test]
     fn a_success_in_half_open_recovers_the_route() {
         let health = RouteHealth {
-            phase: Phase::HalfOpen { since: 2_000 },
+            phase: Phase::HalfOpen {
+                since: 2_000,
+                trial: None,
+            },
             observations: vec![Observation {
                 class: ProviderErrorClass::Transport,
                 at: 1_900,
             }],
             seen_ids: vec!["row-1900".to_string()],
+            ..RouteHealth::default()
         };
         let (next, transition) = record_success(&health, 2_010, &policy());
         assert!(next.phase.is_healthy(), "{next:?}");
@@ -777,6 +1953,7 @@ mod tests {
                 opened_at: 1,
                 until: u64::MAX,
                 reason: "stored".to_string(),
+                class: ProviderErrorClass::Transport,
             },
             ..RouteHealth::default()
         };
@@ -790,17 +1967,20 @@ mod tests {
             ..HealthPolicy::default()
         };
         let mut health = RouteHealth::default();
-        for i in 0..(MAX_OBSERVATIONS as u64 * 3) {
-            let (next, _) = observe(
-                &health,
-                &err(ProviderErrorClass::Other, 1_000 + i),
-                1_000 + i,
-                &policy,
-            );
-            health = next;
+        for i in 0..(MAX_SAMPLES as u64 * 3) {
+            for class in [ProviderErrorClass::Transport, ProviderErrorClass::Other] {
+                let (next, _) = observe(&health, &err(class, 1_000 + i), 1_000 + i, &policy);
+                health = next;
+            }
         }
         assert_eq!(health.observations.len(), MAX_OBSERVATIONS);
-        assert_eq!(health.seen_ids.len(), MAX_OBSERVATIONS);
+        // Finding 8: the counting ring is bounded by the FAILURE ring's cap,
+        // which is larger than the observation ring's -- forgetting a row id
+        // whose TIME is still retained let a full re-parse recount it.
+        assert_eq!(health.seen_ids.len(), MAX_SAMPLES);
+        // R2: the non-counting classes are bounded separately, so they can
+        // never evict a retained failure's id.
+        assert_eq!(health.seen_other_ids.len(), MAX_OBSERVATIONS);
     }
 
     #[test]

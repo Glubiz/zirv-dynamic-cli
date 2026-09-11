@@ -317,9 +317,30 @@ pub fn confirmed_block(
         return Some(detail);
     }
     let seat = seat::load(state, seat_short)?;
-    super::health_store::harness_admission(
+    // Issue #455 slices B and C: the seat's OWN route only. A sibling harness
+    // sharing a configured endpoint host, and a half-open trial another
+    // caller is holding, both deny a PLACEMENT without saying anything about
+    // whether this seat's session can carry on where it is -- rolling the
+    // seat over for either would move a working session for someone else's
+    // failure.
+    super::health_store::harness_block(state, &seat.agent, now, &cfg.fallback.effective_health())
+}
+
+/// Issue #455 slice C: claims `agent`'s single half-open recovery trial for
+/// this seat, returning `Some(reason)` only when another caller already holds
+/// it. `None` -- the ordinary answer -- means this seat may launch: either it
+/// won the claim, or the route was never half-open in the first place.
+fn claim_successor_trial(
+    state: &StateDir,
+    cfg: &CtxConfig,
+    seat_short: &str,
+    agent: &str,
+    now: u64,
+) -> Option<String> {
+    super::health_store::claim_trial(
         state,
-        &seat.agent,
+        agent,
+        seat_short,
         now,
         &cfg.fallback.effective_health(),
     )
@@ -418,14 +439,23 @@ pub fn evaluate(
     let source_observed_at = fresh.map(|window| window.observed_at).unwrap_or(now);
     let source_hard_blocked =
         confirmed_block.is_some() || (fresh.is_some() && source.is_some_and(|p| p.hard_refused));
-    // Issue #455 (finding 5): read straight off the snapshot this function
-    // already built -- `HarnessCapacity::health` is the same verdict
-    // `confirmed_block` consulted, so no second read and no way for the two
-    // to disagree. It is deliberately NARROWER than `source_hard_blocked`:
-    // only an unreachable route relaxes `seat::decide`'s hysteresis floor.
-    let source_unreachable = snapshot
-        .harness(&current.agent)
-        .is_some_and(|harness| harness.health.denied().is_some());
+    // Issue #455 (finding 5): deliberately NARROWER than
+    // `source_hard_blocked` -- only an unreachable route relaxes
+    // `seat::decide`'s hysteresis floor.
+    //
+    // Slices B and C: read through `harness_block` rather than off the
+    // snapshot's `HarnessCapacity::health`, which now also denies a harness
+    // whose sibling shares its configured endpoint host and one whose
+    // half-open trial someone else holds. Neither says this seat's own route
+    // is unreachable, and relaxing the floor on either would let the seat
+    // roll onto a harness with less headroom than the one it is sitting on.
+    let source_unreachable = super::health_store::harness_block(
+        state,
+        &current.agent,
+        now,
+        &cfg.fallback.effective_health(),
+    )
+    .is_some();
 
     let mut candidates: Vec<seat::CandidateHeadroom> = Vec::new();
     let mut dropped: Vec<String> = Vec::new();
@@ -481,6 +511,11 @@ pub fn evaluate(
                 .or_else(|| provider.binding.and_then(|i| provider.windows.get(i)))
                 .map(|window| window.observed_at)
                 .unwrap_or(now),
+            // Finding 6: carried into the ranking rather than dropped here.
+            // Without it a degraded candidate with a better usage reading
+            // beat a healthy one, which is exactly the move the degrade
+            // signal exists to prevent.
+            degraded: harness.health.degraded().is_some(),
         });
     }
 
@@ -584,7 +619,34 @@ pub fn evaluate(
             })
     };
 
-    match seat::decide(&inputs, cfg) {
+    // Issue #455 slice C: a half-open successor admits exactly one recovery
+    // trial, and this is the moment a ranking becomes a launch. A lost race
+    // re-decides ONCE over the same candidates minus the one that was taken;
+    // it never loops.
+    let mut decision = seat::decide(&inputs, cfg);
+    if let seat::RolloverDecision::Proceed { agent, .. } = &decision
+        && let Some(denial) = claim_successor_trial(state, cfg, seat_short, agent, now)
+    {
+        let taken = agent.clone();
+        let narrowed: Vec<seat::CandidateHeadroom> = candidates
+            .iter()
+            .filter(|candidate| !candidate.agent.eq_ignore_ascii_case(&taken))
+            .cloned()
+            .collect();
+        decision = seat::decide(
+            &seat::RolloverInputs {
+                candidates: &narrowed,
+                ..inputs
+            },
+            cfg,
+        );
+        if let seat::RolloverDecision::Proceed { agent, .. } = &decision
+            && claim_successor_trial(state, cfg, seat_short, agent, now).is_some()
+        {
+            decision = seat::RolloverDecision::Wait(denial);
+        }
+    }
+    match decision {
         seat::RolloverDecision::Proceed {
             agent,
             model,
@@ -797,7 +859,7 @@ fn park_until_reset(
                 tool_calls: None,
             },
             now,
-            exclude: None,
+            exclude: &[],
             requester: None,
         },
         &visited,
@@ -2298,6 +2360,116 @@ mod tests {
         assert_eq!(evaluate_interval(&cfg, true), Duration::from_secs(60));
         assert_eq!(evaluate_interval(&cfg, false), Duration::from_secs(900));
     }
+    /// Slices A-C: the seat rolls over for its OWN route being shut, and for
+    /// nothing else. A degraded route still answers, a sibling's failure is
+    /// the sibling's, and a recovery trial someone else is holding only
+    /// denies new placements -- none of the three is a reason to move a
+    /// working session.
+    ///
+    /// `evaluate` derives both `confirmed_block`'s health half and its
+    /// `source_unreachable` (which relaxes `seat::decide`'s hysteresis floor)
+    /// from this one answer, so this pins both.
+    #[test]
+    fn confirmed_block_ignores_degradation_an_alias_and_someone_elses_trial() {
+        let (_dir, state) = temp_state();
+        let mut cfg = cfg();
+        cfg.endpoint.claude = Some(super::super::config::EndpointTarget {
+            vendor: "zai".to_string(),
+            base_url: "https://gateway.example.com/anthropic".to_string(),
+            credential_env: "TOKEN".to_string(),
+            model: Some("glm".to_string()),
+            wire_api: None,
+        });
+        cfg.endpoint.codex = Some(super::super::config::EndpointTarget {
+            vendor: "zai".to_string(),
+            base_url: "https://gateway.example.com/openai".to_string(),
+            credential_env: "TOKEN".to_string(),
+            model: Some("glm".to_string()),
+            wire_api: None,
+        });
+        register_seat(&state);
+        store_usage(&state, "anthropic", 5.0, NOW);
+        store_usage(&state, "openai", 5.0, NOW);
+        let policy = cfg.fallback.effective_health();
+        let key = super::super::health::RouteKey::new("claude");
+
+        for (phase, why) in [
+            (
+                super::super::health::Phase::Degraded {
+                    since: NOW - 100,
+                    reason: "error rate 30% over 10 turns".to_string(),
+                },
+                "a degraded route still answers",
+            ),
+            (
+                super::super::health::Phase::HalfOpen {
+                    since: NOW - 100,
+                    trial: Some(super::super::health::Trial {
+                        claim: "sess-other".to_string(),
+                        at: NOW - 10,
+                    }),
+                },
+                "a trial someone else holds denies placements, not this seat",
+            ),
+        ] {
+            let record = super::super::health_store::RouteHealthRecord {
+                key: key.clone(),
+                model: None,
+                health: super::super::health::RouteHealth {
+                    phase,
+                    ..Default::default()
+                },
+                updated_at: NOW,
+            };
+            super::super::state::create_private_dir_all(&super::super::health_store::dir(&state))
+                .expect("mkdir");
+            std::fs::write(
+                super::super::health_store::dir(&state).join("claude.json"),
+                serde_json::to_string(&record).expect("serialize"),
+            )
+            .expect("write");
+            assert_eq!(
+                confirmed_block(&state, &cfg, NOW, "anthropic", SHORT),
+                None,
+                "{why}"
+            );
+        }
+
+        // The sibling behind the same configured endpoint host IS denied for
+        // new placements -- and still does not move this seat.
+        std::fs::remove_file(super::super::health_store::dir(&state).join("claude.json"))
+            .expect("clear claude");
+        for at in [NOW - 20, NOW - 10, NOW] {
+            super::super::health_store::observe_and_persist(
+                &state,
+                &super::super::health::RouteKey::new("codex"),
+                &super::super::health::Observed::new(
+                    super::super::event::ProviderErrorClass::Transport,
+                    Some(at),
+                    Some(format!("codex-{at}")),
+                ),
+                None,
+                at,
+                &policy,
+            );
+        }
+        let names = vec!["claude".to_string(), "codex".to_string()];
+        assert!(
+            super::super::health_store::admission_for(
+                &super::super::health_store::admissions(&state, &cfg, &names, NOW, &policy),
+                "claude",
+            )
+            .denied()
+            .is_some(),
+            "the alias is denied for placements"
+        );
+        assert_eq!(
+            confirmed_block(&state, &cfg, NOW, "anthropic", SHORT),
+            None,
+            "but the seat sitting on it is not blocked by its sibling's failure"
+        );
+    }
+
     /// Issue #455: an open route-health breaker on the seat's own route is a
     /// confirmed block in its own right -- and because that drives the
     /// reactive path, the resulting handover is `structural_only`, so NO

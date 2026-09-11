@@ -11,6 +11,7 @@ use super::super::CtxResult;
 use super::super::catalogue;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, TranscriptUsage,
+    UNRESOLVED_TOOL_CALL_CAP, UnresolvedToolCall,
 };
 use super::super::window::{self, RolloutRecord};
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
@@ -1147,6 +1148,49 @@ fn toml_quoted_string(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+/// The joined, unwrapped script text of a `custom_tool_call`'s own `command`
+/// array (`["bash", "-lc", "<script>"]`) -- mirrors `learn.rs`'s private
+/// `codex_command_string` (not reused directly: that helper is `fn`-private
+/// to a file outside this brief's scope, and this is small and pure enough
+/// that duplicating it beats widening `learn.rs`'s own visibility for one
+/// caller). `None` when `command` is absent, empty, or carries no string.
+fn codex_exec_command(payload: &Value) -> Option<String> {
+    if let Some(s) = payload.get("command").and_then(Value::as_str) {
+        return Some(s.to_string());
+    }
+    let arr = payload.get("command").and_then(Value::as_array)?;
+    let parts: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join(" ");
+    Some(crate::commands::ctx::safety::unwrap_shell_wrapper(&joined).unwrap_or(joined))
+}
+
+/// A single line describing one `custom_tool_call`'s own input, for
+/// `UnresolvedToolCall::summary` (issue #455) -- mirrors
+/// `claude::describe_tool_input`'s priority (command, then path, then a
+/// generic field), adapted to codex's own verified shapes
+/// (`tests/fixtures/codex-rollout-permission-requests.jsonl`): an `exec`
+/// call's joined `command` array, an `apply_patch` call's raw `input` text
+/// or a path-shaped field, otherwise the bare tool name.
+fn describe_codex_call(name: &str, payload: &Value) -> String {
+    if name.eq_ignore_ascii_case("exec")
+        && let Some(command) = codex_exec_command(payload)
+    {
+        return command;
+    }
+    for key in ["input", "path", "file_path"] {
+        if let Some(text) = payload.get(key).and_then(Value::as_str) {
+            return text.to_string();
+        }
+    }
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    "custom_tool_call".to_string()
+}
+
 impl AgentAdapter for CodexAdapter {
     fn name(&self) -> &'static str {
         "codex"
@@ -2079,18 +2123,41 @@ impl AgentAdapter for CodexAdapter {
         })
     }
 
-    /// Only `assistant_texts` is populated, from verified
+    /// `assistant_texts` is populated from verified
     /// `task_complete.last_agent_message` lines -- the one piece of real
     /// transcript content the rollout format gives a verified shape for
-    /// (see `parse_events`'s own doc comment).
-    /// `user_messages`/`files_read`/`files_modified`/`tool_errors` stay
-    /// empty: no verified rollout shape carries them, and inventing one
-    /// would be
-    /// exactly the fabricated-content class `handoff.rs`'s own eventless
-    /// guard exists to prevent -- this is a real, if partial, structural
-    /// context now, not the permanent empty stub it used to be.
-    /// `last_n` truncation mirrors `claude::structural_context`'s own
-    /// `keep_last`: `last_n == 0` keeps nothing at all.
+    /// (see `parse_events`'s own doc comment). `user_messages`/`files_read`/
+    /// `files_modified`/`tool_errors` stay empty: no verified rollout shape
+    /// carries them, and inventing one would be exactly the
+    /// fabricated-content class `handoff.rs`'s own eventless guard exists to
+    /// prevent.
+    ///
+    /// `unresolved_tool_calls` and `tail_cut` (issue #455) ARE populated,
+    /// from shapes this codebase already reads elsewhere for other
+    /// purposes: `response_item`/`custom_tool_call`+`custom_tool_call_output`
+    /// pairs keyed by `call_id` (the same shape
+    /// `permissions::extract_codex_approvals` and
+    /// `learn::extract_codex_attempts` correlate, verified against
+    /// `tests/fixtures/codex-rollout-permission-requests.jsonl`), and
+    /// `event_msg`/`task_complete.error.message` (the same shape
+    /// `parse_events` above classifies as a `ProviderError`, verified
+    /// against `tests/fixtures/codex-provider-errors-model-drift.jsonl`).
+    /// Coverage limit: codex's rollout carries no per-turn "the stream
+    /// ended mid-generation" marker analogous to claude's `stop_reason`
+    /// (nothing in this codebase reads one, and neither real fixture shows
+    /// one), so only the provider-error half of `tail_cut` is observable
+    /// here -- a stream cut with no `task_complete` row at all (the process
+    /// killed before codex ever wrote one) leaves no trace to reconcile.
+    /// `partial_text` (review round 2) always stays `None` for the same
+    /// reason: a failed `task_complete` carries a null `last_agent_message`,
+    /// never a text fragment of what was being generated, so there is
+    /// nothing here to withhold in the first place -- unlike claude, codex
+    /// never risks presenting a cut-off fragment as a completed reply,
+    /// because it never has one to present. `last_n` truncation on
+    /// `assistant_texts` mirrors
+    /// `claude::structural_context`'s own `keep_last`: `last_n == 0` keeps
+    /// nothing at all. `unresolved_tool_calls` is capped independently at
+    /// `event::UNRESOLVED_TOOL_CALL_CAP`, like the claude adapter.
     fn structural_context(&self, jsonl: &str, last_n: usize) -> StructuralContext {
         let mut assistant_texts: Vec<String> = jsonl
             .lines()
@@ -2104,8 +2171,91 @@ impl AgentAdapter for CodexAdapter {
         if assistant_texts.len() > last_n {
             assistant_texts.drain(..assistant_texts.len() - last_n);
         }
+
+        let mut pending_calls: HashMap<String, (usize, String, String)> = HashMap::new();
+        let mut call_seq: usize = 0;
+        let mut tail_cut: Option<String> = None;
+        let mut last_tool_name: Option<String> = None;
+
+        for line in jsonl.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(row) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let Some(payload) = row.get("payload") else {
+                continue;
+            };
+            match row.get("type").and_then(Value::as_str) {
+                Some("response_item") => match payload.get("type").and_then(Value::as_str) {
+                    Some("custom_tool_call") => {
+                        let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let name = payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        last_tool_name = Some(name.clone());
+                        let summary =
+                            super::redacted_tool_summary(&describe_codex_call(&name, payload));
+                        call_seq += 1;
+                        pending_calls.insert(call_id.to_string(), (call_seq, name, summary));
+                    }
+                    Some("custom_tool_call_output") => {
+                        if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
+                            pending_calls.remove(call_id);
+                        }
+                    }
+                    _ => {}
+                },
+                Some("event_msg")
+                    if payload.get("type").and_then(Value::as_str) == Some("task_complete") =>
+                {
+                    if let Some(message) = payload
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                    {
+                        let detail = super::redacted_tool_summary(message);
+                        tail_cut = Some(match last_tool_name.as_deref() {
+                            Some(name) => format!("API error ({detail}) after tool call {name}"),
+                            None => format!("API error ({detail})"),
+                        });
+                    } else if payload
+                        .get("last_agent_message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        // A later, genuine completed turn supersedes any
+                        // earlier cut -- same rule as the claude adapter.
+                        tail_cut = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut unresolved: Vec<(usize, String, String, String)> = pending_calls
+            .into_iter()
+            .map(|(id, (seq, name, summary))| (seq, id, name, summary))
+            .collect();
+        unresolved.sort_by_key(|(seq, ..)| *seq);
+        if unresolved.len() > UNRESOLVED_TOOL_CALL_CAP {
+            unresolved.drain(..unresolved.len() - UNRESOLVED_TOOL_CALL_CAP);
+        }
+        let unresolved_tool_calls = unresolved
+            .into_iter()
+            .map(|(_, id, name, summary)| UnresolvedToolCall { name, id, summary })
+            .collect();
+
         StructuralContext {
             assistant_texts,
+            unresolved_tool_calls,
+            tail_cut,
             ..StructuralContext::default()
         }
     }
@@ -2648,6 +2798,117 @@ mod tests {
             ctx.files_read.is_empty() && ctx.files_modified.is_empty(),
             "documents the pre-existing gap, not a regression: {ctx:?}"
         );
+    }
+
+    /// Issue #455, grounded against a scrubbed but shape-faithful fixture:
+    /// an `exec` `custom_tool_call` (`git push`) never gets a
+    /// `custom_tool_call_output` before the turn's own `task_complete`
+    /// reports an `error`, so it must surface as unresolved, and the turn
+    /// failure itself must be reported as a cut tail.
+    #[test]
+    fn structural_context_flags_an_unresolved_tool_call_and_the_cut_tail() {
+        let jsonl = fixture("codex-partial-stream.jsonl");
+        let adapter = CodexAdapter::new(None);
+        let ctx = adapter.structural_context(&jsonl, 10);
+
+        assert_eq!(ctx.unresolved_tool_calls.len(), 1);
+        let call = &ctx.unresolved_tool_calls[0];
+        assert_eq!(call.name, "exec");
+        assert_eq!(call.id, "call_partial_1");
+        assert!(call.summary.contains("git push origin feat/x"));
+
+        let reason = ctx.tail_cut.as_deref().expect("a cut tail");
+        assert!(reason.contains("server_error"));
+        assert!(reason.contains("exec"));
+
+        assert!(
+            ctx.partial_text.is_none(),
+            "codex's rollout gives no per-turn text fragment for a failed \
+             task_complete (last_agent_message is null), so there is never \
+             anything to quote: {:?}",
+            ctx.partial_text
+        );
+    }
+
+    /// Issue #455 review round 2: a completed turn's `last_agent_message`
+    /// must survive in `done` (via `assistant_texts`) even when a LATER
+    /// turn is the one whose `task_complete` reports an error -- codex gives
+    /// no partial-text fragment for a failed turn at all, so this is
+    /// automatically correct rather than something codex.rs must compute,
+    /// but is worth pinning down as a regression test.
+    #[test]
+    fn structural_context_keeps_an_earlier_completed_turn_when_a_later_one_is_cut() {
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-09-04T07:00:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"Pushed the branch."}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-04T07:01:00Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_1","name":"exec","command":["bash","-lc","git status"]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-04T07:02:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","last_agent_message":null,"error":{"message":"server_error"}}}"#,
+            "\n",
+        );
+        let ctx = CodexAdapter::new(None).structural_context(jsonl, 10);
+        assert_eq!(ctx.assistant_texts, vec!["Pushed the branch.".to_string()]);
+        assert!(ctx.tail_cut.is_some());
+        assert!(ctx.partial_text.is_none());
+    }
+
+    /// The counterpart to the above: once the `custom_tool_call_output`
+    /// arrives, the call is resolved.
+    #[test]
+    fn structural_context_does_not_flag_a_tool_call_once_its_output_arrives() {
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-09-04T07:00:00Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_1","name":"exec","command":["bash","-lc","echo hi"]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-04T07:00:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_1","output":[{"type":"input_text","text":"hi"}]}}"#,
+            "\n",
+        );
+        let ctx = CodexAdapter::new(None).structural_context(jsonl, 10);
+        assert!(ctx.unresolved_tool_calls.is_empty());
+        assert!(ctx.tail_cut.is_none());
+    }
+
+    /// Grounded against the SAME recorded fixture `a_derived_event_stream_
+    /// scores_through_the_rot_engine` already relies on: its own last row is
+    /// a `task_complete` with `error.message: "tool call failed"` and no
+    /// later successful turn, so the cut must be reported here too.
+    #[test]
+    fn structural_context_reports_a_cut_tail_for_a_failed_task_complete_in_the_recorded_fixture() {
+        let jsonl = fixture("codex-rollout-turn-events.jsonl");
+        let ctx = CodexAdapter::new(None).structural_context(&jsonl, 10);
+        let reason = ctx.tail_cut.as_deref().expect("a cut tail");
+        assert!(reason.contains("tool call failed"), "got {reason}");
+    }
+
+    /// Issue #455: a later, genuine `task_complete` (a non-empty
+    /// `last_agent_message`) recovers from an earlier failed turn --
+    /// `tail_cut` reflects only the state as of the END of the range.
+    #[test]
+    fn structural_context_clears_tail_cut_after_a_later_successful_task_complete() {
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-09-04T07:00:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":null,"error":{"message":"server_error"}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-04T07:01:00Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2","last_agent_message":"recovered and finished"}}"#,
+            "\n",
+        );
+        let ctx = CodexAdapter::new(None).structural_context(jsonl, 10);
+        assert!(ctx.tail_cut.is_none());
+        assert_eq!(ctx.assistant_texts, vec!["recovered and finished"]);
+    }
+
+    /// Issue #455: `unresolved_tool_calls` is capped independently of
+    /// `last_n`, newest last -- same contract as the claude adapter.
+    #[test]
+    fn structural_context_caps_unresolved_tool_calls_to_the_newest_eight() {
+        let mut jsonl = String::new();
+        for i in 0..12 {
+            jsonl.push_str(&format!(
+                "{{\"timestamp\":\"2026-09-04T07:00:{i:02}Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"custom_tool_call\",\"call_id\":\"call-{i}\",\"name\":\"exec\",\"command\":[\"bash\",\"-lc\",\"echo {i}\"]}}}}\n"
+            ));
+        }
+        let ctx = CodexAdapter::new(None).structural_context(&jsonl, 1_000);
+        assert_eq!(ctx.unresolved_tool_calls.len(), 8);
+        assert_eq!(ctx.unresolved_tool_calls.first().unwrap().id, "call-4");
+        assert_eq!(ctx.unresolved_tool_calls.last().unwrap().id, "call-11");
     }
 
     #[test]
