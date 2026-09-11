@@ -2464,7 +2464,7 @@ mod tests {
         let second = journal.replay(&session).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.identity.generation, 8);
-        assert_eq!(first.last_sequence, SequenceId(9));
+        assert_eq!(first.last_sequence, SequenceId(10));
         assert_eq!(first.messages.len(), 2);
         assert_eq!(first.usage[&usage("usage-1")].input_tokens, 123);
         assert_eq!(first.tool_calls[&tool("call-1")].name, "read");
@@ -2481,7 +2481,7 @@ mod tests {
         let events = journal.events(&session).unwrap();
         assert_eq!(
             events.iter().map(|event| event.sequence.0).collect::<Vec<_>>(),
-            (1..=9).collect::<Vec<_>>()
+            (1..=10).collect::<Vec<_>>()
         );
         let normalized = journal.normalized_events(&session).unwrap();
         assert!(matches!(
