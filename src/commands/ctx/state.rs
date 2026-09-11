@@ -605,6 +605,15 @@ impl StateDir {
         &self.0
     }
 
+    /// Authoritative native conversation and tool-execution journal
+    /// (`<state>/native-journal.sqlite`, issue #472). This is one
+    /// machine-local database shared by native sessions; every row is keyed
+    /// by the full logical session id and the journal keeps provider/account
+    /// identity separate from repository state.
+    pub fn native_journal(&self) -> PathBuf {
+        self.0.join("native-journal.sqlite")
+    }
+
     pub fn handoffs(&self) -> PathBuf {
         self.0.join("handoffs")
     }

@@ -1443,6 +1443,27 @@ example payloads under `tests/fixtures/runtime/v1/` so a later change can't
 silently break what v1 meant. No daemon or socket exists yet; everything is
 in-process.
 
+Native sessions use an authoritative schema-v1 SQLite/WAL journal at
+`<state>/native-journal.sqlite`. It records acknowledged inputs, complete
+typed assistant blocks, exact tool calls, execution-state receipts, usage,
+task receipts, portable checkpoints, and monotonic sequence/generation IDs.
+Bounded streaming frames are transient until a completed-message barrier
+commits them; incomplete tool arguments never enter the executable event log.
+An execution interrupted after it starts becomes `outcome_unknown` and must be
+reconciled rather than blindly replayed. Provider continuation envelopes live
+outside portable replay and are readable only with the same route, provider,
+endpoint, account, protocol, vendor, and model identity. The journal projects
+committed facts into the existing `NormalizedEvent` scoring vocabulary, so
+the pure rot engine is unchanged. The storage/recovery contract is documented
+in
+[`docs/design/2026-09-11-native-conversation-journal.md`](docs/design/2026-09-11-native-conversation-journal.md).
+
+The journal does not replace the session registry, seat, task, mailbox,
+workflow, or policy stores. Those remain the single authorities for their own
+state and the journal records only their stable identifiers and receipts.
+Existing harness transcripts are untouched, and older Zirv builds simply
+ignore the additional private database.
+
 `zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
 [`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
 honest against the real command surface and source tree: every command verb
