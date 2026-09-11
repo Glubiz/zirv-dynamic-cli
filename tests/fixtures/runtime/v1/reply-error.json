@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "id": "req-8",
+  "reply": "error",
+  "code": "unknown_session",
+  "message": "unknown session: 11111111-2222-4333-8444-555555555555"
+}

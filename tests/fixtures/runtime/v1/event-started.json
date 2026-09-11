@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "revision": 1,
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "generation": 1,
+  "event": "started",
+  "session": {
+    "runtime": "harness",
+    "logical_id": "11111111-2222-4333-8444-555555555555",
+    "short": "abcd1234",
+    "generation": 1,
+    "role": "worker",
+    "surface": "headless",
+    "conversation": {
+      "agent": "claude",
+      "conversation": "11111111-2222-4333-8444-555555555555"
+    }
+  }
+}

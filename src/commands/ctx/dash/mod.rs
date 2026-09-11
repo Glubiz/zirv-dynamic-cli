@@ -49,7 +49,7 @@ use super::policy;
 use super::state::StateDir;
 use super::term;
 use super::window;
-use super::{fallback, handoff, handover, mail, memory, prompt, score, seat, sessions};
+use super::{fallback, handoff, handover, mail, memory, prompt, runtime, score, seat, sessions};
 use crate::commands::workflow;
 use crate::style;
 use actions::{MENU_NO_CWD, MENU_NO_REQUEST};
@@ -4133,6 +4133,7 @@ fn settle_pending_rollover(
                     &short,
                     &seat.agent,
                     &seat.session,
+                    runtime::RuntimeKind::Harness,
                 ) {
                     // A lifecycle hook OBSERVED this conversation for this
                     // exact seat and zirv session: the strongest evidence
@@ -14725,6 +14726,7 @@ mod tests {
             role: None,
             start_time: None,
             in_flight: None,
+            runtime: runtime::RuntimeKind::Harness,
         }
     }
 

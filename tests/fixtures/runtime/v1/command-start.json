@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "id": "req-2",
+  "command": "start",
+  "spec": {
+    "runtime": "harness",
+    "role": "worker",
+    "agent": "claude",
+    "provider_route": "anthropic",
+    "model": "claude-sonnet-5",
+    "surface": "headless",
+    "cwd": "/repo",
+    "prompt": "hello",
+    "extra_args": [
+      "--flag"
+    ]
+  }
+}

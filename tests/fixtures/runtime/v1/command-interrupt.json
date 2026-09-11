@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "id": "req-5",
+  "command": "interrupt",
+  "session": {
+    "runtime": "harness",
+    "logical_id": "11111111-2222-4333-8444-555555555555",
+    "short": "abcd1234",
+    "generation": 1,
+    "role": "worker",
+    "surface": "headless",
+    "conversation": {
+      "agent": "claude",
+      "conversation": "11111111-2222-4333-8444-555555555555"
+    }
+  }
+}

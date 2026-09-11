@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::config::{CtxConfig, EnvLookup, env_from_process};
+use super::runtime::RuntimeKind;
 use super::state::{self, StateDir};
 
 /// Mirrors `StateDir::socket_for`'s own derivation exactly: the first eight
@@ -415,6 +416,14 @@ pub struct Record {
     /// other optional field on this struct already follows.
     #[serde(default)]
     pub in_flight: Option<InFlight>,
+    /// Issue #470: which backend actually drives this session --
+    /// `runtime::RuntimeKind::Harness` for every session this build spawns
+    /// today. `#[serde(default)]` so a record written by an older build
+    /// (before this field existed) deserializes as `Harness`, the same
+    /// value `Record::new` itself always stamps right now -- the only
+    /// runtime this codebase can actually run a session under yet.
+    #[serde(default)]
+    pub runtime: RuntimeKind,
 }
 
 /// Issue #281: the crash-interruption witness marker. Stamped by a
@@ -482,6 +491,9 @@ impl Record {
             // Left unset here too: nothing is in flight until a supervisor's
             // own `stamp_in_flight` call says otherwise.
             in_flight: None,
+            // Issue #470: every session this build spawns runs on the
+            // existing harness-process backend.
+            runtime: RuntimeKind::Harness,
         }
     }
 
@@ -1644,6 +1656,13 @@ struct NativeConversation {
     session: String,
     /// The harness's own conversation id.
     conversation: String,
+    /// Issue #470: which backend recorded this conversation. Every writer
+    /// today is the existing harness-process backend, so this is always
+    /// `RuntimeKind::Harness`. `#[serde(default)]` so a marker written by an
+    /// older build still parses (and, correctly, still answers as
+    /// `Harness`, the only runtime that existed when it was written).
+    #[serde(default)]
+    runtime: RuntimeKind,
 }
 
 fn conversation_marker_path(state: &StateDir, short: &str) -> PathBuf {
@@ -1672,6 +1691,8 @@ pub fn record_native_conversation(
         agent: agent.to_string(),
         session: session.to_string(),
         conversation: conversation.to_string(),
+        // Issue #470: the only backend that can call this today.
+        runtime: RuntimeKind::Harness,
     };
     let Ok(body) = serde_json::to_string(&record) else {
         return;
@@ -1681,19 +1702,24 @@ pub fn record_native_conversation(
 }
 
 /// The native conversation id recorded for `short`, but only when the marker
-/// names this exact `agent` AND this exact zirv `session`. `None` for a
-/// missing, unreadable, malformed or mismatched marker -- the caller then has
-/// no proof about which conversation the harness is in, which is a reason to
-/// relaunch cold, never to guess.
+/// names this exact `agent`, this exact zirv `session`, AND this exact
+/// `runtime` (issue #470: a marker a harness-process backend recorded must
+/// never be handed to a native backend as if it could resume it, and vice
+/// versa). `None` for a missing, unreadable, malformed or mismatched marker
+/// -- the caller then has no proof about which conversation the harness is
+/// in, which is a reason to relaunch cold, never to guess.
 pub fn native_conversation(
     state: &StateDir,
     short: &str,
     agent: &str,
     session: &str,
+    runtime: RuntimeKind,
 ) -> Option<String> {
     let body = std::fs::read_to_string(conversation_marker_path(state, short)).ok()?;
     let record: NativeConversation = serde_json::from_str(&body).ok()?;
-    (record.agent.eq_ignore_ascii_case(agent) && record.session == session)
+    (record.agent.eq_ignore_ascii_case(agent)
+        && record.session == session
+        && record.runtime == runtime)
         .then_some(record.conversation)
         .filter(|conversation| !conversation.is_empty())
 }
@@ -2318,6 +2344,31 @@ mod tests {
         Record::new(session, "claude", repo, verb)
     }
 
+    /// Issue #470: a session record written before the `runtime` field
+    /// existed has to still parse (and default to `Harness`, the only
+    /// runtime any build could have registered a session under before now),
+    /// and a record written by this build must round-trip its `runtime`
+    /// value exactly.
+    #[test]
+    fn a_record_without_a_runtime_field_still_parses_as_harness_and_round_trips_with_it() {
+        let record = record_for(
+            "11111111-2222-4333-8444-555555555555",
+            Path::new("/repo"),
+            Verb::Exec,
+        );
+        let mut without_runtime = serde_json::to_value(&record).expect("serialize");
+        without_runtime
+            .as_object_mut()
+            .expect("record is a JSON object")
+            .remove("runtime");
+        let parsed: Record = serde_json::from_value(without_runtime).expect("deserialize");
+        assert_eq!(parsed.runtime, RuntimeKind::Harness);
+
+        let json = serde_json::to_string(&record).expect("serialize");
+        let round_tripped: Record = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped.runtime, RuntimeKind::Harness);
+    }
+
     /// Issue #243 (review round, F1): the whole point of the sibling file --
     /// a screening write must never open, let alone rewrite, `record_path`
     /// at all. Proven at the strongest level available: the record's own
@@ -2354,28 +2405,109 @@ mod tests {
 
         record_native_conversation(&state, "orch0001", "claude", zirv_session, native);
         assert_eq!(
-            native_conversation(&state, "orch0001", "claude", zirv_session).as_deref(),
+            native_conversation(
+                &state,
+                "orch0001",
+                "claude",
+                zirv_session,
+                RuntimeKind::Harness
+            )
+            .as_deref(),
             Some(native),
         );
         assert_eq!(
-            native_conversation(&state, "orch0001", "Claude", zirv_session).as_deref(),
+            native_conversation(
+                &state,
+                "orch0001",
+                "Claude",
+                zirv_session,
+                RuntimeKind::Harness
+            )
+            .as_deref(),
             Some(native),
             "an agent name differing only in case is the same harness"
         );
         assert_eq!(
-            native_conversation(&state, "orch0001", "codex", zirv_session),
+            native_conversation(
+                &state,
+                "orch0001",
+                "codex",
+                zirv_session,
+                RuntimeKind::Harness
+            ),
             None,
             "a seat rolled over to another harness must not resume claude's conversation"
         );
         assert_eq!(
-            native_conversation(&state, "orch0001", "claude", "some-other-session"),
+            native_conversation(
+                &state,
+                "orch0001",
+                "claude",
+                "some-other-session",
+                RuntimeKind::Harness
+            ),
             None,
             "a marker left by an earlier session at this address is not this one's"
         );
         assert_eq!(
-            native_conversation(&state, "orch0002", "claude", zirv_session),
+            native_conversation(
+                &state,
+                "orch0002",
+                "claude",
+                zirv_session,
+                RuntimeKind::Harness
+            ),
             None,
             "no marker at all is no answer, never a guess"
+        );
+    }
+
+    /// Issue #470: a conversation recorded by the harness backend must
+    /// never be handed to a caller asking on behalf of the native backend,
+    /// even for the exact same agent/session -- the two runtimes' own
+    /// conversation ids live in entirely different namespaces.
+    #[test]
+    fn native_conversation_does_not_answer_for_a_different_runtime() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        record_native_conversation(&state, "orch0004", "claude", "sess", "conv");
+        assert_eq!(
+            native_conversation(&state, "orch0004", "claude", "sess", RuntimeKind::Harness)
+                .as_deref(),
+            Some("conv")
+        );
+        assert_eq!(
+            native_conversation(&state, "orch0004", "claude", "sess", RuntimeKind::Native),
+            None,
+            "a marker the harness backend recorded must not resume the native backend"
+        );
+    }
+
+    /// An older build's marker file predates the `runtime` field entirely.
+    /// It must still parse, and must answer as `Harness` -- the only
+    /// runtime that could have written it.
+    #[test]
+    fn a_marker_without_a_runtime_field_still_parses_as_harness() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = state_in(tmp.path());
+        let _ = super::super::state::create_private_dir_all(&state.sessions());
+        let body = serde_json::json!({
+            "agent": "claude",
+            "session": "sess",
+            "conversation": "conv",
+        })
+        .to_string();
+        super::super::state::write_private(&conversation_marker_path(&state, "orch0005"), &body)
+            .expect("write marker");
+        assert_eq!(
+            native_conversation(&state, "orch0005", "claude", "sess", RuntimeKind::Harness)
+                .as_deref(),
+            Some("conv"),
+            "a pre-#470 marker has no runtime field and must default to Harness"
+        );
+        assert_eq!(
+            native_conversation(&state, "orch0005", "claude", "sess", RuntimeKind::Native),
+            None
         );
     }
 
@@ -2388,7 +2520,7 @@ mod tests {
         record_native_conversation(&state, "orch0003", "claude", "sess", "");
         record_native_conversation(&state, "orch0003", "", "sess", "conv");
         assert_eq!(
-            native_conversation(&state, "orch0003", "claude", "sess"),
+            native_conversation(&state, "orch0003", "claude", "sess", RuntimeKind::Harness),
             None
         );
     }
