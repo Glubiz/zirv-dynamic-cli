@@ -66,7 +66,9 @@ impl ExecutionIdentity {
 pub enum NetworkScope {
     #[default]
     Denied,
-    Only { targets: BTreeSet<NetworkTarget> },
+    Only {
+        targets: BTreeSet<NetworkTarget>,
+    },
     Any,
 }
 
