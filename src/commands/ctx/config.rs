@@ -5743,45 +5743,7 @@ fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> CtxResult<()>
         )
     })?;
 
-    if !target.base_url.starts_with("http://") && !target.base_url.starts_with("https://") {
-        return Err(format!(
-            "{key}: base_url must be an http(s) URL, got \"{}\"",
-            target.base_url
-        )
-        .into());
-    }
-
-    // Review finding: `CodexAdapter::base` renders `base_url` into a codex
-    // `-c model_providers.<vendor>.base_url=<toml_quoted_string(base_url)>`
-    // argv token. `toml_quoted_string` prefers a TOML literal string
-    // (`'...'`) but falls back to an escaped basic string (`"..."`) the
-    // moment `base_url` itself contains a `'` -- and that fallback's OWN
-    // raw `"` delimiters, plus any of `&`, `(`, `)`, `%`, `!`, `^` etc. that
-    // survive either quoting form unescaped, are exactly the characters
-    // `adapters::guard_cmd_shim_reparse` fails a Windows npm-shim launch
-    // closed on. Refusing them here, at load time, catches a hostile or
-    // merely careless `base_url` before it ever reaches that argv --
-    // reusing `CMD_REPARSE_METACHARS` rather than a second, possibly
-    // drifting copy of the same character list. Whitespace and `'` are
-    // refused too, even though neither is in that list on its own: a space
-    // would silently split into a second argv token, and `'` is what
-    // forces the unsafe quoting fallback in the first place. Applied to
-    // `endpoint.claude` as well for consistency, even though its base_url
-    // currently only ever reaches its child via an environment variable
-    // (`ClaudeAdapter::base`'s `ANTHROPIC_BASE_URL`), not argv -- one rule
-    // for both tables, so they can never quietly drift apart.
-    if let Some(bad) = target.base_url.chars().find(|c| {
-        c.is_whitespace()
-            || *c == '\''
-            || *c == '"'
-            || super::adapters::CMD_REPARSE_METACHARS.contains(c)
-    }) {
-        return Err(format!(
-            "{key}: base_url must not contain {bad:?} (it is passed to codex as a -c argv \
-             token)"
-        )
-        .into());
-    }
+    validate_endpoint_base_url(key, &target.base_url)?;
 
     if target.credential_env.is_empty()
         || target.credential_env.contains('=')
@@ -5831,6 +5793,28 @@ fn validate_endpoint_target(key: &str, target: &EndpointTarget) -> CtxResult<()>
         }
     }
 
+    Ok(())
+}
+
+/// Shared base-URL validation for harness overrides and native provider
+/// endpoints. The metacharacter rule lives in one place so the two config
+/// surfaces cannot drift.
+pub(crate) fn validate_endpoint_base_url(key: &str, base_url: &str) -> CtxResult<()> {
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(format!("{key}: base_url must be an http(s) URL, got \"{base_url}\"").into());
+    }
+    if let Some(bad) = base_url.chars().find(|c| {
+        c.is_whitespace()
+            || *c == '\''
+            || *c == '"'
+            || super::adapters::CMD_REPARSE_METACHARS.contains(c)
+    }) {
+        return Err(format!(
+            "{key}: base_url must not contain {bad:?} (it is passed to codex as a -c argv \
+             token)"
+        )
+        .into());
+    }
     Ok(())
 }
 

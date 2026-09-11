@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use self::protocol::EventEnvelope;
 use super::CtxResult;
 use super::adapters::AgentAdapter;
+use super::provider::RouteId;
 
 /// Which backend drives a session's own conversation. `Unknown` is the
 /// forward-compat fallback for a value a future build wrote that this one
@@ -143,7 +144,7 @@ pub struct SessionSpec {
     #[serde(default)]
     pub agent: Option<String>,
     #[serde(default)]
-    pub provider_route: Option<String>,
+    pub provider_route: Option<RouteId>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]

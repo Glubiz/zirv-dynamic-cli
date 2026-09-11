@@ -88,6 +88,7 @@ criterion).
 | `ctx optimize` | N15 (#484) |  |
 | `ctx output` | N03 (#472) | lists/shows stored session outputs (issue #326's `ctx run` capture) |
 | `ctx permissions` | N04 (#473) |  |
+| `ctx provider` | N02 (#471) | `init`, `list`, `check`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
 | `ctx recall` | N06 (#475) |  |
 | `ctx remember` | N06 (#475) |  |
 | `ctx resume` | N17 (#486) |  |
