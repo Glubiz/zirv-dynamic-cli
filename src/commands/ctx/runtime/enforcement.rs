@@ -1452,7 +1452,7 @@ fn inside_any(path: &Path, roots: &[PathBuf]) -> bool {
 }
 
 fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
+    let mut out: Vec<PathBuf> = Vec::new();
     for path in paths {
         if !out.iter().any(|existing| same_path(existing, &path)) {
             out.push(path);
