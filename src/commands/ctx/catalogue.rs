@@ -813,6 +813,7 @@ pub fn tier_model(vendor: &Vendor, tier: Tier) -> Option<&'static str> {
 /// naming a vendor this catalogue actually knows about is stripped, so a
 /// model id that legitimately contains `/` or `.` without meaning "vendor
 /// namespace" passes through untouched.
+#[allow(dead_code)] // first callers are the multi-provider wave-1 adapters (#385 OpenCode, #386 Pi), which resolve the billed vendor from a `provider/model` pin
 pub fn normalize_id(model: &str) -> Cow<'_, str> {
     let mut s = model;
     match s.split_once('/') {

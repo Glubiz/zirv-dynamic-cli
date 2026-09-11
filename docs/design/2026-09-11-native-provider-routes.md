@@ -27,7 +27,11 @@ The provider layer uses validated lower-case slug newtypes for `ProviderId`,
 `EndpointId`, `AccountId`, `BillingPoolId`, and `RouteId`. A route resolves an
 account, endpoint, protocol, billing class, and exact `ModelId { vendor, id }`.
 The model id is an exact catalogue id after resolving a case-insensitive exact
-id or alias; it is never the result of choosing the strongest fuzzy match.
+id or alias; it is never the result of choosing the strongest fuzzy match. A
+`vendor/` prefix is accepted only when it names the endpoint vendor. Version
+and provider decorations such as `@date` and `:suffix` are never stripped.
+Exact identity matters because N12/N13 cloud routes must send decorated model
+ids verbatim rather than silently substituting another identity.
 
 `BillingPoolId` is explicitly separate from account and provider. Its default
 is the account id, while two accounts may deliberately name the same pool when
@@ -62,12 +66,15 @@ account, endpoint, credential, role binding, route, or allowed route. A role
 left bound outside the intersection is an error rather than a fallback.
 
 All references and provider/endpoint agreement are validated while loading,
-before credentials or network access. Schema versions newer than 1 fail with
-an upgrade instruction.
+before credentials or network access. Every route must declare a model that is
+non-empty after trimming, including routes for rungless compatible vendors.
+Schema versions newer than 1 fail with an upgrade instruction.
 
 ### 2.3 Credential references and protected stores
 
 Accounts refer to credentials as `env:NAME`, `store:<item>`, or `file:<path>`.
+Every account except `openai-compatible` must declare a credential reference;
+compatible endpoints may deliberately operate without authentication.
 Environment values are read through an injectable lookup. Files expand `~`,
 must be regular files, and on Unix must not be group/world readable. Values
 are trimmed, wrapped in `Secret`, and can be exposed only by the explicit
@@ -76,6 +83,12 @@ transport-facing accessor; debug and display always render `[redacted]`.
 Harness login locations are denylisted. The Claude Code credential keychain
 service and the Claude/Codex login files are refused with the explanation that
 harness login tokens are subscription entitlements, not API credentials.
+File paths are checked both lexically and after canonicalization, and store
+names and path components are compared without case sensitivity. This
+denylist is an operator guardrail against accidentally reusing a harness
+login, not a security boundary against a hostile operator, who already owns
+`~/.zirv/native.toml`. Credential storage applies the same refusal before
+reading a secret or touching the OS store.
 Claude.ai and ChatGPT subscription-billed accounts stop at `Configured`; the
 harness backend remains the path that can spend those subscriptions.
 
@@ -106,7 +119,8 @@ Routes advance monotonically through `Recognized`, `Configured`,
 - Credentialed means a non-empty, unexpired API credential resolved without
   network access.
 - Reachable means an opt-in live model-list probe received HTTP.
-- Authenticated means that probe received HTTP 200.
+- Authenticated means a credential was accepted by a probe that received HTTP
+  200. A credential-less compatible endpoint can reach only `Reachable`.
 - Validated requires a real model transport to verify behavior. N02 cannot
   produce it and reports that fact instead of inferring access from a list.
 
@@ -128,11 +142,18 @@ match or model-list response.
 `zirv ctx provider check --live` makes a ten-second-bounded GET request to the
 provider's model-list endpoint with its configured auth scheme. The default
 check and all list operations remain offline. The probe parses only model ids
-and never emits bodies or headers. A 200 proves authentication, 401/403 proves
-reachability but records credential rejection, and a compatible endpoint's
-404 is a reachable endpoint without model listing. A missing route model is a
-note because vendor lists can reflect entitlement restrictions or aliases; it
-is not silently substituted.
+and never emits bodies or headers. A 200 with a credential proves
+authentication; without a credential it proves only reachability. A 401/403
+proves reachability but records credential rejection or the need to declare a
+credential, and a compatible endpoint's 404 is a reachable endpoint without
+model listing. A missing route model is a note because vendor lists can
+reflect entitlement restrictions or aliases; it is not silently substituted.
+
+A credential is never attached to plaintext HTTP on a non-loopback host. Such
+a live probe is skipped with an actionable problem, while the offline
+inventory flags the endpoint. Plaintext loopback endpoints remain available
+for local runtimes, and a credential-less compatible endpoint may still be
+probed because there is no secret to disclose.
 
 ## 3. Consequences
 

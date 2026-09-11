@@ -1840,17 +1840,27 @@ allowed_routes = ["work-sonnet"]
 Providers with a default URL have an implicit endpoint named after the
 provider. `openai-compatible` instead requires both `base_url` and `vendor`.
 Account pools default to the account id; two accounts may deliberately share
-one `pool` when they share quota. Credential references are `env:NAME`,
+one `pool` when they share quota. Every account except `openai-compatible`
+must declare a credential reference. Credential references are `env:NAME`,
 `store:<item>`, or `file:<path>` (`~` expands; Unix files must be mode 0600 or
 stricter). Claude Code/Codex harness login tokens are refused: Claude.ai and
 ChatGPT subscriptions are entitlements for the harness backend, not native API
-credentials.
+credentials, and `credential set` refuses those store refs before reading a
+secret. Every route must declare a non-empty model. Model ids and aliases
+resolve by exact case-insensitive match. A matching `vendor/` prefix is
+accepted, but `@date` and `:suffix` decorations are never stripped or silently
+substituted.
 
 The evidence ladder is `recognized` → `configured` → `credentialed` →
 `reachable` → `authenticated` → `validated`. Catalogue recognition never
-claims account access. The offline commands stop at `credentialed`; `--live`
-can establish reachability/authentication, while `validated` remains
-unavailable until the native model transports record a real validation.
+claims account access, and `authenticated` specifically means a credential was
+accepted. A credential-less compatible route stops at `configured` offline
+and can reach only `reachable` during a live check. The offline commands stop
+at `credentialed`; `--live` can establish reachability/authentication, while
+`validated` remains unavailable until the native model transports record a
+real validation. Credentials are withheld from plaintext HTTP on non-loopback
+hosts and that live probe is skipped; loopback HTTP remains available for
+local runtimes.
 
 The optional repository layer `<repo>/.zirv/native.toml` may contain only
 `schema` and `[policy].allowed_routes`. Its routes are intersected with the

@@ -18,6 +18,28 @@ pub trait Probe {
     ) -> ProbeResult;
 }
 
+pub(crate) fn is_plaintext_non_loopback(endpoint_url: &str) -> bool {
+    let Some(rest) = endpoint_url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
+        bracketed
+            .split_once(']')
+            .map_or(bracketed, |(host, _)| host)
+    } else if host_and_port.eq_ignore_ascii_case("::1") {
+        host_and_port
+    } else {
+        host_and_port
+            .split_once(':')
+            .map_or(host_and_port, |(host, _)| host)
+    };
+    !host.eq_ignore_ascii_case("localhost") && host != "127.0.0.1" && host != "::1"
+}
+
 pub struct HttpProbe {
     agent: ureq::Agent,
 }
@@ -130,18 +152,35 @@ fn parse_model_ids(protocol: Protocol, body: &str) -> Vec<String> {
 #[derive(Clone)]
 pub struct FakeProbe {
     result: ProbeResult,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>>,
 }
 
 #[cfg(test)]
 impl FakeProbe {
     pub fn new(result: ProbeResult) -> Self {
-        Self { result }
+        Self {
+            result,
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn calls(&self) -> Vec<(String, bool)> {
+        self.calls.lock().unwrap().clone()
     }
 }
 
 #[cfg(test)]
 impl Probe for FakeProbe {
-    fn models(&self, _: &str, _: &ProviderSpec, _: Option<&Credential>) -> ProbeResult {
+    fn models(
+        &self,
+        endpoint_url: &str,
+        _: &ProviderSpec,
+        credential: Option<&Credential>,
+    ) -> ProbeResult {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((endpoint_url.to_string(), credential.is_some()));
         self.result.clone()
     }
 }

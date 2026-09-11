@@ -5,7 +5,7 @@ use serde::Serialize;
 use super::capability::{ModelCapabilities, declared};
 use super::config::{NativeConfig, ResolvedEndpoint};
 use super::credential::{Credential, CredentialRef, CredentialStore, resolve};
-use super::probe::{Probe, ProbeResult};
+use super::probe::{Probe, ProbeResult, is_plaintext_non_loopback};
 use super::{
     AccountId, BillingClass, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
     Support, provider, providers,
@@ -93,8 +93,19 @@ pub struct Inventory {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelResolutionError {
-    Ambiguous { candidates: Vec<String> },
-    UnknownModel { vendor: String, known: Vec<String> },
+    Ambiguous {
+        candidates: Vec<String>,
+    },
+    UnknownModel {
+        vendor: String,
+        known: Vec<String>,
+    },
+    VendorMismatch {
+        route: RouteId,
+        named_vendor: String,
+        endpoint: EndpointId,
+        endpoint_vendor: String,
+    },
 }
 
 impl std::fmt::Display for ModelResolutionError {
@@ -110,6 +121,15 @@ impl std::fmt::Display for ModelResolutionError {
                 "unknown model for vendor `{vendor}` (known ids: {})",
                 known.join(", ")
             ),
+            Self::VendorMismatch {
+                route,
+                named_vendor,
+                endpoint,
+                endpoint_vendor,
+            } => write!(
+                f,
+                "route `{route}` model names vendor `{named_vendor}` but endpoint `{endpoint}` is vendor `{endpoint_vendor}`"
+            ),
         }
     }
 }
@@ -117,16 +137,30 @@ impl std::fmt::Display for ModelResolutionError {
 impl std::error::Error for ModelResolutionError {}
 
 pub(crate) fn resolve_model(
+    route: &RouteId,
+    endpoint: &EndpointId,
     vendor_slug: &str,
     requested: &str,
 ) -> Result<(ModelId, Option<String>), ModelResolutionError> {
-    let normalized = crate::commands::ctx::catalogue::normalize_id(requested);
-    let needle = normalized.to_ascii_lowercase();
+    let model_name = if let Some((named_vendor, model_name)) = requested.split_once('/') {
+        if !named_vendor.eq_ignore_ascii_case(vendor_slug) {
+            return Err(ModelResolutionError::VendorMismatch {
+                route: route.clone(),
+                named_vendor: named_vendor.to_string(),
+                endpoint: endpoint.clone(),
+                endpoint_vendor: vendor_slug.to_string(),
+            });
+        }
+        model_name
+    } else {
+        requested
+    };
+    let needle = model_name.to_ascii_lowercase();
     let Some(vendor) = crate::commands::ctx::catalogue::vendor(vendor_slug) else {
         return Ok((
             ModelId {
                 vendor: vendor_slug.to_string(),
-                id: normalized.into_owned(),
+                id: model_name.to_string(),
             },
             Some("not in the catalogue; declared by the operator".into()),
         ));
@@ -135,13 +169,13 @@ pub(crate) fn resolve_model(
         return Ok((
             ModelId {
                 vendor: vendor_slug.to_string(),
-                id: normalized.into_owned(),
+                id: model_name.to_string(),
             },
             Some("not in the catalogue; declared by the operator".into()),
         ));
     }
     if let Some(rung) = vendor.rungs.iter().find(|rung| {
-        rung.id.eq_ignore_ascii_case(&needle) || rung.alias.eq_ignore_ascii_case(&needle)
+        rung.id.eq_ignore_ascii_case(model_name) || rung.alias.eq_ignore_ascii_case(model_name)
     }) {
         return Ok((
             ModelId {
@@ -151,17 +185,21 @@ pub(crate) fn resolve_model(
             None,
         ));
     }
-    let candidates: Vec<String> = vendor
-        .rungs
-        .iter()
-        .filter(|rung| {
-            rung.id.to_ascii_lowercase().contains(&needle)
-                || rung.alias.to_ascii_lowercase().contains(&needle)
-                || needle.contains(&rung.id.to_ascii_lowercase())
-                || needle.contains(&rung.alias.to_ascii_lowercase())
-        })
-        .map(|rung| rung.id.to_string())
-        .collect();
+    let candidates: Vec<String> = if model_name.contains('@') || model_name.contains(':') {
+        Vec::new()
+    } else {
+        vendor
+            .rungs
+            .iter()
+            .filter(|rung| {
+                rung.id.to_ascii_lowercase().contains(&needle)
+                    || rung.alias.to_ascii_lowercase().contains(&needle)
+                    || needle.contains(&rung.id.to_ascii_lowercase())
+                    || needle.contains(&rung.alias.to_ascii_lowercase())
+            })
+            .map(|rung| rung.id.to_string())
+            .collect()
+    };
     if !candidates.is_empty() {
         return Err(ModelResolutionError::Ambiguous { candidates });
     }
@@ -198,7 +236,9 @@ impl Inventory {
             let Some(spec) = provider(account.provider.as_ref()) else {
                 continue;
             };
-            let Ok((model, catalogue_note)) = resolve_model(&endpoint.vendor, &route.model) else {
+            let Ok((model, catalogue_note)) =
+                resolve_model(route_id, &endpoint_id, &endpoint.vendor, &route.model)
+            else {
                 continue;
             };
             let mut report = RouteReport {
@@ -216,6 +256,12 @@ impl Inventory {
                 problems: Vec::new(),
                 notes: catalogue_note.into_iter().collect(),
             };
+            let plaintext_non_loopback = is_plaintext_non_loopback(&endpoint.base_url);
+            if plaintext_non_loopback {
+                report
+                    .notes
+                    .push("plaintext http endpoint (non-loopback)".into());
+            }
             if account.billing == BillingClass::Subscription {
                 report.problems.push(format!(
                     "account `{}` is subscription-billed; the native `{}` route needs an API credential. The harness backend remains the way to spend that subscription.",
@@ -227,9 +273,15 @@ impl Inventory {
 
             let credential = resolve_account_credential(account, spec, env, store, now);
             let credential = match credential {
-                Ok(credential) => {
+                Ok(Some(credential)) => {
                     report.state = RouteState::Credentialed;
-                    credential
+                    Some(credential)
+                }
+                Ok(None) => {
+                    report
+                        .notes
+                        .push("no credential declared (unauthenticated endpoint)".into());
+                    None
                 }
                 Err(problem) => {
                     report.problems.push(problem);
@@ -239,7 +291,14 @@ impl Inventory {
             };
 
             if let Some(probe) = probe {
-                apply_probe(&mut report, endpoint, spec, credential.as_ref(), probe);
+                if plaintext_non_loopback && credential.is_some() {
+                    report.problems.push(format!(
+                        "endpoint `{}` is plaintext http; credential withheld and probe skipped -- use https or a loopback address",
+                        report.endpoint
+                    ));
+                } else {
+                    apply_probe(&mut report, endpoint, spec, credential.as_ref(), probe);
+                }
             }
             routes.push(report);
         }
@@ -331,7 +390,14 @@ fn apply_probe(
             status: 200,
             model_ids,
         } => {
-            report.state = RouteState::Authenticated;
+            if credential.is_some() {
+                report.state = RouteState::Authenticated;
+            } else {
+                report.state = RouteState::Reachable;
+                report
+                    .notes
+                    .push("endpoint answered without authentication".into());
+            }
             if !model_ids
                 .iter()
                 .any(|id| id.eq_ignore_ascii_case(&report.model.id))
@@ -346,9 +412,16 @@ fn apply_probe(
             status: 401 | 403, ..
         } => {
             report.state = RouteState::Reachable;
-            report
-                .problems
-                .push("credential rejected (expired or invalid)".into());
+            if credential.is_some() {
+                report
+                    .problems
+                    .push("credential rejected (expired or invalid)".into());
+            } else {
+                report.problems.push(format!(
+                    "endpoint requires a credential; declare `account.{}.credential`",
+                    report.account
+                ));
+            }
         }
         ProbeResult::Http { status: 404, .. }
             if spec.protocol == Protocol::OpenAiChatCompatible =>
@@ -453,14 +526,34 @@ mod tests {
     }
 
     #[test]
-    fn exact_resolution_never_uses_a_fuzzy_strongest_match() {
-        let exact = resolve_model("anthropic", "sonnet").unwrap().0;
+    fn model_resolution_preserves_exact_route_identity() {
+        let route = RouteId::new("work").unwrap();
+        let endpoint = EndpointId::new("anthropic").unwrap();
+        let exact = resolve_model(&route, &endpoint, "anthropic", "sonnet")
+            .unwrap()
+            .0;
         assert_eq!(exact.id, "claude-sonnet-5");
-        let ambiguous = resolve_model("openai", "gpt-5.6").unwrap_err();
+        let prefixed = resolve_model(&route, &endpoint, "anthropic", "anthropic/claude-sonnet-5")
+            .unwrap()
+            .0;
+        assert_eq!(prefixed.id, "claude-sonnet-5");
+        let mismatch =
+            resolve_model(&route, &endpoint, "anthropic", "openai/gpt-5.6-sol").unwrap_err();
+        assert_eq!(
+            mismatch.to_string(),
+            "route `work` model names vendor `openai` but endpoint `anthropic` is vendor `anthropic`"
+        );
+        let decorated =
+            resolve_model(&route, &endpoint, "anthropic", "claude-sonnet-5@20260101").unwrap_err();
+        assert!(matches!(
+            decorated,
+            ModelResolutionError::UnknownModel { .. }
+        ));
+        let ambiguous = resolve_model(&route, &endpoint, "openai", "gpt-5.6").unwrap_err();
         assert!(matches!(ambiguous, ModelResolutionError::Ambiguous { .. }));
         assert!(ambiguous.to_string().contains("gpt-5.6-sol"));
         assert!(ambiguous.to_string().contains("gpt-5.6-terra"));
-        let unknown = resolve_model("anthropic", "unknown-alias").unwrap_err();
+        let unknown = resolve_model(&route, &endpoint, "anthropic", "unknown-alias").unwrap_err();
         assert!(unknown.to_string().contains("claude-sonnet-5"));
     }
 
@@ -568,6 +661,126 @@ mod tests {
         assert!(rejected.routes[0].problems[0].contains("credential rejected"));
         let down = build(ProbeResult::Unreachable("connection refused".into()));
         assert_eq!(down.routes[0].state, RouteState::Credentialed);
+    }
+
+    #[test]
+    fn live_probe_withholds_credentials_from_plaintext_non_loopback_endpoints() {
+        let cfg = config(
+            "schema=1\n[endpoint.remote]\nprovider='openai-compatible'\nbase_url='http://models.example.com'\nvendor='ollama'\n[endpoint.local]\nprovider='openai-compatible'\nbase_url='http://127.0.0.1:11434'\nvendor='ollama'\n[endpoint.secure]\nprovider='openai-compatible'\nbase_url='https://models.example.com'\nvendor='ollama'\n[account.remote]\nprovider='openai-compatible'\ncredential='env:KEY'\n[account.local]\nprovider='openai-compatible'\ncredential='env:KEY'\n[account.secure]\nprovider='openai-compatible'\ncredential='env:KEY'\n[route.remote]\naccount='remote'\nendpoint='remote'\nmodel='model'\n[route.local]\naccount='local'\nendpoint='local'\nmodel='model'\n[route.secure]\naccount='secure'\nendpoint='secure'\nmodel='model'\n",
+        );
+        let offline = Inventory::build(
+            &cfg,
+            &|_| Some("key".into()),
+            &FakeStore::default(),
+            0,
+            None,
+        );
+        let remote = offline
+            .routes
+            .iter()
+            .find(|route| route.route.as_ref() == "remote")
+            .unwrap();
+        assert!(
+            remote
+                .notes
+                .contains(&"plaintext http endpoint (non-loopback)".into())
+        );
+        assert!(remote.problems.is_empty());
+
+        let probe = FakeProbe::new(ProbeResult::Http {
+            status: 200,
+            model_ids: vec!["model".into()],
+        });
+        let live = Inventory::build(
+            &cfg,
+            &|_| Some("key".into()),
+            &FakeStore::default(),
+            0,
+            Some(&probe),
+        );
+        let remote = live
+            .routes
+            .iter()
+            .find(|route| route.route.as_ref() == "remote")
+            .unwrap();
+        assert_eq!(remote.state, RouteState::Credentialed);
+        assert_eq!(
+            remote.problems,
+            [
+                "endpoint `remote` is plaintext http; credential withheld and probe skipped -- use https or a loopback address"
+            ]
+        );
+        let calls = probe.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .any(|(url, credential)| url.starts_with("http://127.0.0.1") && *credential)
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(url, credential)| url.starts_with("https://") && *credential)
+        );
+    }
+
+    #[test]
+    fn credentialless_compatible_routes_remain_weaker_than_authenticated() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let path = NativeConfig::operator_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "schema=1\n[account.work]\nprovider='anthropic'\n").unwrap();
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("`account.work.credential`"),
+            "got {error}"
+        );
+
+        let cfg = config(
+            "schema=1\n[endpoint.local]\nprovider='openai-compatible'\nbase_url='http://127.0.0.1:11434'\nvendor='ollama'\n[account.local]\nprovider='openai-compatible'\n[route.local]\naccount='local'\nendpoint='local'\nmodel='model'\n",
+        );
+        let offline = Inventory::build(&cfg, &|_| None, &FakeStore::default(), 0, None);
+        assert_eq!(offline.routes[0].state, RouteState::Configured);
+        assert!(
+            offline.routes[0]
+                .notes
+                .contains(&"no credential declared (unauthenticated endpoint)".into())
+        );
+
+        let live = Inventory::build(
+            &cfg,
+            &|_| None,
+            &FakeStore::default(),
+            0,
+            Some(&FakeProbe::new(ProbeResult::Http {
+                status: 200,
+                model_ids: vec!["model".into()],
+            })),
+        );
+        assert_eq!(live.routes[0].state, RouteState::Reachable);
+        assert_ne!(live.routes[0].state, RouteState::Authenticated);
+        assert!(
+            live.routes[0]
+                .notes
+                .contains(&"endpoint answered without authentication".into())
+        );
+
+        let rejected = Inventory::build(
+            &cfg,
+            &|_| None,
+            &FakeStore::default(),
+            0,
+            Some(&FakeProbe::new(ProbeResult::Http {
+                status: 401,
+                model_ids: Vec::new(),
+            })),
+        );
+        assert_eq!(rejected.routes[0].state, RouteState::Reachable);
+        assert_eq!(
+            rejected.routes[0].problems,
+            ["endpoint requires a credential; declare `account.local.credential`"]
+        );
     }
 
     #[test]

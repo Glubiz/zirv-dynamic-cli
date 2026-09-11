@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 
 use super::config::{EnvLookup, env_from_process};
 use super::provider::config::{NATIVE_SCHEMA, NativeConfig};
-use super::provider::credential::{CredentialStore, OsStore};
+use super::provider::credential::{CredentialStore, OsStore, refuse_harness_login};
 use super::provider::inventory::{Inventory, state_text};
 use super::provider::probe::{HttpProbe, Probe};
 use super::{CtxResult, state};
@@ -138,6 +138,7 @@ fn run_with(
             let reference = account_cfg.credential.as_ref().ok_or_else(|| {
                 format!("account `{account}` has no credential ref; set it to store:<item>")
             })?;
+            refuse_harness_login(reference)?;
             let item = reference.store_item().ok_or_else(|| {
                 format!(
                     "account `{account}` credential is `{reference}`; credential set requires store:<item>"
@@ -411,7 +412,7 @@ mod tests {
         let repo = repo();
         write_config(
             home.path(),
-            "schema=1\n[account.work]\nprovider='anthropic'\n[route.work]\naccount='work'\nmodel='sonnet'\n[roles]\nworker='work'\n",
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:MISSING_KEY'\n[route.work]\naccount='work'\nmodel='sonnet'\n[roles]\nworker='work'\n",
         );
         let (code, output) = invoke(
             home.path(),
@@ -468,5 +469,43 @@ mod tests {
                 .unwrap()
                 .contains("sk-test-secret-123")
         );
+    }
+
+    #[test]
+    fn credential_set_refuses_harness_login_stores_before_reading_or_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        write_config(
+            home.path(),
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='store:Claude Code-credentials'\n",
+        );
+        let store = FakeStore::default();
+        let mut output = Vec::new();
+        let error = run_with(
+            &ProviderArgs {
+                command: ProviderVerb::Credential(CredentialArgs {
+                    command: CredentialVerb::Set {
+                        account: "work".parse().unwrap(),
+                    },
+                }),
+            },
+            &mut output,
+            home.path(),
+            repo.path(),
+            &|_| None,
+            &store,
+            &FakeProbe::new(ProbeResult::Unreachable("offline".into())),
+            0,
+            || panic!("refusal must happen before reading a secret"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("harness login tokens are subscription entitlements"),
+            "got {error}"
+        );
+        assert_eq!(store.get("Claude Code-credentials").unwrap(), None);
     }
 }
