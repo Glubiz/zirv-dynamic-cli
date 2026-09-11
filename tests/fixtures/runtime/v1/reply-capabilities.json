@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "id": "req-1",
+  "reply": "capabilities",
+  "capabilities": {
+    "steer": false,
+    "interrupt": true,
+    "resume": true,
+    "events": true,
+    "surfaces": [
+      "headless"
+    ]
+  }
+}

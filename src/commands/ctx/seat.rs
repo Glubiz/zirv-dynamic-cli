@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use super::CtxResult;
 use super::config::{CtxConfig, EnvLookup};
+use super::runtime::RuntimeKind;
 use super::state::StateDir;
 
 /// Env var a superseded session's own `ZIRV_CTX_SEAT_GENERATION` is compared
@@ -203,6 +204,12 @@ pub struct Seat {
     pub displaced: Option<Displaced>,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Issue #470: which backend this seat's CURRENT agent actually runs
+    /// on. `#[serde(default)]` so a seat record from before this field
+    /// existed deserializes as `Harness` -- the only runtime any build
+    /// could have registered a seat under before now.
+    #[serde(default)]
+    pub runtime: RuntimeKind,
 }
 
 fn record_path(state: &StateDir, short: &str) -> PathBuf {
@@ -317,6 +324,9 @@ pub fn register(
             pending: None,
             created_at: now,
             updated_at: now,
+            // Issue #470: every seat this build registers runs on the
+            // existing harness-process backend.
+            runtime: RuntimeKind::Harness,
         },
     };
     store(state, &seat)?;
@@ -469,6 +479,7 @@ pub fn commit(
                     short,
                     &old_agent,
                     &old_session,
+                    RuntimeKind::Harness,
                 ),
                 session: old_session,
                 since: now,
@@ -1160,7 +1171,27 @@ mod tests {
             pending: None,
             created_at: 1_000,
             updated_at: 1_000,
+            runtime: RuntimeKind::Harness,
         }
+    }
+
+    /// Issue #470: a seat record written before the `runtime` field existed
+    /// has to still parse (and default to `Harness`, the only runtime any
+    /// build could have registered a seat under before now), and a seat
+    /// written by this build must round-trip its `runtime` value exactly.
+    #[test]
+    fn a_seat_without_a_runtime_field_still_parses_as_harness_and_round_trips_with_it() {
+        let mut without_runtime = serde_json::to_value(base_seat()).expect("serialize");
+        without_runtime
+            .as_object_mut()
+            .expect("seat is a JSON object")
+            .remove("runtime");
+        let parsed: Seat = serde_json::from_value(without_runtime).expect("deserialize");
+        assert_eq!(parsed.runtime, RuntimeKind::Harness);
+
+        let json = serde_json::to_string(&parsed).expect("serialize");
+        let round_tripped: Seat = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_tripped.runtime, RuntimeKind::Harness);
     }
 
     #[test]

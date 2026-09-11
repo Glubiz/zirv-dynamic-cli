@@ -4522,8 +4522,14 @@ mod tests {
         let state = StateDir::from_root(state_root);
         let short = super::super::sessions::short_id("49195b07-217f-4401-8681-c857fcea294e");
         assert_eq!(
-            super::super::sessions::native_conversation(&state, &short, "claude", zirv_session)
-                .as_deref(),
+            super::super::sessions::native_conversation(
+                &state,
+                &short,
+                "claude",
+                zirv_session,
+                super::super::runtime::RuntimeKind::Harness,
+            )
+            .as_deref(),
             Some("49195b07-217f-4401-8681-c857fcea294e"),
             "the harness's own conversation id must be recorded against zirv's session"
         );

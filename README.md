@@ -1409,6 +1409,44 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx handover [--agent <name>] [--model <tier\|id>] [--dry-run] [--force]` | Swaps the orchestrator seat's harness or model in place mid-session, carrying a handoff packet across the swap — see [Cross-harness fallback and handover](#cross-harness-fallback-and-handover) below |
 | `zirv ctx permissions audit\|compile\|propose` | Audits, compiles, or (operator opt-in) proposes command-permission approvals from recent transcripts — see [Permission auditing](#permission-auditing-and-safe-list-proposals-issue-178) below |
 
+### Runtime backends
+
+Every supervised session picks a `RuntimeKind`: `harness` (the default,
+today's only implementation — an `AgentAdapter` spawns the real Claude
+Code/Codex/etc. binary through the `supervise::spawn_tapped` chokepoint) or
+`native` (not yet available; a direct provider call with no vendor CLI
+in the loop, tracked on the native-runtime roadmap,
+[issue #469](https://github.com/Glubiz/zirv-cli/issues/469)). Selecting
+`native` today (`runtime::select(RuntimeKind::Native, ..)`) returns a typed
+`RuntimeError::Unsupported` naming roadmap steps N02-N09 by number, rather
+than a silent fallback to `harness`.
+
+The session registry (`sessions::Record`), the orchestrator seat
+(`seat::Seat`), and the `.conversation` marker each persist which
+`RuntimeKind` they were started under, defaulting to `harness` so every
+record written by an older binary still parses. A resume matches agent,
+session id, **and** runtime before reusing a recorded conversation, so a
+session can never silently cross from a harness-backed conversation to a
+native one (or back).
+
+The in-process wire shapes a `RuntimeBackend` speaks — commands, events
+(`EventEnvelope`'s wire keys are `version, revision, session_id, generation,
+event`), replies, and a structured `ErrorCode` (`runtime::RuntimeError`'s
+`Unsupported`/`UnknownSession`/`Busy`/`StaleGeneration` map 1:1 to it; any
+other backend error maps to `ErrorCode::Backend`) — are versioned from day
+one as protocol v1 (`src/commands/ctx/runtime/protocol.rs`), with frozen
+example payloads under `tests/fixtures/runtime/v1/` so a later change can't
+silently break what v1 meant. No daemon or socket exists yet; everything is
+in-process.
+
+`zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
+[`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
+honest against the real command surface and source tree: every command verb
+and every model-calling call site in `src/` has a named implementation
+owner, checked on every run. The architecture decision behind all of this is
+recorded in
+[`docs/design/2026-09-11-native-runtime-contracts.md`](docs/design/2026-09-11-native-runtime-contracts.md).
+
 ### Signals and verdicts
 
 Four signals over the trailing window (default 10 turns):

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "id": "req-7",
+  "reply": "events",
+  "events": [
+    {
+      "version": 1,
+      "revision": 4,
+      "session_id": "11111111-2222-4333-8444-555555555555",
+      "generation": 1,
+      "event": "tool_call",
+      "name": "read_file"
+    },
+    {
+      "version": 1,
+      "revision": 5,
+      "session_id": "11111111-2222-4333-8444-555555555555",
+      "generation": 1,
+      "event": "tool_result",
+      "is_error": false
+    }
+  ]
+}
