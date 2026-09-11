@@ -762,6 +762,16 @@ impl From<serde_json::Error> for JournalError {
 }
 
 pub type JournalResult<T> = Result<T, JournalError>;
+type ContinuationRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<u8>,
+);
 
 #[derive(Debug)]
 pub struct Journal {
@@ -838,6 +848,7 @@ impl Journal {
         read_session(&self.conn, session)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn acknowledge_input(
         &mut self,
         session: &JournalSessionId,
@@ -880,6 +891,7 @@ impl Journal {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_assistant_message(
         &mut self,
         session: &JournalSessionId,
@@ -914,6 +926,7 @@ impl Journal {
         Ok(sequence)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_tool_call(
         &mut self,
         session: &JournalSessionId,
@@ -942,6 +955,7 @@ impl Journal {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_execution(
         &mut self,
         session: &JournalSessionId,
@@ -1058,6 +1072,7 @@ impl Journal {
         Ok(started.into_iter().map(|(id, _)| id).collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_task_receipt(
         &mut self,
         session: &JournalSessionId,
@@ -1081,6 +1096,7 @@ impl Journal {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_checkpoint(
         &mut self,
         session: &JournalSessionId,
@@ -1419,16 +1435,7 @@ impl Journal {
         attempt: &RequestAttemptId,
         identity: &ContinuationIdentity,
     ) -> JournalResult<Option<Vec<u8>>> {
-        let row: Option<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Vec<u8>,
-        )> = self
+        let row: Option<ContinuationRow> = self
             .conn
             .query_row(
                 "SELECT route_id, provider_id, endpoint_id, account_id, protocol,
