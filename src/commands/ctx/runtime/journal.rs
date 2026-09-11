@@ -148,7 +148,9 @@ pub struct PolicyProvenance {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "storage", rename_all = "snake_case")]
 pub enum ContentRef {
-    Inline { text: String },
+    Inline {
+        text: String,
+    },
     Artifact {
         sha256: String,
         byte_len: u64,
@@ -308,9 +310,7 @@ impl JournalEvent {
                 checkpoint: Some(checkpoint_id),
                 ..IndexedIds::default()
             },
-            Self::GenerationAdvanced { .. } | Self::SessionEnded { .. } => {
-                IndexedIds::default()
-            }
+            Self::GenerationAdvanced { .. } | Self::SessionEnded { .. } => IndexedIds::default(),
         }
     }
 }
@@ -478,7 +478,11 @@ impl ConversationState {
                     usage: usage.clone(),
                 }),
                 JournalEvent::UsageRecorded { usage } => {
-                    if state.usage.insert(usage.id.clone(), usage.clone()).is_some() {
+                    if state
+                        .usage
+                        .insert(usage.id.clone(), usage.clone())
+                        .is_some()
+                    {
                         return Err(JournalError::Corrupt(format!(
                             "duplicate usage id {}",
                             usage.id
@@ -629,15 +633,27 @@ pub enum JournalError {
     Sqlite(rusqlite::Error),
     Io(std::io::Error),
     Json(serde_json::Error),
-    InvalidId { kind: &'static str, value: String },
-    InvalidNumber { field: &'static str, value: u64 },
+    InvalidId {
+        kind: &'static str,
+        value: String,
+    },
+    InvalidNumber {
+        field: &'static str,
+        value: u64,
+    },
     UnsupportedSchema(i64),
     UnversionedSchema,
     Corrupt(String),
     UnknownSession(String),
     SessionExists(String),
-    StaleGeneration { expected: u64, got: u64 },
-    DuplicateId { kind: &'static str, value: String },
+    StaleGeneration {
+        expected: u64,
+        got: u64,
+    },
+    DuplicateId {
+        kind: &'static str,
+        value: String,
+    },
     UnknownToolCall(String),
     UnknownExecution(String),
     InvalidExecutionTransition {
@@ -646,8 +662,14 @@ pub enum JournalError {
     },
     InvalidToolArguments(String),
     InvalidStream(String),
-    FrameTooLarge { bytes: usize, limit: usize },
-    DraftTooLarge { bytes: usize, limit: usize },
+    FrameTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
+    DraftTooLarge {
+        bytes: usize,
+        limit: usize,
+    },
     ContinuationMismatch,
 }
 
@@ -658,10 +680,16 @@ impl std::fmt::Display for JournalError {
             Self::Io(error) => write!(f, "native journal I/O error: {error}"),
             Self::Json(error) => write!(f, "native journal JSON error: {error}"),
             Self::InvalidId { kind, value } => {
-                write!(f, "invalid {kind} {value:?}; expected 1..=256 non-NUL bytes")
+                write!(
+                    f,
+                    "invalid {kind} {value:?}; expected 1..=256 non-NUL bytes"
+                )
             }
             Self::InvalidNumber { field, value } => {
-                write!(f, "{field} value {value} exceeds SQLite's signed integer range")
+                write!(
+                    f,
+                    "{field} value {value} exceeds SQLite's signed integer range"
+                )
             }
             Self::UnsupportedSchema(version) => write!(
                 f,
@@ -675,7 +703,10 @@ impl std::fmt::Display for JournalError {
             Self::UnknownSession(id) => write!(f, "unknown native journal session {id}"),
             Self::SessionExists(id) => write!(f, "native journal session already exists: {id}"),
             Self::StaleGeneration { expected, got } => {
-                write!(f, "stale native journal generation: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "stale native journal generation: expected {expected}, got {got}"
+                )
             }
             Self::DuplicateId { kind, value } => write!(f, "duplicate {kind} id: {value}"),
             Self::UnknownToolCall(id) => write!(f, "unknown native tool call {id}"),
@@ -1015,7 +1046,9 @@ impl Journal {
                     tool_call_id: tool_call_id.clone(),
                     state: ExecutionState::OutcomeUnknown,
                     result: None,
-                    detail: Some("runtime stopped after effect began; reconcile before retry".into()),
+                    detail: Some(
+                        "runtime stopped after effect began; reconcile before retry".into(),
+                    ),
                     at_ms,
                 },
                 committed_at,
@@ -1252,7 +1285,10 @@ impl Journal {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_generation(&tx, session, generation)?;
         let frames = read_frames(&tx, session, stream_id)?;
-        if frames.is_empty() || frames.iter().any(|(kind, _)| *kind != StreamFrameKind::ToolArguments)
+        if frames.is_empty()
+            || frames
+                .iter()
+                .any(|(kind, _)| *kind != StreamFrameKind::ToolArguments)
         {
             return Err(JournalError::InvalidStream(
                 "tool call needs one or more tool_arguments frames only".into(),
@@ -1383,7 +1419,16 @@ impl Journal {
         attempt: &RequestAttemptId,
         identity: &ContinuationIdentity,
     ) -> JournalResult<Option<Vec<u8>>> {
-        let row: Option<(String, String, String, String, String, String, String, Vec<u8>)> = self
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Vec<u8>,
+        )> = self
             .conn
             .query_row(
                 "SELECT route_id, provider_id, endpoint_id, account_id, protocol,
@@ -1508,7 +1553,11 @@ impl Journal {
                     detail,
                     at_ms,
                     ..
-                } if matches!(execution_state, ExecutionState::Completed | ExecutionState::Failed) => {
+                } if matches!(
+                    execution_state,
+                    ExecutionState::Completed | ExecutionState::Failed
+                ) =>
+                {
                     let is_error = execution_state == ExecutionState::Failed;
                     projected.push(NormalizedEvent::ToolResult { is_error });
                     if is_error && let Some(detail) = detail.as_deref() {
@@ -1558,14 +1607,7 @@ impl Journal {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let sequence = append_tx(
-            &tx,
-            session,
-            generation,
-            scope,
-            &event,
-            committed_at,
-        )?;
+        let sequence = append_tx(&tx, session, generation, scope, &event, committed_at)?;
         tx.commit()?;
         Ok(sequence)
     }
@@ -1727,7 +1769,10 @@ fn append_tx(
             indexed.tool_call.map(ToolCallId::as_str),
             indexed.execution.map(ExecutionId::as_str),
             indexed.usage.map(UsageId::as_str),
-            indexed.task.map(TaskId::as_str).or_else(|| scope.task.as_ref().map(TaskId::as_str)),
+            indexed
+                .task
+                .map(TaskId::as_str)
+                .or_else(|| scope.task.as_ref().map(TaskId::as_str)),
             indexed.checkpoint.map(CheckpointId::as_str),
             payload,
             sql_u64(committed_at, "committed_at")?,
@@ -2307,7 +2352,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.sqlite");
         let conn = Connection::open(&path).unwrap();
-        conn.execute("CREATE TABLE mystery (value TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE mystery (value TEXT)", [])
+            .unwrap();
         drop(conn);
         assert!(matches!(
             Journal::open_path(path).unwrap_err(),
@@ -2472,7 +2518,10 @@ mod tests {
             first.executions[&execution("exec-1")].state,
             ExecutionState::Completed
         );
-        assert_eq!(first.task_receipts[&TaskId::new("task-1").unwrap()].len(), 1);
+        assert_eq!(
+            first.task_receipts[&TaskId::new("task-1").unwrap()].len(),
+            1
+        );
         assert_eq!(
             first.checkpoints[&CheckpointId::new("checkpoint-1").unwrap()].kind,
             CheckpointKind::Compaction
@@ -2480,7 +2529,10 @@ mod tests {
 
         let events = journal.events(&session).unwrap();
         assert_eq!(
-            events.iter().map(|event| event.sequence.0).collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event.sequence.0)
+                .collect::<Vec<_>>(),
             (1..=10).collect::<Vec<_>>()
         );
         let normalized = journal.normalized_events(&session).unwrap();
@@ -2490,15 +2542,21 @@ mod tests {
         ));
         assert!(normalized.iter().any(|event| matches!(
             event,
-            NormalizedEvent::AssistantFinal { input_tokens: 123, .. }
+            NormalizedEvent::AssistantFinal {
+                input_tokens: 123,
+                ..
+            }
         )));
-        assert!(normalized.iter().any(|event| matches!(
-            event,
-            NormalizedEvent::ToolResult { is_error: false }
-        )));
-        assert!(normalized
-            .iter()
-            .any(|event| matches!(event, NormalizedEvent::Compaction)));
+        assert!(
+            normalized
+                .iter()
+                .any(|event| matches!(event, NormalizedEvent::ToolResult { is_error: false }))
+        );
+        assert!(
+            normalized
+                .iter()
+                .any(|event| matches!(event, NormalizedEvent::Compaction))
+        );
     }
 
     #[test]
@@ -2630,19 +2688,21 @@ mod tests {
             state.executions[&execution("started")].state,
             ExecutionState::OutcomeUnknown
         );
-        assert!(journal
-            .transition_execution(
-                &session,
-                7,
-                &EventScope::default(),
-                &execution("started"),
-                ExecutionState::Started,
-                None,
-                None,
-                None,
-                7,
-            )
-            .is_err());
+        assert!(
+            journal
+                .transition_execution(
+                    &session,
+                    7,
+                    &EventScope::default(),
+                    &execution("started"),
+                    ExecutionState::Started,
+                    None,
+                    None,
+                    None,
+                    7,
+                )
+                .is_err()
+        );
         journal
             .transition_execution(
                 &session,
@@ -2702,19 +2762,21 @@ mod tests {
                 4,
             )
             .unwrap();
-        assert!(journal
-            .transition_execution(
-                &session,
-                7,
-                &EventScope::default(),
-                &execution("exec-1"),
-                ExecutionState::Completed,
-                None,
-                None,
-                None,
-                5,
-            )
-            .is_err());
+        assert!(
+            journal
+                .transition_execution(
+                    &session,
+                    7,
+                    &EventScope::default(),
+                    &execution("exec-1"),
+                    ExecutionState::Completed,
+                    None,
+                    None,
+                    None,
+                    5,
+                )
+                .is_err()
+        );
         assert_eq!(
             journal.replay(&session).unwrap().executions[&execution("exec-1")].state,
             ExecutionState::Started
@@ -2819,18 +2881,20 @@ mod tests {
                 }
             ]
         );
-        assert!(journal
-            .commit_assistant_stream(
-                &session,
-                7,
-                &EventScope::default(),
-                "message-stream",
-                message("assistant-2"),
-                None,
-                None,
-                4,
-            )
-            .is_err());
+        assert!(
+            journal
+                .commit_assistant_stream(
+                    &session,
+                    7,
+                    &EventScope::default(),
+                    "message-stream",
+                    message("assistant-2"),
+                    None,
+                    None,
+                    4,
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -2890,13 +2954,7 @@ mod tests {
         ));
         assert!(matches!(
             journal
-                .store_continuation(
-                    &session,
-                    &attempt("attempt-2"),
-                    &wrong_model,
-                    b"wrong",
-                    3,
-                )
+                .store_continuation(&session, &attempt("attempt-2"), &wrong_model, b"wrong", 3,)
                 .unwrap_err(),
             JournalError::ContinuationMismatch
         ));
@@ -2911,10 +2969,15 @@ mod tests {
         let ContentRef::Artifact { sha256, .. } = first else {
             panic!("artifact reference");
         };
-        assert_eq!(journal.read_artifact(&sha256).unwrap(), Some(b"result".to_vec()));
+        assert_eq!(
+            journal.read_artifact(&sha256).unwrap(),
+            Some(b"result".to_vec())
+        );
         let count: i64 = journal
             .conn
-            .query_row("SELECT COUNT(*) FROM native_artifacts", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM native_artifacts", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -2989,7 +3052,9 @@ mod tests {
                 2,
             )
             .unwrap();
-        journal.complete_session(&old, 7, "done".into(), 10).unwrap();
+        journal
+            .complete_session(&old, 7, "done".into(), 10)
+            .unwrap();
         assert_eq!(journal.prune_completed_before(11).unwrap(), 1);
         assert!(matches!(
             journal.replay(&old).unwrap_err(),
@@ -3004,7 +3069,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let (_dir, journal) = journal();
-        let mode = std::fs::metadata(journal.path()).unwrap().permissions().mode();
+        let mode = std::fs::metadata(journal.path())
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
 }
