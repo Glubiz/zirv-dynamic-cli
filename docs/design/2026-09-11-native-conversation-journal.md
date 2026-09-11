@@ -93,4 +93,3 @@ arguments, frame bounds, provider-envelope identity, content addressing,
 concurrent WAL readers, normalized projection, owner-only file permissions,
 and retention cascades. Live provider credentials are neither needed nor
 read.
-
