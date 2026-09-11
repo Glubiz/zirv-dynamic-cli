@@ -1430,8 +1430,18 @@ fn strip_windows_verbatim(path: PathBuf) -> PathBuf {
 fn path_within(path: &Path, root: &Path) -> bool {
     #[cfg(windows)]
     {
-        let path = path.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-        let mut root = root.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        fn normalized(path: &Path) -> String {
+            let rendered = path.to_string_lossy().replace('/', "\\");
+            let rendered = rendered
+                .strip_prefix(r"\\?\UNC\")
+                .map(|rest| format!(r"\\{rest}"))
+                .or_else(|| rendered.strip_prefix(r"\\?\").map(str::to_string))
+                .unwrap_or(rendered);
+            rendered.to_ascii_lowercase()
+        }
+
+        let path = normalized(path);
+        let mut root = normalized(root);
         if !root.ends_with('\\') {
             root.push('\\');
         }
