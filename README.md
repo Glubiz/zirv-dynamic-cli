@@ -597,10 +597,13 @@ to the section that documents it in depth.
   printing a compact, reversible summary; `compile` prints or measures the
   composed session prompt. See [Verbs](#verbs).
 - **Configuration and instruction hygiene** — `config` shows or edits the
-  operator's `~/.zirv/ctx.toml`; `context` (`sync`/`lint`/`status`) manages
-  the canonical instruction-file layer; `optimize` reports redundancy,
-  contradictions, and dead references across every configuration surface;
-  `usage` reports usage-window state or tees the statusline. See [Reviewing
+  operator's `~/.zirv/ctx.toml`; `provider` (`init`/`list`/`check`/
+  `credential set`) configures and inspects opt-in native provider
+  routes, accounts and credentials; `context` (`sync`/`lint`/`status`)
+  manages the canonical instruction-file layer; `optimize` reports
+  redundancy, contradictions, and dead references across every
+  configuration surface; `usage` reports usage-window state or tees the
+  statusline. See [Reviewing
   your instruction files](#reviewing-your-instruction-files) and
   [Environment variables worth
   knowing](#environment-variables-worth-knowing).
