@@ -31,6 +31,7 @@
 #![allow(dead_code)]
 
 pub mod fake;
+pub mod enforcement;
 pub mod harness;
 pub mod journal;
 pub mod protocol;

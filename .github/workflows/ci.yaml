@@ -150,6 +150,28 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  native-enforcement-platforms:
+    name: Native Enforcement (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The broker suite uses real filesystem roots and a real linked git
+      # worktree. Platform detection may honestly report unavailable, but an
+      # unavailable sandbox must remain a typed refusal rather than a plain
+      # subprocess launch.
+      - name: Verify Native Enforcement Contract
+        run: cargo test --bin zirv runtime::enforcement::tests -- --test-threads=1
+
   # CD is idempotent on an already-published version (the release step prints
   # "release $TAG is already published; nothing to do" and skips the
   # Homebrew/Chocolatey jobs), so an unbumped merge just deploys nothing --

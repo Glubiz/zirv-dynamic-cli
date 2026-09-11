@@ -65,7 +65,7 @@
 use super::CtxResult;
 use super::adapters::AgentAdapter;
 use super::config::EnvLookup;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// One thing zirv's policy has an opinion about. Deliberately harness-neutral:
 /// these are the questions an operator asks ("may this session write outside
@@ -151,7 +151,9 @@ impl Capability {
 /// least-to-most restrictive: `Allow < Ask < Deny`, which is what makes
 /// narrowing expressible as `max` (see the module doc) rather than as a
 /// hand-written comparison per capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Stance {
     /// zirv declares no restriction of its own. The harness's own defaults and
@@ -222,7 +224,7 @@ impl Stance {
 /// `deny_unknown_fields`: a typo'd capability name hard-errors rather than
 /// silently leaving that capability at `Allow`, which is the failure mode a
 /// permissions surface can least afford.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EffectivePolicy {
     pub repo_fs_write: Stance,
