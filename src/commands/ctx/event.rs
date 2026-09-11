@@ -179,7 +179,7 @@ impl TranscriptUsage {
 /// `Overflow` still belongs to rot (the session's own context), `RateLimit`
 /// to `pace` (the account's own capacity), and `Other` remains genuinely
 /// unattributed and changes no routing decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderErrorClass {
     Overflow,
@@ -195,6 +195,10 @@ pub enum ProviderErrorClass {
     /// missing credential, a forbidden model, a 404-shaped configuration
     /// error. No cooldown fixes this class.
     Auth,
+    /// The `Default`, so a health record written before `Phase::Open` carried
+    /// a class at all reads back as "unattributed" -- which never propagates
+    /// a shared-endpoint denial (see `health_store::admissions`).
+    #[default]
     Other,
 }
 
@@ -488,6 +492,65 @@ pub struct StructuralContext {
     /// confirmed passed. Rendered by `handoff::structural`'s `Verification`
     /// section.
     pub last_verification: Option<VerificationOutcome>,
+    /// Issue #455 (partial-stream reconciliation): every tool call the
+    /// adapter saw BEGIN in the scanned range whose result never arrived --
+    /// a `tool_use`/`custom_tool_call` id with no paired `tool_result`/
+    /// `custom_tool_call_output`. A rollover triggered mid-turn drops these
+    /// silently otherwise, and the successor session can neither confirm
+    /// the side effect happened nor safely assume it did not. Capped at
+    /// [`UNRESOLVED_TOOL_CALL_CAP`], newest last.
+    pub unresolved_tool_calls: Vec<UnresolvedToolCall>,
+    /// Issue #455: set when the scanned range's last assistant activity did
+    /// not finish -- a provider-error row with no later successful
+    /// assistant row (both adapters), or, where the transcript shape gives
+    /// a verified marker, a stream that ended mid-turn. Independent of
+    /// `partial_text` below: this is always set on a cut, `partial_text`
+    /// only when there was actually open text at the moment of the cut.
+    /// `handoff::structural` renders this as a `PARTIAL` note in
+    /// `remaining`.
+    pub tail_cut: Option<String>,
+    /// Issue #455 (review round 2): the assistant text that was still OPEN
+    /// -- pushed by an assistant row whose own turn had not yet reached a
+    /// boundary (a `tool_result`/user row, or a successful `end_turn`) --
+    /// at the exact moment `tail_cut` was set. `None` when the cut turn
+    /// itself carried no text (e.g. a bare `tool_use`/`custom_tool_call`
+    /// with nothing else), which must never be confused with "no cut
+    /// happened" (`tail_cut` is the signal for that). The adapter keeps
+    /// this text OUT of `assistant_texts` entirely -- an EARLIER, already-
+    /// closed reply (one a later assistant row or tool result followed)
+    /// stays in `assistant_texts`/`done` untouched even when a cut happens
+    /// afterward, because only the text open at the moment of the cut is
+    /// actually incomplete. Already redacted and capped by the adapter
+    /// (`adapters::redacted_tool_summary`, the same helper `UnresolvedToolCall
+    /// ::summary` uses) before it ever reaches this struct.
+    pub partial_text: Option<String>,
+    /// Issue #455: the subset of `files_modified` whose only introducing
+    /// tool call is itself present in `unresolved_tool_calls` -- the call
+    /// claimed to modify the file, but its result never arrived, so whether
+    /// the write actually happened is unknown. `handoff::structural` renders
+    /// these with an `(unconfirmed)` suffix instead of as a plain, completed
+    /// edit.
+    pub unconfirmed_files_modified: Vec<String>,
+}
+
+/// Bound on [`StructuralContext::unresolved_tool_calls`] -- independent of
+/// the caller's own `last_n`, since a long session can leave far more than a
+/// handful of stale, never-resolved ids behind, and a handoff carrying all
+/// of them would be exactly the unbounded-growth failure mode every other
+/// `StructuralContext` field is already capped against.
+pub const UNRESOLVED_TOOL_CALL_CAP: usize = 8;
+
+/// One `tool_use`/`custom_tool_call` an adapter saw begin but never saw
+/// resolve within the scanned range (issue #455).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedToolCall {
+    pub name: String,
+    pub id: String,
+    /// A single redacted line describing the call's own input (the command
+    /// for a shell-shaped tool, the path for a file-shaped one, otherwise a
+    /// description or the tool name itself) -- never the raw input, which
+    /// may be arbitrarily large or carry a secret.
+    pub summary: String,
 }
 
 /// One command-shaped tool invocation and whether its result errored,

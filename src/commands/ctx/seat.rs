@@ -691,6 +691,13 @@ pub struct CandidateHeadroom {
     /// A real weekly reading retained past the collector freshness limit.
     pub stale: bool,
     pub observed_at: u64,
+    /// Issue #455 finding 6: whether this candidate's route is `Degraded`.
+    /// A degraded route still answers, so it stays eligible -- it just loses
+    /// every comparison to a healthy one, however much more headroom it has.
+    /// Rolling a seat onto a route zirv has stopped trusting because it had
+    /// a better usage reading is the one outcome the degrade signal exists
+    /// to prevent.
+    pub degraded: bool,
 }
 
 /// Everything [`decide`] needs to reach a verdict, gathered once by the
@@ -916,8 +923,15 @@ pub fn decide(inputs: &RolloverInputs<'_>, cfg: &CtxConfig) -> RolloverDecision 
 
     let order = &cfg.fallback.order;
     eligible.sort_by(|a, b| {
-        b.projected_headroom_pct
-            .total_cmp(&a.projected_headroom_pct)
+        // Finding 6: healthy before degraded, outright. Only then the
+        // existing ordering (greatest projected headroom, ties by
+        // `fallback.order` position).
+        a.degraded
+            .cmp(&b.degraded)
+            .then_with(|| {
+                b.projected_headroom_pct
+                    .total_cmp(&a.projected_headroom_pct)
+            })
             .then_with(|| {
                 let ai = order
                     .iter()
@@ -1444,7 +1458,58 @@ mod tests {
             assumed: false,
             stale: false,
             observed_at: 500,
+            degraded: false,
         }
+    }
+
+    /// Finding 6: a degraded candidate stays eligible but loses to a healthy
+    /// one outright, however much more headroom it has -- rolling the seat
+    /// onto a route zirv has stopped trusting is the one move the degrade
+    /// signal exists to prevent.
+    #[test]
+    fn a_healthy_candidate_outranks_a_degraded_one_with_more_headroom() {
+        // `decide` is pure over its candidate list, so a third harness name
+        // needs no adapter here -- only an `order` position. The seat itself
+        // sits on claude, whose own row is filtered out of the candidates.
+        let mut cfg = cfg();
+        cfg.fallback.order = vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "gemini".to_string(),
+        ];
+        let seat = base_seat();
+        let mut rich = candidate("codex", 95.0);
+        rich.degraded = true;
+        let candidates = vec![rich.clone(), candidate("gemini", 60.0)];
+        let inputs = RolloverInputs {
+            seat: &seat,
+            now: 2_000,
+            pending_since: None,
+            source_headroom_pct: Some(5.0),
+            source_observed_at: 1_000,
+            source_hard_blocked: false,
+            source_unreachable: false,
+            auto_enabled: true,
+            idle: true,
+            reclaim: false,
+            candidates: &candidates,
+        };
+        let RolloverDecision::Proceed { agent, .. } = decide(&inputs, &cfg) else {
+            panic!("a source at 5% headroom rolls over");
+        };
+        assert_eq!(agent, "gemini", "60% healthy beats 95% degraded");
+
+        // A degraded candidate that is the only one still wins: reduce,
+        // never exclude.
+        let only = vec![rich];
+        let inputs = RolloverInputs {
+            candidates: &only,
+            ..inputs
+        };
+        let RolloverDecision::Proceed { agent, .. } = decide(&inputs, &cfg) else {
+            panic!("the only candidate there is must still be chosen");
+        };
+        assert_eq!(agent, "codex");
     }
 
     #[test]
@@ -1978,6 +2043,7 @@ mod tests {
             assumed: true,
             stale: false,
             observed_at: 1_000,
+            degraded: false,
         }];
         let inputs = RolloverInputs {
             seat: &seat,

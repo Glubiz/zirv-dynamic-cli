@@ -13,7 +13,8 @@ use super::super::catalogue;
 use super::super::event::input_hash;
 use super::super::event::{
     Capabilities, NormalizedEvent, SessionId, SessionRef, StructuralContext, ToolInvocation,
-    TranscriptUsage, error_text_hash, last_verification_run,
+    TranscriptUsage, UNRESOLVED_TOOL_CALL_CAP, UnresolvedToolCall, error_text_hash,
+    last_verification_run,
 };
 use super::super::window::parse_iso8601_utc_ms;
 use super::{AgentAdapter, ResolvedProgram, TurnSignalSetup};
@@ -839,6 +840,36 @@ const FILE_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
 const MODIFICATION_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const ERROR_SNIPPET: usize = 200;
 
+/// A single line describing one `tool_use` block's own input, for
+/// [`UnresolvedToolCall::summary`] (issue #455): the command for `Bash`, the
+/// path for a file-shaped tool, its `description` otherwise, and -- when
+/// none of those keys is present -- the first string value in the input
+/// object (`serde_json`'s default, non-`preserve_order` `Map` sorts by key,
+/// so this is deterministic even though it is not encounter order), falling
+/// back to the bare tool name when the input carries no string at all.
+/// Redacted and capped by the caller (`adapters::redacted_tool_summary`),
+/// never rendered raw.
+fn describe_tool_input(tool_name: &str, input: &Value) -> String {
+    if tool_name.eq_ignore_ascii_case("Bash")
+        && let Some(command) = input.get("command").and_then(Value::as_str)
+    {
+        return command.to_string();
+    }
+    for key in FILE_KEYS {
+        if let Some(path) = input.get(*key).and_then(Value::as_str) {
+            return path.to_string();
+        }
+    }
+    if let Some(description) = input.get("description").and_then(Value::as_str) {
+        return description.to_string();
+    }
+    input
+        .as_object()
+        .and_then(|obj| obj.values().find_map(Value::as_str))
+        .map(str::to_string)
+        .unwrap_or_else(|| tool_name.to_string())
+}
+
 /// Conservative context window (issue #155) for a Claude model id this
 /// adapter does not recognise as a long-window seat, and for an unstated
 /// model. Conservative on purpose: an overstated capacity raises the
@@ -867,6 +898,36 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     // `event::last_verification_run` over it is.
     let mut pending_bash: HashMap<String, String> = HashMap::new();
     let mut invocations: Vec<ToolInvocation> = Vec::new();
+    // Issue #455: every `tool_use` id seen, keyed by its own id, removed the
+    // moment a `tool_result` for it arrives -- whatever is left at the end
+    // never resolved within the scanned range. `seq` records encounter
+    // order (a `HashMap` does not) so the final list can still be rendered
+    // oldest-first, newest-last, like every other capped field.
+    let mut pending_calls: HashMap<String, (usize, String, String)> = HashMap::new();
+    let mut call_seq: usize = 0;
+    // Every modification-shaped tool_use call's id that ever named a given
+    // path, by that path -- ALL of them, not just the first: a path is
+    // unconfirmed if ANY call that touched it is still unresolved at the
+    // end of the scan, regardless of order (review finding: a path first
+    // touched by a call that later resolved, then touched again by one that
+    // never did, must still end up unconfirmed -- the unsafe direction is
+    // claiming a write landed when the LAST attempt on it never reported
+    // back).
+    let mut path_source_calls: HashMap<String, Vec<String>> = HashMap::new();
+    // The most recent tool_use's own name, for the "after tool call X"
+    // clause in a `tail_cut` reason -- rolling state because the row that
+    // reveals the cut (a provider-error row) carries no tool reference of
+    // its own.
+    let mut last_tool_name: Option<String> = None;
+    // Issue #455 review round 2: text pushed by an assistant row whose own
+    // turn has not yet reached a boundary (a `tool_result`/user row, or a
+    // successful `end_turn`) -- the ONLY text a cut can legitimately mark
+    // partial. Flushed into `assistant_texts` the moment a boundary is
+    // reached (a prior reply demonstrably was not the one cut), and moved
+    // into `out.partial_text` instead when the cut itself arrives, so an
+    // unrelated, already-closed reply from earlier in the transcript is
+    // never the one withheld.
+    let mut pending_open_text: Option<String> = None;
 
     for line in jsonl.lines() {
         let line = line.trim();
@@ -879,10 +940,46 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
         if row.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
+
+        // Issue #455: gated on `isApiErrorMessage` alone, exactly like
+        // `parse_events` above -- never on the row's own text, so an
+        // ordinary assistant reply that merely QUOTES "API Error: 503"
+        // can never be mistaken for one. Handled before the `type` match
+        // below (an API-error row's own `type` is `"assistant"`) so its
+        // placeholder text ("API Error: ...") never reaches
+        // `assistant_texts` and gets shown as though it were a finished
+        // reply -- exactly the bug this issue reports.
+        if row.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true) {
+            let kind = row
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            out.tail_cut = Some(match last_tool_name.as_deref() {
+                Some(name) => format!("API error ({kind}) after tool call {name}"),
+                None => format!("API error ({kind})"),
+            });
+            // Issue #455 review round 2: only text still OPEN at this exact
+            // moment is the cut turn's own -- `None` when the cut turn
+            // carried no text of its own (e.g. a bare tool_use), which must
+            // never be confused with "nothing was cut".
+            out.partial_text = pending_open_text
+                .take()
+                .map(|raw| super::redacted_tool_summary(&raw));
+            continue;
+        }
+
         let message = row.get("message").cloned().unwrap_or(Value::Null);
 
         match row.get("type").and_then(Value::as_str) {
             Some("user") => {
+                // Issue #455 review round 2: a user-type row (a fresh
+                // prompt, or a tool_result) is a turn boundary -- its mere
+                // presence proves the assistant text still open before it
+                // was not cut, so it settles into `assistant_texts` rather
+                // than staying eligible to be marked partial later.
+                if let Some(prev) = pending_open_text.take() {
+                    out.assistant_texts.push(prev);
+                }
                 if row.get("isMeta").and_then(Value::as_bool) == Some(true) {
                     continue;
                 }
@@ -909,10 +1006,9 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                                 out.tool_errors
                                     .push(detail.chars().take(ERROR_SNIPPET).collect());
                             }
-                            if let Some(command) = block
-                                .get("tool_use_id")
-                                .and_then(Value::as_str)
-                                .and_then(|id| pending_bash.remove(id))
+                            let tool_use_id = block.get("tool_use_id").and_then(Value::as_str);
+                            if let Some(command) =
+                                tool_use_id.and_then(|id| pending_bash.remove(id))
                             {
                                 invocations.push(ToolInvocation {
                                     command,
@@ -920,15 +1016,39 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                                     error_text: if is_error { detail } else { String::new() },
                                 });
                             }
+                            if let Some(id) = tool_use_id {
+                                pending_calls.remove(id);
+                            }
                         }
                         _ => {}
                     }
                 }
             }
             Some("assistant") => {
+                // Issue #455 review round 2: this row is itself further
+                // activity, so whatever was still open from an EARLIER row
+                // demonstrably was not the one cut -- settle it before
+                // deciding what this row's own text does.
+                if let Some(prev) = pending_open_text.take() {
+                    out.assistant_texts.push(prev);
+                }
+                // A later, genuine assistant row supersedes any earlier
+                // cut: whatever `tail_cut`/`partial_text` read after the
+                // whole scan is the state as of the END of the range, which
+                // is exactly what `handoff::structural` needs.
+                out.tail_cut = None;
+                out.partial_text = None;
                 let text = text_of(&message);
+                // `end_turn` is this row's own boundary -- a complete reply
+                // on its own, never held open even for a single row.
+                let is_end_turn =
+                    message.get("stop_reason").and_then(Value::as_str) == Some("end_turn");
                 if !text.trim().is_empty() {
-                    out.assistant_texts.push(text);
+                    if is_end_turn {
+                        out.assistant_texts.push(text);
+                    } else {
+                        pending_open_text = Some(text);
+                    }
                 }
                 let Some(blocks) = message.get("content").and_then(Value::as_array) else {
                     continue;
@@ -941,6 +1061,9 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                         continue;
                     };
                     let tool_name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                    last_tool_name = Some(tool_name.to_string());
+                    let id = block.get("id").and_then(Value::as_str);
+
                     let is_modification = MODIFICATION_TOOLS
                         .iter()
                         .any(|t| tool_name.eq_ignore_ascii_case(t));
@@ -950,25 +1073,50 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
                         &mut out.files_read
                     };
                     for key in FILE_KEYS {
-                        if let Some(path) = input.get(*key).and_then(Value::as_str)
-                            && !target.iter().any(|p| p == path)
-                        {
-                            target.push(path.to_string());
+                        if let Some(path) = input.get(*key).and_then(Value::as_str) {
+                            // Recorded for EVERY modification call that
+                            // names this path, not only the one that ends
+                            // up pushed below -- a later call on an
+                            // already-listed path must still be able to
+                            // mark it unconfirmed.
+                            if is_modification && let Some(id) = id {
+                                path_source_calls
+                                    .entry(path.to_string())
+                                    .or_default()
+                                    .push(id.to_string());
+                            }
+                            if !target.iter().any(|p| p == path) {
+                                target.push(path.to_string());
+                            }
                         }
                     }
                     let is_bash = tool_name.eq_ignore_ascii_case("Bash");
                     if is_bash
-                        && let (Some(id), Some(command)) = (
-                            block.get("id").and_then(Value::as_str),
-                            input.get("command").and_then(Value::as_str),
-                        )
+                        && let (Some(id), Some(command)) =
+                            (id, input.get("command").and_then(Value::as_str))
                     {
                         pending_bash.insert(id.to_string(), command.to_string());
+                    }
+
+                    if let Some(id) = id {
+                        let summary =
+                            super::redacted_tool_summary(&describe_tool_input(tool_name, input));
+                        call_seq += 1;
+                        pending_calls
+                            .insert(id.to_string(), (call_seq, tool_name.to_string(), summary));
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    // Issue #455 review round 2: whatever is still open at the end of the
+    // scanned range was never claimed by a cut (that path already moved it
+    // into `partial_text` and cleared this), so it is a normal, uncut reply
+    // -- the pre-#455 behaviour for a session that simply ends there.
+    if let Some(text) = pending_open_text.take() {
+        out.assistant_texts.push(text);
     }
 
     out.last_verification = last_verification_run(&invocations);
@@ -983,10 +1131,42 @@ pub fn structural_context(jsonl: &str, last_n: usize) -> StructuralContext {
     // session that can no longer relaunch at all.
     keep_last(&mut out.files_read, last_n);
     keep_last(&mut out.files_modified, last_n);
+
+    // Issue #455: `pending_calls` left over is every call whose result never
+    // arrived in the scanned range. `unresolved_ids` (the FULL set, before
+    // the display cap below) drives the `files_modified` unconfirmed check,
+    // so a call old enough to be dropped from the rendered list still marks
+    // its file -- the file is no less unconfirmed for not being individually
+    // listed.
+    let mut unresolved: Vec<(usize, String, String, String)> = pending_calls
+        .into_iter()
+        .map(|(id, (seq, name, summary))| (seq, id, name, summary))
+        .collect();
+    unresolved.sort_by_key(|(seq, ..)| *seq);
+    let unresolved_ids: std::collections::HashSet<&str> =
+        unresolved.iter().map(|(_, id, ..)| id.as_str()).collect();
+    out.unconfirmed_files_modified = out
+        .files_modified
+        .iter()
+        .filter(|path| {
+            path_source_calls
+                .get(*path)
+                .is_some_and(|ids| ids.iter().any(|id| unresolved_ids.contains(id.as_str())))
+        })
+        .cloned()
+        .collect();
+    if unresolved.len() > UNRESOLVED_TOOL_CALL_CAP {
+        unresolved.drain(..unresolved.len() - UNRESOLVED_TOOL_CALL_CAP);
+    }
+    out.unresolved_tool_calls = unresolved
+        .into_iter()
+        .map(|(_, id, name, summary)| UnresolvedToolCall { name, id, summary })
+        .collect();
+
     out
 }
 
-fn keep_last(items: &mut Vec<String>, last_n: usize) {
+fn keep_last<T>(items: &mut Vec<T>, last_n: usize) {
     if items.len() > last_n {
         items.drain(..items.len() - last_n);
     }
@@ -5173,6 +5353,180 @@ mod tests {
             crate::commands::ctx::event::VerificationStatus::Failed
         );
         assert_eq!(outcome.error_excerpt, vec!["boom: it failed".to_string()]);
+    }
+
+    /// Issue #455, grounded against a scrubbed but shape-faithful fixture: a
+    /// `Bash` `git push` never gets a `tool_result` before the stream cuts
+    /// with an `isApiErrorMessage` row, so it must surface as an unresolved
+    /// call, and the cut itself must be reported rather than letting the
+    /// synthetic "API Error: ..." text stand in as a finished reply. The
+    /// fixture's own preceding text ("I'll push the branch now.", stop_reason
+    /// `tool_use`, never closed by a boundary before the cut) is exactly the
+    /// text that WAS open at the cut, so it must surface as `partial_text`,
+    /// never in `assistant_texts` (review round 2).
+    #[test]
+    fn structural_context_flags_an_unresolved_tool_call_and_the_cut_tail() {
+        let jsonl =
+            std::fs::read_to_string(fixture_path("claude-partial-stream.jsonl")).expect("fixture");
+        let ctx = structural_context(&jsonl, 10);
+
+        assert_eq!(ctx.unresolved_tool_calls.len(), 1);
+        let call = &ctx.unresolved_tool_calls[0];
+        assert_eq!(call.name, "Bash");
+        assert_eq!(call.id, "toolu_partial01");
+        assert!(call.summary.contains("git push origin feat/x"));
+
+        let reason = ctx.tail_cut.as_deref().expect("a cut tail");
+        assert!(reason.contains("server_error"));
+        assert!(reason.contains("Bash"));
+
+        let partial = ctx.partial_text.as_deref().expect("open text at the cut");
+        assert!(partial.contains("I'll push the branch now."));
+
+        assert!(
+            ctx.assistant_texts.is_empty(),
+            "text open at the moment of the cut must never reach assistant_texts: {:?}",
+            ctx.assistant_texts
+        );
+    }
+
+    /// Issue #455 review round 2, the exact regression this round fixes: a
+    /// text-only turn completes normally (`end_turn`), then a LATER,
+    /// separate turn issues only a `tool_use` (no text of its own) before
+    /// the stream cuts. The first turn's text must stay in `assistant_texts`
+    /// (and therefore `done`), and `partial_text` must be `None` -- the cut
+    /// turn itself had nothing open to withhold.
+    #[test]
+    fn structural_context_only_withholds_the_text_open_at_the_moment_of_the_cut() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"Pushed the branch."}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"git status"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","isApiErrorMessage":true,"error":"server_error","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 500"}],"usage":{}}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 10);
+        assert_eq!(ctx.assistant_texts, vec!["Pushed the branch.".to_string()]);
+        assert!(ctx.tail_cut.is_some());
+        assert!(
+            ctx.partial_text.is_none(),
+            "the cut turn itself carried no text: {:?}",
+            ctx.partial_text
+        );
+    }
+
+    /// The counterpart to the above: once the `tool_result` arrives, the
+    /// call is resolved and neither field fires.
+    #[test]
+    fn structural_context_does_not_flag_a_tool_call_once_its_result_arrives() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"git push origin feat/x"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":false,"content":"ok"}]}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 10);
+        assert!(ctx.unresolved_tool_calls.is_empty());
+        assert!(ctx.tail_cut.is_none());
+    }
+
+    /// Classifier gating (issue #455): a row that merely QUOTES the words
+    /// "API Error"/"503" in ordinary assistant prose, or in a tool result,
+    /// must never be mistaken for a real provider-error row -- the gate
+    /// stays `isApiErrorMessage` alone.
+    #[test]
+    fn structural_context_ignores_text_that_merely_quotes_an_api_error() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b1","name":"Bash","input":{"command":"grep -r 'API Error' logs/"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b1","is_error":false,"content":"logs/app.log: API Error: 503 last Tuesday"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Looks like the logs mention API Error: 503 already."}],"usage":{}}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 10);
+        assert!(ctx.tail_cut.is_none());
+        assert!(ctx.unresolved_tool_calls.is_empty());
+    }
+
+    /// Issue #455: a file an unresolved `Edit`/`Write`-style call claimed to
+    /// modify is reported separately so `handoff::structural` can mark it
+    /// `(unconfirmed)`; a resolved call's file is never flagged.
+    #[test]
+    fn structural_context_marks_files_from_an_unresolved_edit_as_unconfirmed() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/work/src/lib.rs"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e2","name":"Write","input":{"file_path":"/work/src/main.rs"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"e2","is_error":false,"content":"ok"}]}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 10);
+        assert_eq!(
+            ctx.files_modified,
+            vec!["/work/src/lib.rs", "/work/src/main.rs"]
+        );
+        assert_eq!(ctx.unconfirmed_files_modified, vec!["/work/src/lib.rs"]);
+    }
+
+    /// Issue #455 review finding: attribution must not stick to the FIRST
+    /// call that ever named a path -- a path first touched by a call that
+    /// went on to resolve, then touched AGAIN by a call that never did, must
+    /// still end up unconfirmed. The unsafe direction is the reverse:
+    /// claiming a write landed when the LAST attempt on it never reported
+    /// back.
+    #[test]
+    fn structural_context_marks_a_path_unconfirmed_even_when_its_first_call_resolved() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e1","name":"Edit","input":{"file_path":"/work/src/lib.rs"}}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"e1","is_error":false,"content":"ok"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e2","name":"Edit","input":{"file_path":"/work/src/lib.rs"}}],"usage":{}}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 10);
+        assert_eq!(ctx.files_modified, vec!["/work/src/lib.rs"]);
+        assert_eq!(
+            ctx.unconfirmed_files_modified,
+            vec!["/work/src/lib.rs"],
+            "the second, unresolved edit must still mark the path unconfirmed"
+        );
+    }
+
+    /// Issue #455: a later, genuine assistant row recovers from an earlier
+    /// cut -- `tail_cut` reflects only the state as of the END of the
+    /// scanned range.
+    #[test]
+    fn structural_context_clears_tail_cut_after_a_later_successful_assistant_row() {
+        let jsonl = concat!(
+            r#"{"type":"assistant","isApiErrorMessage":true,"error":"server_error","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 500"}],"usage":{}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"recovered and finished"}],"usage":{}}}"#,
+            "\n",
+        );
+        let ctx = structural_context(jsonl, 10);
+        assert!(ctx.tail_cut.is_none());
+        assert_eq!(ctx.assistant_texts, vec!["recovered and finished"]);
+    }
+
+    /// Issue #455: `unresolved_tool_calls` is capped independently of
+    /// `last_n`, newest last -- mirrors
+    /// `structural_context_caps_files_read_like_every_other_field` below.
+    #[test]
+    fn structural_context_caps_unresolved_tool_calls_to_the_newest_eight() {
+        let mut jsonl = String::new();
+        for i in 0..12 {
+            jsonl.push_str(&format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"call-{i}\",\"name\":\"Bash\",\"input\":{{\"command\":\"echo {i}\"}}}}],\"usage\":{{}}}}}}\n"
+            ));
+        }
+        let ctx = structural_context(&jsonl, 1_000);
+        assert_eq!(ctx.unresolved_tool_calls.len(), 8);
+        assert_eq!(ctx.unresolved_tool_calls.first().unwrap().id, "call-4");
+        assert_eq!(ctx.unresolved_tool_calls.last().unwrap().id, "call-11");
     }
 
     #[test]
