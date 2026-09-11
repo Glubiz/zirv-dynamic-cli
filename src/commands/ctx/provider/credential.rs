@@ -67,7 +67,7 @@ impl std::str::FromStr for CredentialRef {
             ));
         }
         if let Some(item) = value.strip_prefix("store:") {
-            if item == "Claude Code-credentials" || valid_item(item) {
+            if item.eq_ignore_ascii_case("Claude Code-credentials") || valid_item(item) {
                 return Ok(Self::Store(item.to_string()));
             }
             return Err(format!(
@@ -249,13 +249,20 @@ pub fn resolve(
     Ok(credential)
 }
 
-fn refuse_harness_login(reference: &CredentialRef) -> Result<(), CredentialError> {
+pub(crate) fn refuse_harness_login(reference: &CredentialRef) -> Result<(), CredentialError> {
     let refused = match reference {
-        CredentialRef::Store(item) => item == "Claude Code-credentials",
+        CredentialRef::Store(item) => item.eq_ignore_ascii_case("Claude Code-credentials"),
         CredentialRef::File(path) => {
-            let normalized = path.to_string_lossy().replace('\\', "/");
-            normalized.ends_with(".claude/.credentials.json")
-                || normalized.ends_with(".codex/auth.json")
+            if is_harness_login_path(path) {
+                true
+            } else {
+                let canonical =
+                    std::fs::canonicalize(path).map_err(|error| CredentialError::File {
+                        reference: reference.clone(),
+                        why: format!("could not resolve {}: {error}", path.display()),
+                    })?;
+                is_harness_login_path(&canonical)
+            }
         }
         CredentialRef::Env(_) => false,
     };
@@ -267,6 +274,20 @@ fn refuse_harness_login(reference: &CredentialRef) -> Result<(), CredentialError
     } else {
         Ok(())
     }
+}
+
+fn is_harness_login_path(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let components: Vec<_> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let ends_with = |directory: &str, file: &str| {
+        components.len() >= 2
+            && components[components.len() - 2].eq_ignore_ascii_case(directory)
+            && components[components.len() - 1].eq_ignore_ascii_case(file)
+    };
+    ends_with(".claude", ".credentials.json") || ends_with(".codex", "auth.json")
 }
 
 fn read_secret_file(path: &Path) -> Result<String, String> {
@@ -672,6 +693,30 @@ mod tests {
         for raw in refs {
             let reference: CredentialRef = raw.parse().unwrap();
             let error = resolve(&reference, &|_| None, &FakeStore::default(), 0).unwrap_err();
+            assert!(error.to_string().contains(HARNESS_REFUSAL), "got {error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harness_login_guard_canonicalizes_symlinks_and_ignores_case() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let harness_dir = dir.path().join(".claude");
+        std::fs::create_dir(&harness_dir).unwrap();
+        let harness_file = harness_dir.join(".credentials.json");
+        std::fs::write(&harness_file, "harness-login").unwrap();
+        std::fs::set_permissions(&harness_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("creds.txt");
+        symlink(&harness_file, &link).unwrap();
+
+        for reference in [
+            CredentialRef::File(link),
+            "store:claude code-CREDENTIALS".parse().unwrap(),
+        ] {
+            let error = resolve(&reference, &|_| None, &FakeStore::default(), 0).unwrap_err();
+            assert!(matches!(error, CredentialError::Refused { .. }));
             assert!(error.to_string().contains(HARNESS_REFUSAL), "got {error}");
         }
     }

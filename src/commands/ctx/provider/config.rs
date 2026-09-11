@@ -273,9 +273,17 @@ impl NativeConfig {
         }
 
         for (id, account) in &self.accounts {
-            if provider(account.provider.as_ref()).is_none() {
+            let Some(spec) = provider(account.provider.as_ref()) else {
                 return Err(format!(
                     "{}: `account.{id}.provider` names unknown provider `{}`",
+                    path.display(),
+                    account.provider
+                )
+                .into());
+            };
+            if spec.id != "openai-compatible" && account.credential.is_none() {
+                return Err(format!(
+                    "{}: `account.{id}.credential` is required for provider `{}`",
                     path.display(),
                     account.provider
                 )
@@ -285,6 +293,9 @@ impl NativeConfig {
 
         let endpoints = self.effective_endpoints();
         for (id, route) in &self.routes {
+            if route.model.trim().is_empty() {
+                return Err(format!("{}: `route.{id}.model` is required", path.display()).into());
+            }
             let account = self.accounts.get(&route.account).ok_or_else(|| {
                 format!(
                     "{}: `route.{id}.account` references undeclared account `{}`",
@@ -327,7 +338,7 @@ impl NativeConfig {
                 )
                 .into());
             }
-            super::inventory::resolve_model(&endpoint.vendor, &route.model)
+            super::inventory::resolve_model(id, &endpoint_id, &endpoint.vendor, &route.model)
                 .map_err(|error| format!("{}: `route.{id}.model`: {error}", path.display()))?;
         }
 
@@ -469,7 +480,7 @@ mod tests {
         let repo = repo();
         write(
             &NativeConfig::operator_path(home.path()),
-            "schema=1\n[account.work]\nprovider='anthropic'\n[route.a]\naccount='work'\nmodel='haiku'\n[route.b]\naccount='work'\nmodel='sonnet'\n[policy]\nallowed_routes=['a']\n",
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n[route.a]\naccount='work'\nmodel='haiku'\n[route.b]\naccount='work'\nmodel='sonnet'\n[policy]\nallowed_routes=['a']\n",
         );
         write(
             &NativeConfig::repo_path(repo.path()),
@@ -494,7 +505,7 @@ mod tests {
         let repo = repo();
         write(
             &NativeConfig::operator_path(home.path()),
-            "schema=1\n[account.work]\nprovider='anthropic'\n[route.a]\naccount='work'\nmodel='haiku'\n[route.b]\naccount='work'\nmodel='sonnet'\n[roles]\nworker='b'\n",
+            "schema=1\n[account.work]\nprovider='anthropic'\ncredential='env:KEY'\n[route.a]\naccount='work'\nmodel='haiku'\n[route.b]\naccount='work'\nmodel='sonnet'\n[roles]\nworker='b'\n",
         );
         write(
             &NativeConfig::repo_path(repo.path()),
@@ -515,9 +526,25 @@ mod tests {
         let repo = repo();
         write(
             &NativeConfig::operator_path(home.path()),
-            "schema=1\n[account.work]\nprovider='google-vertex'\n[route.work]\naccount='work'\nmodel='gemini-2.5-pro'\n",
+            "schema=1\n[account.work]\nprovider='google-vertex'\ncredential='env:KEY'\n[route.work]\naccount='work'\nmodel='gemini-2.5-pro'\n",
         );
         let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
         assert!(error.to_string().contains("N12 (#481)"), "got {error}");
+    }
+
+    #[test]
+    fn every_route_requires_a_nonempty_model() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let repo = repo();
+        write(
+            &NativeConfig::operator_path(home.path()),
+            "schema=1\n[endpoint.local]\nprovider='openai-compatible'\nbase_url='http://127.0.0.1:11434'\nvendor='ollama'\n[account.local]\nprovider='openai-compatible'\n[route.local]\naccount='local'\nendpoint='local'\n",
+        );
+        let error = NativeConfig::load(home.path(), repo.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("`route.local.model`"),
+            "got {error}"
+        );
     }
 }
