@@ -61,18 +61,13 @@ impl ExecutionIdentity {
 /// Network scope attached by trusted runtime configuration. `Only` is usable
 /// by brokered HTTP tools; arbitrary shells cannot enforce a host allowlist
 /// portably and are therefore refused when they request network under it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum NetworkScope {
+    #[default]
     Denied,
     Only { targets: BTreeSet<NetworkTarget> },
     Any,
-}
-
-impl Default for NetworkScope {
-    fn default() -> Self {
-        Self::Denied
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -594,12 +589,12 @@ impl PlatformIsolation {
     pub fn detect() -> Self {
         #[cfg(target_os = "linux")]
         {
-            return find_executable("bwrap")
+            find_executable("bwrap")
                 .map(|executable| Self::LinuxBubblewrap { executable })
                 .unwrap_or_else(|| Self::Unavailable {
                     platform: "linux".to_string(),
                     reason: "bubblewrap (bwrap) is not installed or not executable".to_string(),
-                });
+                })
         }
         #[cfg(target_os = "macos")]
         {
@@ -873,15 +868,15 @@ impl ExecutionBroker {
                 ));
             }
             if self.approval_mode == ApprovalMode::Headless {
-                return Err(BrokerError::ApprovalUnavailable(request));
+                return Err(BrokerError::ApprovalUnavailable(Box::new(request)));
             }
             match grant {
                 Some(grant) if self.approval_authority.verify(grant, &request, now) => {
                     approved_by = Some(grant.approved_by.clone());
                     approval_expires_at = grant.expires_at;
                 }
-                Some(_) => return Err(BrokerError::InvalidApproval(request)),
-                None => return Err(BrokerError::ApprovalRequired(request)),
+                Some(_) => return Err(BrokerError::InvalidApproval(Box::new(request))),
+                None => return Err(BrokerError::ApprovalRequired(Box::new(request))),
             }
         } else if grant.is_some() {
             // A grant for an action that no longer needs one is ignored. It
@@ -1281,9 +1276,9 @@ pub enum BrokerError {
     ProtectedPath(PathBuf),
     WriterPermit(String),
     Denied(String),
-    ApprovalRequired(ApprovalRequest),
-    ApprovalUnavailable(ApprovalRequest),
-    InvalidApproval(ApprovalRequest),
+    ApprovalRequired(Box<ApprovalRequest>),
+    ApprovalUnavailable(Box<ApprovalRequest>),
+    InvalidApproval(Box<ApprovalRequest>),
     IsolationUnavailable(String),
     Internal(String),
 }
@@ -1756,8 +1751,10 @@ mod tests {
 
     #[test]
     fn workspace_write_needs_the_exact_writer_permit_and_scope() {
-        let mut policy = EffectivePolicy::default();
-        policy.approval = Stance::Allow;
+        let policy = EffectivePolicy {
+            approval: Stance::Allow,
+            ..EffectivePolicy::default()
+        };
         let permitted = fixture(policy, ApprovalMode::Headless, true);
         let action = ExecutionAction::WriteFile {
             path: permitted.worktree.join("src/new.rs"),
@@ -1791,9 +1788,11 @@ mod tests {
 
     #[test]
     fn approval_is_bound_to_action_policy_generation_and_parent_identity() {
-        let mut effective = EffectivePolicy::default();
-        effective.repo_fs_write = Stance::Ask;
-        effective.approval = Stance::Ask;
+        let effective = EffectivePolicy {
+            repo_fs_write: Stance::Ask,
+            approval: Stance::Ask,
+            ..EffectivePolicy::default()
+        };
         let fixture = fixture(effective, ApprovalMode::Interactive, true);
         let first = ExecutionAction::WriteFile {
             path: fixture.worktree.join("one.rs"),
@@ -1866,9 +1865,11 @@ mod tests {
 
     #[test]
     fn headless_approval_is_an_explicit_refusal() {
-        let mut policy = EffectivePolicy::default();
-        policy.repo_fs_write = Stance::Ask;
-        policy.approval = Stance::Ask;
+        let policy = EffectivePolicy {
+            repo_fs_write: Stance::Ask,
+            approval: Stance::Ask,
+            ..EffectivePolicy::default()
+        };
         let fixture = fixture(policy, ApprovalMode::Headless, true);
         let action = ExecutionAction::WriteFile {
             path: fixture.worktree.join("one.rs"),
@@ -1881,8 +1882,10 @@ mod tests {
 
     #[test]
     fn symlink_escape_and_protected_state_are_blocked() {
-        let mut policy = EffectivePolicy::default();
-        policy.approval = Stance::Allow;
+        let policy = EffectivePolicy {
+            approval: Stance::Allow,
+            ..EffectivePolicy::default()
+        };
         let fixture = fixture(policy, ApprovalMode::Headless, true);
         let protected = fixture._root.path().join("state/secret");
         std::fs::write(&protected, "secret").expect("write protected fixture");
