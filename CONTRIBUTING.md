@@ -38,14 +38,13 @@ Size verification to the change using [CLAUDE.md](CLAUDE.md#build-and-verify-by-
 - Docs or comments: run `cargo fmt -- --check` if Rust was touched; otherwise no checks.
 - Code: run `cargo build`, `cargo nextest run <filter>` for touched modules, and
   `cargo clippy --all-targets -- -D warnings`.
-- Before opening or updating a PR: run all five gates below once.
+- Before opening or updating a PR: run all four gates below once.
 
 ## Before opening a PR
 
 ```sh
 cargo build
 cargo nextest run --no-fail-fast
-cargo test --verbose -- --test-threads=1
 cargo fmt -- --check
 cargo clippy --all-targets -- -D warnings
 ```

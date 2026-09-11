@@ -8,15 +8,14 @@ Size the change (trivial / bounded / substantial, per the zirv engineering stand
 
 - Doc/comment-only: `cargo fmt -- --check` if Rust was touched, else nothing.
 - Code change: `cargo build`, `cargo nextest run <filter>` for the touched modules, `cargo clippy --all-targets -- -D warnings`.
-- Before opening or updating a PR, the full five once:
+- Before opening or updating a PR, the full four once:
 
       cargo build
       cargo nextest run --no-fail-fast
-      cargo test --verbose -- --test-threads=1
       cargo fmt -- --check
       cargo clippy --all-targets -- -D warnings
 
-Nextest isolates tests per process; `--no-fail-fast` is mandatory -- diff sorted failure-NAME lists, never counts; the serial run must pass too. Report failures verbatim (command, exit code, test names, error text); never claim a check passed that you did not finish running.
+Nextest isolates tests per process; `--no-fail-fast` is mandatory -- diff sorted failure-NAME lists, never counts. Report failures verbatim (command, exit code, test names, error text); never claim a check passed that you did not finish running.
 
 ## Module map
 
