@@ -237,6 +237,11 @@ pub struct HeavyPermit {
     /// never has a tree to claim) and set by [`acquire_writer`] once its own
     /// pool-slot claim (via [`acquire_record`]) actually succeeds.
     tree_claim: Option<PathBuf>,
+    /// Canonical checkout covered by a writer permit. Kept on the live RAII
+    /// guard so the native execution broker can prove that a write is backed
+    /// by the permit for this exact worktree, rather than trusting a caller's
+    /// boolean claim. `None` for heavy-command permits.
+    tree: Option<PathBuf>,
 }
 
 impl Drop for HeavyPermit {
@@ -249,6 +254,11 @@ impl Drop for HeavyPermit {
 }
 
 impl HeavyPermit {
+    /// The exact checkout this guard owns when it is a writer permit.
+    pub fn writer_tree(&self) -> Option<&Path> {
+        self.tree.as_deref()
+    }
+
     /// Records the spawned heavy child's own pid on this permit (finding
     /// B5), once it exists, so [`live_records`]' dead-owner sweep can treat
     /// the slot as still held if EITHER the parent (the script-runner
@@ -504,6 +514,7 @@ fn acquire_record(dir: &Path, limit: usize, record: PermitRecord) -> Option<Heav
             return Some(HeavyPermit {
                 path,
                 tree_claim: None,
+                tree: record.tree.clone(),
             });
         }
         // The file this claim just wrote is gone (swept) or holds a record

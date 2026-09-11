@@ -30,6 +30,7 @@
 //! same thing as code that should be deleted.
 #![allow(dead_code)]
 
+pub mod enforcement;
 pub mod fake;
 pub mod harness;
 pub mod journal;

@@ -1464,6 +1464,26 @@ state and the journal records only their stable identifiers and receipts.
 Existing harness transcripts are untouched, and older Zirv builds simply
 ignore the additional private database.
 
+Native effects are admitted through one Zirv-owned execution broker before
+any tool implementation can touch the machine. The broker reloads the
+current canonical policy, fences the persisted native seat generation,
+resolves paths through symlinks/junctions, requires the writer permit for the
+exact linked worktree, protects Zirv/provider credential paths, and strips
+credential-bearing environment variables from subprocesses. Interactive
+approvals are signed and bound to the exact action arguments, canonical path
+targets, task/session/role/generation, resource claims, and current policy;
+they cannot be reused after any of those facts changes, and a headless ask is
+an explicit refusal.
+
+Arbitrary native processes require a verified OS isolation launcher. Linux
+uses bubblewrap when `bwrap` is installed, macOS uses the built-in Seatbelt
+launcher, and Windows requires Zirv's restricted-token/AppContainer helper;
+a Job Object is cleanup, not containment. A missing mechanism is reported as
+unsupported and never falls back to an unsandboxed spawn. Consequently Zirv
+does not advertise native coding support on a host until that host's
+enforcement probe passes. The contract and current platform evidence are in
+[`docs/design/2026-09-11-native-execution-enforcement.md`](docs/design/2026-09-11-native-execution-enforcement.md).
+
 `zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
 [`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
 honest against the real command surface and source tree: every command verb
@@ -1634,6 +1654,11 @@ enough to change what zirv executes. `<repo>/.zirv/ctx.toml` may not set
 that names the key. Set those in `~/.zirv/ctx.toml`, or with the matching
 `ZIRV_CTX_*` variable below, which comes from the operator rather than the
 checkout:
+
+The same narrowing-only rule applies to native execution. Native tools receive
+the already-resolved policy and resource claims from trusted runtime state;
+repository instructions and model output cannot add roots, provider
+credentials, network targets, approvals, or a different seat generation.
 
 | Forbidden repo key | Set instead via |
 |---|---|
