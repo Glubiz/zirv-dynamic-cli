@@ -269,13 +269,19 @@ impl ProcessInvocation {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecutionAction {
-    ReadFile { path: PathBuf },
-    WriteFile { path: PathBuf },
+    ReadFile {
+        path: PathBuf,
+    },
+    WriteFile {
+        path: PathBuf,
+    },
     Process {
         invocation: ProcessInvocation,
         effects: ProcessEffects,
     },
-    Network { target: NetworkTarget },
+    Network {
+        target: NetworkTarget,
+    },
     Mcp {
         server: String,
         tool: String,
@@ -285,9 +291,16 @@ pub enum ExecutionAction {
         /// all-effects declaration before it reaches this broker.
         effects: ProcessEffects,
     },
-    ArtifactRead { path: PathBuf },
-    ArtifactWrite { path: PathBuf },
-    Delegate { role: String, task: String },
+    ArtifactRead {
+        path: PathBuf,
+    },
+    ArtifactWrite {
+        path: PathBuf,
+    },
+    Delegate {
+        role: String,
+        task: String,
+    },
 }
 
 /// Full policy snapshot reloaded at every effect boundary. Its fingerprint is
@@ -413,8 +426,9 @@ pub trait WriterLease: std::fmt::Debug + Send + Sync {
 
 impl WriterLease for HeavyPermit {
     fn covers(&self, worktree: &Path) -> bool {
-        self.writer_tree()
-            .is_some_and(|tree| super::super::permit::tree_key(tree) == super::super::permit::tree_key(worktree))
+        self.writer_tree().is_some_and(|tree| {
+            super::super::permit::tree_key(tree) == super::super::permit::tree_key(worktree)
+        })
     }
 }
 
@@ -495,12 +509,7 @@ impl ApprovalAuthority {
             ));
         }
         let approved_by = approved_by.into();
-        let signature = self.sign_grant(
-            &request.scope_digest,
-            &approved_by,
-            issued_at,
-            expires_at,
-        );
+        let signature = self.sign_grant(&request.scope_digest, &approved_by, issued_at, expires_at);
         Ok(ApprovalGrant {
             scope_digest: request.scope_digest.clone(),
             approved_by,
@@ -1003,8 +1012,7 @@ impl ExecutionBroker {
                 self.validate_network_target(target)?;
                 required.push(Capability::Network);
             }
-            ExecutionAction::ArtifactRead { path }
-            | ExecutionAction::ArtifactWrite { path } => {
+            ExecutionAction::ArtifactRead { path } | ExecutionAction::ArtifactWrite { path } => {
                 resolved_paths.push(self.validate_artifact(path)?);
             }
             ExecutionAction::Mcp {
@@ -1063,7 +1071,8 @@ impl ExecutionBroker {
                 effects,
             } => {
                 if !self.isolation.is_available() {
-                    let PlatformIsolation::Unavailable { platform, reason } = &self.isolation else {
+                    let PlatformIsolation::Unavailable { platform, reason } = &self.isolation
+                    else {
                         unreachable!()
                     };
                     return Err(BrokerError::IsolationUnavailable(format!(
@@ -1214,7 +1223,10 @@ impl ExecutionBroker {
         }
     }
 
-    fn process_policy(&self, effects: &ProcessEffects) -> Result<ProcessSandboxPolicy, BrokerError> {
+    fn process_policy(
+        &self,
+        effects: &ProcessEffects,
+    ) -> Result<ProcessSandboxPolicy, BrokerError> {
         let mut write_roots = Vec::new();
         if effects.repo_write {
             write_roots.push(self.claims.worktree_root.clone());
@@ -1247,10 +1259,7 @@ impl ExecutionBroker {
                 .cloned()
                 .collect(),
             network: effects.network,
-            environment: scrub_tool_environment(
-                std::env::vars_os(),
-                &self.protected_env_names,
-            ),
+            environment: scrub_tool_environment(std::env::vars_os(), &self.protected_env_names),
         })
     }
 }
@@ -1291,18 +1300,25 @@ impl std::fmt::Display for BrokerError {
             | Self::IsolationUnavailable(message)
             | Self::Internal(message) => f.write_str(message),
             Self::StaleGeneration { expected, got } => {
-                write!(f, "stale seat generation {got}; current generation is {expected}")
+                write!(
+                    f,
+                    "stale seat generation {got}; current generation is {expected}"
+                )
             }
             Self::ProtectedPath(path) => {
-                write!(f, "protected path is not available to native tools: {}", path.display())
+                write!(
+                    f,
+                    "protected path is not available to native tools: {}",
+                    path.display()
+                )
             }
             Self::ApprovalRequired(_) => f.write_str("operator approval is required"),
             Self::ApprovalUnavailable(_) => {
                 f.write_str("operator approval is required but this session is headless")
             }
-            Self::InvalidApproval(_) => {
-                f.write_str("approval does not match the current action, policy, scope, or generation")
-            }
+            Self::InvalidApproval(_) => f.write_str(
+                "approval does not match the current action, policy, scope, or generation",
+            ),
         }
     }
 }
@@ -1359,7 +1375,10 @@ fn sensitive_env_name(upper: &str) -> bool {
 
 fn canonical_existing_dir(path: &Path, label: &str) -> Result<PathBuf, BrokerError> {
     let path = std::fs::canonicalize(path).map_err(|error| {
-        BrokerError::Scope(format!("could not resolve {label} {}: {error}", path.display()))
+        BrokerError::Scope(format!(
+            "could not resolve {label} {}: {error}",
+            path.display()
+        ))
     })?;
     if !path.is_dir() {
         return Err(BrokerError::Scope(format!(
@@ -1383,7 +1402,10 @@ fn resolve_action_path(path: &Path, base: &Path) -> Result<PathBuf, BrokerError>
 /// components. This catches symlink/junction escapes for both reads and new
 /// write targets without requiring the final file to exist already.
 fn normalize_scope_path(path: &Path) -> Result<PathBuf, BrokerError> {
-    if path.components().any(|component| matches!(component, Component::ParentDir)) {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
         return Err(BrokerError::Scope(format!(
             "path must not contain `..`: {}",
             path.display()
@@ -1560,7 +1582,8 @@ fn seatbelt_escape(path: &Path) -> String {
 }
 
 fn digest_json(value: &impl Serialize) -> Result<String, BrokerError> {
-    let bytes = serde_json::to_vec(value).map_err(|error| BrokerError::Internal(error.to_string()))?;
+    let bytes =
+        serde_json::to_vec(value).map_err(|error| BrokerError::Internal(error.to_string()))?;
     Ok(hex_digest(Sha256::digest(bytes)))
 }
 
@@ -1578,7 +1601,9 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     }
     left.iter()
         .zip(right)
-        .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
         == 0
 }
 
@@ -1649,24 +1674,17 @@ mod tests {
         let home = root.path().join("home");
         std::fs::create_dir_all(&home).expect("create home");
         let worktree = std::fs::canonicalize(worktree).expect("canonical worktree");
-        let claims = ResourceClaims::new(
-            &workspace,
-            &worktree,
-            &state,
-            &home,
-            NetworkScope::Any,
-        )
-        .expect("claims")
-        .allow_outside_writes(&outside)
-        .expect("outside claim");
+        let claims = ResourceClaims::new(&workspace, &worktree, &state, &home, NetworkScope::Any)
+            .expect("claims")
+            .allow_outside_writes(&outside)
+            .expect("outside claim");
         let policy = Arc::new(MutablePolicy(Mutex::new(
             PolicySnapshot::new(effective, SafetyPolicy::default()).expect("policy"),
         )));
         let generation = Arc::new(TestFence(Mutex::new(7)));
         let authority = Arc::new(ApprovalAuthority::new());
-        let writer = with_writer.then(|| {
-            Box::new(TestWriter(worktree.clone())) as Box<dyn WriterLease>
-        });
+        let writer =
+            with_writer.then(|| Box::new(TestWriter(worktree.clone())) as Box<dyn WriterLease>);
         let broker = ExecutionBroker::new(
             ExecutionIdentity {
                 session: "session-1".to_string(),
@@ -1797,9 +1815,7 @@ mod tests {
             path: fixture.worktree.join("two.rs"),
         };
         assert!(matches!(
-            fixture
-                .broker
-                .authorize_at(&changed_args, Some(&grant), 11),
+            fixture.broker.authorize_at(&changed_args, Some(&grant), 11),
             Err(BrokerError::InvalidApproval(_))
         ));
 
@@ -2024,16 +2040,11 @@ mod tests {
         let home = root.path().join("home");
         std::fs::create_dir_all(&home).expect("home");
 
-        let linked_claims = ResourceClaims::new(
-            &main,
-            &linked,
-            &state,
-            &home,
-            NetworkScope::Denied,
-        )
-            .expect("claims")
-            .discover_linked_worktree_git()
-            .expect("linked git claims");
+        let linked_claims =
+            ResourceClaims::new(&main, &linked, &state, &home, NetworkScope::Denied)
+                .expect("claims")
+                .discover_linked_worktree_git()
+                .expect("linked git claims");
         assert!(!linked_claims.git_write_roots.is_empty());
         assert!(
             linked_claims
@@ -2042,13 +2053,7 @@ mod tests {
                 .any(|path| path.to_string_lossy().contains("worktrees"))
         );
 
-        let main_claims = ResourceClaims::new(
-            &main,
-            &main,
-            &state,
-            &home,
-            NetworkScope::Denied,
-        )
+        let main_claims = ResourceClaims::new(&main, &main, &state, &home, NetworkScope::Denied)
             .expect("main claims")
             .discover_linked_worktree_git();
         assert!(matches!(main_claims, Err(BrokerError::Scope(_))));

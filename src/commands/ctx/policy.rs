@@ -151,9 +151,7 @@ impl Capability {
 /// least-to-most restrictive: `Allow < Ask < Deny`, which is what makes
 /// narrowing expressible as `max` (see the module doc) rather than as a
 /// hand-written comparison per capability.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stance {
     /// zirv declares no restriction of its own. The harness's own defaults and
