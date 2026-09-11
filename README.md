@@ -1401,6 +1401,7 @@ including `score`, `handoff` and `status`, works on all three platforms.
 | `zirv ctx status [--json]` | Shows supervised sessions, the resolved chat agent, unread mail, recent decisions, handoffs, and (issue #358) a cross-harness capacity/pool section; `--json` emits the pool view plus the orchestrator seat as structured JSON |
 | `zirv ctx usage` | Shows usage-window state, or `usage tee` to collect it from the statusline |
 | `zirv ctx optimize` | Reports redundancy, contradictions and dead references in the files that steer your sessions |
+| `zirv ctx provider init\|list\|check\|credential set` | Initializes, inventories, validates, or stores credentials for opt-in native provider routes |
 | `zirv ctx chat [--pin-harness]` | Starts an interactive orchestrator session on the resolved adapter (also `zirv chat`, or bare `zirv`; see [Just Run `zirv`](#just-run-zirv)). `--pin-harness` (same as `ZIRV_CTX_SEAT_PIN=1`) opts this session's orchestrator seat out of automatic rollover (issue #358) — a manual `zirv ctx handover` still works on a pinned seat |
 | `zirv ctx agent <name> <prompt>` | Delegates one task to a supervised worker on another enabled harness -- a dashboard pane when one is live, otherwise inline in this terminal (also `zirv agent`) |
 | `zirv ctx send [--to-session <prefix>]` / `zirv ctx inbox` | Leaves or reads short notes between agent sessions on this machine, scoped to the repo, optionally addressed to one live session |
@@ -1680,6 +1681,7 @@ checkout:
 | `worker.default_read_only` | `ZIRV_CTX_WORKER_DEFAULT_READ_ONLY` |
 | `handover` (`handover.<agent>.<tier>`) | `ZIRV_CTX_HANDOVER_<AGENT>_<TIER>` (e.g. `ZIRV_CTX_HANDOVER_CLAUDE_DEEP`) |
 | `endpoint` (`endpoint.claude`, `endpoint.codex`) | none -- `~/.zirv/ctx.toml` only, chooses which vendor account a seat spends |
+| `native.toml` keys other than `policy.allowed_routes` | `~/.zirv/native.toml` only; repository `allowed_routes` is intersected with the operator set |
 | `safety.allow` | `ZIRV_CTX_SAFETY_ALLOW` |
 | `safety.escape_allow` | `ZIRV_CTX_SAFETY_ESCAPE_ALLOW` |
 | `safety.default` | `ZIRV_CTX_SAFETY_DEFAULT` |
@@ -1797,6 +1799,63 @@ the names follow the key, for example `ZIRV_CTX_DEBOUNCE_MS` for
 (`ZIRV_CTX_QUIET=true` turns events off) rather than `ZIRV_CTX_CHROME_EVENTS`,
 because "quiet" is the more natural spelling for the flag most people will
 actually reach for.
+
+### Native provider routes
+
+Native routing is opt-in through a separate `~/.zirv/native.toml`; older
+zirv binaries ignore this file and continue reading the unchanged
+`ctx.toml`. Start with `zirv ctx provider init`, inspect the offline inventory
+with `zirv ctx provider list [--json]`, and validate role access with
+`zirv ctx provider check [--live] [--role <role>] [--json]`. Live checks are
+off by default and only call the configured model-list endpoint. Store a
+`store:` credential without accepting its value as a zirv argument with
+`zirv ctx provider credential set <account>`.
+
+```toml
+schema = 1
+
+[endpoint.local]
+provider = "openai-compatible"
+base_url = "http://127.0.0.1:11434"
+vendor = "ollama"
+
+[account.work]
+provider = "anthropic"
+credential = "env:ANTHROPIC_API_KEY_WORK"
+billing = "api"
+pool = "work"
+
+[route.work-sonnet]
+account = "work"
+endpoint = "anthropic"
+model = "claude-sonnet-5"
+
+[roles]
+orchestrator = "work-sonnet"
+
+[policy]
+allowed_routes = ["work-sonnet"]
+```
+
+Providers with a default URL have an implicit endpoint named after the
+provider. `openai-compatible` instead requires both `base_url` and `vendor`.
+Account pools default to the account id; two accounts may deliberately share
+one `pool` when they share quota. Credential references are `env:NAME`,
+`store:<item>`, or `file:<path>` (`~` expands; Unix files must be mode 0600 or
+stricter). Claude Code/Codex harness login tokens are refused: Claude.ai and
+ChatGPT subscriptions are entitlements for the harness backend, not native API
+credentials.
+
+The evidence ladder is `recognized` → `configured` → `credentialed` →
+`reachable` → `authenticated` → `validated`. Catalogue recognition never
+claims account access. The offline commands stop at `credentialed`; `--live`
+can establish reachability/authentication, while `validated` remains
+unavailable until the native model transports record a real validation.
+
+The optional repository layer `<repo>/.zirv/native.toml` may contain only
+`schema` and `[policy].allowed_routes`. Its routes are intersected with the
+operator's set, so a checkout can narrow access but cannot add accounts,
+endpoints, routes, role bindings, credentials, or permissions.
 
 ### .settings.toml
 

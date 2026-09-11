@@ -62,6 +62,8 @@ pub mod pool;
 pub mod price;
 pub mod priority;
 pub mod prompt;
+pub mod provider;
+pub mod provider_cmd;
 pub mod reservation;
 pub mod result_schema;
 pub mod resume;
@@ -426,6 +428,8 @@ pub struct CtxCli {
 pub enum CtxVerb {
     /// Show or edit operator ~/.zirv/ctx.toml; set/add ask for approval in wrapped sessions.
     Config(config_cmd::ConfigArgs),
+    /// Configure and inspect opt-in native provider routes.
+    Provider(provider_cmd::ProviderArgs),
     /// Rot-score a session transcript and print JSON.
     Score(score::ScoreArgs),
     /// Distill a handoff from a transcript.
@@ -631,6 +635,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     let mut out = std::io::stdout();
     let result = match &cli.verb {
         CtxVerb::Config(a) => config_cmd::run(a, &mut out),
+        CtxVerb::Provider(a) => provider_cmd::run(a, &mut out),
         CtxVerb::Score(a) => score::run(a, &mut out),
         CtxVerb::Handoff(a) => handoff::run(a, &mut out),
         CtxVerb::Resume(a) => resume::run(a, &mut out),
