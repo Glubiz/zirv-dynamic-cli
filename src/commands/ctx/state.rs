@@ -479,6 +479,16 @@ pub(crate) fn write_atomic(
     contents: &str,
     force_owner_only: bool,
 ) -> std::io::Result<()> {
+    write_atomic_bytes(path, contents.as_bytes(), force_owner_only)
+}
+
+/// Byte-preserving counterpart used by native coding tools for files whose
+/// existing UTF BOM/encoding must survive an atomic edit.
+pub(crate) fn write_atomic_bytes(
+    path: &Path,
+    contents: &[u8],
+    force_owner_only: bool,
+) -> std::io::Result<()> {
     use std::io::Write;
 
     let tmp = temp_sibling(path);
@@ -505,7 +515,7 @@ pub(crate) fn write_atomic(
         {
             file.set_permissions(metadata.permissions())?;
         }
-        file.write_all(contents.as_bytes())?;
+        file.write_all(contents)?;
         file.flush()
     };
 

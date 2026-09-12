@@ -35,6 +35,7 @@ pub mod fake;
 pub mod harness;
 pub mod journal;
 pub mod protocol;
+pub mod tools;
 
 use std::path::PathBuf;
 

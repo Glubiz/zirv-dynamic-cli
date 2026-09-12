@@ -217,12 +217,16 @@ pub enum ProcessInvocation {
         program: String,
         args: Vec<String>,
         cwd: PathBuf,
+        #[serde(default)]
+        environment: BTreeMap<String, String>,
     },
     Shell {
         program: String,
         args: Vec<String>,
         script: String,
         cwd: PathBuf,
+        #[serde(default)]
+        environment: BTreeMap<String, String>,
     },
 }
 
@@ -230,6 +234,12 @@ impl ProcessInvocation {
     fn cwd(&self) -> &Path {
         match self {
             Self::Argv { cwd, .. } | Self::Shell { cwd, .. } => cwd,
+        }
+    }
+
+    fn environment(&self) -> &BTreeMap<String, String> {
+        match self {
+            Self::Argv { environment, .. } | Self::Shell { environment, .. } => environment,
         }
     }
 
@@ -275,6 +285,20 @@ pub enum ExecutionAction {
     Process {
         invocation: ProcessInvocation,
         effects: ProcessEffects,
+    },
+    /// Control of a process already admitted and spawned by the native tool
+    /// service. The opaque handle is resolved by that service; the broker
+    /// still fences the seat and `tool_access` policy on every poll, input,
+    /// wait, or termination request.
+    ProcessControl {
+        handle: String,
+        operation: String,
+    },
+    /// Retrieval from the trusted output store by opaque id. No caller path
+    /// is accepted, but the read still crosses the broker for effect-time
+    /// seat and tool-policy validation.
+    OutputRead {
+        id: String,
     },
     Network {
         target: NetworkTarget,
@@ -999,6 +1023,24 @@ impl ExecutionBroker {
 
         match action {
             ExecutionAction::ReadFile { path } => resolved_paths.push(self.validate_read(path)?),
+            ExecutionAction::ProcessControl { handle, operation } => {
+                if handle.trim().is_empty() || operation.trim().is_empty() {
+                    return Err(BrokerError::InvalidAction(
+                        "process handle and control operation must not be empty".to_string(),
+                    ));
+                }
+            }
+            ExecutionAction::OutputRead { id } => {
+                if id.is_empty()
+                    || !id
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+                {
+                    return Err(BrokerError::InvalidAction(
+                        "output id must be a non-empty ASCII alphanumeric value".to_string(),
+                    ));
+                }
+            }
             ExecutionAction::WriteFile { path } => {
                 let (path, capability) = self.validate_write(path)?;
                 resolved_paths.push(path);
@@ -1122,7 +1164,8 @@ impl ExecutionBroker {
                     Verdict::Ask => required.push(Capability::Approval),
                     Verdict::Allow => {}
                 }
-                process_sandbox = Some(self.process_policy(effects)?);
+                self.validate_process_environment(invocation.environment())?;
+                process_sandbox = Some(self.process_policy(invocation, effects)?);
             }
         }
 
@@ -1220,8 +1263,29 @@ impl ExecutionBroker {
         }
     }
 
+    fn validate_process_environment(
+        &self,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<(), BrokerError> {
+        for (key, value) in environment {
+            let upper = key.to_ascii_uppercase();
+            if key.is_empty()
+                || key.contains(['=', '\0'])
+                || value.contains('\0')
+                || self.protected_env_names.contains(&upper)
+                || sensitive_env_name(&upper)
+            {
+                return Err(BrokerError::InvalidAction(format!(
+                    "process environment override {key:?} is invalid or protected"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn process_policy(
         &self,
+        invocation: &ProcessInvocation,
         effects: &ProcessEffects,
     ) -> Result<ProcessSandboxPolicy, BrokerError> {
         let mut write_roots = Vec::new();
@@ -1239,6 +1303,9 @@ impl ExecutionBroker {
         if effects.outside_write {
             write_roots.extend(self.claims.outside_write_roots.clone());
         }
+        let mut environment =
+            scrub_tool_environment(std::env::vars_os(), &self.protected_env_names);
+        environment.extend(invocation.environment().clone());
         Ok(ProcessSandboxPolicy {
             read_roots: self.claims.read_roots.clone(),
             write_roots: dedup_paths(write_roots),
@@ -1256,7 +1323,7 @@ impl ExecutionBroker {
                 .cloned()
                 .collect(),
             network: effects.network,
-            environment: scrub_tool_environment(std::env::vars_os(), &self.protected_env_names),
+            environment,
         })
     }
 }
@@ -1955,6 +2022,7 @@ mod tests {
                 program: "git".to_string(),
                 args: vec!["status".to_string()],
                 cwd: fixture.worktree.clone(),
+                environment: BTreeMap::new(),
             },
             effects: ProcessEffects::default(),
         };
@@ -1987,6 +2055,7 @@ mod tests {
             program: "git".to_string(),
             args: vec!["status".to_string()],
             cwd: writable,
+            environment: BTreeMap::new(),
         };
         let launch = PlatformIsolation::LinuxBubblewrap {
             executable: PathBuf::from("/usr/bin/bwrap"),

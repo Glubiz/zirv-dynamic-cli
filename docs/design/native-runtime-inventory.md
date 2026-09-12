@@ -86,13 +86,13 @@ criterion).
 | `ctx nudge` | N10 (#479) |  |
 | `ctx objective` | N09 (#478) |  |
 | `ctx optimize` | N15 (#484) |  |
-| `ctx output` | N03 (#472) | lists/shows stored session outputs (issue #326's `ctx run` capture) |
+| `ctx output` | N05 (#474) | the native tool service streams raw process/file evidence into the existing store and retrieves it only by opaque id; the CLI remains the operator surface |
 | `ctx permissions` | N04 (#473) | canonical policy and approval audit remain shared; native effects consume them through `runtime::enforcement` |
 | `ctx provider` | N02 (#471) | `init`, `list`, `check`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
 | `ctx recall` | N06 (#475) |  |
 | `ctx remember` | N06 (#475) |  |
 | `ctx resume` | N17 (#486) |  |
-| `ctx run` | N05 (#474) | runs one command and stores its output; shape a native tool executor must replicate |
+| `ctx run` | N05 (#474) | its output store, compaction classifier and heavy permits are reused by `runtime::tools`; native process execution itself stays behind N04 authorization/isolation |
 | `ctx safety` | N04 (#473) | the existing command classifier is re-evaluated by the native execution broker at each process boundary |
 | `ctx savings` | N18 (#487) |  |
 | `ctx score` | N17 (#486) |  |

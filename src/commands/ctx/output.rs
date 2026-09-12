@@ -1615,6 +1615,84 @@ pub(crate) fn capture_text(
     )
 }
 
+/// A single streaming capture in the existing per-repository output store.
+/// Native processes append stdout/stderr bytes as they arrive and finalize
+/// the same file once on exit, so large or non-UTF-8 output is never buffered
+/// in the runtime and never copied through a second evidence store.
+#[derive(Debug)]
+pub(crate) struct StreamingCapture {
+    dir: PathBuf,
+    id: String,
+    path: PathBuf,
+    started_at: u64,
+    sink: std::fs::File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapturedOutput {
+    pub(crate) id: String,
+    pub(crate) summary: Option<String>,
+}
+
+impl StreamingCapture {
+    pub(crate) fn start(state: &StateDir, repo: &Path) -> CtxResult<Self> {
+        let dir = outputs_dir(state, repo);
+        state::create_private_dir_all(&dir)?;
+        let started_at = state::now_secs();
+        let (id, path) = reserve_log(&dir, started_at);
+        let sink = state::open_private_append(&path)?;
+        Ok(Self {
+            dir,
+            id,
+            path,
+            started_at,
+            sink,
+        })
+    }
+
+    pub(crate) fn append(&mut self, bytes: &[u8]) -> CtxResult<()> {
+        use std::io::Write as _;
+        self.sink.write_all(bytes)?;
+        self.sink.flush()?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        command: &[String],
+        exit_code: Option<i32>,
+        max_summary_bytes: usize,
+        scope: CompactionScope,
+        filter_rules: &[super::config::OutputFilterRule],
+    ) -> CtxResult<CapturedOutput> {
+        use std::io::Write as _;
+        self.sink.flush()?;
+        drop(self.sink);
+        let (_, summary) = summarize_stored(
+            &self.dir,
+            &self.id,
+            &self.path,
+            command,
+            exit_code,
+            self.started_at,
+            max_summary_bytes,
+            scope,
+            filter_rules,
+        )?;
+        Ok(CapturedOutput {
+            id: self.id,
+            summary,
+        })
+    }
+
+    pub(crate) fn abort(mut self) {
+        use std::io::Write as _;
+        let _ = self.sink.flush();
+        drop(self.sink);
+        let _ = std::fs::remove_file(self.path);
+    }
+}
+
 /// Same as [`capture_text`], plus the operator's `[[output.filter]]` rules
 /// (issue #417) -- threaded through to `summarize_stored`, which is where
 /// they are actually applied (and only for `CompactionScope::Generic`).
@@ -1629,28 +1707,30 @@ pub(crate) fn capture_text_with_filters(
     scope: CompactionScope,
     filter_rules: &[super::config::OutputFilterRule],
 ) -> CtxResult<(String, Option<String>)> {
-    let dir = outputs_dir(state, repo);
-    state::create_private_dir_all(&dir)?;
-    let started_at = state::now_secs();
-    let (id, path) = reserve_log(&dir, started_at);
-    {
-        use std::io::Write as _;
-        let mut sink = state::open_private_append(&path)?;
-        sink.write_all(output.as_bytes())?;
-        sink.flush()?;
-    }
-    let (_, summary) = summarize_stored(
-        &dir,
-        &id,
-        &path,
-        command,
-        exit_code,
-        started_at,
-        max_summary_bytes,
-        scope,
-        filter_rules,
+    let mut capture = StreamingCapture::start(state, repo)?;
+    capture.append(output.as_bytes())?;
+    let captured = capture.finish(command, exit_code, max_summary_bytes, scope, filter_rules)?;
+    Ok((captured.id, captured.summary))
+}
+
+/// Trusted retrieval by opaque output id for native tools. Path validation
+/// remains inside this module, shared with the public CLI surface.
+pub(crate) fn show_captured(
+    state: &StateDir,
+    repo: &Path,
+    id: String,
+    range: Option<String>,
+    bytes: Option<String>,
+    max_output_bytes: usize,
+) -> CtxResult<String> {
+    let mut out = Vec::new();
+    show_output(
+        &ShowArgs { id, range, bytes },
+        &mut out,
+        &outputs_dir(state, repo),
+        max_output_bytes,
     )?;
-    Ok((id, summary))
+    Ok(String::from_utf8(out)?)
 }
 
 pub fn run<W: Write>(args: &RunArgs, w: &mut W) -> CtxResult<i32> {
