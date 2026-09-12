@@ -619,8 +619,10 @@ fn decode_text(bytes: &[u8]) -> Option<(String, TextEncoding)> {
             return None;
         }
         let words = body
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair));
         return char::decode_utf16(words)
             .collect::<Result<String, _>>()
             .ok()
@@ -631,8 +633,10 @@ fn decode_text(bytes: &[u8]) -> Option<(String, TextEncoding)> {
             return None;
         }
         let words = body
-            .chunks_exact(2)
-            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_be_bytes(*pair));
         return char::decode_utf16(words)
             .collect::<Result<String, _>>()
             .ok()

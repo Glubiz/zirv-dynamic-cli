@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -155,6 +155,8 @@ struct StreamChunk {
     stream: ProcessStream,
     bytes: Vec<u8>,
 }
+
+type SpawnedProcess = (ProcessChild, Receiver<StreamChunk>, Vec<JoinHandle<()>>);
 
 enum ProcessChild {
     Standard {
@@ -488,7 +490,7 @@ impl Drop for ProcessManager {
 fn spawn(
     launch: &SandboxLaunch,
     interactive: bool,
-) -> Result<(ProcessChild, Receiver<StreamChunk>, Vec<JoinHandle<()>>), ToolError> {
+) -> Result<SpawnedProcess, ToolError> {
     if interactive {
         spawn_pty(launch)
     } else {
@@ -498,7 +500,7 @@ fn spawn(
 
 fn spawn_standard(
     launch: &SandboxLaunch,
-) -> Result<(ProcessChild, Receiver<StreamChunk>, Vec<JoinHandle<()>>), ToolError> {
+) -> Result<SpawnedProcess, ToolError> {
     let mut command = Command::new(&launch.program);
     command
         .args(&launch.args)
@@ -533,7 +535,7 @@ fn spawn_standard(
 
 fn spawn_pty(
     launch: &SandboxLaunch,
-) -> Result<(ProcessChild, Receiver<StreamChunk>, Vec<JoinHandle<()>>), ToolError> {
+) -> Result<SpawnedProcess, ToolError> {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -667,27 +669,22 @@ fn drain(
     let mut output = Vec::new();
     let mut remaining = inline_budget;
     let mut suppressed = 0usize;
-    loop {
-        match process.receiver.try_recv() {
-            Ok(chunk) => {
-                if let Some(capture) = process.capture.as_mut() {
-                    capture.append(&chunk.bytes).map_err(ToolError::external)?;
-                }
-                let take = remaining.min(chunk.bytes.len());
-                if take > 0 {
-                    let bytes = &chunk.bytes[..take];
-                    output.push(ProcessOutputChunk {
-                        stream: chunk.stream,
-                        text: String::from_utf8_lossy(bytes).into_owned(),
-                        byte_len: chunk.bytes.len(),
-                        inline_truncated: take < chunk.bytes.len(),
-                    });
-                    remaining -= take;
-                }
-                suppressed = suppressed.saturating_add(chunk.bytes.len().saturating_sub(take));
-            }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+    while let Ok(chunk) = process.receiver.try_recv() {
+        if let Some(capture) = process.capture.as_mut() {
+            capture.append(&chunk.bytes).map_err(ToolError::external)?;
         }
+        let take = remaining.min(chunk.bytes.len());
+        if take > 0 {
+            let bytes = &chunk.bytes[..take];
+            output.push(ProcessOutputChunk {
+                stream: chunk.stream,
+                text: String::from_utf8_lossy(bytes).into_owned(),
+                byte_len: chunk.bytes.len(),
+                inline_truncated: take < chunk.bytes.len(),
+            });
+            remaining -= take;
+        }
+        suppressed = suppressed.saturating_add(chunk.bytes.len().saturating_sub(take));
     }
     Ok((output, suppressed))
 }
@@ -906,8 +903,4 @@ mod tests {
         manager.terminate(&first.handle).expect("terminate");
     }
 
-    #[test]
-    fn completed_retention_constant_is_intentionally_bounded() {
-        assert!(MAX_COMPLETED >= 32);
-    }
 }

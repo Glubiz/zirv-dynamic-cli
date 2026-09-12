@@ -445,7 +445,7 @@ pub struct ToolError {
     pub code: ToolErrorCode,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval: Option<ApprovalRequest>,
+    pub approval: Option<Box<ApprovalRequest>>,
     pub outcome_unknown: bool,
 }
 
@@ -505,7 +505,7 @@ impl From<BrokerError> for ToolError {
         let approval = match &error {
             BrokerError::ApprovalRequired(request)
             | BrokerError::ApprovalUnavailable(request)
-            | BrokerError::InvalidApproval(request) => Some((**request).clone()),
+            | BrokerError::InvalidApproval(request) => Some(request.clone()),
             _ => None,
         };
         Self {
@@ -922,9 +922,9 @@ fn definition(
     capabilities: &[&str],
     execution_mode: ToolExecutionMode,
     resource_claims: &[ResourceClaimKind],
-    cancellation: CancellationContract,
-    retry: RetryPolicy,
+    lifecycle: (CancellationContract, RetryPolicy),
 ) -> ToolDefinition {
+    let (cancellation, retry) = lifecycle;
     ToolDefinition {
         name: name.into(),
         description: description.into(),
@@ -980,8 +980,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &read_caps,
             ToolExecutionMode::Immediate,
             &[ResourceClaimKind::ReadRoot, ResourceClaimKind::OutputStore],
-            CancellationContract::BeforeEffect,
-            RetryPolicy::Safe,
+            (CancellationContract::BeforeEffect, RetryPolicy::Safe),
         ),
         definition(
             DIRECTORY_LIST,
@@ -997,8 +996,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &read_caps,
             ToolExecutionMode::Immediate,
             &[ResourceClaimKind::ReadRoot, ResourceClaimKind::OutputStore],
-            CancellationContract::BeforeEffect,
-            RetryPolicy::Safe,
+            (CancellationContract::BeforeEffect, RetryPolicy::Safe),
         ),
         definition(
             GLOB_SEARCH,
@@ -1014,8 +1012,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &read_caps,
             ToolExecutionMode::Immediate,
             &[ResourceClaimKind::ReadRoot, ResourceClaimKind::OutputStore],
-            CancellationContract::BeforeEffect,
-            RetryPolicy::Safe,
+            (CancellationContract::BeforeEffect, RetryPolicy::Safe),
         ),
         definition(
             TEXT_SEARCH,
@@ -1034,8 +1031,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &read_caps,
             ToolExecutionMode::Immediate,
             &[ResourceClaimKind::ReadRoot, ResourceClaimKind::OutputStore],
-            CancellationContract::BeforeEffect,
-            RetryPolicy::Safe,
+            (CancellationContract::BeforeEffect, RetryPolicy::Safe),
         ),
         definition(
             FILE_WRITE,
@@ -1053,8 +1049,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &write_caps,
             ToolExecutionMode::Immediate,
             &[ResourceClaimKind::WorktreeWrite],
-            CancellationContract::AtomicCommit,
-            RetryPolicy::Reconcile,
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
         ),
         definition(
             APPLY_PATCH,
@@ -1079,8 +1074,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &write_caps,
             ToolExecutionMode::Immediate,
             &[ResourceClaimKind::WorktreeWrite],
-            CancellationContract::AtomicCommit,
-            RetryPolicy::Reconcile,
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
         ),
         definition(
             PROCESS_START,
@@ -1113,8 +1107,10 @@ fn native_definitions() -> Vec<ToolDefinition> {
                 ResourceClaimKind::Network,
                 ResourceClaimKind::OutputStore,
             ],
-            CancellationContract::ProcessTree,
-            RetryPolicy::NeverAfterStart,
+            (
+                CancellationContract::ProcessTree,
+                RetryPolicy::NeverAfterStart,
+            ),
         ),
         control_definition(
             PROCESS_POLL,
@@ -1133,8 +1129,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &read_caps,
             ToolExecutionMode::ProcessControl,
             &[ResourceClaimKind::OutputStore],
-            CancellationContract::ProcessTree,
-            RetryPolicy::Safe,
+            (CancellationContract::ProcessTree, RetryPolicy::Safe),
         ),
         definition(
             PROCESS_WRITE,
@@ -1150,8 +1145,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &read_caps,
             ToolExecutionMode::ProcessControl,
             &[ResourceClaimKind::OutputStore],
-            CancellationContract::ProcessTree,
-            RetryPolicy::Reconcile,
+            (CancellationContract::ProcessTree, RetryPolicy::Reconcile),
         ),
         control_definition(PROCESS_TERMINATE, "Terminate and reap a process tree."),
         definition(
@@ -1168,8 +1162,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &read_caps,
             ToolExecutionMode::Retrieval,
             &[ResourceClaimKind::OutputStore],
-            CancellationContract::NotApplicable,
-            RetryPolicy::Safe,
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
         ),
     ]
 }
@@ -1185,12 +1178,14 @@ fn control_definition(name: &str, description: &str) -> ToolDefinition {
         &["tool_access"],
         ToolExecutionMode::ProcessControl,
         &[ResourceClaimKind::OutputStore],
-        CancellationContract::ProcessTree,
-        if name == PROCESS_POLL {
-            RetryPolicy::Safe
-        } else {
-            RetryPolicy::Reconcile
-        },
+        (
+            CancellationContract::ProcessTree,
+            if name == PROCESS_POLL {
+                RetryPolicy::Safe
+            } else {
+                RetryPolicy::Reconcile
+            },
+        ),
     )
 }
 
