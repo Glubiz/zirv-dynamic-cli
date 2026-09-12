@@ -18,8 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use self::files::{
-    ApplyPatchArgs, DirectoryArgs, FileOutcome, GlobArgs, ReadFileArgs, SearchArgs,
-    WriteFileArgs,
+    ApplyPatchArgs, DirectoryArgs, FileOutcome, GlobArgs, ReadFileArgs, SearchArgs, WriteFileArgs,
 };
 use self::process::{
     ProcessHandleArgs, ProcessLimits, ProcessManager, ProcessStartArgs, ProcessWaitArgs,
@@ -134,13 +133,13 @@ impl ToolRegistry {
                 format!("unknown native tool {name:?}"),
             ));
         }
-        let bytes = serde_json::to_vec(&arguments).map_err(ToolError::external)?.len();
+        let bytes = serde_json::to_vec(&arguments)
+            .map_err(ToolError::external)?
+            .len();
         if bytes > MAX_TOOL_ARGUMENT_BYTES {
             return Err(ToolError::new(
                 ToolErrorCode::InvalidArguments,
-                format!(
-                    "tool arguments are {bytes} bytes; limit is {MAX_TOOL_ARGUMENT_BYTES}"
-                ),
+                format!("tool arguments are {bytes} bytes; limit is {MAX_TOOL_ARGUMENT_BYTES}"),
             ));
         }
         if !arguments.is_object() {
@@ -250,7 +249,11 @@ impl ParsedTool {
             Self::ProcessStart(args) => {
                 non_empty(&args.program, "program")?;
                 non_empty_path(&args.cwd, "cwd")?;
-                if args.shell_script.as_ref().is_some_and(|script| script.is_empty()) {
+                if args
+                    .shell_script
+                    .as_ref()
+                    .is_some_and(|script| script.is_empty())
+                {
                     return Err(ToolError::new(
                         ToolErrorCode::InvalidArguments,
                         "shell_script must not be empty when supplied",
@@ -726,9 +729,9 @@ impl NativeToolClient {
             ParsedTool::ProcessPoll(args) => {
                 ProcessManager::output_json(self.processes.poll(&args.handle)?)
             }
-            ParsedTool::ProcessWait(args) => ProcessManager::output_json(
-                self.processes.wait(&args.handle, args.wait_ms)?,
-            ),
+            ParsedTool::ProcessWait(args) => {
+                ProcessManager::output_json(self.processes.wait(&args.handle, args.wait_ms)?)
+            }
             ParsedTool::ProcessWrite(args) => ProcessManager::output_json(
                 self.processes
                     .write_input(&args.handle, &args.input, args.close)?,
@@ -814,12 +817,16 @@ fn persist_capture(
 }
 
 fn authorized_path(authorization: &Authorization) -> Result<&Path, ToolError> {
-    authorization.resolved_paths().first().map(PathBuf::as_path).ok_or_else(|| {
-        ToolError::new(
-            ToolErrorCode::Internal,
-            "filesystem authorization did not resolve a target path",
-        )
-    })
+    authorization
+        .resolved_paths()
+        .first()
+        .map(PathBuf::as_path)
+        .ok_or_else(|| {
+            ToolError::new(
+                ToolErrorCode::Internal,
+                "filesystem authorization did not resolve a target path",
+            )
+        })
 }
 
 fn journal_start(record: &mut JournalExecution<'_>) -> Result<(), super::journal::JournalError> {
@@ -1109,7 +1116,10 @@ fn native_definitions() -> Vec<ToolDefinition> {
             CancellationContract::ProcessTree,
             RetryPolicy::NeverAfterStart,
         ),
-        control_definition(PROCESS_POLL, "Poll a process and return only new bounded output."),
+        control_definition(
+            PROCESS_POLL,
+            "Poll a process and return only new bounded output.",
+        ),
         definition(
             PROCESS_WAIT,
             "Wait up to 60 seconds for a process while keeping output responsive.",
@@ -1196,7 +1206,14 @@ mod tests {
             .map(|definition| definition.name.as_str())
             .collect();
         assert_eq!(names.len(), 12);
-        assert_eq!(names.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), 12);
+        assert_eq!(
+            names
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            12
+        );
         for definition in registry.definitions() {
             assert_eq!(definition.input_schema["type"], "object");
             assert_eq!(definition.input_schema["additionalProperties"], false);
@@ -1236,7 +1253,11 @@ mod tests {
                 }),
             )
             .expect("parse");
-        let ExecutionAction::Process { invocation, effects } = parsed.action() else {
+        let ExecutionAction::Process {
+            invocation,
+            effects,
+        } = parsed.action()
+        else {
             panic!("process action");
         };
         let ProcessInvocation::Argv {

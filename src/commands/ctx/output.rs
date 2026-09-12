@@ -1709,13 +1709,7 @@ pub(crate) fn capture_text_with_filters(
 ) -> CtxResult<(String, Option<String>)> {
     let mut capture = StreamingCapture::start(state, repo)?;
     capture.append(output.as_bytes())?;
-    let captured = capture.finish(
-        command,
-        exit_code,
-        max_summary_bytes,
-        scope,
-        filter_rules,
-    )?;
+    let captured = capture.finish(command, exit_code, max_summary_bytes, scope, filter_rules)?;
     Ok((captured.id, captured.summary))
 }
 

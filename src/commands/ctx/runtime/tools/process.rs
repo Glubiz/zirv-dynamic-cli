@@ -12,9 +12,7 @@ use serde_json::Value;
 
 use super::{ToolError, ToolErrorCode};
 use crate::commands::ctx::config::OutputFilterRule;
-use crate::commands::ctx::output::{
-    self, CapturedOutput, CompactionScope, StreamingCapture,
-};
+use crate::commands::ctx::output::{self, CapturedOutput, CompactionScope, StreamingCapture};
 use crate::commands::ctx::permit::HeavyPermit;
 use crate::commands::ctx::runtime::enforcement::{ProcessEffects, SandboxLaunch};
 use crate::commands::ctx::state::StateDir;
@@ -234,7 +232,11 @@ impl ProcessChild {
 
     fn terminate(&mut self) -> Result<(), ToolError> {
         match self {
-            Self::Standard { child, stdin, guard } => {
+            Self::Standard {
+                child,
+                stdin,
+                guard,
+            } => {
                 stdin.take();
                 supervise::terminate(child, TERMINATE_GRACE).map_err(ToolError::external)?;
                 guard.release();
@@ -306,7 +308,10 @@ impl ProcessManager {
         args: &ProcessStartArgs,
     ) -> Result<ProcessSnapshot, ToolError> {
         validate_key(&args.idempotency_key)?;
-        if let Some(handle) = self.existing_for_key(&args.idempotency_key).map(str::to_string) {
+        if let Some(handle) = self
+            .existing_for_key(&args.idempotency_key)
+            .map(str::to_string)
+        {
             return self.poll(&handle);
         }
         let running = self
@@ -322,28 +327,26 @@ impl ProcessManager {
         }
         let command = args.display_command();
         let command_line = command.join(" ");
-        let heavy_permit = if crate::commands::ctx::permit::is_heavy(
-            &command_line,
-            &self.limits.heavy_patterns,
-        ) {
-            Some(
-                crate::commands::ctx::permit::acquire(
-                    &self.state,
-                    self.limits.max_heavy_operations.max(1),
-                    &format!("native:{}", args.idempotency_key),
-                )
-                .ok_or_else(|| {
-                    ToolError::new(
-                        ToolErrorCode::ResourceBusy,
-                        "heavy-operation permit pool is exhausted",
+        let heavy_permit =
+            if crate::commands::ctx::permit::is_heavy(&command_line, &self.limits.heavy_patterns) {
+                Some(
+                    crate::commands::ctx::permit::acquire(
+                        &self.state,
+                        self.limits.max_heavy_operations.max(1),
+                        &format!("native:{}", args.idempotency_key),
                     )
-                })?,
-            )
-        } else {
-            None
-        };
-        let capture = StreamingCapture::start(&self.state, &self.repo)
-            .map_err(ToolError::external)?;
+                    .ok_or_else(|| {
+                        ToolError::new(
+                            ToolErrorCode::ResourceBusy,
+                            "heavy-operation permit pool is exhausted",
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
+        let capture =
+            StreamingCapture::start(&self.state, &self.repo).map_err(ToolError::external)?;
         let (child, receiver, readers) = match spawn(&launch, args.interactive) {
             Ok(spawned) => spawned,
             Err(error) => {
@@ -384,7 +387,10 @@ impl ProcessManager {
 
     pub(super) fn poll(&mut self, handle: &str) -> Result<ProcessSnapshot, ToolError> {
         let limits = self.limits.clone();
-        let process = self.processes.get_mut(handle).ok_or_else(|| unknown(handle))?;
+        let process = self
+            .processes
+            .get_mut(handle)
+            .ok_or_else(|| unknown(handle))?;
         let (output, pending) = update_process(process, &limits)?;
         Ok(snapshot(process, output, pending))
     }
@@ -410,7 +416,10 @@ impl ProcessManager {
         input: &str,
         close: bool,
     ) -> Result<ProcessSnapshot, ToolError> {
-        let process = self.processes.get_mut(handle).ok_or_else(|| unknown(handle))?;
+        let process = self
+            .processes
+            .get_mut(handle)
+            .ok_or_else(|| unknown(handle))?;
         if process.state != ProcessState::Running {
             return Err(ToolError::new(
                 ToolErrorCode::ProcessClosed,
@@ -423,7 +432,10 @@ impl ProcessManager {
 
     pub(super) fn terminate(&mut self, handle: &str) -> Result<ProcessSnapshot, ToolError> {
         let limits = self.limits.clone();
-        let process = self.processes.get_mut(handle).ok_or_else(|| unknown(handle))?;
+        let process = self
+            .processes
+            .get_mut(handle)
+            .ok_or_else(|| unknown(handle))?;
         if process.state == ProcessState::Running {
             process.child.terminate()?;
             process.state = ProcessState::Cancelled;
@@ -541,7 +553,10 @@ fn spawn_pty(
     for (key, value) in &launch.environment {
         command.env(key, value);
     }
-    let reader = pair.master.try_clone_reader().map_err(ToolError::external)?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(ToolError::external)?;
     let writer = pair.master.take_writer().map_err(ToolError::external)?;
     let child = pair
         .slave
@@ -694,7 +709,11 @@ fn snapshot(
             .as_ref()
             .and_then(|capture| capture.summary.clone()),
         interactive: process.interactive,
-        elapsed_ms: process.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        elapsed_ms: process
+            .started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
     }
 }
 
@@ -817,7 +836,10 @@ mod tests {
             infer_git_effects("git", &["reset".into(), "--hard".into()]),
             (true, true)
         );
-        assert_eq!(infer_git_effects("git.exe", &["push".into()]), (false, true));
+        assert_eq!(
+            infer_git_effects("git.exe", &["push".into()]),
+            (false, true)
+        );
     }
 
     #[cfg(unix)]

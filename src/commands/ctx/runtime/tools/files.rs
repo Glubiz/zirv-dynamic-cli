@@ -168,10 +168,7 @@ pub(super) fn read_file(
     })
 }
 
-pub(super) fn list_directory(
-    root: &Path,
-    args: &DirectoryArgs,
-) -> Result<FileOutcome, ToolError> {
+pub(super) fn list_directory(root: &Path, args: &DirectoryArgs) -> Result<FileOutcome, ToolError> {
     let limit = args.max_results.clamp(1, MAX_WALK_ENTRIES);
     let mut entries = Vec::new();
     walk(root, args.recursive, &mut |path, metadata| {
@@ -220,7 +217,10 @@ pub(super) fn glob(root: &Path, args: &GlobArgs) -> Result<FileOutcome, ToolErro
     let mut matches = Vec::new();
     walk(root, true, &mut |path, _| {
         let relative = relative(root, path);
-        if glob_matches(&args.pattern.replace('\\', "/"), &relative.replace('\\', "/")) {
+        if glob_matches(
+            &args.pattern.replace('\\', "/"),
+            &relative.replace('\\', "/"),
+        ) {
             matches.push(relative);
         }
         matches.len() < MAX_WALK_ENTRIES
@@ -237,19 +237,23 @@ pub(super) fn search(root: &Path, args: &SearchArgs) -> Result<FileOutcome, Tool
             "search query must not be empty",
         ));
     }
-    let include = args.include.as_ref().map(|pattern| pattern.replace('\\', "/"));
-    let regex = if args.regex {
-        let pattern = if args.case_sensitive {
-            args.query.clone()
+    let include = args
+        .include
+        .as_ref()
+        .map(|pattern| pattern.replace('\\', "/"));
+    let regex =
+        if args.regex {
+            let pattern = if args.case_sensitive {
+                args.query.clone()
+            } else {
+                format!("(?i:{})", args.query)
+            };
+            Some(regex::Regex::new(&pattern).map_err(|error| {
+                ToolError::new(ToolErrorCode::InvalidArguments, error.to_string())
+            })?)
         } else {
-            format!("(?i:{})", args.query)
+            None
         };
-        Some(regex::Regex::new(&pattern).map_err(|error| {
-            ToolError::new(ToolErrorCode::InvalidArguments, error.to_string())
-        })?)
-    } else {
-        None
-    };
     let needle = (!args.case_sensitive && !args.regex).then(|| args.query.to_lowercase());
     let limit = args.max_results.clamp(1, MAX_WALK_ENTRIES);
     let mut matches = Vec::new();
@@ -278,7 +282,8 @@ pub(super) fn search(root: &Path, args: &SearchArgs) -> Result<FileOutcome, Tool
             } else if args.case_sensitive {
                 line.find(&args.query)
             } else {
-                line.to_lowercase().find(needle.as_deref().unwrap_or_default())
+                line.to_lowercase()
+                    .find(needle.as_deref().unwrap_or_default())
             };
             if let Some(column) = found {
                 matches.push(json!({
@@ -346,7 +351,10 @@ pub(super) fn write_file(path: &Path, args: &WriteFileArgs) -> Result<FileOutcom
     let content = normalize_line_endings(&args.content, ending);
     let desired = encode_text(&content, encoding);
     let desired_sha = sha256(&desired);
-    if current.as_deref().is_some_and(|bytes| sha256(bytes) == desired_sha) {
+    if current
+        .as_deref()
+        .is_some_and(|bytes| sha256(bytes) == desired_sha)
+    {
         return Ok(FileOutcome {
             data: json!({
                 "path": path,
@@ -457,7 +465,10 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, ToolError> {
     if metadata.len() > MAX_FILE_BYTES {
         return Err(ToolError::new(
             ToolErrorCode::OutputLimit,
-            format!("file is {} bytes; hard limit is {MAX_FILE_BYTES}", metadata.len()),
+            format!(
+                "file is {} bytes; hard limit is {MAX_FILE_BYTES}",
+                metadata.len()
+            ),
         ));
     }
     std::fs::read(path).map_err(ToolError::io)
@@ -552,8 +563,7 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
             } else {
                 &pattern[2..]
             };
-            return matches(rest, path)
-                || (!path.is_empty() && matches(pattern, &path[1..]));
+            return matches(rest, path) || (!path.is_empty() && matches(pattern, &path[1..]));
         }
         match pattern[0] {
             '*' => {
@@ -561,12 +571,13 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
                     || (!path.is_empty() && path[0] != '/' && matches(pattern, &path[1..]))
             }
             '?' => !path.is_empty() && path[0] != '/' && matches(&pattern[1..], &path[1..]),
-            literal => {
-                !path.is_empty() && literal == path[0] && matches(&pattern[1..], &path[1..])
-            }
+            literal => !path.is_empty() && literal == path[0] && matches(&pattern[1..], &path[1..]),
         }
     }
-    matches(&pattern.chars().collect::<Vec<_>>(), &path.chars().collect::<Vec<_>>())
+    matches(
+        &pattern.chars().collect::<Vec<_>>(),
+        &path.chars().collect::<Vec<_>>(),
+    )
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -1031,7 +1031,11 @@ impl ExecutionBroker {
                 }
             }
             ExecutionAction::OutputRead { id } => {
-                if id.is_empty() || !id.chars().all(|character| character.is_ascii_alphanumeric()) {
+                if id.is_empty()
+                    || !id
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+                {
                     return Err(BrokerError::InvalidAction(
                         "output id must be a non-empty ASCII alphanumeric value".to_string(),
                     ));
