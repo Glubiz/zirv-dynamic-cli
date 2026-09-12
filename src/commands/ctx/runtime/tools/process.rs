@@ -487,10 +487,7 @@ impl Drop for ProcessManager {
     }
 }
 
-fn spawn(
-    launch: &SandboxLaunch,
-    interactive: bool,
-) -> Result<SpawnedProcess, ToolError> {
+fn spawn(launch: &SandboxLaunch, interactive: bool) -> Result<SpawnedProcess, ToolError> {
     if interactive {
         spawn_pty(launch)
     } else {
@@ -498,9 +495,7 @@ fn spawn(
     }
 }
 
-fn spawn_standard(
-    launch: &SandboxLaunch,
-) -> Result<SpawnedProcess, ToolError> {
+fn spawn_standard(launch: &SandboxLaunch) -> Result<SpawnedProcess, ToolError> {
     let mut command = Command::new(&launch.program);
     command
         .args(&launch.args)
@@ -533,9 +528,7 @@ fn spawn_standard(
     ))
 }
 
-fn spawn_pty(
-    launch: &SandboxLaunch,
-) -> Result<SpawnedProcess, ToolError> {
+fn spawn_pty(launch: &SandboxLaunch) -> Result<SpawnedProcess, ToolError> {
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -902,5 +895,4 @@ mod tests {
         assert_eq!(first.handle, second.handle);
         manager.terminate(&first.handle).expect("terminate");
     }
-
 }
