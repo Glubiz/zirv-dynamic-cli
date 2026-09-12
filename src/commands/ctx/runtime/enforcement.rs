@@ -300,6 +300,17 @@ pub enum ExecutionAction {
     OutputRead {
         id: String,
     },
+    /// Shared Zirv context services. These never expose a storage path to
+    /// provider output. Read operations need only tool access; writes to the
+    /// repository-owned shared memory scope additionally require the same
+    /// repository writer capability and lease as a file write.
+    Knowledge {
+        service: String,
+        operation: String,
+        scope: Option<String>,
+        key: Option<String>,
+        write: bool,
+    },
     Network {
         target: NetworkTarget,
     },
@@ -821,6 +832,10 @@ impl std::fmt::Debug for ExecutionBroker {
 }
 
 impl ExecutionBroker {
+    pub fn identity(&self) -> &ExecutionIdentity {
+        &self.identity
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identity: ExecutionIdentity,
@@ -1039,6 +1054,28 @@ impl ExecutionBroker {
                     return Err(BrokerError::InvalidAction(
                         "output id must be a non-empty ASCII alphanumeric value".to_string(),
                     ));
+                }
+            }
+            ExecutionAction::Knowledge {
+                service,
+                operation,
+                scope,
+                key,
+                write,
+            } => {
+                if service.trim().is_empty() || operation.trim().is_empty() {
+                    return Err(BrokerError::InvalidAction(
+                        "knowledge service and operation must not be empty".to_string(),
+                    ));
+                }
+                if key.as_deref().is_some_and(|key| key.trim().is_empty()) {
+                    return Err(BrokerError::InvalidAction(
+                        "knowledge key must not be empty when supplied".to_string(),
+                    ));
+                }
+                if *write && scope.as_deref() == Some("shared") {
+                    required.push(Capability::RepoFsWrite);
+                    needs_writer = true;
                 }
             }
             ExecutionAction::WriteFile { path } => {
@@ -1852,6 +1889,39 @@ mod tests {
         assert!(matches!(
             permitted.broker.authorize_at(&escaped, None, 10),
             Err(BrokerError::Scope(_))
+        ));
+    }
+
+    #[test]
+    fn only_shared_memory_writes_need_repository_write_authority() {
+        let policy = EffectivePolicy {
+            repo_fs_write: Stance::Deny,
+            approval: Stance::Allow,
+            ..EffectivePolicy::default()
+        };
+        let fixture = fixture(policy, ApprovalMode::Headless, true);
+        let session = ExecutionAction::Knowledge {
+            service: "memory".to_string(),
+            operation: "remember".to_string(),
+            scope: Some("session".to_string()),
+            key: Some("fact".to_string()),
+            write: true,
+        };
+        fixture
+            .broker
+            .authorize_at(&session, None, 10)
+            .expect("session memory is state-local");
+
+        let shared = ExecutionAction::Knowledge {
+            service: "memory".to_string(),
+            operation: "remember".to_string(),
+            scope: Some("shared".to_string()),
+            key: Some("fact".to_string()),
+            write: true,
+        };
+        assert!(matches!(
+            fixture.broker.authorize_at(&shared, None, 10),
+            Err(BrokerError::Denied(_))
         ));
     }
 

@@ -1,4 +1,4 @@
-//! Native coding tool service (issue #474, roadmap N05).
+//! Native coding and knowledge tool service (issues #474-#475, roadmap N05-N06).
 //!
 //! Provider output supplies only a stable tool name and JSON arguments. This
 //! module validates that payload against a closed typed registry, converts it
@@ -50,6 +50,10 @@ pub const PROCESS_WAIT: &str = "process_wait";
 pub const PROCESS_WRITE: &str = "process_write";
 pub const PROCESS_TERMINATE: &str = "process_terminate";
 pub const OUTPUT_READ: &str = "output_read";
+pub const MEMORY_RECALL: &str = "memory_recall";
+pub const MEMORY_REMEMBER: &str = "memory_remember";
+pub const MEMORY_FORGET: &str = "memory_forget";
+pub const CONTEXT_SEARCH: &str = "context_search";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +73,8 @@ pub enum ResourceClaimKind {
     GitMetadata,
     Network,
     OutputStore,
+    MemoryStore,
+    SearchIndex,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -170,6 +176,10 @@ impl ToolRegistry {
             PROCESS_WRITE => parse!(ProcessWrite, ProcessWriteArgs),
             PROCESS_TERMINATE => parse!(ProcessTerminate, ProcessHandleArgs),
             OUTPUT_READ => parse!(OutputRead, OutputReadArgs),
+            MEMORY_RECALL => parse!(MemoryRecall, MemoryRecallArgs),
+            MEMORY_REMEMBER => parse!(MemoryRemember, MemoryRememberArgs),
+            MEMORY_FORGET => parse!(MemoryForget, MemoryForgetArgs),
+            CONTEXT_SEARCH => parse!(ContextSearch, ContextSearchArgs),
             _ => unreachable!("registry membership and parser match stay in lockstep"),
         }?;
         parsed.validate()?;
@@ -187,6 +197,69 @@ struct OutputReadArgs {
     bytes: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MemoryToolScope {
+    Private,
+    Global,
+    Shared,
+    #[default]
+    Session,
+}
+
+impl MemoryToolScope {
+    fn memory_scope(self) -> crate::commands::ctx::memory::MemoryScope {
+        use crate::commands::ctx::memory::MemoryScope;
+        match self {
+            Self::Private => MemoryScope::Private,
+            Self::Global => MemoryScope::Global,
+            Self::Shared => MemoryScope::Shared,
+            Self::Session => MemoryScope::Session,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Global => "global",
+            Self::Shared => "shared",
+            Self::Session => "session",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryRecallArgs {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    scope: Option<MemoryToolScope>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryRememberArgs {
+    key: String,
+    text: String,
+    #[serde(default)]
+    scope: MemoryToolScope,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryForgetArgs {
+    key: String,
+    #[serde(default)]
+    scope: MemoryToolScope,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextSearchArgs {
+    query: String,
+}
+
 #[derive(Debug)]
 enum ParsedTool {
     ReadFile(ReadFileArgs),
@@ -201,6 +274,10 @@ enum ParsedTool {
     ProcessWrite(ProcessWriteArgs),
     ProcessTerminate(ProcessHandleArgs),
     OutputRead(OutputReadArgs),
+    MemoryRecall(MemoryRecallArgs),
+    MemoryRemember(MemoryRememberArgs),
+    MemoryForget(MemoryForgetArgs),
+    ContextSearch(ContextSearchArgs),
 }
 
 impl ParsedTool {
@@ -282,6 +359,21 @@ impl ParsedTool {
             }
             Self::ProcessWrite(args) => non_empty(&args.handle, "handle"),
             Self::OutputRead(args) => non_empty(&args.id, "id"),
+            Self::MemoryRecall(args) => {
+                if args.key.as_deref().is_some_and(str::is_empty) {
+                    return Err(ToolError::new(
+                        ToolErrorCode::InvalidArguments,
+                        "key must not be empty when supplied",
+                    ));
+                }
+                Ok(())
+            }
+            Self::MemoryRemember(args) => {
+                non_empty(&args.key, "key")?;
+                non_empty(&args.text, "text")
+            }
+            Self::MemoryForget(args) => non_empty(&args.key, "key"),
+            Self::ContextSearch(args) => non_empty(&args.query, "query"),
         }
     }
 
@@ -333,6 +425,34 @@ impl ParsedTool {
             Self::OutputRead(args) => ExecutionAction::OutputRead {
                 id: args.id.clone(),
             },
+            Self::MemoryRecall(args) => ExecutionAction::Knowledge {
+                service: "memory".into(),
+                operation: "recall".into(),
+                scope: args.scope.map(|scope| scope.label().to_string()),
+                key: args.key.clone(),
+                write: false,
+            },
+            Self::MemoryRemember(args) => ExecutionAction::Knowledge {
+                service: "memory".into(),
+                operation: "remember".into(),
+                scope: Some(args.scope.label().into()),
+                key: Some(args.key.clone()),
+                write: true,
+            },
+            Self::MemoryForget(args) => ExecutionAction::Knowledge {
+                service: "memory".into(),
+                operation: "forget".into(),
+                scope: Some(args.scope.label().into()),
+                key: Some(args.key.clone()),
+                write: true,
+            },
+            Self::ContextSearch(args) => ExecutionAction::Knowledge {
+                service: "context".into(),
+                operation: "search".into(),
+                scope: None,
+                key: Some(args.query.clone()),
+                write: false,
+            },
         }
     }
 
@@ -344,11 +464,15 @@ impl ParsedTool {
             | Self::Search(_)
             | Self::ProcessPoll(_)
             | Self::ProcessWait(_)
-            | Self::OutputRead(_) => RetryPolicy::Safe,
+            | Self::OutputRead(_)
+            | Self::MemoryRecall(_)
+            | Self::ContextSearch(_) => RetryPolicy::Safe,
             Self::WriteFile(_)
             | Self::ApplyPatch(_)
             | Self::ProcessWrite(_)
-            | Self::ProcessTerminate(_) => RetryPolicy::Reconcile,
+            | Self::ProcessTerminate(_)
+            | Self::MemoryRemember(_)
+            | Self::MemoryForget(_) => RetryPolicy::Reconcile,
             Self::ProcessStart(args)
                 if args.network || args.outside_write || args.git_push_or_destructive =>
             {
@@ -751,7 +875,150 @@ impl NativeToolClient {
                 .map_err(ToolError::external)?;
                 Ok(json!({ "content": text }))
             }
+            ParsedTool::MemoryRecall(args) => self.recall_memory(args),
+            ParsedTool::MemoryRemember(args) => self.remember_memory(args),
+            ParsedTool::MemoryForget(args) => self.forget_memory(args),
+            ParsedTool::ContextSearch(args) => self.search_context(args),
         }
+    }
+
+    fn recall_memory(&self, args: MemoryRecallArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::memory::{self, MemoryScope};
+
+        let cfg = CtxConfig::load(&self.repo, &|key| std::env::var(key).ok())
+            .map_err(ToolError::external)?;
+        let slug = state::repo_slug(&self.repo);
+        let scopes: Vec<MemoryToolScope> = args.scope.map_or_else(
+            || {
+                vec![
+                    MemoryToolScope::Session,
+                    MemoryToolScope::Private,
+                    MemoryToolScope::Global,
+                    MemoryToolScope::Shared,
+                ]
+            },
+            |scope| vec![scope],
+        );
+        let mut rows = Vec::new();
+        for scope in scopes {
+            let entries = match scope.memory_scope() {
+                MemoryScope::Session if cfg.memory.session_enabled => {
+                    memory::list_session(&self.state, &slug, &self.broker.identity().session)
+                }
+                MemoryScope::Session => Ok(Vec::new()),
+                scope => memory::list_scoped(scope, &self.repo, &self.state, &slug, &cfg),
+            }
+            .map_err(ToolError::external)?;
+            for (_, entry) in entries {
+                if args.key.as_deref().is_none_or(|key| key == entry.key) {
+                    rows.push(json!({"scope": scope.label(), "entry": entry}));
+                }
+            }
+        }
+        Ok(json!({"entries": rows}))
+    }
+
+    fn remember_memory(&self, args: MemoryRememberArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::memory::{self, Entry, MemoryScope};
+
+        let cfg = CtxConfig::load(&self.repo, &|key| std::env::var(key).ok())
+            .map_err(ToolError::external)?;
+        let scope = args.scope.memory_scope();
+        if !scope.enabled(&cfg) {
+            return Err(ToolError::new(
+                ToolErrorCode::AuthorizationDenied,
+                format!("memory write disabled by {}", scope.disabled_reason(&cfg)),
+            ));
+        }
+        let slug = state::repo_slug(&self.repo);
+        let now = state::now_secs();
+        let entry = Entry {
+            key: args.key,
+            written_by: format!("native:{}", self.broker.identity().short),
+            written: now,
+            verified: now,
+            source: "explicit".into(),
+            body: args.text,
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        match scope {
+            MemoryScope::Session => memory::remember_session(
+                &self.state,
+                &slug,
+                &self.broker.identity().session,
+                &entry,
+                &cfg,
+            ),
+            scope => memory::upsert_scoped(scope, &self.repo, &self.state, &slug, &cfg, &entry),
+        }
+        .map_err(ToolError::external)?;
+        Ok(json!({
+            "stored": true,
+            "scope": args.scope.label(),
+            "key": entry.key,
+        }))
+    }
+
+    fn forget_memory(&self, args: MemoryForgetArgs) -> Result<Value, ToolError> {
+        use crate::commands::ctx::memory::{self, MemoryScope};
+
+        let slug = state::repo_slug(&self.repo);
+        let removed = match args.scope.memory_scope() {
+            MemoryScope::Session => memory::forget_session(
+                &self.state,
+                &slug,
+                &self.broker.identity().session,
+                &args.key,
+            )
+            .map_err(ToolError::external)?,
+            scope => {
+                memory::forget_scoped(scope, &self.repo, &self.state, &slug, &args.key)
+                    .map_err(ToolError::external)?
+                    .removed
+            }
+        };
+        Ok(json!({
+            "removed": removed,
+            "scope": args.scope.label(),
+            "key": args.key,
+        }))
+    }
+
+    fn search_context(&self, args: ContextSearchArgs) -> Result<Value, ToolError> {
+        let state_root = self.state.root().to_string_lossy().into_owned();
+        let env = |key: &str| {
+            if key == state::STATE_ENV {
+                Some(state_root.clone())
+            } else {
+                std::env::var(key).ok()
+            }
+        };
+        let mut output = Vec::new();
+        let code = crate::commands::ctx::search::run_with(
+            &crate::commands::ctx::search::SearchArgs {
+                query: Some(args.query),
+                around: None,
+                session: None,
+                all_repos: false,
+                json: true,
+            },
+            &mut output,
+            &self.repo,
+            &env,
+            state::now_secs(),
+        )
+        .map_err(ToolError::external)?;
+        if code != 0 {
+            return Err(ToolError::new(
+                ToolErrorCode::Internal,
+                format!("context search exited with {code}"),
+            ));
+        }
+        serde_json::from_slice(output.trim_ascii())
+            .map_err(|error| ToolError::new(ToolErrorCode::Internal, error.to_string()))
     }
 
     fn finish_file(&self, mut outcome: FileOutcome) -> Result<Value, ToolError> {
@@ -1150,7 +1417,7 @@ fn native_definitions() -> Vec<ToolDefinition> {
         control_definition(PROCESS_TERMINATE, "Terminate and reap a process tree."),
         definition(
             OUTPUT_READ,
-            "Retrieve a bounded line or byte range from a stored full output.",
+            "Retrieve a bounded line or byte range from a stored evidence output.",
             object_schema(
                 &["id"],
                 json!({
@@ -1162,6 +1429,67 @@ fn native_definitions() -> Vec<ToolDefinition> {
             &read_caps,
             ToolExecutionMode::Retrieval,
             &[ResourceClaimKind::OutputStore],
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
+        ),
+        definition(
+            MEMORY_RECALL,
+            "Recall typed entries from native session, private, global, or shared memory without changing them.",
+            object_schema(
+                &[],
+                json!({
+                    "key":{"type":"string","minLength":1},
+                    "scope":{"type":"string","enum":["session","private","global","shared"]}
+                }),
+            ),
+            &read_caps,
+            ToolExecutionMode::Retrieval,
+            &[ResourceClaimKind::MemoryStore],
+            (CancellationContract::NotApplicable, RetryPolicy::Safe),
+        ),
+        definition(
+            MEMORY_REMEMBER,
+            "Store one explicit fact in a selected memory scope; session is the safe default.",
+            object_schema(
+                &["key", "text"],
+                json!({
+                    "key":{"type":"string","minLength":1},
+                    "text":{"type":"string","minLength":1},
+                    "scope":{"type":"string","enum":["session","private","global","shared"],"default":"session"}
+                }),
+            ),
+            &read_caps,
+            ToolExecutionMode::Immediate,
+            &[
+                ResourceClaimKind::MemoryStore,
+                ResourceClaimKind::WorktreeWrite,
+            ],
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
+        ),
+        definition(
+            MEMORY_FORGET,
+            "Remove one fact from a selected memory scope; session is the safe default.",
+            object_schema(
+                &["key"],
+                json!({
+                    "key":{"type":"string","minLength":1},
+                    "scope":{"type":"string","enum":["session","private","global","shared"],"default":"session"}
+                }),
+            ),
+            &read_caps,
+            ToolExecutionMode::Immediate,
+            &[
+                ResourceClaimKind::MemoryStore,
+                ResourceClaimKind::WorktreeWrite,
+            ],
+            (CancellationContract::AtomicCommit, RetryPolicy::Reconcile),
+        ),
+        definition(
+            CONTEXT_SEARCH,
+            "Search prior sessions and bounded Zirv evidence without making a model call.",
+            object_schema(&["query"], json!({"query":{"type":"string","minLength":1}})),
+            &read_caps,
+            ToolExecutionMode::Retrieval,
+            &[ResourceClaimKind::SearchIndex],
             (CancellationContract::NotApplicable, RetryPolicy::Safe),
         ),
     ]
@@ -1200,14 +1528,14 @@ mod tests {
             .definitions()
             .map(|definition| definition.name.as_str())
             .collect();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 16);
         assert_eq!(
             names
                 .iter()
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            12
+            16
         );
         for definition in registry.definitions() {
             assert_eq!(definition.input_schema["type"], "object");
@@ -1268,6 +1596,35 @@ mod tests {
         assert_eq!(args, ["%s", "hello world"]);
         assert_eq!(environment.get("LANG").map(String::as_str), Some("C"));
         assert!(!effects.repo_write);
+    }
+
+    #[test]
+    fn knowledge_tools_have_typed_scope_and_effects() {
+        let registry = ToolRegistry::native();
+        for name in [
+            MEMORY_RECALL,
+            MEMORY_REMEMBER,
+            MEMORY_FORGET,
+            CONTEXT_SEARCH,
+        ] {
+            assert!(registry.get(name).is_some(), "missing {name}");
+        }
+        let parsed = registry
+            .parse(
+                MEMORY_REMEMBER,
+                json!({"key":"architecture", "text":"native", "scope":"shared"}),
+            )
+            .expect("parse memory write");
+        assert_eq!(
+            parsed.action(),
+            ExecutionAction::Knowledge {
+                service: "memory".into(),
+                operation: "remember".into(),
+                scope: Some("shared".into()),
+                key: Some("architecture".into()),
+                write: true,
+            }
+        );
     }
 
     #[test]

@@ -9,7 +9,8 @@ service. It is callable by the native provider/agent loop planned in N07-N09;
 it does not expose a second public CLI or change the still-default harness
 backend.
 
-The registry has twelve stable tools:
+The registry has sixteen stable tools. N06 adds the four knowledge tools to
+the same closed service rather than creating a context-only side channel:
 
 | Tool | Contract |
 |---|---|
@@ -25,6 +26,10 @@ The registry has twelve stable tools:
 | `process_write` | pipe or PTY input and explicit input close |
 | `process_terminate` | process-tree cancellation and reap |
 | `output_read` | bounded line/byte retrieval from an opaque existing output id |
+| `memory_recall` | typed session/private/global/shared lookup |
+| `memory_remember` | explicit fact write; session is the safe default |
+| `memory_forget` | scoped fact removal through the existing locked memory bank |
+| `context_search` | bounded zero-model search over prior sessions and evidence |
 
 Every definition carries a closed JSON schema, capability requirements,
 execution mode, resource-claim kinds, cancellation behavior, retry policy,

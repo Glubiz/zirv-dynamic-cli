@@ -68,12 +68,12 @@ criterion).
 | `ctx agent` | N10 (#479) |  |
 | `ctx ask` | N15 (#484) |  |
 | `ctx chat` | N11 (#480) |  |
-| `ctx compile` | N06 (#475) | composes the session prompt from context/skills/memory layers |
+| `ctx compile` | N06 (#475) | legacy composition stays unchanged; `runtime::context` separately compiles typed native instruction/data messages with provenance and hard-budget retention |
 | `ctx config` | shared |  |
 | `ctx discover` | N03 (#472) | reads the compaction ledger to size Bash tool-result bloat |
 | `ctx exec` | N09 (#478) |  |
 | `ctx explain-status` | shared |  |
-| `ctx forget` | N06 (#475) |  |
+| `ctx forget` | N06 (#475) | native `memory_forget` reuses the same locked store and journal semantics |
 | `ctx group` | N10 (#479) |  |
 | `ctx handoff` | N17 (#486) |  |
 | `ctx handover` | N16 (#485) |  |
@@ -89,14 +89,14 @@ criterion).
 | `ctx output` | N05 (#474) | the native tool service streams raw process/file evidence into the existing store and retrieves it only by opaque id; the CLI remains the operator surface |
 | `ctx permissions` | N04 (#473) | canonical policy and approval audit remain shared; native effects consume them through `runtime::enforcement` |
 | `ctx provider` | N02 (#471) | `init`, `list`, `check`, and nested `credential set`; inventory tracks depth 1/2, so this is the owning depth-2 row |
-| `ctx recall` | N06 (#475) |  |
-| `ctx remember` | N06 (#475) |  |
+| `ctx recall` | N06 (#475) | native `memory_recall` preserves session/private/global/shared precedence |
+| `ctx remember` | N06 (#475) | native `memory_remember` defaults to session scope; shared writes retain policy/writer enforcement |
 | `ctx resume` | N17 (#486) |  |
 | `ctx run` | N05 (#474) | its output store, compaction classifier and heavy permits are reused by `runtime::tools`; native process execution itself stays behind N04 authorization/isolation |
 | `ctx safety` | N04 (#473) | the existing command classifier is re-evaluated by the native execution broker at each process boundary |
 | `ctx savings` | N18 (#487) |  |
 | `ctx score` | N17 (#486) |  |
-| `ctx search` | N06 (#475) | explicitly zero-model cross-session recall |
+| `ctx search` | N06 (#475) | explicitly zero-model cross-session recall, also exposed as typed native `context_search` |
 | `ctx send` | N10 (#479) |  |
 | `ctx snapshot` | N14 (#483) | redacted diagnostic-state summary |
 | `ctx spend` | N18 (#487) |  |

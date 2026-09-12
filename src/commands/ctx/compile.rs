@@ -373,7 +373,7 @@ fn find_after(haystack: &str, from: usize, needle: &str) -> Option<usize> {
 /// the core returned here is now itself already <= `core_max_bytes`, the
 /// merged core+retrieval set downstream always fits under the summed cap by
 /// construction, so nothing is re-selected out from under either side.
-fn gather_memory(
+pub(crate) fn gather_memory(
     state: &StateDir,
     repo: &Path,
     slug: &str,

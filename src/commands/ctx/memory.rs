@@ -2388,6 +2388,20 @@ fn forget_session_inner(
     Ok(removed)
 }
 
+/// Removes one key from a live native session's ephemeral memory tier. This
+/// is the typed-service counterpart to [`remember_session`]; unlike the bulk
+/// retirement cleanup it journals the individual deletion and holds the
+/// bank lock across lookup and removal.
+pub fn forget_session(
+    state: &StateDir,
+    slug: &str,
+    session_id: &str,
+    key: &str,
+) -> CtxResult<bool> {
+    let lock = lock_bank(MemoryScope::Session, state, slug)?;
+    forget_session_inner(state, slug, session_id, key, true, &lock)
+}
+
 /// Removes this session's ENTIRE tier outright -- called when the session's
 /// own registry entry retires (`sessions::SessionGuard::release`, issue
 /// #295): a session-scoped entry must never outlive the session it belongs
