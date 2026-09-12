@@ -1512,6 +1512,24 @@ survive a runtime crash. N03 journal states make an interrupted effect
 contract is documented in
 [`docs/design/2026-09-11-native-coding-tools.md`](docs/design/2026-09-11-native-coding-tools.md).
 
+Native context is compiled independently from provider delivery. Zirv emits
+typed instruction and data messages with source/trust provenance, a stable
+methodology prefix, an output-token reservation, and explicit records for
+every included, truncated, referenced, or excluded source. Operator and Zirv
+methodology are instructions; repository prompts, canonical context, shared
+memory, and repository skills remain untrusted data and cannot grant
+authority. Only the active workflow step's skills and bounded relevant memory
+are selected. Required task, workflow, and evidence handles either fit or the
+compile fails—optional prose can never silently crowd them out.
+
+The native registry also exposes `memory_recall`, `memory_remember`,
+`memory_forget`, and zero-model `context_search`. They reuse the existing
+locked memory/search stores and opaque `output_read` evidence handles; shared
+memory writes still cross the repository policy and writer-lease boundary.
+No Claude/Codex prompt file, helper process, or `AgentAdapter` participates in
+native compilation. The contract is documented in
+[`docs/design/2026-09-12-native-context-compiler.md`](docs/design/2026-09-12-native-context-compiler.md).
+
 `zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
 [`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
 honest against the real command surface and source tree: every command verb
