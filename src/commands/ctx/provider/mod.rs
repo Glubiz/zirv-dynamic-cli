@@ -1,5 +1,7 @@
 //! Native provider identities and the built-in provider registry (issue #471).
 
+pub mod adapter;
+pub mod anthropic;
 pub mod capability;
 pub mod config;
 pub mod credential;
@@ -7,6 +9,29 @@ pub mod inventory;
 pub mod probe;
 
 use serde::{Deserialize, Serialize};
+
+/// Provider-owned continuation material is persisted verbatim but never
+/// printed through `Debug`; signatures and redacted-thinking payloads are
+/// protocol data, not diagnostics.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OpaqueProviderData(serde_json::Value);
+
+impl OpaqueProviderData {
+    pub fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn expose(&self) -> &serde_json::Value {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for OpaqueProviderData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[opaque provider data]")
+    }
+}
 
 macro_rules! slug_id {
     ($name:ident) => {

@@ -33,7 +33,8 @@ use sha2::{Digest, Sha256};
 
 use super::super::event::{NormalizedEvent, error_text_hash, input_hash};
 use super::super::provider::{
-    AccountId, BillingPoolId, EndpointId, ModelId, Protocol, ProviderId, RouteId,
+    AccountId, BillingPoolId, EndpointId, ModelId, OpaqueProviderData, Protocol, ProviderId,
+    RouteId,
 };
 use super::super::state::{self, StateDir};
 
@@ -120,10 +121,23 @@ pub struct EventScope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AssistantBlock {
-    Text { text: String },
-    Thinking { text: String },
-    Refusal { text: String },
-    ToolCall { tool_call: ToolCallId },
+    Text {
+        text: String,
+    },
+    Thinking {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<OpaqueProviderData>,
+    },
+    RedactedThinking {
+        data: OpaqueProviderData,
+    },
+    Refusal {
+        text: String,
+    },
+    ToolCall {
+        tool_call: ToolCallId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +147,8 @@ pub struct UsageRecord {
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
     pub provider_request_id: Option<String>,
     pub estimated: bool,
 }
@@ -1518,10 +1534,11 @@ impl Journal {
                         match block {
                             AssistantBlock::Text { text: block }
                             | AssistantBlock::Refusal { text: block } => text.push_str(&block),
-                            AssistantBlock::Thinking { text } => {
+                            AssistantBlock::Thinking { text, .. } => {
                                 thinking_bytes = thinking_bytes.saturating_add(text.len() as u64);
                             }
-                            AssistantBlock::ToolCall { .. } => {}
+                            AssistantBlock::RedactedThinking { .. }
+                            | AssistantBlock::ToolCall { .. } => {}
                         }
                     }
                     if !text.is_empty() {
@@ -2061,7 +2078,10 @@ fn assistant_blocks_from_frames(
                 .map_err(|error| JournalError::InvalidStream(error.to_string()))?;
             match kind {
                 StreamFrameKind::AssistantText => Ok(AssistantBlock::Text { text }),
-                StreamFrameKind::AssistantThinking => Ok(AssistantBlock::Thinking { text }),
+                StreamFrameKind::AssistantThinking => Ok(AssistantBlock::Thinking {
+                    text,
+                    signature: None,
+                }),
                 StreamFrameKind::AssistantRefusal => Ok(AssistantBlock::Refusal { text }),
                 StreamFrameKind::ToolArguments => unreachable!("rejected above"),
             }
@@ -2397,6 +2417,7 @@ mod tests {
                     cache_creation_input_tokens: 4,
                     cache_read_input_tokens: 80,
                     output_tokens: 20,
+                    reasoning_tokens: Some(12),
                     provider_request_id: Some("req-provider-1".into()),
                     estimated: false,
                 },
@@ -2424,6 +2445,10 @@ mod tests {
                 vec![
                     AssistantBlock::Thinking {
                         text: "private working state".into(),
+                        signature: Some(OpaqueProviderData::new(serde_json::json!("sig-secret"))),
+                    },
+                    AssistantBlock::RedactedThinking {
+                        data: OpaqueProviderData::new(serde_json::json!("redacted-secret")),
                     },
                     AssistantBlock::Text {
                         text: "I will inspect it.".into(),
@@ -2520,6 +2545,22 @@ mod tests {
         assert_eq!(first.last_sequence, SequenceId(10));
         assert_eq!(first.messages.len(), 2);
         assert_eq!(first.usage[&usage("usage-1")].input_tokens, 123);
+        assert_eq!(first.usage[&usage("usage-1")].reasoning_tokens, Some(12));
+        assert!(matches!(
+            &first.messages[1].blocks[0],
+            AssistantBlock::Thinking {
+                signature: Some(signature),
+                ..
+            } if signature.expose() == "sig-secret"
+        ));
+        assert!(matches!(
+            &first.messages[1].blocks[1],
+            AssistantBlock::RedactedThinking { data }
+                if data.expose() == "redacted-secret"
+        ));
+        let diagnostic = format!("{:?}", first.messages[1]);
+        assert!(!diagnostic.contains("sig-secret"));
+        assert!(!diagnostic.contains("redacted-secret"));
         assert_eq!(first.tool_calls[&tool("call-1")].name, "read");
         assert_eq!(
             first.executions[&execution("exec-1")].state,
@@ -2881,7 +2922,8 @@ mod tests {
             journal.replay(&session).unwrap().messages[0].blocks,
             vec![
                 AssistantBlock::Thinking {
-                    text: "inspect first".into()
+                    text: "inspect first".into(),
+                    signature: None,
                 },
                 AssistantBlock::Text {
                     text: "Done".into()
