@@ -192,7 +192,7 @@ jobs:
       # that spawn a POSIX shell are cfg(unix); Windows still compiles every
       # process path and runs its path/argv/junction regressions.
       - name: Verify Native Coding Tool Contract
-        run: cargo test --bin zirv runtime::tools:: -- --test-threads=1
+        run: 'cargo test --bin zirv runtime::tools:: -- --test-threads=1'
 
   # CD is idempotent on an already-published version (the release step prints
   # "release $TAG is already published; nothing to do" and skips the
