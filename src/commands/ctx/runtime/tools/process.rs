@@ -773,6 +773,7 @@ fn default_wait_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::ffi::OsString;
 
     use super::*;
