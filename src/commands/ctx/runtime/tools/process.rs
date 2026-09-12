@@ -767,6 +767,7 @@ mod tests {
     use std::ffi::OsString;
 
     use super::*;
+    use crate::commands::ctx::state as ctx_state;
 
     fn limits() -> ProcessLimits {
         ProcessLimits {
@@ -839,7 +840,7 @@ mod tests {
         let id = final_snapshot.output_id.expect("output id");
         let log = state
             .outputs()
-            .join(state::repo_slug(dir.path()))
+            .join(ctx_state::repo_slug(dir.path()))
             .join(format!("{id}.log"));
         assert_eq!(std::fs::read(log).expect("read"), b"\xffok\n");
     }
