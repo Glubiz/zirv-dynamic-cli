@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 106749)
-Total output lines: 10517
-
 //! Cross-session memory bank: agent sessions leave durable notes ("we always
 //! run migrations before tests", "the staging DB creds live in 1Password")
 //! that outlive any single transcript. Mirrors `mail.rs`'s storage idioms
@@ -4560,7 +4557,721 @@ mod tests {
         )
         .expect("recall");
         let recalled = String::from_utf8(out).expect("utf8");
-    …6749 tokens truncated…cape: `foo.md -> /etc/passwd` would read an arbitrary
+        assert!(recalled.contains(&entry.key), "{recalled}");
+        assert!(recalled.contains(&entry.body), "{recalled}");
+        assert!(!state.memory().join(&legacy).exists());
+        let slug = repo_slug(&repo);
+        assert_eq!(
+            get(&state, &slug, &entry.key)
+                .expect("get")
+                .expect("entry")
+                .body,
+            entry.body
+        );
+
+        // A later legacy write (for example from a still-running old binary)
+        // must not cause another adoption in this process, even if current vanished.
+        std::fs::rename(state.memory().join(&slug), state.memory().join("saved"))
+            .expect("move current");
+        remember(&state, &legacy, &entry, &CtxConfig::default()).expect("late legacy write");
+        assert_eq!(repo_slug(&repo.join(".")), slug);
+        assert!(state.memory().join(&legacy).exists());
+        assert!(!state.memory().join(&slug).exists());
+    }
+
+    #[test]
+    fn from_flags_prefers_global_then_shared_then_private() {
+        assert_eq!(MemoryScope::from_flags(false, false), MemoryScope::Private);
+        assert_eq!(MemoryScope::from_flags(true, false), MemoryScope::Shared);
+        assert_eq!(MemoryScope::from_flags(false, true), MemoryScope::Global);
+        assert_eq!(MemoryScope::from_flags(true, true), MemoryScope::Global);
+    }
+
+    #[test]
+    fn global_scope_dir_is_the_state_global_bank_and_ignores_repo_and_slug() {
+        let repo_a = tempfile::tempdir().expect("repo a");
+        let repo_b = tempfile::tempdir().expect("repo b");
+        let state = StateDir::from_root(repo_a.path().join("state"));
+        let expected = state.memory().join(GLOBAL_SLUG);
+
+        assert_eq!(
+            MemoryScope::Global.dir(repo_a.path(), &state, "repo-a"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            MemoryScope::Global.dir(repo_b.path(), &state, "repo-b"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn remember_global_writes_under_the_global_slug_and_never_under_the_repo_slug() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+
+        let path = upsert_scoped(
+            MemoryScope::Global,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("global-fact", 1),
+        )
+        .expect("remember global");
+
+        assert!(path.starts_with(state.memory().join(GLOBAL_SLUG)));
+        assert!(!state.memory().join(&slug).exists());
+    }
+
+    #[test]
+    fn an_entry_remembered_globally_from_one_repo_is_recalled_from_another_repo() {
+        let repo_a = tempfile::tempdir().expect("repo a");
+        let repo_b = tempfile::tempdir().expect("repo b");
+        let state = StateDir::from_root(repo_a.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        upsert_scoped(
+            MemoryScope::Global,
+            repo_a.path(),
+            &state,
+            &repo_slug(repo_a.path()),
+            &cfg,
+            &sample("global-fact", 1),
+        )
+        .expect("remember global");
+
+        let recalled = get_scoped(
+            MemoryScope::Global,
+            repo_b.path(),
+            &state,
+            &repo_slug(repo_b.path()),
+            &cfg,
+            "global-fact",
+        )
+        .expect("recall global");
+        assert_eq!(recalled.expect("global entry").key, "global-fact");
+    }
+
+    #[test]
+    fn global_scope_follows_the_master_switch_like_private() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = repo_slug(repo.path());
+        let mut cfg = CtxConfig::default();
+        remember(&state, &slug, &sample("private-fact", 1), &cfg).expect("remember private");
+        remember(&state, GLOBAL_SLUG, &sample("global-fact", 1), &cfg).expect("remember global");
+
+        cfg.memory.enabled = false;
+        assert_eq!(
+            MemoryScope::Global.enabled(&cfg),
+            MemoryScope::Private.enabled(&cfg)
+        );
+        assert!(!MemoryScope::Global.enabled(&cfg));
+        assert_eq!(
+            MemoryScope::Global.disabled_reason(&cfg),
+            "memory.enabled = false"
+        );
+        assert!(
+            get_scoped(
+                MemoryScope::Global,
+                repo.path(),
+                &state,
+                &slug,
+                &cfg,
+                "global-fact",
+            )
+            .expect("get global")
+            .is_none(),
+            "global reads follow the same disabled master switch as private reads"
+        );
+
+        cfg.memory.enabled = true;
+        assert_eq!(
+            MemoryScope::Global.enabled(&cfg),
+            MemoryScope::Private.enabled(&cfg)
+        );
+        assert!(MemoryScope::Global.enabled(&cfg));
+        assert!(
+            get_scoped(
+                MemoryScope::Global,
+                repo.path(),
+                &state,
+                &slug,
+                &cfg,
+                "global-fact",
+            )
+            .expect("get global")
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn forget_all_global_clears_only_the_global_bank() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+        remember(&state, &slug, &sample("local-fact", 1), &cfg).expect("local");
+        remember(&state, GLOBAL_SLUG, &sample("global-fact", 2), &cfg).expect("global");
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("shared-fact", 3),
+        )
+        .expect("shared");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+        let args = ForgetArgs {
+            key: None,
+            all: true,
+            repo: false,
+            global: true,
+        };
+        let mut out = Vec::new();
+
+        run_forget_with(&args, &mut out, repo.path(), &|key| env.get(key).cloned())
+            .expect("forget global");
+
+        assert!(list(&state, GLOBAL_SLUG).expect("global list").is_empty());
+        assert_eq!(list(&state, &slug).expect("local list").len(), 1);
+        assert_eq!(
+            list_scoped_unchecked(MemoryScope::Shared, repo.path(), &state, &slug)
+                .expect("shared list")
+                .len(),
+            1
+        );
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "zirv ctx forget: cleared the global memory bank\n"
+        );
+    }
+
+    #[test]
+    fn ctx_recall_lists_global_entries_with_the_global_label_and_json_scope() {
+        let repo = tempfile::tempdir().expect("repo");
+        let state_dir = repo.path().join("state");
+        let state = StateDir::from_root(state_dir.clone());
+        let cfg = CtxConfig::default();
+        let slug = repo_slug(repo.path());
+        remember(&state, &slug, &sample("local-fact", now_secs()), &cfg).expect("remember local");
+        remember(
+            &state,
+            GLOBAL_SLUG,
+            &sample("global-fact", now_secs()),
+            &cfg,
+        )
+        .expect("remember global");
+        upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            &slug,
+            &cfg,
+            &sample("shared-fact", now_secs()),
+        )
+        .expect("remember shared");
+        let env = env_map(&[(state::STATE_ENV, state_dir.to_str().expect("utf8"))]);
+
+        let mut human = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                key: None,
+                stale: None,
+                json: false,
+            },
+            &mut human,
+            repo.path(),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("human recall");
+        let human = String::from_utf8(human).expect("utf8");
+        let local_at = human.find("local-fact").expect("local entry");
+        let global_at = human.find("global-fact [global]").expect("global entry");
+        let shared_at = human.find("shared-fact").expect("shared entry");
+        assert!(local_at < global_at && global_at < shared_at, "{human}");
+
+        let mut json = Vec::new();
+        run_recall_with(
+            &RecallArgs {
+                key: None,
+                stale: None,
+                json: true,
+            },
+            &mut json,
+            repo.path(),
+            &|key| env.get(key).cloned(),
+        )
+        .expect("json recall");
+        assert!(
+            String::from_utf8(json)
+                .expect("utf8")
+                .contains("\"scope\":\"global\"")
+        );
+    }
+
+    #[test]
+    fn ctx_remember_and_forget_repo_and_global_flags_conflict() {
+        use clap::Parser as _;
+
+        assert!(
+            crate::commands::ctx::CtxCli::try_parse_from([
+                "zirv ctx", "remember", "--key", "k", "--text", "v", "--repo", "--global",
+            ])
+            .is_err()
+        );
+        assert!(
+            crate::commands::ctx::CtxCli::try_parse_from([
+                "zirv ctx", "forget", "k", "--repo", "--global",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_entry_round_trips_its_key_author_timestamps_and_body() {
+        let entry = Entry {
+            key: "staging-db-creds".to_string(),
+            written_by: "claude".to_string(),
+            written: 1_700_000_000,
+            verified: 1_700_000_500,
+            source: "handoff".to_string(),
+            body: "The staging DB creds live in 1Password under 'staging-db'.".to_string(),
+            importance: None,
+            confidence: None,
+            tags: Vec::new(),
+            paths: Vec::new(),
+        };
+        let parsed = parse_markdown(&entry.to_markdown());
+        assert_eq!(parsed, entry);
+    }
+
+    // E-1: a later `## ` heading in the body used to end the entry outright
+    // (`in_entry` was re-evaluated on every line), silently dropping
+    // everything from that heading onward -- and `verify` would write that
+    // truncation back to disk. An unknown HEADER LINE inside the `##
+    // Memory` block (`- Priority: urgent`) is still correctly skipped;
+    // what changes is that a `## ` heading appearing anywhere in the body
+    // is body text, not a section boundary, and now survives to the parsed
+    // entry (mirrors `mail::parse_markdown`'s own `header_seen` fix).
+    #[test]
+    fn an_unknown_header_is_skipped_but_a_later_heading_stays_in_the_body() {
+        let md = "## Memory\n\
+- Key: build-cmd\n\
+- Written-by: claude\n\
+- Priority: urgent\n\
+- Written: 1700000000\n\
+- Verified: 1700000000\n\
+- Source: explicit\n\
+\n\
+Run `cargo build` before tests.\n\
+\n\
+## Footer\n\
+This is part of the body too.\n";
+
+        let entry = parse_markdown(md);
+        assert_eq!(entry.key, "build-cmd");
+        assert_eq!(entry.written_by, "claude");
+        assert_eq!(entry.written, 1_700_000_000);
+        assert_eq!(
+            entry.body,
+            "Run `cargo build` before tests.\n\n## Footer\nThis is part of the body too."
+        );
+    }
+
+    #[test]
+    fn remembering_an_existing_key_replaces_the_entry_rather_than_duplicating_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        let mut first = sample("build-cmd", 1_700_000_000);
+        first.body = "cargo build".to_string();
+        remember(&state, "-work-repo", &first, &cfg).expect("remember first");
+
+        let mut second = sample("build-cmd", 1_700_000_100);
+        second.body = "cargo build --release".to_string();
+        remember(&state, "-work-repo", &second, &cfg).expect("remember second");
+
+        let listed = list(&state, "-work-repo").expect("list");
+        assert_eq!(
+            listed.len(),
+            1,
+            "the old entry must be replaced, not duplicated"
+        );
+        assert_eq!(listed[0].1.body, "cargo build --release");
+    }
+
+    #[test]
+    fn an_oversized_entry_body_is_truncated_and_says_so() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.max_entry_bytes = 50;
+
+        let mut entry = sample("huge", 1);
+        entry.body = "x".repeat(500);
+
+        let path = remember(&state, "-work-repo", &entry, &cfg)
+            .expect("remember must not fail on oversize");
+        let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
+        assert!(
+            stored.body.len() <= 50,
+            "body respects the cap: {} bytes",
+            stored.body.len()
+        );
+        assert!(
+            stored.body.ends_with("[truncated]"),
+            "says it was truncated: {}",
+            stored.body
+        );
+    }
+
+    #[test]
+    fn upsert_scoped_shared_truncates_an_oversized_body_to_the_cap_like_the_private_path() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.max_entry_bytes = 50;
+
+        let mut entry = sample("huge-shared", 1);
+        entry.body = "x".repeat(500);
+
+        let path = upsert_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+            &entry,
+        )
+        .expect("upsert_scoped must not fail on oversize");
+        let stored = parse_markdown(&std::fs::read_to_string(&path).expect("read"));
+        assert!(
+            stored.body.len() <= 50,
+            "body respects the cap: {} bytes",
+            stored.body.len()
+        );
+        assert!(
+            stored.body.ends_with("[truncated]"),
+            "says it was truncated: {}",
+            stored.body
+        );
+    }
+
+    #[test]
+    fn the_bank_is_pruned_to_the_entry_cap_oldest_written_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.max_entries = 3;
+
+        for i in 0..5u64 {
+            let entry = sample(&format!("key-{i}"), 1_700_000_000 + i);
+            remember(&state, "-work-repo", &entry, &cfg).expect("remember");
+        }
+
+        let remaining = list(&state, "-work-repo").expect("list");
+        assert_eq!(remaining.len(), 3, "pruned down to the cap");
+        let keys: Vec<&str> = remaining.iter().map(|(_, e)| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["key-2", "key-3", "key-4"],
+            "the two oldest-Written entries are dropped, newest three remain"
+        );
+    }
+
+    /// MED: `prune_to_cap` must never select a present-but-unparseable file
+    /// (an empty/partial read mid-rewrite, or a malformed file) for deletion.
+    /// Before the fix it read as `written == 0`, sorted first as the "oldest",
+    /// and was deleted -- silent data loss racing a concurrent write.
+    #[test]
+    fn prune_never_deletes_a_present_but_unparseable_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+
+        // An unparseable file: empty, so `parse_markdown` yields `written: 0`.
+        let junk = dir.join("0000000000-junk.md");
+        std::fs::write(&junk, "").expect("write empty");
+
+        // Plus several real entries, more than the cap.
+        for i in 0..5u64 {
+            let entry = sample(&format!("k{i}"), 1_700_000_000 + i);
+            std::fs::write(
+                dir.join(format!("{:010}-k{i}.md", 1_700_000_000 + i)),
+                entry.to_markdown(),
+            )
+            .expect("write entry");
+        }
+
+        prune_to_cap(dir, 2);
+
+        assert!(
+            junk.exists(),
+            "an unparseable file is never chosen for pruning"
+        );
+        let real: Vec<_> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "0000000000-junk.md")
+            .collect();
+        assert_eq!(
+            real.len(),
+            2,
+            "the real entries are still pruned down to the cap: {real:?}"
+        );
+    }
+
+    /// LOW: a key that ended up with two entries (as a racing pair of
+    /// `remember`s could leave) resolves the same way on every read, and a
+    /// fresh `remember` collapses the key back down to exactly one entry.
+    #[test]
+    fn duplicate_entries_for_one_key_resolve_deterministically_and_remember_converges_to_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+        let slug = "-work-repo";
+        let dir = state.memory().join(slug);
+        super::super::state::create_private_dir_all(&dir).expect("mkdir");
+
+        // Two entries under one key: same base name, the second bumped to a
+        // `_NNN` suffix -- exactly the shape claim_and_write's collision path
+        // produces for a concurrent second writer.
+        let mut a = sample("build-cmd", 1_700_000_000);
+        a.body = "cargo build".to_string();
+        let mut b = sample("build-cmd", 1_700_000_000);
+        b.body = "cargo build --release".to_string();
+        std::fs::write(dir.join("1700000000-build-cmd.md"), a.to_markdown()).expect("write a");
+        std::fs::write(dir.join("1700000000-build-cmd_001.md"), b.to_markdown()).expect("write b");
+
+        // Deterministic read: `get` returns the same entry on every call.
+        let first = get(&state, slug, "build-cmd")
+            .expect("get")
+            .expect("present");
+        let again = get(&state, slug, "build-cmd")
+            .expect("get")
+            .expect("present");
+        assert_eq!(first, again, "a duplicated key resolves to a stable entry");
+
+        // A fresh `remember` collapses the key back to exactly one entry.
+        let mut c = sample("build-cmd", 1_700_000_100);
+        c.body = "cargo build --locked".to_string();
+        remember(&state, slug, &c, &cfg).expect("remember");
+
+        let for_key: Vec<_> = list(&state, slug)
+            .expect("list")
+            .into_iter()
+            .filter(|(_, e)| e.key == "build-cmd")
+            .collect();
+        assert_eq!(
+            for_key.len(),
+            1,
+            "remember converges the key to a single entry: {for_key:?}"
+        );
+        assert_eq!(for_key[0].1.body, "cargo build --locked");
+    }
+
+    #[test]
+    fn entries_never_leak_across_repositories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+        let cfg = CtxConfig::default();
+
+        remember(&state, "-work-a", &sample("only-in-a", 1_700_000_000), &cfg).expect("remember a");
+        remember(&state, "-work-b", &sample("only-in-b", 1_700_000_000), &cfg).expect("remember b");
+
+        let listed_a = list(&state, "-work-a").expect("list a");
+        assert_eq!(listed_a.len(), 1);
+        assert_eq!(listed_a[0].1.key, "only-in-a");
+
+        let listed_b = list(&state, "-work-b").expect("list b");
+        assert_eq!(listed_b.len(), 1);
+        assert_eq!(listed_b[0].1.key, "only-in-b");
+    }
+
+    // N8: this test used to be named `nothing_in_the_repository_checkout_
+    // can_seed_the_bank`, back when there was only one bank. `MemoryScope`
+    // below makes that no longer true system-wide: the whole point of
+    // `Shared` is that a checkout DOES seed a bank. The invariant this test
+    // actually guards -- narrowed, not weakened -- is that the *private*
+    // scope specifically still never reads anything a repo checkout wrote;
+    // see `shared_scope_reads_memory_committed_in_the_repository_checkout`
+    // just below for the shared scope's deliberately opposite behavior, and
+    // `shared_scope_content_is_never_read_back_as_configuration` for the
+    // boundary that still holds for both: repo-owned memory content can
+    // never reach `CtxConfig`.
+    #[test]
+    fn nothing_in_the_repository_checkout_can_seed_the_private_bank() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        let slug = repo_slug(repo.path());
+        let decoy_dir = repo.path().join(".zirv").join("memory").join(&slug);
+        std::fs::create_dir_all(&decoy_dir).expect("mkdir decoy");
+        std::fs::write(
+            decoy_dir.join("0000000000-decoy.md"),
+            sample("decoy", 1).to_markdown(),
+        )
+        .expect("write decoy");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::from_root(tmp.path().join("state"));
+
+        let listed = list(&state, &slug).expect("list");
+        assert!(
+            listed.is_empty(),
+            "a repo-side memory tree must never seed the private scope: {listed:?}"
+        );
+    }
+
+    // MemoryScope: `Shared` (repo-owned, untrusted, `<repo>/.zirv/memory/`)
+    // vs. `Private` (machine-local, unchanged by this task).
+
+    /// `memory.enabled` is a MASTER switch (fix round: memory review): off,
+    /// it disables `Shared` too, however `shared_enabled` is set.
+    /// `shared_enabled` is a second, shared-only toggle underneath it --
+    /// `Private` never consults it, and `Shared` needs both flags on.
+    #[test]
+    fn memory_scope_enabled_treats_the_master_switch_as_a_floor_for_shared() {
+        let mut cfg = CtxConfig::default();
+        cfg.memory.enabled = false;
+        cfg.memory.shared_enabled = true;
+        assert!(!MemoryScope::Private.enabled(&cfg));
+        assert!(
+            !MemoryScope::Shared.enabled(&cfg),
+            "the master switch must suppress shared too, even with shared_enabled on"
+        );
+
+        cfg.memory.enabled = true;
+        cfg.memory.shared_enabled = false;
+        assert!(MemoryScope::Private.enabled(&cfg));
+        assert!(!MemoryScope::Shared.enabled(&cfg));
+    }
+
+    #[test]
+    fn shared_scope_resolves_to_a_deterministic_repo_relative_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        assert_eq!(
+            MemoryScope::Shared.dir(repo.path(), &state, "-irrelevant"),
+            Some(repo.path().join(".zirv").join("memory"))
+        );
+    }
+
+    #[test]
+    fn private_scope_dir_is_unchanged_from_before_scopes_existed() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let state = StateDir::from_root(repo.path().join("state"));
+        let slug = repo_slug(repo.path());
+        assert_eq!(
+            MemoryScope::Private.dir(repo.path(), &state, &slug),
+            Some(state.memory().join(&slug))
+        );
+    }
+
+    /// A repository checkout can commit a symlink at `.zirv` pointing
+    /// anywhere on the filesystem. Following it would treat an arbitrary
+    /// directory elsewhere on this machine as this repo's shared memory --
+    /// the same escape `optimize.rs`'s `nested_claude_files` refuses for
+    /// `CLAUDE.md` discovery.
+    #[cfg(unix)]
+    #[test]
+    fn shared_scope_refuses_a_symlinked_zirv_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(outside.path().join("memory")).expect("mkdir");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".zirv")).expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        assert_eq!(
+            MemoryScope::Shared.dir(repo.path(), &state, "-irrelevant"),
+            None,
+            "a symlinked .zirv must never be followed"
+        );
+    }
+
+    /// Same escape one level deeper: `.zirv` itself is real, but
+    /// `.zirv/memory` is the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn shared_scope_refuses_a_symlinked_memory_directory() {
+        let repo = crate::commands::ctx::testenv::repo();
+        std::fs::create_dir_all(repo.path().join(".zirv")).expect("mkdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        std::fs::write(outside.path().join("secret.md"), "leak").expect("write");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".zirv").join("memory"))
+            .expect("symlink");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        assert_eq!(
+            MemoryScope::Shared.dir(repo.path(), &state, "-irrelevant"),
+            None,
+            "a symlinked .zirv/memory must never be followed"
+        );
+    }
+
+    /// The deliberate counterpart of `nothing_in_the_repository_checkout_
+    /// can_seed_the_private_bank` above: the whole point of the shared scope
+    /// is that a checkout's own committed content is read.
+    #[test]
+    fn shared_scope_reads_memory_committed_in_the_repository_checkout() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("0000000001-shared-fact.md"),
+            sample("shared-fact", 1).to_markdown(),
+        )
+        .expect("write");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let cfg = CtxConfig::default();
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1.key, "shared-fact");
+    }
+
+    #[test]
+    fn list_scoped_is_empty_when_the_shared_scope_is_disabled() {
+        let repo = crate::commands::ctx::testenv::repo();
+        let dir = repo.path().join(".zirv").join("memory");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("0000000001-shared-fact.md"),
+            sample("shared-fact", 1).to_markdown(),
+        )
+        .expect("write");
+
+        let state = StateDir::from_root(repo.path().join("state"));
+        let mut cfg = CtxConfig::default();
+        cfg.memory.shared_enabled = false;
+        let listed = list_scoped(
+            MemoryScope::Shared,
+            repo.path(),
+            &state,
+            "-irrelevant",
+            &cfg,
+        )
+        .expect("list shared");
+        assert!(
+            listed.is_empty(),
+            "a disabled shared scope must report empty even with entries on disk: {listed:?}"
+        );
+    }
+
+    /// A committed symlink inside an otherwise-legitimate shared memory
+    /// directory (rather than at the directory itself) is a narrower version
+    /// of the same escape: `foo.md -> /etc/passwd` would read an arbitrary
     /// file on this machine back as if it were an innocuous memory entry.
     #[cfg(unix)]
     #[test]
