@@ -764,6 +764,8 @@ fn default_wait_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
 
     fn limits() -> ProcessLimits {
@@ -838,7 +840,7 @@ mod tests {
         let files = std::fs::read_dir(state.outputs()).expect("outputs");
         let log = files
             .filter_map(Result::ok)
-            .find(|entry| entry.file_name() == format!("{id}.log"))
+            .find(|entry| entry.file_name() == format!("{id}.log").as_str())
             .expect("log");
         assert_eq!(std::fs::read(log.path()).expect("read"), b"\xffok\n");
     }

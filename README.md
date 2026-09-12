@@ -1484,6 +1484,34 @@ does not advertise native coding support on a host until that host's
 enforcement probe passes. The contract and current platform evidence are in
 [`docs/design/2026-09-11-native-execution-enforcement.md`](docs/design/2026-09-11-native-execution-enforcement.md).
 
+The native coding tool service now exposes a closed, schema-described
+registry for file ranges, directory/glob/text search, atomic writes,
+exact-content patches, process start/poll/wait/input/termination, and stored
+output retrieval. JSON is fully decoded into a typed request before the N04
+broker sees an action; unknown fields, incomplete payloads, empty handles,
+and oversized arguments are refused without executing anything. File writes
+require idempotency keys and existing files require SHA-256 preconditions.
+Patches additionally require exact occurrence counts. UTF-8 BOM, UTF-16
+endianness, existing permissions, and consistent line endings survive an
+atomic replacement; binary and image reads report their media type and hash
+instead of corrupting bytes through a text decoder.
+
+Processes use explicit argv by default. Shell mode is a separate
+`shell_script` shape and receives conservative git/destructive effects.
+Requested network, outside-write, and git-metadata access can only add broker
+checks and sandbox bindings; omitting them leaves those effects unavailable.
+Non-interactive commands use pipes, interactive commands alone use
+PTY/ConPTY, and every live command has an opaque handle for bounded polling,
+waiting, input, and process-tree termination. Raw stdout/stderr streams once
+into the existing output store, so large and non-UTF-8 failures return a
+bounded summary plus `output_id` rather than filling model context. Process
+handles are intentionally machine-process-local and are not claimed to
+survive a runtime crash. N03 journal states make an interrupted effect
+`outcome_unknown`; receipts mark each tool `safe`, `reconcile`, or
+`never_after_start`, preventing blind replay of remote mutations. The exact
+contract is documented in
+[`docs/design/2026-09-11-native-coding-tools.md`](docs/design/2026-09-11-native-coding-tools.md).
+
 `zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
 [`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
 honest against the real command surface and source tree: every command verb
@@ -1659,6 +1687,10 @@ The same narrowing-only rule applies to native execution. Native tools receive
 the already-resolved policy and resource claims from trusted runtime state;
 repository instructions and model output cannot add roots, provider
 credentials, network targets, approvals, or a different seat generation.
+Process environment overrides are part of the broker-signed action and may
+not replace protected credential variables. Declared process effects only
+request additional sandbox access; under-declaring an effect leaves that
+resource read-only or disconnected rather than bypassing policy.
 
 | Forbidden repo key | Set instead via |
 |---|---|

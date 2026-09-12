@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -740,6 +739,8 @@ fn default_results() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
     #[test]
@@ -833,7 +834,15 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink");
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&outside, root.join("link")).expect("symlink");
+        {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(root.join("link"))
+                .arg(&outside)
+                .status()
+                .expect("junction command");
+            assert!(status.success(), "Windows CI must support a test junction");
+        }
         let outcome = list_directory(
             &root,
             &DirectoryArgs {

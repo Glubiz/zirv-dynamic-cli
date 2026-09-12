@@ -172,6 +172,28 @@ jobs:
       - name: Verify Native Enforcement Contract
         run: cargo test --bin zirv runtime::enforcement::tests -- --test-threads=1
 
+  native-tools-platforms:
+    name: Native Tools (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set Up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Exercises the closed registry, Unicode/line-ending-safe file tools,
+      # bounded raw-byte output capture and process lifecycle contracts. Tests
+      # that spawn a POSIX shell are cfg(unix); Windows still compiles every
+      # process path and runs its path/argv/junction regressions.
+      - name: Verify Native Coding Tool Contract
+        run: cargo test --bin zirv runtime::tools:: -- --test-threads=1
+
   # CD is idempotent on an already-published version (the release step prints
   # "release $TAG is already published; nothing to do" and skips the
   # Homebrew/Chocolatey jobs), so an unbumped merge just deploys nothing --
