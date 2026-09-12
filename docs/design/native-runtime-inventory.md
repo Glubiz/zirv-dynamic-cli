@@ -189,6 +189,7 @@ installed binary during self-update; never spawns it).
 
 | Entry point | Path | Symbol | Owner | Notes |
 |---|---|---|---|---|
+| Native Anthropic Messages request | `src/commands/ctx/provider/anthropic.rs` | `perform_blocking` | N07 (#476) | direct HTTPS/SSE transport behind `ProviderAdapter`; no vendor CLI or SDK agent loop |
 | Interactive orchestrator launch | `src/commands/ctx/chat.rs` | `build_launch` | N11 (#480) | backs `zirv ctx chat` / `zirv chat` |
 | Wrap first-launch PTY spawn | `src/commands/ctx/wrap.rs` | `run_with` | harness-backend | initial `zirv ctx wrap` PTY `CommandBuilder` |
 | Wrap mid-session PTY relaunch | `src/commands/ctx/wrap.rs` | `relaunch` | harness-backend | in-place restart after compaction/handoff |
@@ -220,4 +221,6 @@ ctx/ask.rs` (`run_model`), `src/commands/ctx/optimize.rs` (`run_with`),
 `src/commands/ctx/run_loop.rs`'s second call site (`evaluate_objective_
 after_cycle`, distinct from its main headless spawn),
 `src/commands/workflow/frontend_render.rs` (`launch_visual_reviewer`), and
-`src/commands/workflow/engine.rs` (`spawn_auto_worker`).
+`src/commands/workflow/engine.rs` (`spawn_auto_worker`). N07 adds the first
+native direct-model call in `src/commands/ctx/provider/anthropic.rs`
+(`perform_blocking`).

@@ -1530,6 +1530,19 @@ No Claude/Codex prompt file, helper process, or `AgentAdapter` participates in
 native compilation. The contract is documented in
 [`docs/design/2026-09-12-native-context-compiler.md`](docs/design/2026-09-12-native-context-compiler.md).
 
+The first direct-model adapter speaks Anthropic's Messages API over raw
+HTTPS/SSE behind a provider-neutral transport contract. It sends only Zirv's
+compiled system/data messages and public tool schemas, reassembles interleaved
+text, tool-use, thinking signatures, and redacted-thinking blocks, and keeps
+all tool execution in Zirv. Exact model IDs and model-specific thinking/effort
+controls are checked locally; authentication, entitlement, model access,
+context limits, rate limits, overloads, timeouts, cancellation, refusals, and
+usage/cache classes remain typed. Opaque continuation material is replayed
+verbatim but excluded from diagnostics. Versioned fixtures and an ignored,
+credential-gated live contract test cover the provider boundary; N09 owns
+wiring this adapter into the durable agent loop. The transport contract is in
+[`docs/design/2026-09-12-native-anthropic-provider.md`](docs/design/2026-09-12-native-anthropic-provider.md).
+
 `zirv verify --builtin`'s `ZCHK-RUNTIME-INVENTORY` check keeps
 [`docs/design/native-runtime-inventory.md`](docs/design/native-runtime-inventory.md)
 honest against the real command surface and source tree: every command verb
